@@ -40,6 +40,7 @@ function color_print
 end
 
 argparse dry_run only_output "g/glob=" "o/output_dir=" -- $argv
+or exit
 
 if not set -q _flag_glob
     set _flag_glob "*.mkv"
@@ -48,6 +49,8 @@ end
 if not set -q _flag_output_dir
     set _flag_output_dir "/mnt/daveynet/nfs/media 0/needs_processing/ffmpeg_output/"
 end
+
+set error_files
 
 fd --ignore-case --glob $_flag_glob -0 | while read -z input
     if not set -q _flag_only_output
@@ -84,7 +87,7 @@ fd --ignore-case --glob $_flag_glob -0 | while read -z input
     else
         set show_name (basename $PWD)
         set output (realpath -m "$_flag_output_dir/$show_name/$input")
-        set ffmpeg_command ffmpeg -n -hide_banner -v error -stats -i "$input" -map 0 $metadata -c copy $audio_streams "$output"
+        set ffmpeg_command ffmpeg -n -nostdin -hide_banner -v error -stats -i "$input" -map 0 $metadata -c copy $audio_streams "$output"
 
         if not set -q _flag_only_output
             printf \t
@@ -98,16 +101,22 @@ fd --ignore-case --glob $_flag_glob -0 | while read -z input
                 color_print $COLOR_Y $output\n
             else
                 mkdir -p (dirname "$output")
-                cat /dev/null | $ffmpeg_command
+                $ffmpeg_command
                 set ffmpeg_status $status
 
                 # ffmpeg returned 0
+                set ffmpeg_status_color
                 if [ $status = 0 ]
-                    color_print $COLOR_G \t"status: "$ffmpeg_status\n
-                    chmod -R oug+rw "$_flag_output_dir" &
+                    set ffmpeg_status_color $COLOR_G
                 else
-                    color_print $EM_R \t"status: "$ffmpeg_status\n
+                    set ffmpeg_status_color $EM_R
+                    rm "$output"
+                    set -a error_files $input
                 end
+
+                color_print $ffmpeg_status_color \t"status: "$ffmpeg_status\n\n
+
+                chmod -R oug+rw "$_flag_output_dir" &
             end
         end
 
@@ -115,4 +124,9 @@ fd --ignore-case --glob $_flag_glob -0 | while read -z input
             echo
         end
     end
+end
+
+if set -q error_files[1]
+    color_print $EM_R "Errored files:"\n
+    printf %s\n $error_files
 end
