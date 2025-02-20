@@ -39,7 +39,7 @@ function color_print
     printf "%b" "$argv[1]\e0$argv[2]$COLOR_RESET"
 end
 
-argparse dry_run only_output "g/glob=" "o/output_dir=" -- $argv
+argparse dry_run only_output copy_first "g/glob=" "o/output_dir=" -- $argv
 or exit
 
 if not set -q _flag_glob
@@ -87,13 +87,22 @@ fd --ignore-case --glob $_flag_glob -0 | while read -z input
     else
         set show_name (basename $PWD)
         set output (realpath -m "$_flag_output_dir/$show_name/$input")
-        set ffmpeg_command ffmpeg -n -nostdin -hide_banner -v error -stats -i "$input" -map 0 $metadata -c copy $audio_streams "$output"
+
+        if set -q _flag_copy_first
+            function ffmpeg_command
+                ffmpeg -n -nostdin -hide_banner -v error -stats -i "$input" -map 0 -c copy -f matroska pipe: | ffmpeg -n -hide_banner -v error -stats -f matroska -i pipe: -map 0 $metadata -c copy $audio_streams "$output"
+            end
+        else
+            function ffmpeg_command
+                ffmpeg -n -nostdin -hide_banner -v error -stats -i "$input" -map 0 $metadata -c copy $audio_streams "$output"
+            end
+        end
 
         if not set -q _flag_only_output
             printf \t
         end
 
-        printf "$ffmpeg_command"\n
+        printf "$input"\n
 
         if not set -q _flag_dry_run
             if test -e "$output"
@@ -101,7 +110,7 @@ fd --ignore-case --glob $_flag_glob -0 | while read -z input
                 color_print $COLOR_Y $output\n
             else
                 mkdir -p (dirname "$output")
-                $ffmpeg_command
+                ffmpeg_command
                 set ffmpeg_status $status
 
                 # ffmpeg returned 0
