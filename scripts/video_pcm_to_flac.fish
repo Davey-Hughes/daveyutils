@@ -39,7 +39,11 @@ function color_print
     printf "%b" "$argv[1]\e0$argv[2]$COLOR_RESET"
 end
 
-argparse dry_run only_output copy_first "g/glob=" "o/output_dir=" -- $argv
+function inc -a int
+    math $int + 1
+end
+
+argparse dry_run only_output copy_first "g/glob=" "o/output_dir=" "m#max_files" -- $argv
 or exit
 
 if not set -q _flag_glob
@@ -52,7 +56,16 @@ end
 
 set error_files
 
+set i 0
 fd --ignore-case --glob $_flag_glob -0 | while read -z input
+    # break if max files is reached
+    if set -q _flag_max_files
+        if test $i -ge $_flag_max_files
+            break
+        end
+    end
+    set i (math $i + 1)
+
     if not set -q _flag_only_output
         color_print $EM_Y $input\n
     end
@@ -66,12 +79,14 @@ fd --ignore-case --glob $_flag_glob -0 | while read -z input
         # get stream index, codec name, and title
         set stream (string split , $line)
 
-
-        # if stream is PCM
+        # if stream title is set and stream type is PCM
         if string match --quiet --all --regex '^pcm_.*' $stream[2]
-            # replace "PCM" with "FLAC" in stream title
-            set stream[3] (string replace PCM FLAC $stream[3])
-            set -a metadata -metadata:s:$stream[1] title="$stream[3]"
+
+            # replace "PCM" with "FLAC" in stream title if title exists
+            if set -q stream[3]
+                set stream[3] (string replace PCM FLAC $stream[3])
+                set -a metadata -metadata:s:$stream[1] title="$stream[3]"
+            end
 
             # set output stream to encode to flac
             set -a audio_streams -c:$stream[1] flac
