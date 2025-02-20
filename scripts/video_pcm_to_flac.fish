@@ -56,15 +56,14 @@ end
 
 set error_files
 
-set i 0
+set files_converted 0
 fd --ignore-case --glob $_flag_glob -0 | while read -z input
     # break if max files is reached
     if set -q _flag_max_files
-        if test $i -ge $_flag_max_files
+        if test $files_converted -ge $_flag_max_files
             break
         end
     end
-    set i (math $i + 1)
 
     if not set -q _flag_only_output
         color_print $EM_Y $input\n
@@ -100,6 +99,7 @@ fd --ignore-case --glob $_flag_glob -0 | while read -z input
             echo
         end
     else
+        set files_converted (math $files_converted + 1)
         set show_name (basename $PWD)
         set output (realpath -m "$_flag_output_dir/$show_name/$input")
 
