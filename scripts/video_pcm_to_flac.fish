@@ -43,7 +43,7 @@ function inc -a int
     math $int + 1
 end
 
-argparse dry_run only_output copy_first "g/glob=" "o/output_dir=" "m#max_files" -- $argv
+argparse dry-run only-output copy-first "g/glob=" "o/output-dir=" "m#max-files" -- $argv
 or exit
 
 if not set -q _flag_glob
