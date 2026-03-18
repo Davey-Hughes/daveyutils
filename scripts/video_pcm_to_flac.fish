@@ -43,7 +43,7 @@ function inc -a int
     math $int + 1
 end
 
-argparse dry-run only-output copy-first "g/glob=" "o/output-dir=" "m#max-files" -- $argv
+argparse dry-run only-output copy-first flac-to-pcm "g/glob=" "o/output-dir=" "m#max-files" -- $argv
 or exit
 
 if not set -q _flag_glob
@@ -74,30 +74,64 @@ fd --ignore-case --glob $_flag_glob -0 | while read -z input
     set audio_streams
     set metadata
 
-    for line in $audio_track_info
-        # get stream index, codec name, and title
-        set stream (string split , $line)
+    if set -q _flag_flac_to_pcm
+        # Convert FLAC to PCM
+        for line in $audio_track_info
+            # get stream index, codec name, and title
+            set stream (string split , $line)
 
-        # if stream title is set and stream type is PCM
-        if string match --quiet --all --regex '^pcm_.*' $stream[2]
+            # if stream type is FLAC
+            if string match --quiet flac $stream[2]
 
-            # replace "PCM" with "FLAC" in stream title if title exists
-            if set -q stream[3]
-                set stream[3] (string replace PCM FLAC $stream[3])
-                set -a metadata -metadata:s:$stream[1] title="$stream[3]"
+                # replace "FLAC" with "PCM" in stream title if title exists
+                if set -q stream[3]
+                    set stream[3] (string replace FLAC PCM $stream[3])
+                    set -a metadata -metadata:s:$stream[1] title="$stream[3]"
+                end
+
+                # set output stream to encode to pcm_s16le
+                set -a audio_streams -c:$stream[1] pcm_s16le
             end
+        end
 
-            # set output stream to encode to flac
-            set -a audio_streams -c:$stream[1] flac
+        if not set -q audio_streams[1]
+            if not set -q _flag_only_output
+                color_print $EM_R \t"No FLAC audio streams found in "
+                color_print $COLOR_Y $input\n
+                echo
+            end
+        end
+    else
+        # Convert PCM to FLAC (default behavior)
+        for line in $audio_track_info
+            # get stream index, codec name, and title
+            set stream (string split , $line)
+
+            # if stream title is set and stream type is PCM
+            if string match --quiet --all --regex '^pcm_.*' $stream[2]
+
+                # replace "PCM" with "FLAC" in stream title if title exists
+                if set -q stream[3]
+                    set stream[3] (string replace PCM FLAC $stream[3])
+                    set -a metadata -metadata:s:$stream[1] title="$stream[3]"
+                end
+
+                # set output stream to encode to flac
+                set -a audio_streams -c:$stream[1] flac
+            end
+        end
+
+        if not set -q audio_streams[1]
+            if not set -q _flag_only_output
+                color_print $EM_R \t"No PCM audio streams found in "
+                color_print $COLOR_Y $input\n
+                echo
+            end
         end
     end
 
     if not set -q audio_streams[1]
-        if not set -q _flag_only_output
-            color_print $EM_R \t"No PCM audio streams found in "
-            color_print $COLOR_Y $input\n
-            echo
-        end
+        # Skip this file, no matching streams found
     else
         set files_converted (math $files_converted + 1)
         set show_name (basename $PWD)
