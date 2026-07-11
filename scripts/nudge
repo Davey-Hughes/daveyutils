@@ -37,9 +37,19 @@ SEND_DELAY="0.75"
 NOTIFY=false
 AUTO_RETRY=false
 RETRY_LIMIT=2
+VERIFY=false
 EXECUTE_NUDGE=false
 
 # --- Helpers ---------------------------------------------------------------
+
+# Interpret a string (arg 1) as a boolean: 1/true/yes/on (any case) -> "true",
+# everything else (including empty/unset) -> "false". Used for NUDGE_* env vars.
+env_bool() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) printf 'true' ;;
+        *) printf 'false' ;;
+    esac
+}
 
 print_help() {
     echo "Usage: nudge [OPTIONS]"
@@ -56,10 +66,21 @@ print_help() {
     echo "  -n, --notify          Send a desktop notification when the injection fires"
     echo "  -a, --auto-retry      If rate-limited, autonomously schedule another nudge (Defaults to 2 retries)"
     echo "  -r, --retries <num>   Set the exact number of auto-retries. Set to -1 to retry forever."
+    echo "  -v, --verify          Before injecting, confirm the pane still shows a rate-limit banner; skip the send if it doesn't (guards against nudging a session you already resumed)"
+    echo "      --no-notify       Disable notifications (overrides a NUDGE_NOTIFY default)"
+    echo "      --no-auto-retry   Disable auto-retry (overrides a NUDGE_AUTO_RETRY default)"
+    echo "      --no-verify       Disable verification (overrides a NUDGE_VERIFY default)"
     echo "  -h, --help            Show this help message"
     echo ""
     echo "If essential options are omitted, the script will prompt you interactively."
     echo "  (If 'fzf' is installed, you will get a live visual preview of each pane!)"
+    echo "  After picking a pane you can set run options (fzf: press Alt-o; text menu: you'll be asked)."
+    echo ""
+    echo "Environment (persistent defaults; overridden by flags, then by interactive toggles):"
+    echo "  NUDGE_AUTO_RETRY=1    Enable auto-retry by default"
+    echo "  NUDGE_VERIFY=1        Enable pane verification by default"
+    echo "  NUDGE_NOTIFY=1        Enable desktop notifications by default"
+    echo "  NUDGE_RETRIES=<num>   Default retry count (implies auto-retry; -1 = forever)"
     echo ""
     echo "Examples:"
     echo "  # Run fully interactively (will present a menu of tmux panes)"
@@ -119,6 +140,15 @@ strip_ansi() {
     "$SED" -E "s/${ESC}\[[0-9;]*[mK]//g"
 }
 
+# Fire a desktop notification (arg 1 = body), portable across macOS / Linux.
+notify() {
+    if [ "$IS_DARWIN" = true ]; then
+        osascript -e "display notification \"$1\" with title \"AI Nudge\""
+    else
+        notify-send 'AI Nudge' "$1"
+    fi
+}
+
 # Scan captured pane text (arg 1) for a known rate-limit pattern. On success,
 # prints the target epoch (with 3-minute safety padding) to stdout plus a short
 # human note to stderr; returns 1 with no stdout if nothing is detected.
@@ -161,6 +191,31 @@ detect_reset_epoch() {
     return 1
 }
 
+# Return 0 if the pane text (arg 1) currently shows a known rate-limit banner
+# (Claude session limit or Agy quota). Presence check only, no time parsing --
+# used by --verify to confirm a limit is still up before we inject. Keep the
+# patterns in sync with detect_reset_epoch above.
+has_limit_banner() {
+    local clean
+    clean=$(printf '%s\n' "$1" | strip_ansi)
+    printf '%s\n' "$clean" | grep -qiE "(session limit|current session).*resets" && return 0
+    printf '%s\n' "$clean" | grep -qi "quota reached" && return 0
+    return 1
+}
+
+# Print only the portion of pane text (arg 1) that appears AFTER the last line
+# containing the marker string (arg 2, matched literally). Prints nothing if the
+# marker isn't found. Used post-send to scan only what the AI printed *below*
+# the message we just injected, so the stale banner that triggered this nudge
+# (sitting above our input) isn't re-detected as a fresh limit.
+pane_after_marker() {
+    local clean line_no
+    clean=$(printf '%s\n' "$1" | strip_ansi)
+    line_no=$(printf '%s\n' "$clean" | grep -Fn -- "$2" | tail -n 1 | cut -d: -f1)
+    [ -z "$line_no" ] && return 0
+    printf '%s\n' "$clean" | awk -v n="$line_no" 'NR > n'
+}
+
 # Build the safely-quoted `--execute-nudge` command line the 'at' job will run.
 # Every dynamic value is passed through `printf '%q'` so quotes, spaces and
 # shell metacharacters in messages survive the round-trip intact.
@@ -172,6 +227,7 @@ build_next_cmd() {
         cmd="$cmd -i $(printf '%q' "$m")"
     done
     [ "$NOTIFY" = true ] && cmd="$cmd -n"
+    [ "$VERIFY" = true ] && cmd="$cmd -v"
     [ -n "$retry_limit" ] && cmd="$cmd -r $(printf '%q' "$retry_limit")"
     printf '%s' "$cmd"
 }
@@ -220,6 +276,69 @@ ensure_default_messages() {
     [ ${#MESSAGES[@]} -eq 0 ] && MESSAGES=("$DEFAULT_MESSAGE")
 }
 
+# One-line human summary of the active run options (auto-retry / verify / notify).
+options_summary() {
+    local s=""
+    [ "$AUTO_RETRY" = true ] && s="${s:+$s, }auto-retry($RETRY_LIMIT)"
+    [ "$VERIFY" = true ]     && s="${s:+$s, }verify"
+    [ "$NOTIFY" = true ]     && s="${s:+$s, }notify"
+    printf '%s' "${s:-none}"
+}
+
+# Interactively toggle the boolean run options. Seeded from the already-resolved
+# state (env vars + CLI flags), so this only ADJUSTS what's set. A blank line
+# keeps everything as-is; each letter flips its option. If auto-retry ends up on,
+# offer to set the retry count (Enter keeps the current value).
+prompt_options() {
+    local line ch i
+    echo ""
+    echo "Current options: $(options_summary)"
+    echo "Toggle: [a]uto-retry  [v]erify  [n]otify   (type letters, blank keeps current)"
+    read -r -p "  toggle> " line
+    for (( i=0; i<${#line}; i++ )); do
+        ch="${line:i:1}"
+        case "$ch" in
+            a|A) [ "$AUTO_RETRY" = true ] && AUTO_RETRY=false || AUTO_RETRY=true ;;
+            v|V) [ "$VERIFY" = true ]     && VERIFY=false     || VERIFY=true ;;
+            n|N) [ "$NOTIFY" = true ]     && NOTIFY=false     || NOTIFY=true ;;
+            ' ') ;;
+            *) echo "  (ignoring '$ch')" >&2 ;;
+        esac
+    done
+    if [ "$AUTO_RETRY" = true ]; then
+        read -r -p "  auto-retry count [-1 = forever] ($RETRY_LIMIT)> " line
+        if [ -n "$line" ]; then
+            if [[ "$line" =~ ^-?[0-9]+$ ]]; then
+                RETRY_LIMIT="$line"
+            else
+                echo "  (ignoring non-integer '$line'; keeping $RETRY_LIMIT)" >&2
+            fi
+        fi
+    fi
+    echo "Options set: $(options_summary)"
+}
+
+# --- Persistent env-var defaults -------------------------------------------
+# Applied only for interactive / manual runs. The headless --execute-nudge job
+# (always invoked with --execute-nudge as its first arg) gets its full state as
+# explicit flags from build_next_cmd, so it MUST stay hermetic -- otherwise a
+# stray NUDGE_* in the daemon's environment could silently re-enable an option
+# that was toggled off at schedule time. Precedence, low -> high:
+#   env vars  <  CLI flags  <  interactive toggles
+if [ "${1:-}" != "--execute-nudge" ]; then
+    NOTIFY=$(env_bool "${NUDGE_NOTIFY:-}")
+    AUTO_RETRY=$(env_bool "${NUDGE_AUTO_RETRY:-}")
+    VERIFY=$(env_bool "${NUDGE_VERIFY:-}")
+    if [ -n "${NUDGE_RETRIES:-}" ]; then
+        if [[ "$NUDGE_RETRIES" =~ ^-?[0-9]+$ ]]; then
+            RETRY_LIMIT="$NUDGE_RETRIES"
+            AUTO_RETRY=true   # setting a retry count implies auto-retry, like -r
+        else
+            echo "Warning: ignoring non-integer NUDGE_RETRIES='$NUDGE_RETRIES'." >&2
+        fi
+    fi
+fi
+
 # --- Argument parsing ------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -249,6 +368,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         -a|--auto-retry)
             AUTO_RETRY=true
+            shift 1
+            ;;
+        -v|--verify)
+            VERIFY=true
+            shift 1
+            ;;
+        --no-notify)
+            NOTIFY=false
+            shift 1
+            ;;
+        --no-auto-retry)
+            AUTO_RETRY=false
+            shift 1
+            ;;
+        --no-verify)
+            VERIFY=false
             shift 1
             ;;
         -r|--retries)
@@ -283,6 +418,17 @@ SCRIPT_PATH="$(script_path "$0")"
 if [ "$EXECUTE_NUDGE" = true ]; then
     ensure_default_messages
 
+    # --verify: only inject if the pane STILL shows a live rate-limit banner.
+    # If the session was already resumed (or was never limited) by the time the
+    # timer fires, skip quietly so we don't interrupt a working session.
+    if [ "$VERIFY" = true ]; then
+        pane_now=$(tmux capture-pane -pt "$TARGET_PANE")
+        if ! has_limit_banner "$pane_now"; then
+            [ "$NOTIFY" = true ] && notify "Skipped nudge: no rate-limit banner on $TARGET_PANE"
+            exit 0
+        fi
+    fi
+
     # Inject each message as its own submission, pausing between them so the
     # target TUI has time to accept one before the next arrives.
     last=$(( ${#MESSAGES[@]} - 1 ))
@@ -295,22 +441,23 @@ if [ "$EXECUTE_NUDGE" = true ]; then
     done
 
     # Handle notifications
-    if [ "$NOTIFY" = true ]; then
-        note="Injected ${#MESSAGES[@]} message(s) into $TARGET_PANE"
-        if [ "$IS_DARWIN" = true ]; then
-            osascript -e "display notification \"$note\" with title \"AI Nudge\""
-        else
-            notify-send 'AI Nudge' "$note"
-        fi
-    fi
+    [ "$NOTIFY" = true ] && notify "Injected ${#MESSAGES[@]} message(s) into $TARGET_PANE"
 
     # Handle Autonomous Auto-Retry
     if [ "$AUTO_RETRY" = true ] && [ "$RETRY_LIMIT" -ne 0 ]; then
         # Wait for the AI CLI to process the input and print a new rate limit if one exists
         sleep 5
 
-        pane_out=$(tmux capture-pane -pt "$TARGET_PANE" | tail -n 100)
-        new_target=$(detect_reset_epoch "$pane_out")
+        # Scan ONLY what the AI printed *below* the message we just injected.
+        # The banner that triggered this nudge is still sitting above our input;
+        # scanning the whole pane would re-detect it and schedule a bogus retry
+        # even though the continue succeeded. Our last-sent message is the
+        # marker: a still-limited session prints a fresh banner beneath it, a
+        # resumed one doesn't (and if it worked, our marker may have scrolled
+        # off entirely -> pane_after_marker yields nothing -> no retry).
+        pane_out=$(tmux capture-pane -pt "$TARGET_PANE")
+        recent=$(pane_after_marker "$pane_out" "${MESSAGES[$last]}")
+        new_target=$(detect_reset_epoch "$recent")
 
         if [ -n "$new_target" ]; then
             # Calculate next retry limit
@@ -334,11 +481,11 @@ if [ -z "$TARGET_PANE" ]; then
         # Interactive selection with live pane preview using fzf
         fzf_output=$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} | Window: #{window_name} | Cmd: #{pane_current_command}' \
             | fzf --prompt="Select Target Pane > " \
-                  --expect=alt-enter \
+                  --expect=alt-enter,alt-o \
                   --bind="alt-j:down,alt-k:up,ctrl-d:half-page-down,ctrl-u:half-page-up" \
                   --preview="tmux capture-pane -ept {1}" \
                   --preview-window="up:60%,follow" \
-                  --header="Use ↑/↓, C-n/C-p, or Alt-j/Alt-k. Enter = Default Text, Alt-Enter = Custom Text.")
+                  --header="Use ↑/↓, C-n/C-p, or Alt-j/Alt-k. Enter = Default Text, Alt-Enter = Custom Text, Alt-o = Set Options.")
 
         if [ -z "$fzf_output" ]; then
             echo "Selection cancelled."
@@ -359,6 +506,9 @@ if [ -z "$TARGET_PANE" ]; then
             # Explicit custom entry overrides any -i given on the command line.
             MESSAGES=()
             prompt_messages
+        elif [ "$key" = "alt-o" ]; then
+            # Configure run options; message stays default (or any -i supplied).
+            prompt_options
         fi
     else
         # Fallback text-based menu
@@ -400,6 +550,9 @@ if [ -z "$TARGET_PANE" ]; then
         if [ ${#MESSAGES[@]} -eq 0 ]; then
             prompt_messages
         fi
+
+        read -r -p "Configure run options (auto-retry/verify/notify)? [y/N]: " cfg
+        [[ "$cfg" =~ ^[Yy] ]] && prompt_options
     fi
 fi
 
@@ -449,6 +602,7 @@ echo "Scheduling the following message(s) for $TARGET_TIME_DISPLAY on pane $TARG
 for i in "${!MESSAGES[@]}"; do
     printf '  %d. %s\n' "$(( i + 1 ))" "${MESSAGES[$i]}"
 done
+echo "Options: $(options_summary)"
 
 next_cmd=$(build_next_cmd "$([ "$AUTO_RETRY" = true ] && printf '%s' "$RETRY_LIMIT")")
 
