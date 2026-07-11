@@ -1,0 +1,292 @@
+#!/bin/bash
+
+# Check dependencies
+for cmd in tmux at date grep sed; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Error: Required command '$cmd' is not installed or not in PATH."
+        exit 1
+    fi
+done
+
+# Default values
+TARGET_PANE=""
+TARGET_TIME=""
+INJECT_TEXT="please continue"
+NOTIFY=false
+AUTO_RETRY=false
+RETRY_LIMIT=2
+EXECUTE_NUDGE=false
+
+print_help() {
+    echo "Usage: nudge [OPTIONS]"
+    echo ""
+    echo "Automatically injects text into a specified tmux pane at a calculated or specific time."
+    echo "Auto-detects rate limits for Claude Code and Antigravity (Agy) automatically!"
+    echo ""
+    echo "Options:"
+    echo "  -p, --pane <target>   The tmux pane to target (e.g., bot:0.1)"
+    echo "  -m, --time <time>     Override auto-detection and set a specific target time (e.g., '14:30' or 'now + 45 min')"
+    echo "  -i, --input <text>    Custom text to inject (default: 'please continue')"
+    echo "  -n, --notify          Send a desktop notification when the injection fires"
+    echo "  -a, --auto-retry      If rate-limited, autonomously schedule another nudge (Defaults to 2 retries)"
+    echo "  -r, --retries <num>   Set the exact number of auto-retries. Set to -1 to retry forever."
+    echo "  -h, --help            Show this help message"
+    echo ""
+    echo "If essential options are omitted, the script will prompt you interactively."
+    echo "  (If 'fzf' is installed, you will get a live visual preview of each pane!)"
+    echo ""
+    echo "Examples:"
+    echo "  # Run fully interactively (will present a menu of tmux panes)"
+    echo "  nudge"
+    echo ""
+    echo "  # Target a pane and let the script auto-detect the rate limit from the output"
+    echo "  nudge -p bot:0.1 -a"
+    echo ""
+    echo "  # Override auto-detection and specify a time manually"
+    echo "  nudge -p bot:1.0 -m \"14:30\" -n"
+    echo ""
+    echo "  # Infinite retries for a custom time, injecting custom text"
+    echo "  nudge -p bot:1.0 -m \"now + 1 hour\" -i \"yes\" -r -1"
+    echo ""
+    echo "Note: This script uses the 'at' daemon for background scheduling."
+    echo "      Use 'atq' to view pending jobs, and 'atrm <job_id>' to cancel them."
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -p|--pane)
+            TARGET_PANE="$2"
+            shift 2
+            ;;
+        -m|--time)
+            TARGET_TIME="$2"
+            shift 2
+            ;;
+        -i|--input)
+            INJECT_TEXT="$2"
+            shift 2
+            ;;
+        -n|--notify)
+            NOTIFY=true
+            shift 1
+            ;;
+        -a|--auto-retry)
+            AUTO_RETRY=true
+            shift 1
+            ;;
+        -r|--retries)
+            AUTO_RETRY=true
+            RETRY_LIMIT="$2"
+            shift 2
+            ;;
+        --execute-nudge)
+            # Hidden internal flag used by the 'at' job to actually trigger the sequence
+            EXECUTE_NUDGE=true
+            shift 1
+            ;;
+        -h|--help)
+            print_help
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            print_help
+            exit 1
+            ;;
+    esac
+done
+
+# 0. HEADLESS EXECUTION (Run by 'at' when the timer fires)
+if [ "$EXECUTE_NUDGE" = true ]; then
+    # Inject the text!
+    tmux send-keys -t "$TARGET_PANE" "$INJECT_TEXT" C-m
+
+    # Handle notifications
+    if [ "$NOTIFY" = true ]; then
+        if [[ "$(uname)" == "Darwin" ]]; then
+            osascript -e "display notification \"Injected text into $TARGET_PANE\" with title \"AI Nudge\""
+        else
+            notify-send 'AI Nudge' "Injected text into $TARGET_PANE"
+        fi
+    fi
+
+    # Handle Autonomous Auto-Retry
+    if [ "$AUTO_RETRY" = true ] && [ "$RETRY_LIMIT" -ne 0 ]; then
+        # Wait for the AI CLI to process the input and print a new rate limit if one exists
+        sleep 5
+        
+        pane_out=$(tmux capture-pane -pt "$TARGET_PANE" | tail -n 100)
+        new_target=""
+        
+        # Check for Claude Rate Limit
+        if echo "$pane_out" | grep -qiE "(session limit|current session).*resets"; then
+            new_reset=$(echo "$pane_out" | sed -E 's/\x1B\[[0-9;]*[mK]//g' | grep -iE "(session limit|current session).*resets" | grep -oEI '[0-9]{1,2}:[0-9]{2}(am|pm)' | head -n 1)
+            if [ -n "$new_reset" ]; then
+                new_target=$(date -d "$new_reset + 3 minutes" +"%H:%M %Y-%m-%d")
+            fi
+        # Check for Agy Rate Limit
+        elif echo "$pane_out" | grep -qi "quota reached"; then
+            raw_duration=$(echo "$pane_out" | grep -oEI 'Resets in [0-9hms]+' | sed -E 's/Resets in //I')
+            if [ -n "$raw_duration" ]; then
+                date_add_str=$(echo "$raw_duration" | sed -E 's/h/ hours /g; s/m/ minutes /g; s/s/ seconds /g')
+                new_target=$(date -d "now + $date_add_str + 3 minutes" +"%H:%M %Y-%m-%d")
+            fi
+        fi
+
+        if [ -n "$new_target" ]; then
+            # Calculate next retry limit
+            if [ "$RETRY_LIMIT" -eq -1 ]; then
+                NEXT_LIMIT="-1"
+            else
+                NEXT_LIMIT=$((RETRY_LIMIT - 1))
+            fi
+            
+            # Reschedule this exact script to run again!
+            SCRIPT_PATH="$(realpath "$0")"
+            NEXT_CMD="$SCRIPT_PATH --execute-nudge -p \"$TARGET_PANE\" -i \"$INJECT_TEXT\" -r \"$NEXT_LIMIT\""
+            if [ "$NOTIFY" = true ]; then NEXT_CMD="$NEXT_CMD -n"; fi
+            
+            if [[ "$(uname)" == "Darwin" ]]; then
+                echo "$NEXT_CMD" | at "$new_target"
+            else
+                echo "export DISPLAY=$DISPLAY; export DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS; $NEXT_CMD" | at "$new_target"
+            fi
+        fi
+    fi
+    exit 0
+fi
+
+
+# 1. TMUX TRIAGE MENU
+if [ -z "$TARGET_PANE" ]; then
+    if command -v fzf >/dev/null 2>&1; then
+        # Interactive selection with live pane preview using fzf
+        fzf_output=$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} | Window: #{window_name} | Cmd: #{pane_current_command}' \
+            | fzf --prompt="Select Target Pane > " \
+                  --expect=alt-enter \
+                  --bind="alt-j:down,alt-k:up,ctrl-d:half-page-down,ctrl-u:half-page-up" \
+                  --preview="tmux capture-pane -ept {1}" \
+                  --preview-window="up:60%,follow" \
+                  --header="Use ↑/↓, C-n/C-p, or Alt-j/Alt-k. Enter = Default Text, Alt-Enter = Custom Text.")
+        
+        if [ -z "$fzf_output" ]; then
+            echo "Selection cancelled."
+            exit 1
+        fi
+        
+        key=$(echo "$fzf_output" | head -n 1)
+        selected=$(echo "$fzf_output" | tail -n +2)
+        
+        if [ -z "$selected" ]; then
+            echo "Selection cancelled."
+            exit 1
+        fi
+        
+        TARGET_PANE=$(echo "$selected" | awk '{print $1}')
+
+        if [ "$key" = "alt-enter" ]; then
+            echo ""
+            read -p "Enter text to inject (default: 'please continue'): " custom_text
+            if [ -n "$custom_text" ]; then
+                INJECT_TEXT="$custom_text"
+            fi
+        fi
+    else
+        # Fallback text-based menu
+        echo "======================================"
+        echo "      Tmux Pane Target Selector       "
+        echo "======================================"
+        echo "Fetching active panes..."
+        echo ""
+
+        IFS=$'\n'
+        panes=($(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}|#{window_name}|#{pane_current_command}'))
+
+        if [ ${#panes[@]} -eq 0 ]; then
+            echo "No tmux panes found! Are you running tmux?"
+            exit 1
+        fi
+
+        printf "  %-6s | %-20s | %-20s | %s\n" "ID" "Target Pane" "Window Name" "Command"
+        printf "  %s\n" "------------------------------------------------------------------------"
+        for i in "${!panes[@]}"; do
+            IFS='|' read -r target wname cmd <<< "${panes[$i]}"
+            id_str="[$i]"
+            printf "  %-6s | %-20s | %-20s | %s\n" "$id_str" "$target" "$wname" "$cmd"
+        done
+        echo ""
+
+        read -p "Select the pane index to target (e.g., 0): " pane_idx
+
+        if ! [[ "$pane_idx" =~ ^[0-9]+$ ]] || [ "$pane_idx" -ge "${#panes[@]}" ]; then
+            echo "Invalid selection. Exiting."
+            exit 1
+        fi
+
+        IFS='|' read -r TARGET_PANE _ _ <<< "${panes[$pane_idx]}"
+
+        # For text menu, always ask since they don't have fzf hotkeys
+        echo ""
+        read -p "Enter text to inject (default: 'please continue'): " custom_text
+        if [ -n "$custom_text" ]; then
+            INJECT_TEXT="$custom_text"
+        fi
+    fi
+fi
+
+echo ""
+echo "Target locked: $TARGET_PANE"
+echo "======================================"
+
+# 2. DETERMINE TARGET TIME
+if [ -z "$TARGET_TIME" ]; then
+    echo "Scanning pane $TARGET_PANE for known rate-limit patterns..."
+    pane_out=$(tmux capture-pane -pt "$TARGET_PANE" | tail -n 100)
+    
+    if echo "$pane_out" | grep -qiE "(session limit|current session).*resets"; then
+        echo "Detected Claude rate limit!"
+        reset_time_str=$(echo "$pane_out" | sed -E 's/\x1B\[[0-9;]*[mK]//g' | grep -iE "(session limit|current session).*resets" | grep -oEI '[0-9]{1,2}:[0-9]{2}(am|pm)' | head -n 1)
+        TARGET_TIME=$(date -d "$reset_time_str + 3 minutes" +"%H:%M %Y-%m-%d")
+        echo "Calculated new target time: $TARGET_TIME (added 3m safety padding)"
+        
+    elif echo "$pane_out" | grep -qi "quota reached"; then
+        echo "Detected Agy rate limit!"
+        raw_duration=$(echo "$pane_out" | grep -oEI 'Resets in [0-9hms]+' | sed -E 's/Resets in //I')
+        date_add_str=$(echo "$raw_duration" | sed -E 's/h/ hours /g; s/m/ minutes /g; s/s/ seconds /g')
+        TARGET_TIME=$(date -d "now + $date_add_str + 3 minutes" +"%H:%M %Y-%m-%d")
+        echo "Calculated new target time: $TARGET_TIME (added 3m safety padding)"
+    fi
+    
+    if [ -z "$TARGET_TIME" ]; then
+        echo "Could not auto-detect a known rate limit."
+        read -p "Please specify a manual target time (e.g., '14:30', 'now + 45 minutes'): " TARGET_TIME
+    fi
+fi
+
+echo ""
+# 3. SCHEDULE THE INJECTION
+echo "Scheduling '$INJECT_TEXT' for $TARGET_TIME on pane $TARGET_PANE..."
+
+# Reconstruct the command that the 'at' daemon should run when the time arrives
+SCRIPT_PATH="$(realpath "$0")"
+NEXT_CMD="$SCRIPT_PATH --execute-nudge -p \"$TARGET_PANE\" -i \"$INJECT_TEXT\""
+if [ "$NOTIFY" = true ]; then NEXT_CMD="$NEXT_CMD -n"; fi
+if [ "$AUTO_RETRY" = true ]; then NEXT_CMD="$NEXT_CMD -r \"$RETRY_LIMIT\""; fi
+
+if [[ "$(uname)" == "Darwin" ]]; then
+    at_output=$(echo "$NEXT_CMD" | at "$TARGET_TIME" 2>&1)
+else
+    at_output=$(echo "export DISPLAY=$DISPLAY; export DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS; $NEXT_CMD" | at "$TARGET_TIME" 2>&1)
+fi
+
+job_id=$(echo "$at_output" | grep -oE 'job [0-9]+' | awk '{print $2}')
+
+if [ -n "$job_id" ]; then
+    echo "Done! The injection is scheduled via the 'at' daemon (Job ID: $job_id)."
+    echo "(Use 'atq' to list scheduled jobs, and 'atrm $job_id' to cancel this specific job.)"
+else
+    # Fallback just in case parsing fails
+    echo "$at_output"
+    echo "Done! The injection is scheduled via the 'at' daemon."
+    echo "(Use 'atq' to list scheduled jobs, and 'atrm <job_id>' to cancel one.)"
+fi
