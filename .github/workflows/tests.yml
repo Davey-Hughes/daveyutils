@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  nudge:
+    name: nudge test-suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux at
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux   # BSD `at` (/usr/bin/at) already ships with macOS
+
+      - name: Syntax check
+        run: |
+          bash -n scripts/nudge
+          for f in tests/*.sh; do bash -n "$f"; done
+
+      - name: Run test-suite
+        run: bash tests/run.sh
