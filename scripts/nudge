@@ -1,32 +1,58 @@
 #!/bin/bash
 
-# Check dependencies
-for cmd in tmux at date grep sed; do
+# --- Tool resolution -------------------------------------------------------
+# Prefer GNU coreutils / gnu-sed when available. On macOS these come from
+# `brew install coreutils gnu-sed` (as gdate / gsed); we fall back to the
+# system tools otherwise.
+if command -v gdate >/dev/null 2>&1; then DATE=gdate; else DATE=date; fi
+if command -v gsed  >/dev/null 2>&1; then SED=gsed;  else SED=sed;  fi
+
+IS_GNU_DATE=false
+if "$DATE" --version 2>/dev/null | grep -qi 'GNU coreutils'; then
+    IS_GNU_DATE=true
+fi
+
+IS_DARWIN=false
+[[ "$(uname)" == "Darwin" ]] && IS_DARWIN=true
+
+# Literal ESC byte for stripping ANSI sequences (portable across GNU/BSD sed;
+# avoids the GNU-only \x1B escape).
+ESC=$(printf '\033')
+
+# --- Dependency check ------------------------------------------------------
+for cmd in tmux at "$DATE" grep "$SED" awk; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "Error: Required command '$cmd' is not installed or not in PATH."
         exit 1
     fi
 done
 
-# Default values
+# --- Defaults --------------------------------------------------------------
 TARGET_PANE=""
 TARGET_TIME=""
-INJECT_TEXT="please continue"
+TARGET_EPOCH=""
+MESSAGES=()
+DEFAULT_MESSAGE="please continue"
+SEND_DELAY="0.75"
 NOTIFY=false
 AUTO_RETRY=false
 RETRY_LIMIT=2
 EXECUTE_NUDGE=false
 
+# --- Helpers ---------------------------------------------------------------
+
 print_help() {
     echo "Usage: nudge [OPTIONS]"
     echo ""
-    echo "Automatically injects text into a specified tmux pane at a calculated or specific time."
+    echo "Injects one or more messages into a tmux pane at a calculated or specific time."
     echo "Auto-detects rate limits for Claude Code and Antigravity (Agy) automatically!"
     echo ""
     echo "Options:"
     echo "  -p, --pane <target>   The tmux pane to target (e.g., bot:0.1)"
     echo "  -m, --time <time>     Override auto-detection and set a specific target time (e.g., '14:30' or 'now + 45 min')"
-    echo "  -i, --input <text>    Custom text to inject (default: 'please continue')"
+    echo "  -i, --input <text>    Message to inject. Repeat -i to send several separate"
+    echo "                        messages, each submitted on its own line (default: 'please continue')"
+    echo "  -w, --delay <sec>     Pause between multiple sends (default: 0.75)"
     echo "  -n, --notify          Send a desktop notification when the injection fires"
     echo "  -a, --auto-retry      If rate-limited, autonomously schedule another nudge (Defaults to 2 retries)"
     echo "  -r, --retries <num>   Set the exact number of auto-retries. Set to -1 to retry forever."
@@ -42,6 +68,9 @@ print_help() {
     echo "  # Target a pane and let the script auto-detect the rate limit from the output"
     echo "  nudge -p bot:0.1 -a"
     echo ""
+    echo "  # Send several commands in sequence once the limit resets"
+    echo "  nudge -p bot:0.1 -i 'npm test' -i 'git status' -i 'please continue'"
+    echo ""
     echo "  # Override auto-detection and specify a time manually"
     echo "  nudge -p bot:1.0 -m \"14:30\" -n"
     echo ""
@@ -50,8 +79,148 @@ print_help() {
     echo ""
     echo "Note: This script uses the 'at' daemon for background scheduling."
     echo "      Use 'atq' to view pending jobs, and 'atrm <job_id>' to cancel them."
+    if [ "$IS_DARWIN" = true ]; then
+        echo ""
+        echo "macOS: the 'at' scheduler (atrun) is disabled by default. If jobs never fire:"
+        echo "  sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.atrun.plist"
+        echo "      Relative -m times (e.g. 'now + 45 min') need GNU date: brew install coreutils"
+    fi
 }
 
+# Portable realpath (older macOS lacks the realpath binary).
+script_path() {
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$1"
+    else
+        cd "$(dirname "$1")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$1")"
+    fi
+}
+
+# Format an epoch timestamp. GNU: date -d @epoch ; BSD: date -r epoch.
+format_epoch() {
+    if [ "$IS_GNU_DATE" = true ]; then
+        "$DATE" -d "@$1" +"$2"
+    else
+        date -r "$1" +"$2"
+    fi
+}
+
+# Parse an absolute clock string like "3:00am" into an epoch (today's date).
+parse_clock_epoch() {
+    if [ "$IS_GNU_DATE" = true ]; then
+        "$DATE" -d "$1" +%s 2>/dev/null
+    else
+        date -j -f '%I:%M%p' "$1" +%s 2>/dev/null
+    fi
+}
+
+# Strip ANSI colour / erase sequences from stdin.
+strip_ansi() {
+    "$SED" -E "s/${ESC}\[[0-9;]*[mK]//g"
+}
+
+# Scan captured pane text (arg 1) for a known rate-limit pattern. On success,
+# prints the target epoch (with 3-minute safety padding) to stdout plus a short
+# human note to stderr; returns 1 with no stdout if nothing is detected.
+detect_reset_epoch() {
+    local clean now reset raw h m s parsed target
+    clean=$(printf '%s\n' "$1" | strip_ansi)
+    now=$(date +%s)
+
+    if printf '%s\n' "$clean" | grep -qiE "(session limit|current session).*resets"; then
+        # Claude: absolute clock time such as "3:00am".
+        reset=$(printf '%s\n' "$clean" \
+            | grep -iE "(session limit|current session).*resets" \
+            | grep -oiE '[0-9]{1,2}:[0-9]{2}(am|pm)' | head -n 1)
+        [ -z "$reset" ] && return 1
+        parsed=$(parse_clock_epoch "$reset")
+        [ -z "$parsed" ] && return 1
+        target=$(( parsed + 180 ))
+        # Reset clock already passed today -> it must be tomorrow.
+        [ "$target" -le "$now" ] && target=$(( target + 86400 ))
+        echo "Detected Claude rate limit!" >&2
+        echo "$target"
+        return 0
+    elif printf '%s\n' "$clean" | grep -qi "quota reached"; then
+        # Agy: relative duration such as "Resets in 1h30m".
+        raw=$(printf '%s\n' "$clean" | grep -oE 'Resets in [0-9hms]+' | head -n 1)
+        raw=${raw#Resets in }
+        [ -z "$raw" ] && return 1
+        h=$(printf '%s\n' "$raw" | grep -oE '[0-9]+h' | grep -oE '[0-9]+'); h=${h:-0}
+        m=$(printf '%s\n' "$raw" | grep -oE '[0-9]+m' | grep -oE '[0-9]+'); m=${m:-0}
+        s=$(printf '%s\n' "$raw" | grep -oE '[0-9]+s' | grep -oE '[0-9]+'); s=${s:-0}
+        # All-zero means we matched the label but not a real duration.
+        if [ "$h" -eq 0 ] && [ "$m" -eq 0 ] && [ "$s" -eq 0 ]; then
+            return 1
+        fi
+        target=$(( now + h * 3600 + m * 60 + s + 180 ))
+        echo "Detected Agy rate limit!" >&2
+        echo "$target"
+        return 0
+    fi
+    return 1
+}
+
+# Build the safely-quoted `--execute-nudge` command line the 'at' job will run.
+# Every dynamic value is passed through `printf '%q'` so quotes, spaces and
+# shell metacharacters in messages survive the round-trip intact.
+# Arg 1 (optional): retry limit to embed via -r.
+build_next_cmd() {
+    local retry_limit="$1" cmd m
+    cmd="$SCRIPT_PATH --execute-nudge -p $(printf '%q' "$TARGET_PANE") -w $(printf '%q' "$SEND_DELAY")"
+    for m in "${MESSAGES[@]}"; do
+        cmd="$cmd -i $(printf '%q' "$m")"
+    done
+    [ "$NOTIFY" = true ] && cmd="$cmd -n"
+    [ -n "$retry_limit" ] && cmd="$cmd -r $(printf '%q' "$retry_limit")"
+    printf '%s' "$cmd"
+}
+
+# Pipe a command (arg 1) to `at`, using the remaining args as the at time-spec.
+# Adds the X11/DBus env exports on Linux so desktop notifications work from the
+# detached 'at' job. Echoes at's own output.
+#
+# `at` runs jobs under /bin/sh, which may be a POSIX shell (e.g. dash) that
+# doesn't understand the bash `$'...\n...'` quoting that `printf '%q'` emits for
+# newlines and other control characters. So we wrap the reconstructed command in
+# `bash -c '...'`, single-quote-escaping it (each ' becomes '\'') so the outer
+# shell hands it to bash verbatim and bash does the real parsing.
+at_pipe() {
+    local cmd="$1"; shift
+    local escaped=${cmd//"'"/"'\''"}
+    local job="bash -c '$escaped'"
+    if [ "$IS_DARWIN" = true ]; then
+        printf '%s\n' "$job" | at "$@" 2>&1
+    else
+        printf 'export DISPLAY=%s; export DBUS_SESSION_BUS_ADDRESS=%s; %s\n' \
+            "$DISPLAY" "$DBUS_SESSION_BUS_ADDRESS" "$job" | at "$@" 2>&1
+    fi
+}
+
+# Schedule at a computed epoch via the portable POSIX `at -t CCYYMMDDhhmm`,
+# which both GNU and BSD `at` accept.
+at_schedule_epoch() {
+    at_pipe "$2" -t "$(format_epoch "$1" '%Y%m%d%H%M')"
+}
+
+# Prompt for one or more messages interactively; a blank line finishes.
+prompt_messages() {
+    local line count=0
+    echo ""
+    echo "Enter messages one per line (blank line to finish; default: '$DEFAULT_MESSAGE'):"
+    while true; do
+        read -r -p "  $(( count + 1 ))> " line
+        [ -z "$line" ] && break
+        MESSAGES+=("$line")
+        count=$(( count + 1 ))
+    done
+}
+
+ensure_default_messages() {
+    [ ${#MESSAGES[@]} -eq 0 ] && MESSAGES=("$DEFAULT_MESSAGE")
+}
+
+# --- Argument parsing ------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case $1 in
         -p|--pane)
@@ -63,7 +232,15 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -i|--input)
-            INJECT_TEXT="$2"
+            MESSAGES+=("$2")
+            shift 2
+            ;;
+        -w|--delay)
+            SEND_DELAY="$2"
+            if ! [[ "$SEND_DELAY" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                echo "Error: --delay must be a non-negative number (got '$SEND_DELAY')."
+                exit 1
+            fi
             shift 2
             ;;
         -n|--notify)
@@ -77,6 +254,10 @@ while [[ $# -gt 0 ]]; do
         -r|--retries)
             AUTO_RETRY=true
             RETRY_LIMIT="$2"
+            if ! [[ "$RETRY_LIMIT" =~ ^-?[0-9]+$ ]]; then
+                echo "Error: --retries must be an integer (got '$RETRY_LIMIT')."
+                exit 1
+            fi
             shift 2
             ;;
         --execute-nudge)
@@ -96,17 +277,30 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+SCRIPT_PATH="$(script_path "$0")"
+
 # 0. HEADLESS EXECUTION (Run by 'at' when the timer fires)
 if [ "$EXECUTE_NUDGE" = true ]; then
-    # Inject the text!
-    tmux send-keys -t "$TARGET_PANE" "$INJECT_TEXT" C-m
+    ensure_default_messages
+
+    # Inject each message as its own submission, pausing between them so the
+    # target TUI has time to accept one before the next arrives.
+    last=$(( ${#MESSAGES[@]} - 1 ))
+    for i in "${!MESSAGES[@]}"; do
+        # -l sends the text literally so words like "Enter" or "C-c" aren't
+        # interpreted as key names; a separate Enter submits the line.
+        tmux send-keys -t "$TARGET_PANE" -l -- "${MESSAGES[$i]}"
+        tmux send-keys -t "$TARGET_PANE" Enter
+        [ "$i" -lt "$last" ] && sleep "$SEND_DELAY"
+    done
 
     # Handle notifications
     if [ "$NOTIFY" = true ]; then
-        if [[ "$(uname)" == "Darwin" ]]; then
-            osascript -e "display notification \"Injected text into $TARGET_PANE\" with title \"AI Nudge\""
+        note="Injected ${#MESSAGES[@]} message(s) into $TARGET_PANE"
+        if [ "$IS_DARWIN" = true ]; then
+            osascript -e "display notification \"$note\" with title \"AI Nudge\""
         else
-            notify-send 'AI Nudge' "Injected text into $TARGET_PANE"
+            notify-send 'AI Nudge' "$note"
         fi
     fi
 
@@ -114,43 +308,20 @@ if [ "$EXECUTE_NUDGE" = true ]; then
     if [ "$AUTO_RETRY" = true ] && [ "$RETRY_LIMIT" -ne 0 ]; then
         # Wait for the AI CLI to process the input and print a new rate limit if one exists
         sleep 5
-        
+
         pane_out=$(tmux capture-pane -pt "$TARGET_PANE" | tail -n 100)
-        new_target=""
-        
-        # Check for Claude Rate Limit
-        if echo "$pane_out" | grep -qiE "(session limit|current session).*resets"; then
-            new_reset=$(echo "$pane_out" | sed -E 's/\x1B\[[0-9;]*[mK]//g' | grep -iE "(session limit|current session).*resets" | grep -oEI '[0-9]{1,2}:[0-9]{2}(am|pm)' | head -n 1)
-            if [ -n "$new_reset" ]; then
-                new_target=$(date -d "$new_reset + 3 minutes" +"%H:%M %Y-%m-%d")
-            fi
-        # Check for Agy Rate Limit
-        elif echo "$pane_out" | grep -qi "quota reached"; then
-            raw_duration=$(echo "$pane_out" | grep -oEI 'Resets in [0-9hms]+' | sed -E 's/Resets in //I')
-            if [ -n "$raw_duration" ]; then
-                date_add_str=$(echo "$raw_duration" | sed -E 's/h/ hours /g; s/m/ minutes /g; s/s/ seconds /g')
-                new_target=$(date -d "now + $date_add_str + 3 minutes" +"%H:%M %Y-%m-%d")
-            fi
-        fi
+        new_target=$(detect_reset_epoch "$pane_out")
 
         if [ -n "$new_target" ]; then
             # Calculate next retry limit
             if [ "$RETRY_LIMIT" -eq -1 ]; then
                 NEXT_LIMIT="-1"
             else
-                NEXT_LIMIT=$((RETRY_LIMIT - 1))
+                NEXT_LIMIT=$(( RETRY_LIMIT - 1 ))
             fi
-            
-            # Reschedule this exact script to run again!
-            SCRIPT_PATH="$(realpath "$0")"
-            NEXT_CMD="$SCRIPT_PATH --execute-nudge -p \"$TARGET_PANE\" -i \"$INJECT_TEXT\" -r \"$NEXT_LIMIT\""
-            if [ "$NOTIFY" = true ]; then NEXT_CMD="$NEXT_CMD -n"; fi
-            
-            if [[ "$(uname)" == "Darwin" ]]; then
-                echo "$NEXT_CMD" | at "$new_target"
-            else
-                echo "export DISPLAY=$DISPLAY; export DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS; $NEXT_CMD" | at "$new_target"
-            fi
+
+            # Reschedule this exact script (whole sequence) to run again.
+            at_schedule_epoch "$new_target" "$(build_next_cmd "$NEXT_LIMIT")" >/dev/null
         fi
     fi
     exit 0
@@ -168,28 +339,26 @@ if [ -z "$TARGET_PANE" ]; then
                   --preview="tmux capture-pane -ept {1}" \
                   --preview-window="up:60%,follow" \
                   --header="Use ↑/↓, C-n/C-p, or Alt-j/Alt-k. Enter = Default Text, Alt-Enter = Custom Text.")
-        
+
         if [ -z "$fzf_output" ]; then
             echo "Selection cancelled."
             exit 1
         fi
-        
+
         key=$(echo "$fzf_output" | head -n 1)
         selected=$(echo "$fzf_output" | tail -n +2)
-        
+
         if [ -z "$selected" ]; then
             echo "Selection cancelled."
             exit 1
         fi
-        
+
         TARGET_PANE=$(echo "$selected" | awk '{print $1}')
 
         if [ "$key" = "alt-enter" ]; then
-            echo ""
-            read -p "Enter text to inject (default: 'please continue'): " custom_text
-            if [ -n "$custom_text" ]; then
-                INJECT_TEXT="$custom_text"
-            fi
+            # Explicit custom entry overrides any -i given on the command line.
+            MESSAGES=()
+            prompt_messages
         fi
     else
         # Fallback text-based menu
@@ -199,8 +368,10 @@ if [ -z "$TARGET_PANE" ]; then
         echo "Fetching active panes..."
         echo ""
 
+        OLD_IFS=$IFS
         IFS=$'\n'
         panes=($(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}|#{window_name}|#{pane_current_command}'))
+        IFS=$OLD_IFS
 
         if [ ${#panes[@]} -eq 0 ]; then
             echo "No tmux panes found! Are you running tmux?"
@@ -216,7 +387,7 @@ if [ -z "$TARGET_PANE" ]; then
         done
         echo ""
 
-        read -p "Select the pane index to target (e.g., 0): " pane_idx
+        read -r -p "Select the pane index to target (e.g., 0): " pane_idx
 
         if ! [[ "$pane_idx" =~ ^[0-9]+$ ]] || [ "$pane_idx" -ge "${#panes[@]}" ]; then
             echo "Invalid selection. Exiting."
@@ -225,11 +396,9 @@ if [ -z "$TARGET_PANE" ]; then
 
         IFS='|' read -r TARGET_PANE _ _ <<< "${panes[$pane_idx]}"
 
-        # For text menu, always ask since they don't have fzf hotkeys
-        echo ""
-        read -p "Enter text to inject (default: 'please continue'): " custom_text
-        if [ -n "$custom_text" ]; then
-            INJECT_TEXT="$custom_text"
+        # For the text menu, prompt for messages unless -i was already supplied.
+        if [ ${#MESSAGES[@]} -eq 0 ]; then
+            prompt_messages
         fi
     fi
 fi
@@ -238,55 +407,74 @@ echo ""
 echo "Target locked: $TARGET_PANE"
 echo "======================================"
 
+ensure_default_messages
+
 # 2. DETERMINE TARGET TIME
 if [ -z "$TARGET_TIME" ]; then
     echo "Scanning pane $TARGET_PANE for known rate-limit patterns..."
     pane_out=$(tmux capture-pane -pt "$TARGET_PANE" | tail -n 100)
-    
-    if echo "$pane_out" | grep -qiE "(session limit|current session).*resets"; then
-        echo "Detected Claude rate limit!"
-        reset_time_str=$(echo "$pane_out" | sed -E 's/\x1B\[[0-9;]*[mK]//g' | grep -iE "(session limit|current session).*resets" | grep -oEI '[0-9]{1,2}:[0-9]{2}(am|pm)' | head -n 1)
-        TARGET_TIME=$(date -d "$reset_time_str + 3 minutes" +"%H:%M %Y-%m-%d")
-        echo "Calculated new target time: $TARGET_TIME (added 3m safety padding)"
-        
-    elif echo "$pane_out" | grep -qi "quota reached"; then
-        echo "Detected Agy rate limit!"
-        raw_duration=$(echo "$pane_out" | grep -oEI 'Resets in [0-9hms]+' | sed -E 's/Resets in //I')
-        date_add_str=$(echo "$raw_duration" | sed -E 's/h/ hours /g; s/m/ minutes /g; s/s/ seconds /g')
-        TARGET_TIME=$(date -d "now + $date_add_str + 3 minutes" +"%H:%M %Y-%m-%d")
-        echo "Calculated new target time: $TARGET_TIME (added 3m safety padding)"
-    fi
-    
-    if [ -z "$TARGET_TIME" ]; then
+    TARGET_EPOCH=$(detect_reset_epoch "$pane_out")
+
+    if [ -n "$TARGET_EPOCH" ]; then
+        echo "Calculated new target time: $(format_epoch "$TARGET_EPOCH" '%H:%M %Y-%m-%d') (added 3m safety padding)"
+    else
         echo "Could not auto-detect a known rate limit."
-        read -p "Please specify a manual target time (e.g., '14:30', 'now + 45 minutes'): " TARGET_TIME
+        read -r -p "Please specify a manual target time (e.g., '14:30', 'now + 45 minutes'): " TARGET_TIME
     fi
+fi
+
+# On macOS, BSD `at` can't parse GNU-style / relative strings, so normalise a
+# user-supplied time to an epoch via GNU date when it's available. On Linux we
+# leave it raw and let GNU `at` parse it natively (it also rolls a past clock
+# time forward to tomorrow, which we'd lose by converting).
+if [ -z "$TARGET_EPOCH" ] && [ -n "$TARGET_TIME" ] && [ "$IS_DARWIN" = true ] && [ "$IS_GNU_DATE" = true ]; then
+    maybe=$("$DATE" -d "$TARGET_TIME" +%s 2>/dev/null)
+    [ -n "$maybe" ] && TARGET_EPOCH="$maybe"
+fi
+
+if [ -z "$TARGET_EPOCH" ] && [ -z "$TARGET_TIME" ]; then
+    echo "No target time specified. Aborting."
+    exit 1
+fi
+
+if [ -n "$TARGET_EPOCH" ]; then
+    TARGET_TIME_DISPLAY=$(format_epoch "$TARGET_EPOCH" '%H:%M %Y-%m-%d')
+else
+    TARGET_TIME_DISPLAY="$TARGET_TIME"
 fi
 
 echo ""
 # 3. SCHEDULE THE INJECTION
-echo "Scheduling '$INJECT_TEXT' for $TARGET_TIME on pane $TARGET_PANE..."
+echo "Scheduling the following message(s) for $TARGET_TIME_DISPLAY on pane $TARGET_PANE:"
+for i in "${!MESSAGES[@]}"; do
+    printf '  %d. %s\n' "$(( i + 1 ))" "${MESSAGES[$i]}"
+done
 
-# Reconstruct the command that the 'at' daemon should run when the time arrives
-SCRIPT_PATH="$(realpath "$0")"
-NEXT_CMD="$SCRIPT_PATH --execute-nudge -p \"$TARGET_PANE\" -i \"$INJECT_TEXT\""
-if [ "$NOTIFY" = true ]; then NEXT_CMD="$NEXT_CMD -n"; fi
-if [ "$AUTO_RETRY" = true ]; then NEXT_CMD="$NEXT_CMD -r \"$RETRY_LIMIT\""; fi
+next_cmd=$(build_next_cmd "$([ "$AUTO_RETRY" = true ] && printf '%s' "$RETRY_LIMIT")")
 
-if [[ "$(uname)" == "Darwin" ]]; then
-    at_output=$(echo "$NEXT_CMD" | at "$TARGET_TIME" 2>&1)
+if [ -n "$TARGET_EPOCH" ]; then
+    at_output=$(at_schedule_epoch "$TARGET_EPOCH" "$next_cmd")
 else
-    at_output=$(echo "export DISPLAY=$DISPLAY; export DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS; $NEXT_CMD" | at "$TARGET_TIME" 2>&1)
+    at_output=$(at_pipe "$next_cmd" "$TARGET_TIME")
 fi
 
-job_id=$(echo "$at_output" | grep -oE 'job [0-9]+' | awk '{print $2}')
+job_id=$(printf '%s\n' "$at_output" | grep -oE 'job [0-9]+' | awk '{print $2}')
 
 if [ -n "$job_id" ]; then
     echo "Done! The injection is scheduled via the 'at' daemon (Job ID: $job_id)."
     echo "(Use 'atq' to list scheduled jobs, and 'atrm $job_id' to cancel this specific job.)"
 else
+    # Scheduling produced no job id -> surface a useful error.
+    if [ "$IS_DARWIN" = true ] && [ "$IS_GNU_DATE" = false ] && [ -z "$TARGET_EPOCH" ]; then
+        echo "Error: could not schedule at time \"$TARGET_TIME\"." >&2
+        echo "On macOS without GNU coreutils, relative / GNU-style times aren't supported here." >&2
+        echo "Use an absolute time (e.g. \"14:30\" or \"1430 Jul 12\"), or install GNU date:" >&2
+        echo "  brew install coreutils" >&2
+        [ -n "$at_output" ] && printf '%s\n' "$at_output" >&2
+        exit 1
+    fi
     # Fallback just in case parsing fails
-    echo "$at_output"
+    printf '%s\n' "$at_output"
     echo "Done! The injection is scheduled via the 'at' daemon."
     echo "(Use 'atq' to list scheduled jobs, and 'atrm <job_id>' to cancel one.)"
 fi
