@@ -21,7 +21,12 @@ jobs:
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install tmux   # BSD `at` (/usr/bin/at) already ships with macOS
+        # Silence the runner's pre-installed untrusted tap (aws/tap) warning --
+        # irrelevant here since tmux comes from homebrew/core. BSD `at`
+        # (/usr/bin/at) already ships with macOS, so only tmux is needed.
+        env:
+          HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
+        run: brew install tmux
 
       - name: Syntax check
         run: |
