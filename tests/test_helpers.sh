@@ -120,4 +120,33 @@ r=$(AUTO_RETRY=false VERIFY=false NOTIFY=false RETRY_LIMIT=2
     printf '%s %s %s %s' "$AUTO_RETRY" "$VERIFY" "$NOTIFY" "$RETRY_LIMIT")
 check "prompt: junk ignored, bad count kept" "true false false 2" "$r"
 
+# --- is_relative_timespec (BSD `at` silently drops relative "+" offsets) ------
+# Relative offsets contain a '+'; absolute / named times do not.
+check "reltime: 'now + 45 min' relative"  "0" "$(is_relative_timespec 'now + 45 min'; echo $?)"
+check "reltime: 'now + 1 hour' relative"  "0" "$(is_relative_timespec 'now + 1 hour'; echo $?)"
+check "reltime: 'now +30minutes' relative" "0" "$(is_relative_timespec 'now +30minutes'; echo $?)"
+check "reltime: '14:30' absolute"         "1" "$(is_relative_timespec '14:30'; echo $?)"
+check "reltime: '1159pm' absolute"        "1" "$(is_relative_timespec '1159pm'; echo $?)"
+check "reltime: 'noon' absolute"          "1" "$(is_relative_timespec 'noon'; echo $?)"
+check "reltime: 'tomorrow 9am' absolute"  "1" "$(is_relative_timespec 'tomorrow 9am'; echo $?)"
+check "reltime: empty absolute"           "1" "$(is_relative_timespec ''; echo $?)"
+
+# --- atrun_hint (macOS-only schedule-time reminder; suppressible) -------------
+# Forced IS_DARWIN so both branches are tested regardless of the host OS.
+check "atrun_hint: macOS mentions atrun" "yes" \
+    "$(IS_DARWIN=true NUDGE_NO_ATRUN_HINT= atrun_hint 2>&1 | grep -qi 'atrun' && echo yes || echo no)"
+check "atrun_hint: macOS points at --help" "yes" \
+    "$(IS_DARWIN=true NUDGE_NO_ATRUN_HINT= atrun_hint 2>&1 | grep -q -- '--help' && echo yes || echo no)"
+check "atrun_hint: prints to stderr not stdout" "" \
+    "$(IS_DARWIN=true NUDGE_NO_ATRUN_HINT= atrun_hint 2>/dev/null)"
+check "atrun_hint: suppressed by NUDGE_NO_ATRUN_HINT=1" "" \
+    "$(IS_DARWIN=true NUDGE_NO_ATRUN_HINT=1 atrun_hint 2>&1)"
+check "atrun_hint: silent off macOS" "" \
+    "$(IS_DARWIN=false atrun_hint 2>&1)"
+
+# --- print_help documents the modern launchctl verbs -------------------------
+help_mac=$(IS_DARWIN=true print_help)
+check "help: 'launchctl enable' present"    "yes" "$(printf '%s' "$help_mac" | grep -q 'launchctl enable system/com.apple.atrun' && echo yes || echo no)"
+check "help: 'launchctl bootstrap' present" "yes" "$(printf '%s' "$help_mac" | grep -q 'launchctl bootstrap system' && echo yes || echo no)"
+
 finish
