@@ -15,6 +15,29 @@ fi
 IS_DARWIN=false
 [[ "$(uname)" == "Darwin" ]] && IS_DARWIN=true
 
+# --- macOS: enabling the 'at' scheduler (atrun) ----------------------------
+# On macOS the launchd daemon that actually FIRES queued `at` jobs -- atrun --
+# is disabled by default. `nudge` will happily *schedule* a job (atq shows it),
+# but it never runs until you enable atrun once. This needs root; it's a
+# one-time setup. Modern launchctl verbs (macOS 10.11+):
+#
+#     sudo launchctl enable system/com.apple.atrun
+#     sudo launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.atrun.plist
+#
+# `enable` flips the persistent override (survives reboots -- this is the
+# modern replacement for the old `load -w`); `bootstrap` loads it into the
+# system domain right now. Inspect / force a run with:
+#
+#     sudo launchctl print     system/com.apple.atrun
+#     sudo launchctl kickstart -k system/com.apple.atrun
+#
+# Legacy fallback for pre-10.11 macOS:
+#     sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.atrun.plist
+#
+# atrun also polls only every ~30s, so a fired job can land up to ~30s late;
+# nudge's 3-minute reset padding absorbs that. atrun_hint() prints a short
+# reminder at schedule time (silence it with NUDGE_NO_ATRUN_HINT=1).
+
 # Literal ESC byte for stripping ANSI sequences (portable across GNU/BSD sed;
 # avoids the GNU-only \x1B escape).
 ESC=$(printf '\033')
@@ -102,9 +125,14 @@ print_help() {
     echo "      Use 'atq' to view pending jobs, and 'atrm <job_id>' to cancel them."
     if [ "$IS_DARWIN" = true ]; then
         echo ""
-        echo "macOS: the 'at' scheduler (atrun) is disabled by default. If jobs never fire:"
-        echo "  sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.atrun.plist"
-        echo "      Relative -m times (e.g. 'now + 45 min') need GNU date: brew install coreutils"
+        echo "macOS: the 'at' scheduler (atrun) is disabled by default, so scheduled jobs"
+        echo "are queued but never fire until you enable it once (needs sudo):"
+        echo "  sudo launchctl enable system/com.apple.atrun"
+        echo "  sudo launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.atrun.plist"
+        echo "  Verify:   sudo launchctl print system/com.apple.atrun"
+        echo "  Pre-10.11 macOS: sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.atrun.plist"
+        echo "  (Silence the schedule-time reminder with NUDGE_NO_ATRUN_HINT=1.)"
+        echo "  Relative -m times (e.g. 'now + 45 min') need GNU date: brew install coreutils"
     fi
 }
 
@@ -140,6 +168,19 @@ strip_ansi() {
     "$SED" -E "s/${ESC}\[[0-9;]*[mK]//g"
 }
 
+# Return 0 if a user-supplied time-spec (arg 1) is a RELATIVE offset -- i.e. it
+# contains a '+' ("now + 45 min"). macOS's BSD `at` silently DROPS such offsets
+# and schedules the job for ~now instead, so on a coreutils-less Mac we reject
+# these up front rather than fire an instant nudge. Absolute / named times
+# ("14:30", "1159pm", "noon", "tomorrow 9am") contain no '+' and BSD `at`
+# handles them correctly.
+is_relative_timespec() {
+    case "$1" in
+        *+*) return 0 ;;
+        *)   return 1 ;;
+    esac
+}
+
 # Fire a desktop notification (arg 1 = body), portable across macOS / Linux.
 notify() {
     if [ "$IS_DARWIN" = true ]; then
@@ -147,6 +188,17 @@ notify() {
     else
         notify-send 'AI Nudge' "$1"
     fi
+}
+
+# Print a one-line reminder (to stderr) that macOS's 'at' scheduler must be
+# enabled for a freshly-scheduled job to actually fire. No-op off macOS or when
+# NUDGE_NO_ATRUN_HINT is truthy. Full enable steps live in print_help and the
+# atrun comment block near the top of this script.
+atrun_hint() {
+    [ "$IS_DARWIN" = true ] || return 0
+    [ "$(env_bool "${NUDGE_NO_ATRUN_HINT:-}")" = true ] && return 0
+    echo "Note: macOS's 'at' scheduler (atrun) must be enabled or this job won't fire --" >&2
+    echo "      run 'nudge --help' for the one-time setup (silence: NUDGE_NO_ATRUN_HINT=1)." >&2
 }
 
 # Scan captured pane text (arg 1) for a known rate-limit pattern. On success,
@@ -585,6 +637,17 @@ if [ -z "$TARGET_EPOCH" ] && [ -n "$TARGET_TIME" ] && [ "$IS_DARWIN" = true ] &&
     [ -n "$maybe" ] && TARGET_EPOCH="$maybe"
 fi
 
+# macOS without GNU date: BSD `at` silently DROPS relative offsets ("now + N"),
+# scheduling for ~now. Refuse those up front rather than firing an instant
+# nudge -- the previous behaviour reported success but ran immediately.
+if [ -z "$TARGET_EPOCH" ] && [ -n "$TARGET_TIME" ] && [ "$IS_DARWIN" = true ] \
+   && [ "$IS_GNU_DATE" = false ] && is_relative_timespec "$TARGET_TIME"; then
+    echo "Error: relative time \"$TARGET_TIME\" isn't supported by macOS's BSD 'at'" >&2
+    echo "(it would silently schedule for ~now). Use an absolute time such as \"14:30\"" >&2
+    echo "or \"1159pm\", or install GNU date for relative times:  brew install coreutils" >&2
+    exit 1
+fi
+
 if [ -z "$TARGET_EPOCH" ] && [ -z "$TARGET_TIME" ]; then
     echo "No target time specified. Aborting."
     exit 1
@@ -632,3 +695,7 @@ else
     echo "Done! The injection is scheduled via the 'at' daemon."
     echo "(Use 'atq' to list scheduled jobs, and 'atrm <job_id>' to cancel one.)"
 fi
+
+# We only reach here after a successful schedule (the error branch exits above).
+# On macOS, remind that atrun must be enabled or the job we just queued won't fire.
+atrun_hint
