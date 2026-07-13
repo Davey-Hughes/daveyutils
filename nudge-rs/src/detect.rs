@@ -40,18 +40,23 @@ pub fn detect_reset(
 
     // Duration shape: "... Resets in 1h30m / 45m" or a fully custom
     // NUDGE_DURATION_PATTERN banner (e.g. "out of credits, back in 20m") whose
-    // countdown need not follow the literal word "resets".
-    if duration_re(dur_ext).is_match(&clean) {
-        if let Some(spec) = find_duration_token(&clean) {
+    // countdown need not follow the literal word "resets". Scan only the text
+    // *after* the banner match: a captured pane includes scrollback, and an
+    // unrelated duration-shaped substring earlier in the pane (e.g. "16
+    // minutes ago" in a shell prompt) must not be mistaken for the banner's
+    // own countdown.
+    if let Some(m) = duration_re(dur_ext).find(&clean) {
+        if let Some(spec) = find_duration_token(&clean[m.end()..]) {
             if let Ok(z) = parse_timespec(&spec, now) {
                 return z.checked_add(PADDING_MINUTES.minutes()).ok();
             }
         }
     }
 
-    // Clock shape: "... resets 3:00pm" / "... try again at 4pm".
-    if clock_re(clock_ext).is_match(&clean) {
-        if let Some(tok) = find_clock_token(&clean) {
+    // Clock shape: "... resets 3:00pm" / "... try again at 4pm". Same
+    // scrollback-safety scoping as the duration branch above.
+    if let Some(m) = clock_re(clock_ext).find(&clean) {
+        if let Some(tok) = find_clock_token(&clean[m.end()..]) {
             if let Ok(z) = parse_timespec(&tok, now) {
                 return z.checked_add(PADDING_MINUTES.minutes()).ok();
             }
@@ -133,5 +138,25 @@ mod tests {
     #[test]
     fn no_banner_returns_none() {
         assert!(detect_reset("all good here", &now(), None, None).is_none());
+    }
+
+    #[test]
+    fn duration_token_bound_to_banner_not_scrollback() {
+        // A scrollback line with a duration-shaped phrase ABOVE the real banner
+        // must not hijack the reset time.
+        let pane = "commit abc123 16 minutes ago\nquota reached. Resets in 45m";
+        let z = detect_reset(pane, &now(), None, None).unwrap();
+        // now 10:00 + 45m + 3m padding = 10:48, NOT 10:00 + 16m + 3m.
+        assert_eq!((z.hour(), z.minute()), (10, 48));
+    }
+
+    #[test]
+    fn clock_token_bound_to_banner_not_scrollback() {
+        // A scrollback clock time ABOVE the real banner must not hijack the
+        // reset time either.
+        let pane = "started at 9:15\ncurrent session resets 3:00pm";
+        let z = detect_reset(pane, &now(), None, None).unwrap();
+        // 15:00 + 3m padding = 15:03, NOT derived from the 9:15 scrollback time.
+        assert_eq!((z.hour(), z.minute()), (15, 3));
     }
 }
