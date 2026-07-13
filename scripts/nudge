@@ -86,6 +86,18 @@ EDIT_MESSAGES=()
 # uppercase queues mean batch jobs to `at`.
 AT_QUEUE="${NUDGE_AT_QUEUE:-n}"
 
+# Seconds to wait after injecting before scanning the pane for a fresh rate-limit
+# banner in the auto-retry path. A slow/busy CLI may not have re-rendered within
+# the default 5s; bump this (NUDGE_SETTLE_SECS=10) if retries are being missed.
+# Read unconditionally (like AT_QUEUE) so the headless job honours it too -- it
+# tunes timing only, never the injected content, so it stays outside the
+# hermetic per-job state that build_next_cmd freezes.
+SETTLE_SECS="${NUDGE_SETTLE_SECS:-5}"
+if ! [[ "$SETTLE_SECS" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "Warning: ignoring non-numeric NUDGE_SETTLE_SECS='$SETTLE_SECS'; using 5." >&2
+    SETTLE_SECS=5
+fi
+
 # --- Helpers ---------------------------------------------------------------
 
 # Interpret a string (arg 1) as a boolean: 1/true/yes/on (any case) -> "true",
@@ -139,6 +151,11 @@ print_help() {
     echo "  NUDGE_VERIFY=1        Enable pane verification by default"
     echo "  NUDGE_NOTIFY=1        Enable desktop notifications by default"
     echo "  NUDGE_RETRIES=<num>   Default retry count (implies auto-retry; -1 = forever)"
+    echo "  NUDGE_SETTLE_SECS=<n> Seconds to wait before the auto-retry re-scan (default 5)"
+    echo "  NUDGE_CLOCK_PATTERN=<re>    Also treat panes matching <re> as a clock-time"
+    echo "                             rate limit (parsed like Claude's 'resets 3:00pm')"
+    echo "  NUDGE_DURATION_PATTERN=<re> Also treat panes matching <re> as a countdown"
+    echo "                             rate limit (parsed like Agy's 'Resets in 1h30m')"
     echo ""
     echo "Examples:"
     echo "  # Run fully interactively (will present a menu of tmux panes)"
@@ -191,12 +208,35 @@ format_epoch() {
     fi
 }
 
-# Parse an absolute clock string like "3:00am" into an epoch (today's date).
+# Normalise a captured clock token ("3pm", "3:00 PM", "11:59pm", "3AM ...") into
+# the canonical form "H:MMAM"/"H:MMPM" so BOTH GNU and (strict) BSD date parse
+# it. Handles: lowercase am/pm (BSD strptime's %p wants uppercase), a missing
+# ":MM" (defaults to :00), and stray spaces before the meridiem. Any surrounding
+# text -- e.g. a trailing "(America/New_York)" -- is ignored (the time is assumed
+# to be in local time). Echoes nothing if arg 1 has no am/pm clock time.
+# Uses only tr + grep (BSD awk lacks gawk's match(str,re,arr)).
+normalize_clock() {
+    local up ap hh mm
+    up=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+    ap=$(printf '%s' "$up" | grep -oE '(AM|PM)' | head -n 1)
+    [ -z "$ap" ] && return 0
+    hh=$(printf '%s' "$up" | grep -oE '[0-9]{1,2}' | head -n 1)
+    [ -z "$hh" ] && return 0
+    mm=$(printf '%s' "$up" | grep -oE ':[0-9]{2}' | head -n 1); mm=${mm#:}
+    printf '%s:%s%s' "$hh" "${mm:-00}" "$ap"
+}
+
+# Parse an absolute clock string like "3:00am", "3pm" or "3:00 PM" into an epoch
+# (today's date). Normalises to a canonical form first so both date flavours
+# accept it. Empty on parse failure.
 parse_clock_epoch() {
+    local canon
+    canon=$(normalize_clock "$1")
+    [ -z "$canon" ] && return 1
     if [ "$IS_GNU_DATE" = true ]; then
-        "$DATE" -d "$1" +%s 2>/dev/null
+        "$DATE" -d "$canon" +%s 2>/dev/null
     else
-        date -j -f '%I:%M%p' "$1" +%s 2>/dev/null
+        date -j -f '%I:%M%p' "$canon" +%s 2>/dev/null
     fi
 }
 
@@ -238,30 +278,47 @@ atrun_hint() {
     echo "      run 'nudge --help' for the one-time setup (silence: NUDGE_NO_ATRUN_HINT=1)." >&2
 }
 
+# Effective banner regexes: a built-in pattern plus an optional user extension so
+# nudge can be taught new tools without editing this file. A limit is one of two
+# shapes -- "clock" (a wall-clock reset time, parsed like Claude) or "duration"
+# (a "Resets in 1h30m"-style countdown, parsed like Agy). Point nudge at another
+# CLI by exporting the banner text (an extended-regex alternation) for whichever
+# shape it uses:
+#   NUDGE_CLOCK_PATTERN='codex.*rate limit'   # its message shows a clock time
+#   NUDGE_DURATION_PATTERN='out of credits'   # its message shows "Resets in ..."
+# Computed per-call (not cached) so tests and the headless job pick up the env
+# dynamically. The time itself must still appear in the matching shape's format.
+clock_banner_re()    { printf '(session limit|current session).*resets%s' "${NUDGE_CLOCK_PATTERN:+|$NUDGE_CLOCK_PATTERN}"; }
+duration_banner_re() { printf 'quota reached%s' "${NUDGE_DURATION_PATTERN:+|$NUDGE_DURATION_PATTERN}"; }
+
 # Scan captured pane text (arg 1) for a known rate-limit pattern. On success,
 # prints the target epoch (with 3-minute safety padding) to stdout plus a short
 # human note to stderr; returns 1 with no stdout if nothing is detected.
 detect_reset_epoch() {
-    local clean now reset raw h m s parsed target
+    local clean now reset raw h m s parsed target clock_re dur_re
     clean=$(printf '%s\n' "$1" | strip_ansi)
     now=$(date +%s)
+    clock_re=$(clock_banner_re)
+    dur_re=$(duration_banner_re)
 
-    if printf '%s\n' "$clean" | grep -qiE "(session limit|current session).*resets"; then
-        # Claude: absolute clock time such as "3:00am".
+    if printf '%s\n' "$clean" | grep -qiE "$clock_re"; then
+        # Clock style (Claude et al.): a wall-clock reset time such as "3:00am",
+        # "3pm" or "3:00 PM". Minutes are optional; a trailing timezone is
+        # ignored (time is read as local). Grep the time only from banner lines.
         reset=$(printf '%s\n' "$clean" \
-            | grep -iE "(session limit|current session).*resets" \
-            | grep -oiE '[0-9]{1,2}:[0-9]{2}(am|pm)' | head -n 1)
+            | grep -iE "$clock_re" \
+            | grep -oiE '[0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)' | head -n 1)
         [ -z "$reset" ] && return 1
         parsed=$(parse_clock_epoch "$reset")
         [ -z "$parsed" ] && return 1
         target=$(( parsed + 180 ))
         # Reset clock already passed today -> it must be tomorrow.
         [ "$target" -le "$now" ] && target=$(( target + 86400 ))
-        echo "Detected Claude rate limit!" >&2
+        echo "Detected rate limit (resets $reset)." >&2
         echo "$target"
         return 0
-    elif printf '%s\n' "$clean" | grep -qi "quota reached"; then
-        # Agy: relative duration such as "Resets in 1h30m".
+    elif printf '%s\n' "$clean" | grep -qiE "$dur_re"; then
+        # Duration style (Agy et al.): relative countdown such as "Resets in 1h30m".
         raw=$(printf '%s\n' "$clean" | grep -oE 'Resets in [0-9hms]+' | head -n 1)
         raw=${raw#Resets in }
         [ -z "$raw" ] && return 1
@@ -273,7 +330,7 @@ detect_reset_epoch() {
             return 1
         fi
         target=$(( now + h * 3600 + m * 60 + s + 180 ))
-        echo "Detected Agy rate limit!" >&2
+        echo "Detected rate limit (resets in $raw)." >&2
         echo "$target"
         return 0
     fi
@@ -281,14 +338,14 @@ detect_reset_epoch() {
 }
 
 # Return 0 if the pane text (arg 1) currently shows a known rate-limit banner
-# (Claude session limit or Agy quota). Presence check only, no time parsing --
-# used by --verify to confirm a limit is still up before we inject. Keep the
-# patterns in sync with detect_reset_epoch above.
+# (either shape, including any NUDGE_*_PATTERN extension). Presence check only,
+# no time parsing -- used by --verify to confirm a limit is still up before we
+# inject. Shares the banner regexes with detect_reset_epoch so they can't drift.
 has_limit_banner() {
     local clean
     clean=$(printf '%s\n' "$1" | strip_ansi)
-    printf '%s\n' "$clean" | grep -qiE "(session limit|current session).*resets" && return 0
-    printf '%s\n' "$clean" | grep -qi "quota reached" && return 0
+    printf '%s\n' "$clean" | grep -qiE "$(clock_banner_re)" && return 0
+    printf '%s\n' "$clean" | grep -qiE "$(duration_banner_re)" && return 0
     return 1
 }
 
@@ -352,6 +409,14 @@ at_schedule_epoch() {
 # --- Job inspection (reverse of at_pipe / build_next_cmd) -------------------
 # These recover the scheduled parameters from an `at -c <id>` dump so --jobs can
 # show what each pending job will do.
+#
+# The recovery trick, shared by job_summary / job_detail / load_job: once
+# job_inner_cmd has trimmed the dump to the printf '%q'-quoted payload, they run
+# `eval "set -- $inner"`. `set --` only assigns positional parameters -- it never
+# executes the command word -- and %q-quoting guarantees the payload re-tokenises
+# to the exact original strings with no command substitution able to fire.
+# Trimming to `--execute-nudge` first keeps the script path out of the eval
+# entirely. Each function's "$@" is local, so the caller's args are untouched.
 
 # From a raw `at -c` dump (arg 1), recover the inner nudge command, trimmed to
 # start at `--execute-nudge`. The job body is the LAST non-empty line, wrapped
@@ -372,14 +437,6 @@ job_inner_cmd() {
     line=${line//"$esc"/"$sq"}        # undo it -> real single quotes
     printf '%s' "--execute-nudge${line#*--execute-nudge}"
 }
-
-# Reconstruct the scheduled job's argv from an `at -c` dump WITHOUT running it.
-# `eval "set -- ..."` only assigns positional parameters -- it never executes the
-# command word -- and the payload is printf '%q'-quoted so it re-tokenizes to the
-# exact original strings (no command substitution can fire). Trimming to
-# `--execute-nudge` first keeps the script path out of the eval entirely.
-# Callers use the resulting "$@" locally (a function's positional params are its
-# own; the caller's are untouched).
 
 # Echo "<pane>\t<message-count>" for the job in an `at -c` dump (arg 1).
 # Returns 1 if it isn't a nudge job.
@@ -940,16 +997,17 @@ while [[ $# -gt 0 ]]; do
             shift 1
             ;;
         --cancel)
+            # Only consume the next token as the id if it isn't itself a flag,
+            # so `nudge --cancel -m 15:00` doesn't swallow -m as the id (it then
+            # errors cleanly on the missing id instead).
             MODE="cancel"
-            MODE_ARG="${2:-}"
-            shift 1
-            [ $# -gt 0 ] && shift 1
+            if [ $# -ge 2 ] && [[ "$2" != -* ]]; then MODE_ARG="$2"; shift 2
+            else MODE_ARG=""; shift 1; fi
             ;;
         --edit)
             MODE="edit"
-            MODE_ARG="${2:-}"
-            shift 1
-            [ $# -gt 0 ] && shift 1
+            if [ $# -ge 2 ] && [[ "$2" != -* ]]; then MODE_ARG="$2"; shift 2
+            else MODE_ARG=""; shift 1; fi
             ;;
         --list-plain)
             # Hidden: tab-delimited job list for fzf (source + reload).
@@ -959,9 +1017,8 @@ while [[ $# -gt 0 ]]; do
         --preview-job)
             # Hidden: fzf preview -- render one job's details by id.
             MODE="preview-job"
-            MODE_ARG="${2:-}"
-            shift 1
-            [ $# -gt 0 ] && shift 1
+            if [ $# -ge 2 ] && [[ "$2" != -* ]]; then MODE_ARG="$2"; shift 2
+            else MODE_ARG=""; shift 1; fi
             ;;
         --execute-nudge)
             # Hidden internal flag used by the 'at' job to actually trigger the sequence
@@ -1022,7 +1079,9 @@ if [ "$EXECUTE_NUDGE" = true ]; then
     # If the session was already resumed (or was never limited) by the time the
     # timer fires, skip quietly so we don't interrupt a working session.
     if [ "$VERIFY" = true ]; then
-        pane_now=$(tmux capture-pane -pt "$TARGET_PANE")
+        # -J joins tmux-wrapped lines so a banner split across the pane width
+        # still matches as one line.
+        pane_now=$(tmux capture-pane -pJt "$TARGET_PANE")
         if ! has_limit_banner "$pane_now"; then
             [ "$NOTIFY" = true ] && notify "Skipped nudge: no rate-limit banner on $TARGET_PANE"
             exit 0
@@ -1045,8 +1104,9 @@ if [ "$EXECUTE_NUDGE" = true ]; then
 
     # Handle Autonomous Auto-Retry
     if [ "$AUTO_RETRY" = true ] && [ "$RETRY_LIMIT" -ne 0 ]; then
-        # Wait for the AI CLI to process the input and print a new rate limit if one exists
-        sleep 5
+        # Wait for the AI CLI to process the input and print a new rate limit if
+        # one exists (tunable via NUDGE_SETTLE_SECS for slow/busy sessions).
+        sleep "$SETTLE_SECS"
 
         # Scan ONLY what the AI printed *below* the message we just injected.
         # The banner that triggered this nudge is still sitting above our input;
@@ -1055,7 +1115,7 @@ if [ "$EXECUTE_NUDGE" = true ]; then
         # marker: a still-limited session prints a fresh banner beneath it, a
         # resumed one doesn't (and if it worked, our marker may have scrolled
         # off entirely -> pane_after_marker yields nothing -> no retry).
-        pane_out=$(tmux capture-pane -pt "$TARGET_PANE")
+        pane_out=$(tmux capture-pane -pJt "$TARGET_PANE")
         recent=$(pane_after_marker "$pane_out" "${MESSAGES[$last]}")
         new_target=$(detect_reset_epoch "$recent")
 
@@ -1085,7 +1145,7 @@ if [ -z "$TARGET_PANE" ]; then
                   --bind="alt-j:down,alt-k:up,ctrl-d:half-page-down,ctrl-u:half-page-up" \
                   --preview="tmux capture-pane -ept {1}" \
                   --preview-window="up:60%,follow" \
-                  --header="Use ↑/↓, C-n/C-p, or Alt-j/Alt-k. Enter = Default Text, Alt-Enter = Custom Text, Alt-o = Set Options.")
+                  --header="Use ↑/↓, C-n/C-p, or Alt-j/Alt-k. Enter = Default Text, Alt-Enter = Custom Text, Alt-o = Set Options (then optional text).")
 
         if [ -z "$fzf_output" ]; then
             echo "Selection cancelled."
@@ -1107,8 +1167,15 @@ if [ -z "$TARGET_PANE" ]; then
             MESSAGES=()
             prompt_messages
         elif [ "$key" = "alt-o" ]; then
-            # Configure run options; message stays default (or any -i supplied).
+            # Configure run options, then chain into an optional custom-text
+            # prompt so options + custom text is reachable from one key. Declining
+            # keeps the default (or any -i supplied); accepting replaces it.
             prompt_options
+            read -r -p "Enter custom message(s)? [y/N]: " cfg
+            if [[ "$cfg" =~ ^[Yy] ]]; then
+                MESSAGES=()
+                prompt_messages
+            fi
         fi
     else
         # Fallback text-based menu
@@ -1165,7 +1232,8 @@ ensure_default_messages
 # 2. DETERMINE TARGET TIME
 if [ -z "$TARGET_TIME" ]; then
     echo "Scanning pane $TARGET_PANE for known rate-limit patterns..."
-    pane_out=$(tmux capture-pane -pt "$TARGET_PANE" | tail -n 100)
+    # -J joins wrapped lines so a banner split across the pane width still matches.
+    pane_out=$(tmux capture-pane -pJt "$TARGET_PANE" | tail -n 100)
     TARGET_EPOCH=$(detect_reset_epoch "$pane_out")
 
     if [ -n "$TARGET_EPOCH" ]; then

@@ -70,6 +70,40 @@ diff=$(( ${agy:-0} - now ))
 check "Agy: relative reset ~ now+300s" "yes" \
     "$([ "$diff" -ge 290 ] && [ "$diff" -le 330 ] && echo yes || echo no)"
 
+# --- normalize_clock: canonicalise a captured clock token for both date flavours
+check "normclock: 3:00am -> 3:00AM"   "3:00AM"  "$(normalize_clock '3:00am')"
+check "normclock: lowercase pm"       "11:59PM" "$(normalize_clock '11:59pm')"
+check "normclock: no minutes -> :00"  "3:00PM"  "$(normalize_clock '3pm')"
+check "normclock: space before ap"    "4:30PM"  "$(normalize_clock '4:30 PM')"
+check "normclock: trailing timezone ignored" "9:00AM" "$(normalize_clock '9:00am (America/New_York)')"
+check "normclock: no am/pm -> empty"  ""        "$(normalize_clock '14:30')"
+
+# --- detect_reset_epoch: loosened clock parsing (minutes optional / lowercase) -
+# "resets 3pm" (no minutes) must parse to 15:03 (with the 3m pad).
+check "detect: bare-hour '3pm' -> 15:03" "15:03" \
+    "$(format_epoch "$(detect_reset_epoch 'session limit reached, resets 3pm' 2>/dev/null)" '%H:%M')"
+# Spaced, lowercase meridiem still parses.
+check "detect: '4:30 pm' -> 16:33" "16:33" \
+    "$(format_epoch "$(detect_reset_epoch 'current session resets at 4:30 pm' 2>/dev/null)" '%H:%M')"
+
+# --- extensible patterns: NUDGE_CLOCK_PATTERN / NUDGE_DURATION_PATTERN ----------
+# A foreign CLI's banner is undetected by default...
+check "custom: unknown banner ignored by default" "" \
+    "$(detect_reset_epoch 'FooCLI throttled until 2:00am' 2>/dev/null)"
+# ...but detected once its clock-style pattern is registered (parsed as a time).
+check "custom: NUDGE_CLOCK_PATTERN detects (02:03 w/ pad)" "02:03" \
+    "$(NUDGE_CLOCK_PATTERN='FooCLI throttled' \
+        format_epoch "$(NUDGE_CLOCK_PATTERN='FooCLI throttled' detect_reset_epoch 'FooCLI throttled until 2:00am' 2>/dev/null)" '%H:%M')"
+# Duration-style extension: "cooldown 3m" via NUDGE_DURATION_PATTERN -> ~now+300s.
+now=$(date +%s)
+cust=$(NUDGE_DURATION_PATTERN='cooldown' detect_reset_epoch "$(printf 'cooldown active\nResets in 2m\n')" 2>/dev/null)
+diff=$(( ${cust:-0} - now ))
+check "custom: NUDGE_DURATION_PATTERN detects ~now+300s" "yes" \
+    "$([ "$diff" -ge 290 ] && [ "$diff" -le 330 ] && echo yes || echo no)"
+# has_limit_banner honours the same extension.
+check "custom: has_limit_banner sees clock extension" "0" \
+    "$(NUDGE_CLOCK_PATTERN='FooCLI throttled' has_limit_banner 'FooCLI throttled until 2:00am'; echo $?)"
+
 # --- build_next_cmd flag passthrough -----------------------------------------
 cmd_v=$(SCRIPT_PATH=/x TARGET_PANE="s:0.0" SEND_DELAY=0.75 NOTIFY=false VERIFY=true bash -c '
     source "'"$PRELUDE"'"; SCRIPT_PATH=/x; TARGET_PANE="s:0.0"; SEND_DELAY=0.75
