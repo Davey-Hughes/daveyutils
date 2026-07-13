@@ -43,7 +43,9 @@ IS_DARWIN=false
 ESC=$(printf '\033')
 
 # --- Dependency check ------------------------------------------------------
-for cmd in tmux at "$DATE" grep "$SED" awk; do
+# atq/atrm ship with `at` but are checked explicitly so a broken install surfaces
+# here rather than as an opaque failure inside --list / --cancel / --edit.
+for cmd in tmux at atq atrm "$DATE" grep "$SED" awk; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "Error: Required command '$cmd' is not installed or not in PATH."
         exit 1
@@ -62,6 +64,41 @@ AUTO_RETRY=false
 RETRY_LIMIT=2
 VERIFY=false
 EXECUTE_NUDGE=false
+MODE=""
+MODE_ARG=""
+
+# --edit: track which settings were given as explicit flags (vs left at their
+# default / env value), so `nudge --edit <id> -m 15:00` overrides only that one
+# field non-interactively and leaves the rest of the stored job untouched. The
+# flag values themselves are snapshotted into EDIT_* before the stored job is
+# loaded over the top. Consumed solely by edit_job; inert for every other path.
+SET_PANE=false
+SET_TIME=false
+SET_MESSAGES=false
+SET_DELAY=false
+SET_NOTIFY=false
+SET_AUTO_RETRY=false
+SET_VERIFY=false
+SET_RETRIES=false
+EDIT_MESSAGES=()
+
+# Dedicated 'at' queue for every nudge job. Isolates our jobs from any other
+# 'at' jobs the user has, so `atq -q n` / --jobs list only ours. Overridable
+# (mainly for tests) via NUDGE_AT_QUEUE. Must be a single lowercase letter --
+# uppercase queues mean batch jobs to `at`.
+AT_QUEUE="${NUDGE_AT_QUEUE:-n}"
+
+# Seconds to wait after injecting before scanning the pane for a fresh rate-limit
+# banner in the auto-retry path. A slow/busy CLI may not have re-rendered within
+# the default 5s; bump this (NUDGE_SETTLE_SECS=10) if retries are being missed.
+# Read unconditionally (like AT_QUEUE) so the headless job honours it too -- it
+# tunes timing only, never the injected content, so it stays outside the
+# hermetic per-job state that build_next_cmd freezes.
+SETTLE_SECS="${NUDGE_SETTLE_SECS:-5}"
+if ! [[ "$SETTLE_SECS" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "Warning: ignoring non-numeric NUDGE_SETTLE_SECS='$SETTLE_SECS'; using 5." >&2
+    SETTLE_SECS=5
+fi
 
 # --- Helpers ---------------------------------------------------------------
 
@@ -95,15 +132,33 @@ print_help() {
     echo "      --no-verify       Disable verification (overrides a NUDGE_VERIFY default)"
     echo "  -h, --help            Show this help message"
     echo ""
+    echo "Managing scheduled jobs:"
+    echo "  -l, --list, --jobs    Review pending nudge jobs (pane, time, message count)."
+    echo "                        With 'fzf' installed this is an interactive dashboard:"
+    echo "                        preview each job, Enter edits the highlighted one, and"
+    echo "                        Alt-c / Del cancels it and refreshes the list in place."
+    echo "      --edit <id>       Edit a pending job (pane/time/messages/options), then"
+    echo "                        reschedule it under a new ID. With no other flags it"
+    echo "                        prompts for each field (blank keeps the current value);"
+    echo "                        pass flags to edit non-interactively, e.g."
+    echo "                        'nudge --edit 3 -m 15:00' changes only the time."
+    echo "      --cancel <id>     Cancel one pending nudge job by its ID (from --list)."
+    echo ""
     echo "If essential options are omitted, the script will prompt you interactively."
     echo "  (If 'fzf' is installed, you will get a live visual preview of each pane!)"
-    echo "  After picking a pane you can set run options (fzf: press Alt-o; text menu: you'll be asked)."
+    echo "  After picking a pane you can set custom text and/or run options (fzf: Alt-Enter"
+    echo "  for text, Alt-o for options then optional text; text menu: you'll be asked for both)."
     echo ""
     echo "Environment (persistent defaults; overridden by flags, then by interactive toggles):"
     echo "  NUDGE_AUTO_RETRY=1    Enable auto-retry by default"
     echo "  NUDGE_VERIFY=1        Enable pane verification by default"
     echo "  NUDGE_NOTIFY=1        Enable desktop notifications by default"
     echo "  NUDGE_RETRIES=<num>   Default retry count (implies auto-retry; -1 = forever)"
+    echo "  NUDGE_SETTLE_SECS=<n> Seconds to wait before the auto-retry re-scan (default 5)"
+    echo "  NUDGE_CLOCK_PATTERN=<re>    Also treat panes matching <re> as a clock-time"
+    echo "                             rate limit (parsed like Claude's 'resets 3:00pm')"
+    echo "  NUDGE_DURATION_PATTERN=<re> Also treat panes matching <re> as a countdown"
+    echo "                             rate limit (parsed like Agy's 'Resets in 1h30m')"
     echo ""
     echo "Examples:"
     echo "  # Run fully interactively (will present a menu of tmux panes)"
@@ -121,8 +176,9 @@ print_help() {
     echo "  # Infinite retries for a custom time, injecting custom text"
     echo "  nudge -p bot:1.0 -m \"now + 1 hour\" -i \"yes\" -r -1"
     echo ""
-    echo "Note: This script uses the 'at' daemon for background scheduling."
-    echo "      Use 'atq' to view pending jobs, and 'atrm <job_id>' to cancel them."
+    echo "Note: This script uses the 'at' daemon for background scheduling. Manage"
+    echo "      pending jobs entirely through nudge: 'nudge --list' to review,"
+    echo "      'nudge --edit <id>' to reschedule/change, 'nudge --cancel <id>' to remove."
     if [ "$IS_DARWIN" = true ]; then
         echo ""
         echo "macOS: the 'at' scheduler (atrun) is disabled by default, so scheduled jobs"
@@ -154,12 +210,35 @@ format_epoch() {
     fi
 }
 
-# Parse an absolute clock string like "3:00am" into an epoch (today's date).
+# Normalise a captured clock token ("3pm", "3:00 PM", "11:59pm", "3AM ...") into
+# the canonical form "H:MMAM"/"H:MMPM" so BOTH GNU and (strict) BSD date parse
+# it. Handles: lowercase am/pm (BSD strptime's %p wants uppercase), a missing
+# ":MM" (defaults to :00), and stray spaces before the meridiem. Any surrounding
+# text -- e.g. a trailing "(America/New_York)" -- is ignored (the time is assumed
+# to be in local time). Echoes nothing if arg 1 has no am/pm clock time.
+# Uses only tr + grep (BSD awk lacks gawk's match(str,re,arr)).
+normalize_clock() {
+    local up ap hh mm
+    up=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+    ap=$(printf '%s' "$up" | grep -oE '(AM|PM)' | head -n 1)
+    [ -z "$ap" ] && return 0
+    hh=$(printf '%s' "$up" | grep -oE '[0-9]{1,2}' | head -n 1)
+    [ -z "$hh" ] && return 0
+    mm=$(printf '%s' "$up" | grep -oE ':[0-9]{2}' | head -n 1); mm=${mm#:}
+    printf '%s:%s%s' "$hh" "${mm:-00}" "$ap"
+}
+
+# Parse an absolute clock string like "3:00am", "3pm" or "3:00 PM" into an epoch
+# (today's date). Normalises to a canonical form first so both date flavours
+# accept it. Empty on parse failure.
 parse_clock_epoch() {
+    local canon
+    canon=$(normalize_clock "$1")
+    [ -z "$canon" ] && return 1
     if [ "$IS_GNU_DATE" = true ]; then
-        "$DATE" -d "$1" +%s 2>/dev/null
+        "$DATE" -d "$canon" +%s 2>/dev/null
     else
-        date -j -f '%I:%M%p' "$1" +%s 2>/dev/null
+        date -j -f '%I:%M%p' "$canon" +%s 2>/dev/null
     fi
 }
 
@@ -201,32 +280,52 @@ atrun_hint() {
     echo "      run 'nudge --help' for the one-time setup (silence: NUDGE_NO_ATRUN_HINT=1)." >&2
 }
 
+# Effective banner regexes: a built-in pattern plus an optional user extension so
+# nudge can be taught new tools without editing this file. A limit is one of two
+# shapes -- "clock" (a wall-clock reset time, parsed like Claude) or "duration"
+# (a "Resets in 1h30m"-style countdown, parsed like Agy). Point nudge at another
+# CLI by exporting the banner text (an extended-regex alternation) for whichever
+# shape it uses:
+#   NUDGE_CLOCK_PATTERN='codex.*rate limit'   # its message shows a clock time
+#   NUDGE_DURATION_PATTERN='out of credits'   # its message shows "Resets in ..."
+# Computed per-call (not cached) so tests and the headless job pick up the env
+# dynamically. The time itself must still appear in the matching shape's format.
+clock_banner_re()    { printf '(session limit|current session).*resets%s' "${NUDGE_CLOCK_PATTERN:+|$NUDGE_CLOCK_PATTERN}"; }
+duration_banner_re() { printf 'quota reached%s' "${NUDGE_DURATION_PATTERN:+|$NUDGE_DURATION_PATTERN}"; }
+
 # Scan captured pane text (arg 1) for a known rate-limit pattern. On success,
 # prints the target epoch (with 3-minute safety padding) to stdout plus a short
 # human note to stderr; returns 1 with no stdout if nothing is detected.
 detect_reset_epoch() {
-    local clean now reset raw h m s parsed target
+    local clean now reset raw h m s parsed target clock_re dur_re
     clean=$(printf '%s\n' "$1" | strip_ansi)
     now=$(date +%s)
+    clock_re=$(clock_banner_re)
+    dur_re=$(duration_banner_re)
 
-    if printf '%s\n' "$clean" | grep -qiE "(session limit|current session).*resets"; then
-        # Claude: absolute clock time such as "3:00am".
+    if printf '%s\n' "$clean" | grep -qiE "$clock_re"; then
+        # Clock style (Claude et al.): a wall-clock reset time such as "3:00am",
+        # "3pm" or "3:00 PM". Minutes are optional; a trailing timezone is
+        # ignored (time is read as local). Grep the time only from banner lines.
         reset=$(printf '%s\n' "$clean" \
-            | grep -iE "(session limit|current session).*resets" \
-            | grep -oiE '[0-9]{1,2}:[0-9]{2}(am|pm)' | head -n 1)
+            | grep -iE "$clock_re" \
+            | grep -oiE '[0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)' | head -n 1)
         [ -z "$reset" ] && return 1
         parsed=$(parse_clock_epoch "$reset")
         [ -z "$parsed" ] && return 1
         target=$(( parsed + 180 ))
         # Reset clock already passed today -> it must be tomorrow.
         [ "$target" -le "$now" ] && target=$(( target + 86400 ))
-        echo "Detected Claude rate limit!" >&2
+        echo "Detected rate limit (resets $reset)." >&2
         echo "$target"
         return 0
-    elif printf '%s\n' "$clean" | grep -qi "quota reached"; then
-        # Agy: relative duration such as "Resets in 1h30m".
-        raw=$(printf '%s\n' "$clean" | grep -oE 'Resets in [0-9hms]+' | head -n 1)
-        raw=${raw#Resets in }
+    elif printf '%s\n' "$clean" | grep -qiE "$dur_re"; then
+        # Duration style (Agy et al.): relative countdown. The time itself must be
+        # spelled "Resets in <Nh Nm Ns>" (case-insensitive) -- that literal prefix
+        # is what a NUDGE_DURATION_PATTERN extension also has to emit for the
+        # countdown to be parsed, even though the banner match is fully custom.
+        raw=$(printf '%s\n' "$clean" | grep -oiE 'Resets in [0-9hms]+' | head -n 1)
+        raw=${raw#[Rr]esets [Ii]n }
         [ -z "$raw" ] && return 1
         h=$(printf '%s\n' "$raw" | grep -oE '[0-9]+h' | grep -oE '[0-9]+'); h=${h:-0}
         m=$(printf '%s\n' "$raw" | grep -oE '[0-9]+m' | grep -oE '[0-9]+'); m=${m:-0}
@@ -236,7 +335,7 @@ detect_reset_epoch() {
             return 1
         fi
         target=$(( now + h * 3600 + m * 60 + s + 180 ))
-        echo "Detected Agy rate limit!" >&2
+        echo "Detected rate limit (resets in $raw)." >&2
         echo "$target"
         return 0
     fi
@@ -244,14 +343,14 @@ detect_reset_epoch() {
 }
 
 # Return 0 if the pane text (arg 1) currently shows a known rate-limit banner
-# (Claude session limit or Agy quota). Presence check only, no time parsing --
-# used by --verify to confirm a limit is still up before we inject. Keep the
-# patterns in sync with detect_reset_epoch above.
+# (either shape, including any NUDGE_*_PATTERN extension). Presence check only,
+# no time parsing -- used by --verify to confirm a limit is still up before we
+# inject. Shares the banner regexes with detect_reset_epoch so they can't drift.
 has_limit_banner() {
     local clean
     clean=$(printf '%s\n' "$1" | strip_ansi)
-    printf '%s\n' "$clean" | grep -qiE "(session limit|current session).*resets" && return 0
-    printf '%s\n' "$clean" | grep -qi "quota reached" && return 0
+    printf '%s\n' "$clean" | grep -qiE "$(clock_banner_re)" && return 0
+    printf '%s\n' "$clean" | grep -qiE "$(duration_banner_re)" && return 0
     return 1
 }
 
@@ -274,7 +373,10 @@ pane_after_marker() {
 # Arg 1 (optional): retry limit to embed via -r.
 build_next_cmd() {
     local retry_limit="$1" cmd m
-    cmd="$SCRIPT_PATH --execute-nudge -p $(printf '%q' "$TARGET_PANE") -w $(printf '%q' "$SEND_DELAY")"
+    # %q the script path too, not just the values -- an install path with a space
+    # (e.g. "/Users/John Doe/bin/nudge") would otherwise word-split when the 'at'
+    # job's `bash -c '<path> --execute-nudge ...'` is parsed, and the job fails.
+    cmd="$(printf '%q' "$SCRIPT_PATH") --execute-nudge -p $(printf '%q' "$TARGET_PANE") -w $(printf '%q' "$SEND_DELAY")"
     for m in "${MESSAGES[@]}"; do
         cmd="$cmd -i $(printf '%q' "$m")"
     done
@@ -285,8 +387,10 @@ build_next_cmd() {
 }
 
 # Pipe a command (arg 1) to `at`, using the remaining args as the at time-spec.
-# Adds the X11/DBus env exports on Linux so desktop notifications work from the
-# detached 'at' job. Echoes at's own output.
+# All nudge jobs go into the dedicated queue $AT_QUEUE (-q) so --jobs / atq can
+# list only ours. Adds the X11 / Wayland / DBus env exports on Linux so desktop
+# notifications reach the user's session from the detached 'at' job. Echoes at's
+# own output.
 #
 # `at` runs jobs under /bin/sh, which may be a POSIX shell (e.g. dash) that
 # doesn't understand the bash `$'...\n...'` quoting that `printf '%q'` emits for
@@ -298,10 +402,16 @@ at_pipe() {
     local escaped=${cmd//"'"/"'\''"}
     local job="bash -c '$escaped'"
     if [ "$IS_DARWIN" = true ]; then
-        printf '%s\n' "$job" | at "$@" 2>&1
+        printf '%s\n' "$job" | at -q "$AT_QUEUE" "$@" 2>&1
     else
-        printf 'export DISPLAY=%s; export DBUS_SESSION_BUS_ADDRESS=%s; %s\n' \
-            "$DISPLAY" "$DBUS_SESSION_BUS_ADDRESS" "$job" | at "$@" 2>&1
+        # %q the env values so an unusual DISPLAY/WAYLAND_DISPLAY can't break the
+        # export line; WAYLAND_DISPLAY covers pure-Wayland sessions where notify
+        # -send needs it (DBus alone isn't always enough).
+        printf 'export DISPLAY=%s WAYLAND_DISPLAY=%s DBUS_SESSION_BUS_ADDRESS=%s; %s\n' \
+            "$(printf '%q' "${DISPLAY:-}")" \
+            "$(printf '%q' "${WAYLAND_DISPLAY:-}")" \
+            "$(printf '%q' "${DBUS_SESSION_BUS_ADDRESS:-}")" \
+            "$job" | at -q "$AT_QUEUE" "$@" 2>&1
     fi
 }
 
@@ -309,6 +419,455 @@ at_pipe() {
 # which both GNU and BSD `at` accept.
 at_schedule_epoch() {
     at_pipe "$2" -t "$(format_epoch "$1" '%Y%m%d%H%M')"
+}
+
+# --- Job inspection (reverse of at_pipe / build_next_cmd) -------------------
+# These recover the scheduled parameters from an `at -c <id>` dump so --jobs can
+# show what each pending job will do.
+#
+# The recovery trick, shared by job_summary / job_detail / load_job: once
+# job_inner_cmd has trimmed the dump to the printf '%q'-quoted payload, they run
+# `eval "set -- $inner"`. `set --` only assigns positional parameters -- it never
+# executes the command word -- and %q-quoting guarantees the payload re-tokenises
+# to the exact original strings with no command substitution able to fire.
+# Trimming to `--execute-nudge` first keeps the script path out of the eval
+# entirely. Each function's "$@" is local, so the caller's args are untouched.
+#
+# This safety rests on the job having been created by build_next_cmd (which %q's
+# every field). We only ever read jobs from our own queue, so that holds; a
+# hand-crafted 'at' job with an unquoted metacharacter could defeat it, but such
+# a job is the user's own doing (they can already run arbitrary code).
+
+# From a raw `at -c` dump (arg 1), recover the inner nudge command, trimmed to
+# start at `--execute-nudge`. The job body is the LAST non-empty line, wrapped
+# as `bash -c '<payload>'` (Linux prepends a couple of `export`s). We strip that
+# wrapper, undo the '\'' single-quote escaping at_pipe applied, then drop
+# everything before `--execute-nudge` (the script path / env). Returns 1 if the
+# dump isn't a nudge job.
+job_inner_cmd() {
+    local body line sq esc
+    body=$(printf '%s\n' "$1" | awk 'NF{last=$0} END{print last}')
+    case "$body" in
+        *"bash -c '"*"--execute-nudge"*) ;;
+        *) return 1 ;;
+    esac
+    line=${body#*bash -c \'}          # drop through the first  bash -c '
+    line=${line%\'}                   # drop the closing quote
+    sq=\'; esc="$sq\\$sq$sq"          # the 4-char  '\''  escape sequence
+    line=${line//"$esc"/"$sq"}        # undo it -> real single quotes
+    printf '%s' "--execute-nudge${line#*--execute-nudge}"
+}
+
+# Echo "<pane>\t<message-count>" for the job in an `at -c` dump (arg 1).
+# Returns 1 if it isn't a nudge job.
+job_summary() {
+    local inner; inner=$(job_inner_cmd "$1") || return 1
+    eval "set -- $inner"
+    local pane="" count=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -p) pane="${2:-}"; shift 2 ;;
+            -i) count=$((count + 1)); shift 2 ;;
+            -w|-r) shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    printf '%s\t%s' "$pane" "$count"
+}
+
+# Print a human-readable block (pane, options, each message) for the job in an
+# `at -c` dump (arg 1). Used for the fzf preview. Returns 1 if not a nudge job.
+job_detail() {
+    local inner; inner=$(job_inner_cmd "$1") || return 1
+    eval "set -- $inner"
+    local pane="" retry="" notify=false verify=false o=""
+    local -a msgs=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -p) pane="${2:-}"; shift 2 ;;
+            -i) msgs+=("${2:-}"); shift 2 ;;
+            -r) retry="${2:-}"; shift 2 ;;
+            -w) shift 2 ;;
+            -n) notify=true; shift ;;
+            -v) verify=true; shift ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$retry" ]       && o="auto-retry($retry)"
+    [ "$verify" = true ]  && o="${o:+$o, }verify"
+    [ "$notify" = true ]  && o="${o:+$o, }notify"
+    printf 'Pane:    %s\n' "$pane"
+    printf 'Options: %s\n' "${o:-none}"
+    printf 'Messages:\n'
+    local i
+    for i in "${!msgs[@]}"; do
+        printf '  %d. %s\n' "$(( i + 1 ))" "${msgs[$i]}"
+    done
+}
+
+# Format the ctime-style date `atq` prints into a short "HH:MM Mon DD". Both GNU
+# and BSD atq emit:  <id> <wday> <mon> <mday> <HH:MM:SS> <year> <queue> [user]
+# (arg 1 = a full atq line). Falls back to the line minus its id if it's shorter.
+atq_time_str() {
+    printf '%s\n' "$1" | awk '
+        NF>=6 { printf "%s %s %s", substr($5,1,5), $3, $4; next }
+        { $1=""; sub(/^[ \t]+/, ""); printf "%s", $0 }'
+}
+
+# Extract the ctime-style date (fields 2-6: wday mon mday HH:MM:SS year) from a
+# full atq line (arg 1), e.g. "Mon Aug 16 10:56:00 2027". This is the only place
+# a pending job's fire time is available (`at -c` doesn't carry it).
+atq_ctime() {
+    printf '%s\n' "$1" | awk '{ printf "%s %s %s %s %s", $2, $3, $4, $5, $6 }'
+}
+
+# Convert a ctime-style date string (arg 1) into an epoch. GNU date parses it
+# directly; BSD date needs the explicit format (%e handles the space-padded day
+# ctime uses for single digits). Empty on parse failure.
+ctime_to_epoch() {
+    if [ "$IS_GNU_DATE" = true ]; then
+        "$DATE" -d "$1" +%s 2>/dev/null
+    else
+        date -j -f '%a %b %e %H:%M:%S %Y' "$1" +%s 2>/dev/null
+    fi
+}
+
+# Echo the fire-time epoch of pending nudge job <id> (arg 1) by reading its atq
+# line. Returns 1 if the id isn't in our queue.
+job_epoch() {
+    local line
+    line=$(atq -q "$AT_QUEUE" 2>/dev/null | awk -v id="$1" '$1 == id { print; exit }')
+    [ -z "$line" ] && return 1
+    ctime_to_epoch "$(atq_ctime "$line")"
+}
+
+# Seed the scheduling globals (TARGET_PANE, MESSAGES, SEND_DELAY, NOTIFY, VERIFY,
+# AUTO_RETRY, RETRY_LIMIT) from an `at -c` dump (arg 1), so --edit can present
+# the job's current settings and reschedule from them. A scheduled job carries
+# `-r` only when auto-retry was on, so its presence re-enables AUTO_RETRY.
+# Returns 1 if the dump isn't a nudge job.
+load_job() {
+    local inner; inner=$(job_inner_cmd "$1") || return 1
+    eval "set -- $inner"
+    TARGET_PANE=""; MESSAGES=(); SEND_DELAY="0.75"
+    NOTIFY=false; VERIFY=false; AUTO_RETRY=false; RETRY_LIMIT=2
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -p) TARGET_PANE="${2:-}"; shift 2 ;;
+            -w) SEND_DELAY="${2:-0.75}"; shift 2 ;;
+            -i) MESSAGES+=("${2:-}"); shift 2 ;;
+            -r) AUTO_RETRY=true; RETRY_LIMIT="${2:-2}"; shift 2 ;;
+            -n) NOTIFY=true; shift ;;
+            -v) VERIFY=true; shift ;;
+            *) shift ;;
+        esac
+    done
+}
+
+# Echo "<id>\t<when>\t<pane>\t<count>" for one atq line (arg 1), pulling the
+# pane/count out of `at -c`. Missing/foreign jobs degrade to '?'.
+job_row() {
+    local id raw summary pane count when
+    read -r id _ <<< "$1"
+    [ -z "$id" ] && return 1
+    raw=$(at -c "$id" 2>/dev/null)
+    if summary=$(job_summary "$raw" 2>/dev/null); then
+        pane=${summary%%$'\t'*}
+        count=${summary##*$'\t'}
+    else
+        pane="?"; count="?"
+    fi
+    when=$(atq_time_str "$1")
+    printf '%s\t%s\t%s\t%s' "$id" "$when" "${pane:-?}" "$count"
+}
+
+# Print a headed table of pending nudge jobs (queue $AT_QUEUE).
+list_jobs() {
+    local q; q=$(atq -q "$AT_QUEUE" 2>/dev/null | sort -n)
+    if [ -z "$q" ]; then
+        echo "No pending nudge jobs (queue '$AT_QUEUE')."
+        return 0
+    fi
+    printf '%-5s | %-15s | %-18s | %s\n' "ID" "Scheduled" "Pane" "Action"
+    echo "------+-----------------+--------------------+----------------------"
+    local line id when pane count
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        IFS=$'\t' read -r id when pane count <<< "$(job_row "$line")"
+        printf '%-5s | %-15s | %-18s | %s message(s)\n' "$id" "$when" "$pane" "$count"
+    done <<< "$q"
+}
+
+# Emit one tab-delimited "<id>\t<display>" line per job for fzf (id is field 1
+# so {1} resolves to it; the display carries no tabs). Used as the fzf source
+# and its reload command.
+list_plain() {
+    local line id when pane count
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        IFS=$'\t' read -r id when pane count <<< "$(job_row "$line")"
+        printf '%s\t%s  %-18s  %s msg(s)\n' "$id" "$when" "$pane" "$count"
+    done < <(atq -q "$AT_QUEUE" 2>/dev/null | sort -n)
+}
+
+# Cancel a single nudge job by id (arg 1). Guards that the id really is one of
+# our queued jobs before calling atrm, so a stray id can't remove an unrelated
+# 'at' job. Prints a friendly confirmation naming the target pane.
+cancel_job() {
+    local id="$1" pane
+    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+        echo "Error: --cancel needs a numeric job id (got '$id')." >&2
+        return 1
+    fi
+    if ! atq -q "$AT_QUEUE" 2>/dev/null | awk '{print $1}' | grep -qx "$id"; then
+        echo "Error: no pending nudge job #$id (see 'nudge --jobs')." >&2
+        return 1
+    fi
+    pane=$(job_summary "$(at -c "$id" 2>/dev/null)" 2>/dev/null)
+    pane=${pane%%$'\t'*}
+    if atrm "$id" 2>/dev/null; then
+        if [ -n "$pane" ]; then
+            echo "Cancelled nudge job #$id targeting pane $pane."
+        else
+            echo "Cancelled nudge job #$id."
+        fi
+    else
+        echo "Error: could not cancel job #$id." >&2
+        return 1
+    fi
+}
+
+# Interactive fzf dashboard over the pending jobs: preview shows exactly what
+# each job will inject; Alt-c / Del cancels the highlighted job and live-reloads
+# the list. Falls back to list_jobs (plain table) when fzf isn't installed.
+manage_jobs_fzf() {
+    if [ -z "$(atq -q "$AT_QUEUE" 2>/dev/null)" ]; then
+        echo "No pending nudge jobs (queue '$AT_QUEUE')."
+        return 0
+    fi
+    # Shell-quote $self everywhere it's embedded in an fzf action/preview string
+    # so an install path containing a space (or quote) still resolves -- fzf runs
+    # these via a shell, and unquoted "$self" would word-split. printf %q gives a
+    # form safe to paste into that shell; q holds it to keep the bind lines short.
+    local self="$SCRIPT_PATH" q
+    q=$(printf '%q' "$SCRIPT_PATH")
+    "$self" --list-plain | fzf \
+        --delimiter='\t' --with-nth='2..' \
+        --header=$'nudge jobs\nEnter = edit    Alt-c / Del = cancel    Esc = quit' \
+        --header-first \
+        --preview="$q --preview-job {1}" \
+        --preview-window='up:55%,wrap' \
+        --bind="enter:execute($q --edit {1})+reload($q --list-plain)" \
+        --bind="alt-c:execute-silent($q --cancel {1} >/dev/null 2>&1)+reload($q --list-plain)" \
+        --bind="del:execute-silent($q --cancel {1} >/dev/null 2>&1)+reload($q --list-plain)" \
+        >/dev/null
+}
+
+# Schedule the injection from the resolved globals (TARGET_EPOCH / TARGET_TIME /
+# MESSAGES / options) and report the result. Extracted from the main flow so
+# --edit can reuse the exact same platform handling. Sets SCHEDULED_JOB_ID to the
+# new job's id (empty if scheduling produced no parseable id). Hard-exits on a
+# time macOS's BSD `at` can't handle -- the same abort the main path always did.
+finalize_schedule() {
+    local maybe next_cmd at_output
+
+    # On macOS, BSD `at` can't parse GNU-style / relative strings, so normalise a
+    # user-supplied time to an epoch via GNU date when it's available. On Linux we
+    # leave it raw and let GNU `at` parse it natively (it also rolls a past clock
+    # time forward to tomorrow, which we'd lose by converting).
+    if [ -z "$TARGET_EPOCH" ] && [ -n "$TARGET_TIME" ] && [ "$IS_DARWIN" = true ] && [ "$IS_GNU_DATE" = true ]; then
+        maybe=$("$DATE" -d "$TARGET_TIME" +%s 2>/dev/null)
+        [ -n "$maybe" ] && TARGET_EPOCH="$maybe"
+    fi
+
+    # macOS without GNU date: BSD `at` silently DROPS relative offsets ("now + N"),
+    # scheduling for ~now. Refuse those up front rather than firing an instant
+    # nudge -- the previous behaviour reported success but ran immediately.
+    if [ -z "$TARGET_EPOCH" ] && [ -n "$TARGET_TIME" ] && [ "$IS_DARWIN" = true ] \
+       && [ "$IS_GNU_DATE" = false ] && is_relative_timespec "$TARGET_TIME"; then
+        echo "Error: relative time \"$TARGET_TIME\" isn't supported by macOS's BSD 'at'" >&2
+        echo "(it would silently schedule for ~now). Use an absolute time such as \"14:30\"" >&2
+        echo "or \"1159pm\", or install GNU date for relative times:  brew install coreutils" >&2
+        exit 1
+    fi
+
+    if [ -z "$TARGET_EPOCH" ] && [ -z "$TARGET_TIME" ]; then
+        echo "No target time specified. Aborting."
+        exit 1
+    fi
+
+    local target_display
+    if [ -n "$TARGET_EPOCH" ]; then
+        target_display=$(format_epoch "$TARGET_EPOCH" '%H:%M %Y-%m-%d')
+    else
+        target_display="$TARGET_TIME"
+    fi
+
+    echo ""
+    echo "Scheduling the following message(s) for $target_display on pane $TARGET_PANE:"
+    local i
+    for i in "${!MESSAGES[@]}"; do
+        printf '  %d. %s\n' "$(( i + 1 ))" "${MESSAGES[$i]}"
+    done
+    echo "Options: $(options_summary)"
+
+    next_cmd=$(build_next_cmd "$([ "$AUTO_RETRY" = true ] && printf '%s' "$RETRY_LIMIT")")
+
+    if [ -n "$TARGET_EPOCH" ]; then
+        at_output=$(at_schedule_epoch "$TARGET_EPOCH" "$next_cmd")
+    else
+        at_output=$(at_pipe "$next_cmd" "$TARGET_TIME")
+    fi
+
+    SCHEDULED_JOB_ID=$(printf '%s\n' "$at_output" | grep -oE 'job [0-9]+' | awk '{print $2}')
+
+    if [ -n "$SCHEDULED_JOB_ID" ]; then
+        echo "Done! The injection is scheduled via the 'at' daemon (Job ID: $SCHEDULED_JOB_ID)."
+        echo "(Use 'nudge --list' to review pending jobs, and 'nudge --cancel $SCHEDULED_JOB_ID' to cancel this one.)"
+    else
+        # Scheduling produced no job id -> surface a useful error.
+        if [ "$IS_DARWIN" = true ] && [ "$IS_GNU_DATE" = false ] && [ -z "$TARGET_EPOCH" ]; then
+            echo "Error: could not schedule at time \"$TARGET_TIME\"." >&2
+            echo "On macOS without GNU coreutils, relative / GNU-style times aren't supported here." >&2
+            echo "Use an absolute time (e.g. \"14:30\" or \"1430 Jul 12\"), or install GNU date:" >&2
+            echo "  brew install coreutils" >&2
+            [ -n "$at_output" ] && printf '%s\n' "$at_output" >&2
+            exit 1
+        fi
+        # Fallback just in case parsing fails
+        printf '%s\n' "$at_output"
+        echo "Done! The injection is scheduled via the 'at' daemon."
+        echo "(Use 'nudge --list' to review pending jobs, and 'nudge --cancel <id>' to cancel one.)"
+    fi
+
+    # On macOS, remind that atrun must be enabled or the job we just queued won't fire.
+    atrun_hint
+}
+
+# Return 0 if the user passed ANY editable flag alongside --edit. When true, the
+# edit is applied non-interactively; when false, edit_job prompts for each field.
+edit_has_flags() {
+    [ "$SET_PANE" = true ] || [ "$SET_TIME" = true ] || [ "$SET_MESSAGES" = true ] \
+        || [ "$SET_DELAY" = true ] || [ "$SET_NOTIFY" = true ] || [ "$SET_VERIFY" = true ] \
+        || [ "$SET_AUTO_RETRY" = true ] || [ "$SET_RETRIES" = true ]
+}
+
+# Overlay the explicit --edit flag values (snapshotted in EDIT_*) onto the
+# already-loaded job globals, honouring the SET_* sentinels so only the fields
+# the user actually passed change. Leaves everything else at the stored value.
+# (Time is resolved separately in edit_job, since it also has the keep-original
+# fallback.)
+apply_edit_overrides() {
+    [ "$SET_PANE" = true ]       && TARGET_PANE="$EDIT_PANE"
+    [ "$SET_DELAY" = true ]      && SEND_DELAY="$EDIT_DELAY"
+    [ "$SET_NOTIFY" = true ]     && NOTIFY="$EDIT_NOTIFY"
+    [ "$SET_VERIFY" = true ]     && VERIFY="$EDIT_VERIFY"
+    [ "$SET_AUTO_RETRY" = true ] && AUTO_RETRY="$EDIT_AUTO_RETRY"
+    [ "$SET_RETRIES" = true ]    && { AUTO_RETRY=true; RETRY_LIMIT="$EDIT_RETRIES"; }
+    [ "$SET_MESSAGES" = true ]   && MESSAGES=("${EDIT_MESSAGES[@]}")
+    return 0
+}
+
+# Edit a pending nudge job (arg 1 = id), then reschedule it as a NEW job and
+# remove the old one. Scheduling the replacement BEFORE removing the original
+# means a failed reschedule never loses the job.
+#
+# Two modes: if any editable flag was passed alongside --edit (e.g.
+# `nudge --edit 3 -m 15:00 -i hi`), those fields are overlaid on the stored job
+# and everything else is kept -- no prompts. With no flags it walks through the
+# fields interactively (blank keeps each).
+edit_job() {
+    local id="$1" reply new_pane new_time orig_epoch old_id i
+    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+        echo "Error: --edit needs a numeric job id (got '$id')." >&2
+        return 1
+    fi
+    if ! atq -q "$AT_QUEUE" 2>/dev/null | awk '{print $1}' | grep -qx "$id"; then
+        echo "Error: no pending nudge job #$id (see 'nudge --jobs')." >&2
+        return 1
+    fi
+
+    # Snapshot the flag values BEFORE load_job overwrites the globals with the
+    # stored job. apply_edit_overrides reapplies only the ones SET_* marks.
+    EDIT_PANE="$TARGET_PANE"; EDIT_TIME="$TARGET_TIME"; EDIT_DELAY="$SEND_DELAY"
+    EDIT_NOTIFY="$NOTIFY"; EDIT_VERIFY="$VERIFY"; EDIT_AUTO_RETRY="$AUTO_RETRY"
+    EDIT_RETRIES="$RETRY_LIMIT"; EDIT_MESSAGES=("${MESSAGES[@]}")
+
+    if ! load_job "$(at -c "$id" 2>/dev/null)"; then
+        echo "Error: job #$id doesn't look like a nudge job; not editing." >&2
+        return 1
+    fi
+    orig_epoch=$(job_epoch "$id")
+    apply_edit_overrides
+
+    if edit_has_flags; then
+        # Non-interactive: flags already overlaid; resolve the time and go.
+        echo "Editing nudge job #$id (applying flags, keeping the rest)..."
+        if [ "$SET_TIME" = true ]; then
+            TARGET_EPOCH=""; TARGET_TIME="$EDIT_TIME"
+        elif [ -n "$orig_epoch" ]; then
+            TARGET_EPOCH="$orig_epoch"; TARGET_TIME=""
+        else
+            echo "Error: original time unrecoverable; pass -m <time> as well." >&2
+            return 1
+        fi
+        ensure_default_messages
+    else
+        # Interactive: show the current settings and prompt for each field.
+        echo "Editing nudge job #$id"
+        echo "  Pane:     $TARGET_PANE"
+        [ -n "$orig_epoch" ] && echo "  Fires:    $(format_epoch "$orig_epoch" '%H:%M %Y-%m-%d')"
+        echo "  Options:  $(options_summary)"
+        echo "  Messages:"
+        for i in "${!MESSAGES[@]}"; do
+            printf '    %d. %s\n' "$(( i + 1 ))" "${MESSAGES[$i]}"
+        done
+        echo ""
+        echo "Press Enter to keep the current value at each prompt."
+
+        read -r -p "New target pane [$TARGET_PANE]: " new_pane
+        [ -n "$new_pane" ] && TARGET_PANE="$new_pane"
+
+        if [ -n "$orig_epoch" ]; then
+            read -r -p "New time [keep $(format_epoch "$orig_epoch" '%H:%M %Y-%m-%d')]: " new_time
+        else
+            read -r -p "New time (e.g. '14:30', 'now + 1 hour'): " new_time
+        fi
+
+        read -r -p "Replace the message(s)? [y/N]: " reply
+        if [[ "$reply" =~ ^[Yy] ]]; then
+            MESSAGES=()
+            prompt_messages
+            ensure_default_messages
+        fi
+
+        read -r -p "Change options (auto-retry/verify/notify)? [y/N]: " reply
+        [[ "$reply" =~ ^[Yy] ]] && prompt_options
+
+        if [ -n "$new_time" ]; then
+            TARGET_EPOCH=""; TARGET_TIME="$new_time"
+        elif [ -n "$orig_epoch" ]; then
+            TARGET_EPOCH="$orig_epoch"; TARGET_TIME=""
+        else
+            echo "Error: a target time is required (couldn't recover the original)." >&2
+            return 1
+        fi
+    fi
+
+    old_id="$id"
+    SCHEDULED_JOB_ID=""
+    finalize_schedule   # schedules the replacement (or hard-exits on a bad time)
+
+    if [ -z "$SCHEDULED_JOB_ID" ]; then
+        echo "Warning: couldn't confirm the new job's id; leaving old job #$old_id in place." >&2
+        return 1
+    fi
+    if atrm "$old_id" 2>/dev/null; then
+        echo "Edited: replaced job #$old_id with new job #$SCHEDULED_JOB_ID."
+    else
+        echo "Warning: scheduled new job #$SCHEDULED_JOB_ID but couldn't remove old job #$old_id." >&2
+        echo "         Remove it with 'nudge --cancel $old_id'." >&2
+    fi
 }
 
 # Prompt for one or more messages interactively; a blank line finishes.
@@ -396,14 +955,17 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         -p|--pane)
             TARGET_PANE="$2"
+            SET_PANE=true
             shift 2
             ;;
         -m|--time)
             TARGET_TIME="$2"
+            SET_TIME=true
             shift 2
             ;;
         -i|--input)
             MESSAGES+=("$2")
+            SET_MESSAGES=true
             shift 2
             ;;
         -w|--delay)
@@ -412,30 +974,37 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: --delay must be a non-negative number (got '$SEND_DELAY')."
                 exit 1
             fi
+            SET_DELAY=true
             shift 2
             ;;
         -n|--notify)
             NOTIFY=true
+            SET_NOTIFY=true
             shift 1
             ;;
         -a|--auto-retry)
             AUTO_RETRY=true
+            SET_AUTO_RETRY=true
             shift 1
             ;;
         -v|--verify)
             VERIFY=true
+            SET_VERIFY=true
             shift 1
             ;;
         --no-notify)
             NOTIFY=false
+            SET_NOTIFY=true
             shift 1
             ;;
         --no-auto-retry)
             AUTO_RETRY=false
+            SET_AUTO_RETRY=true
             shift 1
             ;;
         --no-verify)
             VERIFY=false
+            SET_VERIFY=true
             shift 1
             ;;
         -r|--retries)
@@ -445,7 +1014,36 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: --retries must be an integer (got '$RETRY_LIMIT')."
                 exit 1
             fi
+            SET_RETRIES=true
             shift 2
+            ;;
+        -l|--list|--jobs)
+            MODE="jobs"
+            shift 1
+            ;;
+        --cancel)
+            # Only consume the next token as the id if it isn't itself a flag,
+            # so `nudge --cancel -m 15:00` doesn't swallow -m as the id (it then
+            # errors cleanly on the missing id instead).
+            MODE="cancel"
+            if [ $# -ge 2 ] && [[ "$2" != -* ]]; then MODE_ARG="$2"; shift 2
+            else MODE_ARG=""; shift 1; fi
+            ;;
+        --edit)
+            MODE="edit"
+            if [ $# -ge 2 ] && [[ "$2" != -* ]]; then MODE_ARG="$2"; shift 2
+            else MODE_ARG=""; shift 1; fi
+            ;;
+        --list-plain)
+            # Hidden: tab-delimited job list for fzf (source + reload).
+            MODE="list-plain"
+            shift 1
+            ;;
+        --preview-job)
+            # Hidden: fzf preview -- render one job's details by id.
+            MODE="preview-job"
+            if [ $# -ge 2 ] && [[ "$2" != -* ]]; then MODE_ARG="$2"; shift 2
+            else MODE_ARG=""; shift 1; fi
             ;;
         --execute-nudge)
             # Hidden internal flag used by the 'at' job to actually trigger the sequence
@@ -466,6 +1064,38 @@ done
 
 SCRIPT_PATH="$(script_path "$0")"
 
+# --- Job-management modes --------------------------------------------------
+# --jobs / --cancel and the two hidden fzf callbacks short-circuit here, before
+# any scheduling or interactive pane selection.
+case "$MODE" in
+    jobs)
+        if command -v fzf >/dev/null 2>&1; then
+            manage_jobs_fzf
+        else
+            list_jobs
+        fi
+        exit 0
+        ;;
+    list-plain)
+        list_plain
+        exit 0
+        ;;
+    preview-job)
+        detail=$(job_detail "$(at -c "$MODE_ARG" 2>/dev/null)") \
+            && printf '%s\n' "$detail" \
+            || echo "(job #$MODE_ARG not found or not a nudge job)"
+        exit 0
+        ;;
+    cancel)
+        cancel_job "$MODE_ARG"
+        exit $?
+        ;;
+    edit)
+        edit_job "$MODE_ARG"
+        exit $?
+        ;;
+esac
+
 # 0. HEADLESS EXECUTION (Run by 'at' when the timer fires)
 if [ "$EXECUTE_NUDGE" = true ]; then
     ensure_default_messages
@@ -474,7 +1104,9 @@ if [ "$EXECUTE_NUDGE" = true ]; then
     # If the session was already resumed (or was never limited) by the time the
     # timer fires, skip quietly so we don't interrupt a working session.
     if [ "$VERIFY" = true ]; then
-        pane_now=$(tmux capture-pane -pt "$TARGET_PANE")
+        # -J joins tmux-wrapped lines so a banner split across the pane width
+        # still matches as one line.
+        pane_now=$(tmux capture-pane -pJt "$TARGET_PANE")
         if ! has_limit_banner "$pane_now"; then
             [ "$NOTIFY" = true ] && notify "Skipped nudge: no rate-limit banner on $TARGET_PANE"
             exit 0
@@ -497,8 +1129,9 @@ if [ "$EXECUTE_NUDGE" = true ]; then
 
     # Handle Autonomous Auto-Retry
     if [ "$AUTO_RETRY" = true ] && [ "$RETRY_LIMIT" -ne 0 ]; then
-        # Wait for the AI CLI to process the input and print a new rate limit if one exists
-        sleep 5
+        # Wait for the AI CLI to process the input and print a new rate limit if
+        # one exists (tunable via NUDGE_SETTLE_SECS for slow/busy sessions).
+        sleep "$SETTLE_SECS"
 
         # Scan ONLY what the AI printed *below* the message we just injected.
         # The banner that triggered this nudge is still sitting above our input;
@@ -507,7 +1140,7 @@ if [ "$EXECUTE_NUDGE" = true ]; then
         # marker: a still-limited session prints a fresh banner beneath it, a
         # resumed one doesn't (and if it worked, our marker may have scrolled
         # off entirely -> pane_after_marker yields nothing -> no retry).
-        pane_out=$(tmux capture-pane -pt "$TARGET_PANE")
+        pane_out=$(tmux capture-pane -pJt "$TARGET_PANE")
         recent=$(pane_after_marker "$pane_out" "${MESSAGES[$last]}")
         new_target=$(detect_reset_epoch "$recent")
 
@@ -537,7 +1170,7 @@ if [ -z "$TARGET_PANE" ]; then
                   --bind="alt-j:down,alt-k:up,ctrl-d:half-page-down,ctrl-u:half-page-up" \
                   --preview="tmux capture-pane -ept {1}" \
                   --preview-window="up:60%,follow" \
-                  --header="Use ↑/↓, C-n/C-p, or Alt-j/Alt-k. Enter = Default Text, Alt-Enter = Custom Text, Alt-o = Set Options.")
+                  --header="Use ↑/↓, C-n/C-p, or Alt-j/Alt-k. Enter = Default Text, Alt-Enter = Custom Text, Alt-o = Set Options (then optional text).")
 
         if [ -z "$fzf_output" ]; then
             echo "Selection cancelled."
@@ -559,8 +1192,15 @@ if [ -z "$TARGET_PANE" ]; then
             MESSAGES=()
             prompt_messages
         elif [ "$key" = "alt-o" ]; then
-            # Configure run options; message stays default (or any -i supplied).
+            # Configure run options, then chain into an optional custom-text
+            # prompt so options + custom text is reachable from one key. Declining
+            # keeps the default (or any -i supplied); accepting replaces it.
             prompt_options
+            read -r -p "Enter custom message(s)? [y/N]: " cfg
+            if [[ "$cfg" =~ ^[Yy] ]]; then
+                MESSAGES=()
+                prompt_messages
+            fi
         fi
     else
         # Fallback text-based menu
@@ -617,7 +1257,8 @@ ensure_default_messages
 # 2. DETERMINE TARGET TIME
 if [ -z "$TARGET_TIME" ]; then
     echo "Scanning pane $TARGET_PANE for known rate-limit patterns..."
-    pane_out=$(tmux capture-pane -pt "$TARGET_PANE" | tail -n 100)
+    # -J joins wrapped lines so a banner split across the pane width still matches.
+    pane_out=$(tmux capture-pane -pJt "$TARGET_PANE" | tail -n 100)
     TARGET_EPOCH=$(detect_reset_epoch "$pane_out")
 
     if [ -n "$TARGET_EPOCH" ]; then
@@ -628,74 +1269,5 @@ if [ -z "$TARGET_TIME" ]; then
     fi
 fi
 
-# On macOS, BSD `at` can't parse GNU-style / relative strings, so normalise a
-# user-supplied time to an epoch via GNU date when it's available. On Linux we
-# leave it raw and let GNU `at` parse it natively (it also rolls a past clock
-# time forward to tomorrow, which we'd lose by converting).
-if [ -z "$TARGET_EPOCH" ] && [ -n "$TARGET_TIME" ] && [ "$IS_DARWIN" = true ] && [ "$IS_GNU_DATE" = true ]; then
-    maybe=$("$DATE" -d "$TARGET_TIME" +%s 2>/dev/null)
-    [ -n "$maybe" ] && TARGET_EPOCH="$maybe"
-fi
-
-# macOS without GNU date: BSD `at` silently DROPS relative offsets ("now + N"),
-# scheduling for ~now. Refuse those up front rather than firing an instant
-# nudge -- the previous behaviour reported success but ran immediately.
-if [ -z "$TARGET_EPOCH" ] && [ -n "$TARGET_TIME" ] && [ "$IS_DARWIN" = true ] \
-   && [ "$IS_GNU_DATE" = false ] && is_relative_timespec "$TARGET_TIME"; then
-    echo "Error: relative time \"$TARGET_TIME\" isn't supported by macOS's BSD 'at'" >&2
-    echo "(it would silently schedule for ~now). Use an absolute time such as \"14:30\"" >&2
-    echo "or \"1159pm\", or install GNU date for relative times:  brew install coreutils" >&2
-    exit 1
-fi
-
-if [ -z "$TARGET_EPOCH" ] && [ -z "$TARGET_TIME" ]; then
-    echo "No target time specified. Aborting."
-    exit 1
-fi
-
-if [ -n "$TARGET_EPOCH" ]; then
-    TARGET_TIME_DISPLAY=$(format_epoch "$TARGET_EPOCH" '%H:%M %Y-%m-%d')
-else
-    TARGET_TIME_DISPLAY="$TARGET_TIME"
-fi
-
-echo ""
-# 3. SCHEDULE THE INJECTION
-echo "Scheduling the following message(s) for $TARGET_TIME_DISPLAY on pane $TARGET_PANE:"
-for i in "${!MESSAGES[@]}"; do
-    printf '  %d. %s\n' "$(( i + 1 ))" "${MESSAGES[$i]}"
-done
-echo "Options: $(options_summary)"
-
-next_cmd=$(build_next_cmd "$([ "$AUTO_RETRY" = true ] && printf '%s' "$RETRY_LIMIT")")
-
-if [ -n "$TARGET_EPOCH" ]; then
-    at_output=$(at_schedule_epoch "$TARGET_EPOCH" "$next_cmd")
-else
-    at_output=$(at_pipe "$next_cmd" "$TARGET_TIME")
-fi
-
-job_id=$(printf '%s\n' "$at_output" | grep -oE 'job [0-9]+' | awk '{print $2}')
-
-if [ -n "$job_id" ]; then
-    echo "Done! The injection is scheduled via the 'at' daemon (Job ID: $job_id)."
-    echo "(Use 'atq' to list scheduled jobs, and 'atrm $job_id' to cancel this specific job.)"
-else
-    # Scheduling produced no job id -> surface a useful error.
-    if [ "$IS_DARWIN" = true ] && [ "$IS_GNU_DATE" = false ] && [ -z "$TARGET_EPOCH" ]; then
-        echo "Error: could not schedule at time \"$TARGET_TIME\"." >&2
-        echo "On macOS without GNU coreutils, relative / GNU-style times aren't supported here." >&2
-        echo "Use an absolute time (e.g. \"14:30\" or \"1430 Jul 12\"), or install GNU date:" >&2
-        echo "  brew install coreutils" >&2
-        [ -n "$at_output" ] && printf '%s\n' "$at_output" >&2
-        exit 1
-    fi
-    # Fallback just in case parsing fails
-    printf '%s\n' "$at_output"
-    echo "Done! The injection is scheduled via the 'at' daemon."
-    echo "(Use 'atq' to list scheduled jobs, and 'atrm <job_id>' to cancel one.)"
-fi
-
-# We only reach here after a successful schedule (the error branch exits above).
-# On macOS, remind that atrun must be enabled or the job we just queued won't fire.
-atrun_hint
+# 3. SCHEDULE THE INJECTION (platform handling + reporting shared with --edit)
+finalize_schedule
