@@ -173,10 +173,9 @@ print_help() {
     echo "  # Infinite retries for a custom time, injecting custom text"
     echo "  nudge -p bot:1.0 -m \"now + 1 hour\" -i \"yes\" -r -1"
     echo ""
-    echo "Note: This script uses the 'at' daemon for background scheduling. All nudge"
-    echo "      jobs go in a dedicated queue ('${AT_QUEUE}'), so 'nudge --list' (or"
-    echo "      'atq -q ${AT_QUEUE}' manually) shows only nudge jobs. Cancel with"
-    echo "      'nudge --cancel <id>' or 'atrm <job_id>'."
+    echo "Note: This script uses the 'at' daemon for background scheduling. Manage"
+    echo "      pending jobs entirely through nudge: 'nudge --list' to review,"
+    echo "      'nudge --edit <id>' to reschedule/change, 'nudge --cancel <id>' to remove."
     if [ "$IS_DARWIN" = true ]; then
         echo ""
         echo "macOS: the 'at' scheduler (atrun) is disabled by default, so scheduled jobs"
