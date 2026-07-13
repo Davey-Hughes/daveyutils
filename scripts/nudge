@@ -82,6 +82,14 @@ SET_VERIFY=false
 SET_RETRIES=false
 EDIT_MESSAGES=()
 
+# --edit only: the original job's Linux desktop-env export prefix (DISPLAY /
+# WAYLAND_DISPLAY / DBUS_SESSION_BUS_ADDRESS), captured verbatim by load_job so
+# the rescheduled job keeps it instead of re-capturing the EDITING shell's env
+# (which is blank over SSH -> notify-send dies silently). Empty for fresh
+# schedules and Darwin -> at_pipe live-captures as before. Initialised here so a
+# stray value from the environment can't leak into the headless retry path.
+PRESERVED_ENV_EXPORTS=""
+
 # Dedicated 'at' queue for every nudge job. Isolates our jobs from any other
 # 'at' jobs the user has, so `atq -q n` / --jobs list only ours. Overridable
 # (mainly for tests) via NUDGE_AT_QUEUE. Must be a single lowercase letter --
@@ -179,6 +187,8 @@ print_help() {
     echo "Note: This script uses the 'at' daemon for background scheduling. Manage"
     echo "      pending jobs entirely through nudge: 'nudge --list' to review,"
     echo "      'nudge --edit <id>' to reschedule/change, 'nudge --cancel <id>' to remove."
+    echo "      (Jobs from an older nudge may sit in another 'at' queue; list every"
+    echo "      queue with 'atq' and remove one directly with 'atrm <id>'.)"
     if [ "$IS_DARWIN" = true ]; then
         echo ""
         echo "macOS: the 'at' scheduler (atrun) is disabled by default, so scheduled jobs"
@@ -307,8 +317,11 @@ detect_reset_epoch() {
         # Clock style (Claude et al.): a wall-clock reset time such as "3:00am",
         # "3pm" or "3:00 PM". Minutes are optional; a trailing timezone is
         # ignored (time is read as local). Grep the time only from banner lines.
+        # -A1: also scan the line immediately after a banner line, so a reset
+        # time printed on the NEXT line ("...resets\nresumes at 2:00am") parses.
+        # grep -A emits "--" group separators; the time grep below ignores them.
         reset=$(printf '%s\n' "$clean" \
-            | grep -iE "$clock_re" \
+            | grep -iE -A1 "$clock_re" \
             | grep -oiE '[0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)' | head -n 1)
         [ -z "$reset" ] && return 1
         parsed=$(parse_clock_epoch "$reset")
@@ -324,8 +337,11 @@ detect_reset_epoch() {
         # spelled "Resets in <Nh Nm Ns>" (case-insensitive) -- that literal prefix
         # is what a NUDGE_DURATION_PATTERN extension also has to emit for the
         # countdown to be parsed, even though the banner match is fully custom.
-        raw=$(printf '%s\n' "$clean" | grep -oiE 'Resets in [0-9hms]+' | head -n 1)
-        raw=${raw#[Rr]esets [Ii]n }
+        # Lowercase the whole token once so the prefix-strip and the unit greps
+        # below (all lowercase) also handle "Resets in 1H30M" / "RESETS IN 45M".
+        raw=$(printf '%s\n' "$clean" | grep -oiE 'Resets in [0-9hms]+' | head -n 1 \
+            | tr '[:upper:]' '[:lower:]')
+        raw=${raw#resets in }
         [ -z "$raw" ] && return 1
         h=$(printf '%s\n' "$raw" | grep -oE '[0-9]+h' | grep -oE '[0-9]+'); h=${h:-0}
         m=$(printf '%s\n' "$raw" | grep -oE '[0-9]+m' | grep -oE '[0-9]+'); m=${m:-0}
@@ -403,6 +419,11 @@ at_pipe() {
     local job="bash -c '$escaped'"
     if [ "$IS_DARWIN" = true ]; then
         printf '%s\n' "$job" | at -q "$AT_QUEUE" "$@" 2>&1
+    elif [ -n "$PRESERVED_ENV_EXPORTS" ]; then
+        # Rescheduling an --edit: reuse the ORIGINAL job's export prefix verbatim
+        # so notifications keep working even when edited from a different (e.g.
+        # SSH) shell whose DISPLAY/WAYLAND/DBUS would be blank.
+        printf '%s %s\n' "$PRESERVED_ENV_EXPORTS" "$job" | at -q "$AT_QUEUE" "$@" 2>&1
     else
         # %q the env values so an unusual DISPLAY/WAYLAND_DISPLAY can't break the
         # export line; WAYLAND_DISPLAY covers pure-Wayland sessions where notify
@@ -464,11 +485,13 @@ job_summary() {
     local inner; inner=$(job_inner_cmd "$1") || return 1
     eval "set -- $inner"
     local pane="" count=0
+    # `shift 2` is a FAILING no-op when only one arg remains, so a payload that
+    # ends in a dangling value-flag (-p/-i/-w/-r) would loop forever; bail then.
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            -p) pane="${2:-}"; shift 2 ;;
-            -i) count=$((count + 1)); shift 2 ;;
-            -w|-r) shift 2 ;;
+            -p) pane="${2:-}"; shift 2 || return 1 ;;
+            -i) count=$((count + 1)); shift 2 || return 1 ;;
+            -w|-r) shift 2 || return 1 ;;
             *) shift ;;
         esac
     done
@@ -482,12 +505,13 @@ job_detail() {
     eval "set -- $inner"
     local pane="" retry="" notify=false verify=false o=""
     local -a msgs=()
+    # shift 2 || return 1: a dangling value-flag (last token) would loop forever.
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            -p) pane="${2:-}"; shift 2 ;;
-            -i) msgs+=("${2:-}"); shift 2 ;;
-            -r) retry="${2:-}"; shift 2 ;;
-            -w) shift 2 ;;
+            -p) pane="${2:-}"; shift 2 || return 1 ;;
+            -i) msgs+=("${2:-}"); shift 2 || return 1 ;;
+            -r) retry="${2:-}"; shift 2 || return 1 ;;
+            -w) shift 2 || return 1 ;;
             -n) notify=true; shift ;;
             -v) verify=true; shift ;;
             *) shift ;;
@@ -548,15 +572,25 @@ job_epoch() {
 # Returns 1 if the dump isn't a nudge job.
 load_job() {
     local inner; inner=$(job_inner_cmd "$1") || return 1
+    # Capture the original job's `export ...;` env prefix (the part before
+    # ` bash -c '`, Linux only) so at_pipe can re-emit it verbatim on reschedule
+    # instead of the editing shell's env. Empty when there's no such prefix.
+    local body
+    body=$(printf '%s\n' "$1" | awk 'NF{last=$0} END{print last}')
+    PRESERVED_ENV_EXPORTS=""
+    case "$body" in
+        "export "*" bash -c '"*) PRESERVED_ENV_EXPORTS="${body%% bash -c \'*}" ;;
+    esac
     eval "set -- $inner"
     TARGET_PANE=""; MESSAGES=(); SEND_DELAY="0.75"
     NOTIFY=false; VERIFY=false; AUTO_RETRY=false; RETRY_LIMIT=2
+    # shift 2 || return 1: a dangling value-flag (last token) would loop forever.
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            -p) TARGET_PANE="${2:-}"; shift 2 ;;
-            -w) SEND_DELAY="${2:-0.75}"; shift 2 ;;
-            -i) MESSAGES+=("${2:-}"); shift 2 ;;
-            -r) AUTO_RETRY=true; RETRY_LIMIT="${2:-2}"; shift 2 ;;
+            -p) TARGET_PANE="${2:-}"; shift 2 || return 1 ;;
+            -w) SEND_DELAY="${2:-0.75}"; shift 2 || return 1 ;;
+            -i) MESSAGES+=("${2:-}"); shift 2 || return 1 ;;
+            -r) AUTO_RETRY=true; RETRY_LIMIT="${2:-2}"; shift 2 || return 1 ;;
             -n) NOTIFY=true; shift ;;
             -v) VERIFY=true; shift ;;
             *) shift ;;
@@ -581,21 +615,42 @@ job_row() {
     printf '%s\t%s\t%s\t%s' "$id" "$when" "${pane:-?}" "$count"
 }
 
-# Print a headed table of pending nudge jobs (queue $AT_QUEUE).
+# Warn about nudge-shaped jobs sitting OUTSIDE our dedicated queue -- e.g. jobs an
+# older nudge (which used at's default queue) left behind. They never appear in
+# the table and --cancel can't reach them, so point at atq/atrm. Scans every
+# queue (atq with no -q; field 7 is the queue letter) and skips our own. No-op
+# when there are none.
+list_foreign_note() {
+    local fid fqueue ids=""
+    while read -r fid _ _ _ _ _ fqueue _; do
+        [ -z "$fid" ] && continue
+        [ "$fqueue" = "$AT_QUEUE" ] && continue
+        job_inner_cmd "$(at -c "$fid" 2>/dev/null)" >/dev/null 2>&1 \
+            && ids="${ids:+$ids }$fid"
+    done < <(atq 2>/dev/null | sort -n)
+    [ -z "$ids" ] && return 0
+    local n; set -- $ids; n=$#
+    echo "Note: $n nudge job(s) found outside queue '$AT_QUEUE' (scheduled by an older nudge?): ids $ids"
+    echo "      Manage them with 'atq' / 'atrm <id>'."
+}
+
+# Print a headed table of pending nudge jobs (queue $AT_QUEUE), then note any
+# nudge jobs stranded in other queues.
 list_jobs() {
     local q; q=$(atq -q "$AT_QUEUE" 2>/dev/null | sort -n)
     if [ -z "$q" ]; then
         echo "No pending nudge jobs (queue '$AT_QUEUE')."
-        return 0
+    else
+        printf '%-5s | %-15s | %-18s | %s\n' "ID" "Scheduled" "Pane" "Action"
+        echo "------+-----------------+--------------------+----------------------"
+        local line id when pane count
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            IFS=$'\t' read -r id when pane count <<< "$(job_row "$line")"
+            printf '%-5s | %-15s | %-18s | %s message(s)\n' "$id" "$when" "$pane" "$count"
+        done <<< "$q"
     fi
-    printf '%-5s | %-15s | %-18s | %s\n' "ID" "Scheduled" "Pane" "Action"
-    echo "------+-----------------+--------------------+----------------------"
-    local line id when pane count
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        IFS=$'\t' read -r id when pane count <<< "$(job_row "$line")"
-        printf '%-5s | %-15s | %-18s | %s message(s)\n' "$id" "$when" "$pane" "$count"
-    done <<< "$q"
+    list_foreign_note
 }
 
 # Emit one tab-delimited "<id>\t<display>" line per job for fzf (id is field 1
@@ -610,19 +665,32 @@ list_plain() {
     done < <(atq -q "$AT_QUEUE" 2>/dev/null | sort -n)
 }
 
+# Validate that arg 1 is a numeric id belonging to OUR queue ($AT_QUEUE), so a
+# stray / non-member id can't reach the `at -c` eval (job_detail / load_job) or
+# atrm. This is exactly the guard the eval-safety comment above relies on. Arg 2
+# is the flag name for the numeric-error message; optional arg 3 is an extra hint
+# line appended after the not-found error. Errors to stderr, returns non-zero.
+require_job_id() {
+    local id="$1" flag="$2"
+    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+        echo "Error: $flag needs a numeric job id (got '$id')." >&2
+        return 1
+    fi
+    if ! atq -q "$AT_QUEUE" 2>/dev/null | awk '{print $1}' | grep -qx "$id"; then
+        echo "Error: no pending nudge job #$id (see 'nudge --jobs')." >&2
+        [ -n "${3:-}" ] && printf '%s\n' "$3" >&2
+        return 1
+    fi
+}
+
 # Cancel a single nudge job by id (arg 1). Guards that the id really is one of
 # our queued jobs before calling atrm, so a stray id can't remove an unrelated
 # 'at' job. Prints a friendly confirmation naming the target pane.
 cancel_job() {
     local id="$1" pane
-    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
-        echo "Error: --cancel needs a numeric job id (got '$id')." >&2
-        return 1
-    fi
-    if ! atq -q "$AT_QUEUE" 2>/dev/null | awk '{print $1}' | grep -qx "$id"; then
-        echo "Error: no pending nudge job #$id (see 'nudge --jobs')." >&2
-        return 1
-    fi
+    require_job_id "$id" --cancel \
+        "      (A job from an older nudge may sit in another 'at' queue -- check 'atq' / 'atrm $id'.)" \
+        || return 1
     pane=$(job_summary "$(at -c "$id" 2>/dev/null)" 2>/dev/null)
     pane=${pane%%$'\t'*}
     if atrm "$id" 2>/dev/null; then
@@ -669,7 +737,7 @@ manage_jobs_fzf() {
 # new job's id (empty if scheduling produced no parseable id). Hard-exits on a
 # time macOS's BSD `at` can't handle -- the same abort the main path always did.
 finalize_schedule() {
-    local maybe next_cmd at_output
+    local maybe next_cmd at_output at_status
 
     # On macOS, BSD `at` can't parse GNU-style / relative strings, so normalise a
     # user-supplied time to an epoch via GNU date when it's available. On Linux we
@@ -718,6 +786,7 @@ finalize_schedule() {
     else
         at_output=$(at_pipe "$next_cmd" "$TARGET_TIME")
     fi
+    at_status=$?   # at_pipe's pipeline status IS at's exit status
 
     SCHEDULED_JOB_ID=$(printf '%s\n' "$at_output" | grep -oE 'job [0-9]+' | awk '{print $2}')
 
@@ -734,7 +803,16 @@ finalize_schedule() {
             [ -n "$at_output" ] && printf '%s\n' "$at_output" >&2
             exit 1
         fi
-        # Fallback just in case parsing fails
+        # `at` rejected the time (e.g. "garbled time"): its non-zero status means
+        # nothing was queued, so don't claim success. `return` (not exit) so
+        # edit_job's "leaving old job #N in place" warning still runs; at top
+        # level finalize_schedule is the last command, so return 1 -> exit 1.
+        if [ "$at_status" -ne 0 ]; then
+            [ -n "$at_output" ] && printf '%s\n' "$at_output" >&2
+            echo "Error: 'at' rejected the schedule time; nothing was queued." >&2
+            return 1
+        fi
+        # Fallback: at succeeded but we couldn't parse a job id.
         printf '%s\n' "$at_output"
         echo "Done! The injection is scheduled via the 'at' daemon."
         echo "(Use 'nudge --list' to review pending jobs, and 'nudge --cancel <id>' to cancel one.)"
@@ -778,14 +856,7 @@ apply_edit_overrides() {
 # fields interactively (blank keeps each).
 edit_job() {
     local id="$1" reply new_pane new_time orig_epoch old_id i
-    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
-        echo "Error: --edit needs a numeric job id (got '$id')." >&2
-        return 1
-    fi
-    if ! atq -q "$AT_QUEUE" 2>/dev/null | awk '{print $1}' | grep -qx "$id"; then
-        echo "Error: no pending nudge job #$id (see 'nudge --jobs')." >&2
-        return 1
-    fi
+    require_job_id "$id" --edit || return 1
 
     # Snapshot the flag values BEFORE load_job overwrites the globals with the
     # stored job. apply_edit_overrides reapplies only the ones SET_* marks.
@@ -1069,7 +1140,10 @@ SCRIPT_PATH="$(script_path "$0")"
 # any scheduling or interactive pane selection.
 case "$MODE" in
     jobs)
-        if command -v fzf >/dev/null 2>&1; then
+        # Only use the interactive fzf dashboard on a real terminal: a piped or
+        # cron `--list` (fzf installed but no TTY) must print the plain table,
+        # not just fzf's "inappropriate ioctl" error.
+        if command -v fzf >/dev/null 2>&1 && [ -t 0 ] && [ -t 1 ]; then
             manage_jobs_fzf
         else
             list_jobs
@@ -1081,9 +1155,15 @@ case "$MODE" in
         exit 0
         ;;
     preview-job)
-        detail=$(job_detail "$(at -c "$MODE_ARG" 2>/dev/null)") \
-            && printf '%s\n' "$detail" \
-            || echo "(job #$MODE_ARG not found or not a nudge job)"
+        # Validate the id is one of ours BEFORE job_detail's `at -c` eval runs
+        # (same guard as --cancel / --edit). A non-member id just shows "not
+        # found" so the fzf dashboard preview never breaks.
+        if require_job_id "$MODE_ARG" --preview-job 2>/dev/null \
+           && detail=$(job_detail "$(at -c "$MODE_ARG" 2>/dev/null)"); then
+            printf '%s\n' "$detail"
+        else
+            echo "(job #$MODE_ARG not found or not a nudge job)"
+        fi
         exit 0
         ;;
     cancel)
