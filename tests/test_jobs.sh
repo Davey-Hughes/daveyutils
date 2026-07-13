@@ -82,6 +82,24 @@ ep=$(ctime_to_epoch 'Mon Aug 16 10:56:00 2027')
 check "ctime_to_epoch: round-trips HH:MM" "10:56"      "$(format_epoch "${ep:-0}" '%H:%M')"
 check "ctime_to_epoch: round-trips date"  "2027-08-16" "$(format_epoch "${ep:-0}" '%Y-%m-%d')"
 
+# --- F10: ctime parsing must not depend on the user's locale -------------------
+# atq always emits C-locale English names (at never calls setlocale), but BSD
+# strptime honours LC_TIME -- a macOS session in de_DE.UTF-8 rejects "Sun"/"Mar"
+# unless ctime_to_epoch forces the C locale. GNU date parses English names in
+# any locale, so only the BSD path can fail. Self-skips when no German locale is
+# installed (typical Linux CI); macOS ships de_DE.UTF-8, so CI covers the BSD
+# path there. 2026-03-15 IS a Sunday, and both "Sun" and "Mar" differ in German
+# ("So" / "Mär"), so a locale-sensitive parse cannot accidentally pass.
+de=$(locale -a 2>/dev/null | grep -iE '^de_DE\.utf-?8$' | head -n 1)
+if [ -n "$de" ]; then
+    lep=$(LC_ALL="$de" bash -c 'source "'"$PRELUDE"'"
+        ctime_to_epoch "Sun Mar 15 10:56:00 2026"')
+    check "F10: C-locale atq date parsed under de_DE" "10:56 2026-03-15" \
+        "$(format_epoch "${lep:-0}" '%H:%M %Y-%m-%d')"
+else
+    echo "  skip: F10 locale test (no de_DE.UTF-8 installed)"
+fi
+
 # --- edit_has_flags: did the user pass any editable flag with --edit? ----------
 # SET_* default to false (from the Defaults block). Each is set true only by its
 # flag's parse branch, so this decides interactive vs non-interactive editing.

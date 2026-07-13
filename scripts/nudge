@@ -547,12 +547,16 @@ atq_ctime() {
 
 # Convert a ctime-style date string (arg 1) into an epoch. GNU date parses it
 # directly; BSD date needs the explicit format (%e handles the space-padded day
-# ctime uses for single digits). Empty on parse failure.
+# ctime uses for single digits). atq always emits C-locale English day/month
+# names (at never calls setlocale), but BSD strptime honours LC_TIME -- a
+# session in e.g. de_DE.UTF-8 would reject "Sun"/"Mar" -- so force the C locale
+# for the parse (harmless on GNU, whose parser is English-only anyway). Empty on
+# parse failure.
 ctime_to_epoch() {
     if [ "$IS_GNU_DATE" = true ]; then
-        "$DATE" -d "$1" +%s 2>/dev/null
+        LC_ALL=C "$DATE" -d "$1" +%s 2>/dev/null
     else
-        date -j -f '%a %b %e %H:%M:%S %Y' "$1" +%s 2>/dev/null
+        LC_ALL=C date -j -f '%a %b %e %H:%M:%S %Y' "$1" +%s 2>/dev/null
     fi
 }
 
