@@ -82,6 +82,24 @@ ep=$(ctime_to_epoch 'Mon Aug 16 10:56:00 2027')
 check "ctime_to_epoch: round-trips HH:MM" "10:56"      "$(format_epoch "${ep:-0}" '%H:%M')"
 check "ctime_to_epoch: round-trips date"  "2027-08-16" "$(format_epoch "${ep:-0}" '%Y-%m-%d')"
 
+# --- F10: ctime parsing must not depend on the user's locale -------------------
+# atq always emits C-locale English names (at never calls setlocale), but BSD
+# strptime honours LC_TIME -- a macOS session in de_DE.UTF-8 rejects "Sun"/"Mar"
+# unless ctime_to_epoch forces the C locale. GNU date parses English names in
+# any locale, so only the BSD path can fail. Self-skips when no German locale is
+# installed (typical Linux CI); macOS ships de_DE.UTF-8, so CI covers the BSD
+# path there. 2026-03-15 IS a Sunday, and both "Sun" and "Mar" differ in German
+# ("So" / "Mär"), so a locale-sensitive parse cannot accidentally pass.
+de=$(locale -a 2>/dev/null | grep -iE '^de_DE\.utf-?8$' | head -n 1)
+if [ -n "$de" ]; then
+    lep=$(LC_ALL="$de" bash -c 'source "'"$PRELUDE"'"
+        ctime_to_epoch "Sun Mar 15 10:56:00 2026"')
+    check "F10: C-locale atq date parsed under de_DE" "10:56 2026-03-15" \
+        "$(format_epoch "${lep:-0}" '%H:%M %Y-%m-%d')"
+else
+    echo "  skip: F10 locale test (no de_DE.UTF-8 installed)"
+fi
+
 # --- edit_has_flags: did the user pass any editable flag with --edit? ----------
 # SET_* default to false (from the Defaults block). Each is set true only by its
 # flag's parse branch, so this decides interactive vs non-interactive editing.
@@ -119,5 +137,71 @@ r=$(AUTO_RETRY=true RETRY_LIMIT=4
     apply_edit_overrides
     printf '%s' "$AUTO_RETRY")
 check "override: --no-auto-retry disables" "false" "$r"
+
+# --- F2: a payload ending in a dangling value-flag must not spin forever -------
+# job_summary/job_detail/load_job walk args with `shift 2`; in bash `shift 2`
+# with $#==1 is a FAILING no-op, so a nudge job in our queue whose payload ends
+# in a bare -p/-i/-w/-r loops at 100% CPU (hanging --list / preview / --edit).
+# `shift 2 || return 1` degrades it to a clean rejection (job_row shows "?").
+run_guarded() {
+    # Run "$@" under a short timeout if the host has one (stock macOS lacks
+    # timeout(1)); post-fix there is no hang, so run directly when it's absent.
+    if command -v timeout >/dev/null 2>&1; then timeout 5 "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then gtimeout 5 "$@"
+    else "$@"; fi
+}
+BAD=$(mk_at_c '--execute-nudge -p bot:0.1 -i hi -p')
+# Feed the dump via an env var (not $1): sourcing $PRELUDE also loads the arg
+# parser, which would otherwise consume the dump and exit before the function
+# runs. With no positional args the parser stays idle. Pre-fix these HANG (empty
+# capture once timeout kills them); post-fix each returns non-zero cleanly.
+for fn in job_summary job_detail load_job; do
+    rc=$(run_guarded env BAD_DUMP="$BAD" bash -c \
+        'source "'"$PRELUDE"'"; '"$fn"' "$BAD_DUMP" >/dev/null 2>&1; echo $?')
+    check "F2: $fn rejects dangling flag (no hang)" "yes" \
+        "$([ -n "$rc" ] && [ "$rc" != 0 ] && echo yes || echo no)"
+done
+
+# --- F8: --edit must preserve the ORIGINAL job's desktop-env export prefix -----
+# Rescheduling goes through at_pipe, which re-captures DISPLAY/WAYLAND/DBUS from
+# the EDITING shell -- edit over SSH and the replacement gets blank exports, so
+# notify-send dies silently. load_job snapshots the prefix; at_pipe emits it
+# verbatim instead of the live-captured line (empty prefix -> live capture).
+mk_at_c_env() {
+    # Like mk_at_c but with a KNOWN single-statement export prefix (arg 2) -- the
+    # real Linux at_pipe shape: `export ...; bash -c '...'`.
+    local cmd="$1" pfx="$2" escaped q
+    escaped=${cmd//"'"/"'\''"}
+    q="'"
+    printf 'SHELL=/bin/sh\numask 22\ncd /home/u || exit\n'
+    printf '%s bash -c %s%s%s\n' "$pfx" "$q" "$escaped" "$q"
+}
+KNOWN_ENV='export DISPLAY=:7 WAYLAND_DISPLAY=wayland-1 DBUS_SESSION_BUS_ADDRESS=unix:/run/user/1000/bus;'
+f8pfx=$(load_job "$(mk_at_c_env "$CMD" "$KNOWN_ENV")"; printf '%s' "$PRESERVED_ENV_EXPORTS")
+check "F8: load_job captures the export prefix" "$KNOWN_ENV" "$f8pfx"
+# A dump with NO export prefix (Darwin-style / pre-export jobs) leaves it empty.
+f8none=$(load_job "$(printf 'SHELL=/bin/sh\ncd /home/u || exit\nbash -c %s%s%s\n' "'" '--execute-nudge -p x -i hi' "'")"
+    printf '%s' "$PRESERVED_ENV_EXPORTS")
+check "F8: no-export dump -> empty prefix (live capture)" "" "$f8none"
+
+# at_pipe emits the preserved prefix verbatim and IGNORES the live shell env
+# (`at` stubbed to echo back what it would queue -- no daemon needed).
+f8out=$(
+    at() { cat; }
+    AT_QUEUE=w; IS_DARWIN=false
+    PRESERVED_ENV_EXPORTS='export DISPLAY=:4242 WAYLAND_DISPLAY= DBUS_SESSION_BUS_ADDRESS=unix:/x;'
+    DISPLAY=':9999'
+    at_pipe 'echo hi' -t 202601010000)
+check "F8: at_pipe emits the preserved DISPLAY" "yes" \
+    "$(printf '%s' "$f8out" | grep -q 'DISPLAY=:4242' && echo yes || echo no)"
+check "F8: at_pipe drops the live editing DISPLAY" "yes" \
+    "$(printf '%s' "$f8out" | grep -q 'DISPLAY=:9999' && echo no || echo yes)"
+f8live=$(
+    at() { cat; }
+    AT_QUEUE=w; IS_DARWIN=false; PRESERVED_ENV_EXPORTS=''
+    DISPLAY=':9999'
+    at_pipe 'echo hi' -t 202601010000)
+check "F8: empty prefix -> live capture" "yes" \
+    "$(printf '%s' "$f8live" | grep -q 'DISPLAY=:9999' && echo yes || echo no)"
 
 finish
