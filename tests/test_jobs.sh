@@ -57,4 +57,29 @@ check "atq_time: ctime -> HH:MM Mon DD" "14:30 Jul 12" \
 check "atq_time: BSD line (no user col)" "09:05 Dec 1" \
     "$(atq_time_str '17	Mon Dec  1 09:05:00 2025 n')"
 
+# --- load_job: seed the scheduling globals from an at -c dump (for --edit) -----
+# Run in a command-substitution subshell so load_job's global mutations don't
+# leak into the parent (which would corrupt later cases), echoing the state.
+state=$(load_job "$RAW"
+    printf '%s|%s|%s|%s|%s|%s|%s' \
+        "$TARGET_PANE" "${#MESSAGES[@]}" "${MESSAGES[1]:-}" \
+        "$NOTIFY" "$VERIFY" "$AUTO_RETRY" "$RETRY_LIMIT")
+IFS='|' read -r lpane lcount lmsg2 lnotify lverify lretry_on lretry <<< "$state"
+check "load: pane"                    "bot:0.1"   "$lpane"
+check "load: message count"           "2"         "$lcount"
+check "load: message 2 round-trips"   "it's done" "$lmsg2"
+check "load: notify on"               "true"      "$lnotify"
+check "load: verify off"              "false"     "$lverify"
+check "load: auto-retry on (had -r)"  "true"      "$lretry_on"
+check "load: retry count"             "2"         "$lretry"
+check "load: junk rejected" "1" "$(load_job 'not a nudge job' >/dev/null 2>&1; echo $?)"
+
+# --- atq_ctime / ctime_to_epoch: recover a job's fire time (for --edit) --------
+check "atq_ctime: pull date out of atq line" "Mon Aug 16 10:56:00 2027" \
+    "$(atq_ctime '28	Mon Aug 16 10:56:00 2027 z davey')"
+# Round-trip: ctime string -> epoch -> reformatted matches (GNU coreutils host).
+ep=$(ctime_to_epoch 'Mon Aug 16 10:56:00 2027')
+check "ctime_to_epoch: round-trips HH:MM" "10:56"      "$(format_epoch "${ep:-0}" '%H:%M')"
+check "ctime_to_epoch: round-trips date"  "2027-08-16" "$(format_epoch "${ep:-0}" '%Y-%m-%d')"
+
 finish
