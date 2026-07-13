@@ -82,4 +82,42 @@ ep=$(ctime_to_epoch 'Mon Aug 16 10:56:00 2027')
 check "ctime_to_epoch: round-trips HH:MM" "10:56"      "$(format_epoch "${ep:-0}" '%H:%M')"
 check "ctime_to_epoch: round-trips date"  "2027-08-16" "$(format_epoch "${ep:-0}" '%Y-%m-%d')"
 
+# --- edit_has_flags: did the user pass any editable flag with --edit? ----------
+# SET_* default to false (from the Defaults block). Each is set true only by its
+# flag's parse branch, so this decides interactive vs non-interactive editing.
+check "edit_has_flags: none -> 1"   "1" "$(edit_has_flags; echo $?)"
+check "edit_has_flags: pane -> 0"   "0" "$(SET_PANE=true; edit_has_flags; echo $?)"
+check "edit_has_flags: time -> 0"   "0" "$(SET_TIME=true; edit_has_flags; echo $?)"
+check "edit_has_flags: retries -> 0" "0" "$(SET_RETRIES=true; edit_has_flags; echo $?)"
+
+# --- apply_edit_overrides: overlay explicit flags onto the loaded job state ----
+# Precondition: scheduling globals hold the LOADED job; EDIT_* hold the flag
+# values; SET_* mark which flags were explicit. Only marked fields change.
+r=$(TARGET_PANE=loaded:0 MESSAGES=(a b) NOTIFY=true VERIFY=false AUTO_RETRY=true RETRY_LIMIT=3
+    SET_PANE=true EDIT_PANE=new:9
+    apply_edit_overrides
+    printf '%s|%s|%s|%s|%s|%s' "$TARGET_PANE" "${#MESSAGES[@]}" "$NOTIFY" "$VERIFY" "$AUTO_RETRY" "$RETRY_LIMIT")
+check "override: pane only (rest kept)" "new:9|2|true|false|true|3" "$r"
+
+r=$(TARGET_PANE=loaded:0 MESSAGES=(a b c) NOTIFY=true VERIFY=false AUTO_RETRY=false RETRY_LIMIT=2
+    SET_MESSAGES=true EDIT_MESSAGES=(only)
+    SET_NOTIFY=true EDIT_NOTIFY=false
+    apply_edit_overrides
+    printf '%s|%s|%s' "${#MESSAGES[@]}" "${MESSAGES[0]}" "$NOTIFY")
+check "override: messages replaced + notify off" "1|only|false" "$r"
+
+# An explicit -r re-enables auto-retry with the new count (mirrors the flag).
+r=$(AUTO_RETRY=false RETRY_LIMIT=2
+    SET_RETRIES=true EDIT_RETRIES=5
+    apply_edit_overrides
+    printf '%s|%s' "$AUTO_RETRY" "$RETRY_LIMIT")
+check "override: -r implies auto-retry on" "true|5" "$r"
+
+# --no-auto-retry (SET_AUTO_RETRY with EDIT_AUTO_RETRY=false) turns it off.
+r=$(AUTO_RETRY=true RETRY_LIMIT=4
+    SET_AUTO_RETRY=true EDIT_AUTO_RETRY=false
+    apply_edit_overrides
+    printf '%s' "$AUTO_RETRY")
+check "override: --no-auto-retry disables" "false" "$r"
+
 finish

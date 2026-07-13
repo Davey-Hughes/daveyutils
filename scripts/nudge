@@ -65,6 +65,21 @@ EXECUTE_NUDGE=false
 MODE=""
 MODE_ARG=""
 
+# --edit: track which settings were given as explicit flags (vs left at their
+# default / env value), so `nudge --edit <id> -m 15:00` overrides only that one
+# field non-interactively and leaves the rest of the stored job untouched. The
+# flag values themselves are snapshotted into EDIT_* before the stored job is
+# loaded over the top. Consumed solely by edit_job; inert for every other path.
+SET_PANE=false
+SET_TIME=false
+SET_MESSAGES=false
+SET_DELAY=false
+SET_NOTIFY=false
+SET_AUTO_RETRY=false
+SET_VERIFY=false
+SET_RETRIES=false
+EDIT_MESSAGES=()
+
 # Dedicated 'at' queue for every nudge job. Isolates our jobs from any other
 # 'at' jobs the user has, so `atq -q n` / --jobs list only ours. Overridable
 # (mainly for tests) via NUDGE_AT_QUEUE. Must be a single lowercase letter --
@@ -109,8 +124,10 @@ print_help() {
     echo "                        preview each job, Enter edits the highlighted one, and"
     echo "                        Alt-c / Del cancels it and refreshes the list in place."
     echo "      --edit <id>       Edit a pending job (pane/time/messages/options), then"
-    echo "                        reschedule it under a new ID. Prompts for each field;"
-    echo "                        blank keeps the current value."
+    echo "                        reschedule it under a new ID. With no other flags it"
+    echo "                        prompts for each field (blank keeps the current value);"
+    echo "                        pass flags to edit non-interactively, e.g."
+    echo "                        'nudge --edit 3 -m 15:00' changes only the time."
     echo "      --cancel <id>     Cancel one pending nudge job by its ID (from --list)."
     echo ""
     echo "If essential options are omitted, the script will prompt you interactively."
@@ -645,12 +662,40 @@ finalize_schedule() {
     atrun_hint
 }
 
-# Interactively edit a pending nudge job (arg 1 = id): load its current settings,
-# prompt for changes (blank keeps each), then reschedule as a NEW job and remove
-# the old one. Scheduling the replacement BEFORE removing the original means a
-# failed reschedule never loses the job.
+# Return 0 if the user passed ANY editable flag alongside --edit. When true, the
+# edit is applied non-interactively; when false, edit_job prompts for each field.
+edit_has_flags() {
+    [ "$SET_PANE" = true ] || [ "$SET_TIME" = true ] || [ "$SET_MESSAGES" = true ] \
+        || [ "$SET_DELAY" = true ] || [ "$SET_NOTIFY" = true ] || [ "$SET_VERIFY" = true ] \
+        || [ "$SET_AUTO_RETRY" = true ] || [ "$SET_RETRIES" = true ]
+}
+
+# Overlay the explicit --edit flag values (snapshotted in EDIT_*) onto the
+# already-loaded job globals, honouring the SET_* sentinels so only the fields
+# the user actually passed change. Leaves everything else at the stored value.
+# (Time is resolved separately in edit_job, since it also has the keep-original
+# fallback.)
+apply_edit_overrides() {
+    [ "$SET_PANE" = true ]       && TARGET_PANE="$EDIT_PANE"
+    [ "$SET_DELAY" = true ]      && SEND_DELAY="$EDIT_DELAY"
+    [ "$SET_NOTIFY" = true ]     && NOTIFY="$EDIT_NOTIFY"
+    [ "$SET_VERIFY" = true ]     && VERIFY="$EDIT_VERIFY"
+    [ "$SET_AUTO_RETRY" = true ] && AUTO_RETRY="$EDIT_AUTO_RETRY"
+    [ "$SET_RETRIES" = true ]    && { AUTO_RETRY=true; RETRY_LIMIT="$EDIT_RETRIES"; }
+    [ "$SET_MESSAGES" = true ]   && MESSAGES=("${EDIT_MESSAGES[@]}")
+    return 0
+}
+
+# Edit a pending nudge job (arg 1 = id), then reschedule it as a NEW job and
+# remove the old one. Scheduling the replacement BEFORE removing the original
+# means a failed reschedule never loses the job.
+#
+# Two modes: if any editable flag was passed alongside --edit (e.g.
+# `nudge --edit 3 -m 15:00 -i hi`), those fields are overlaid on the stored job
+# and everything else is kept -- no prompts. With no flags it walks through the
+# fields interactively (blank keeps each).
 edit_job() {
-    local id="$1" reply new_pane new_time orig_epoch old_id
+    local id="$1" reply new_pane new_time orig_epoch old_id i
     if ! [[ "$id" =~ ^[0-9]+$ ]]; then
         echo "Error: --edit needs a numeric job id (got '$id')." >&2
         return 1
@@ -659,51 +704,72 @@ edit_job() {
         echo "Error: no pending nudge job #$id (see 'nudge --jobs')." >&2
         return 1
     fi
+
+    # Snapshot the flag values BEFORE load_job overwrites the globals with the
+    # stored job. apply_edit_overrides reapplies only the ones SET_* marks.
+    EDIT_PANE="$TARGET_PANE"; EDIT_TIME="$TARGET_TIME"; EDIT_DELAY="$SEND_DELAY"
+    EDIT_NOTIFY="$NOTIFY"; EDIT_VERIFY="$VERIFY"; EDIT_AUTO_RETRY="$AUTO_RETRY"
+    EDIT_RETRIES="$RETRY_LIMIT"; EDIT_MESSAGES=("${MESSAGES[@]}")
+
     if ! load_job "$(at -c "$id" 2>/dev/null)"; then
         echo "Error: job #$id doesn't look like a nudge job; not editing." >&2
         return 1
     fi
     orig_epoch=$(job_epoch "$id")
+    apply_edit_overrides
 
-    echo "Editing nudge job #$id"
-    echo "  Pane:     $TARGET_PANE"
-    [ -n "$orig_epoch" ] && echo "  Fires:    $(format_epoch "$orig_epoch" '%H:%M %Y-%m-%d')"
-    echo "  Options:  $(options_summary)"
-    echo "  Messages:"
-    local i
-    for i in "${!MESSAGES[@]}"; do
-        printf '    %d. %s\n' "$(( i + 1 ))" "${MESSAGES[$i]}"
-    done
-    echo ""
-    echo "Press Enter to keep the current value at each prompt."
-
-    read -r -p "New target pane [$TARGET_PANE]: " new_pane
-    [ -n "$new_pane" ] && TARGET_PANE="$new_pane"
-
-    if [ -n "$orig_epoch" ]; then
-        read -r -p "New time [keep $(format_epoch "$orig_epoch" '%H:%M %Y-%m-%d')]: " new_time
-    else
-        read -r -p "New time (e.g. '14:30', 'now + 1 hour'): " new_time
-    fi
-
-    read -r -p "Replace the message(s)? [y/N]: " reply
-    if [[ "$reply" =~ ^[Yy] ]]; then
-        MESSAGES=()
-        prompt_messages
+    if edit_has_flags; then
+        # Non-interactive: flags already overlaid; resolve the time and go.
+        echo "Editing nudge job #$id (applying flags, keeping the rest)..."
+        if [ "$SET_TIME" = true ]; then
+            TARGET_EPOCH=""; TARGET_TIME="$EDIT_TIME"
+        elif [ -n "$orig_epoch" ]; then
+            TARGET_EPOCH="$orig_epoch"; TARGET_TIME=""
+        else
+            echo "Error: original time unrecoverable; pass -m <time> as well." >&2
+            return 1
+        fi
         ensure_default_messages
-    fi
-
-    read -r -p "Change options (auto-retry/verify/notify)? [y/N]: " reply
-    [[ "$reply" =~ ^[Yy] ]] && prompt_options
-
-    # Resolve the schedule: a new time (if given) or the original fire time.
-    if [ -n "$new_time" ]; then
-        TARGET_EPOCH=""; TARGET_TIME="$new_time"
-    elif [ -n "$orig_epoch" ]; then
-        TARGET_EPOCH="$orig_epoch"; TARGET_TIME=""
     else
-        echo "Error: a target time is required (couldn't recover the original)." >&2
-        return 1
+        # Interactive: show the current settings and prompt for each field.
+        echo "Editing nudge job #$id"
+        echo "  Pane:     $TARGET_PANE"
+        [ -n "$orig_epoch" ] && echo "  Fires:    $(format_epoch "$orig_epoch" '%H:%M %Y-%m-%d')"
+        echo "  Options:  $(options_summary)"
+        echo "  Messages:"
+        for i in "${!MESSAGES[@]}"; do
+            printf '    %d. %s\n' "$(( i + 1 ))" "${MESSAGES[$i]}"
+        done
+        echo ""
+        echo "Press Enter to keep the current value at each prompt."
+
+        read -r -p "New target pane [$TARGET_PANE]: " new_pane
+        [ -n "$new_pane" ] && TARGET_PANE="$new_pane"
+
+        if [ -n "$orig_epoch" ]; then
+            read -r -p "New time [keep $(format_epoch "$orig_epoch" '%H:%M %Y-%m-%d')]: " new_time
+        else
+            read -r -p "New time (e.g. '14:30', 'now + 1 hour'): " new_time
+        fi
+
+        read -r -p "Replace the message(s)? [y/N]: " reply
+        if [[ "$reply" =~ ^[Yy] ]]; then
+            MESSAGES=()
+            prompt_messages
+            ensure_default_messages
+        fi
+
+        read -r -p "Change options (auto-retry/verify/notify)? [y/N]: " reply
+        [[ "$reply" =~ ^[Yy] ]] && prompt_options
+
+        if [ -n "$new_time" ]; then
+            TARGET_EPOCH=""; TARGET_TIME="$new_time"
+        elif [ -n "$orig_epoch" ]; then
+            TARGET_EPOCH="$orig_epoch"; TARGET_TIME=""
+        else
+            echo "Error: a target time is required (couldn't recover the original)." >&2
+            return 1
+        fi
     fi
 
     old_id="$id"
@@ -807,14 +873,17 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         -p|--pane)
             TARGET_PANE="$2"
+            SET_PANE=true
             shift 2
             ;;
         -m|--time)
             TARGET_TIME="$2"
+            SET_TIME=true
             shift 2
             ;;
         -i|--input)
             MESSAGES+=("$2")
+            SET_MESSAGES=true
             shift 2
             ;;
         -w|--delay)
@@ -823,30 +892,37 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: --delay must be a non-negative number (got '$SEND_DELAY')."
                 exit 1
             fi
+            SET_DELAY=true
             shift 2
             ;;
         -n|--notify)
             NOTIFY=true
+            SET_NOTIFY=true
             shift 1
             ;;
         -a|--auto-retry)
             AUTO_RETRY=true
+            SET_AUTO_RETRY=true
             shift 1
             ;;
         -v|--verify)
             VERIFY=true
+            SET_VERIFY=true
             shift 1
             ;;
         --no-notify)
             NOTIFY=false
+            SET_NOTIFY=true
             shift 1
             ;;
         --no-auto-retry)
             AUTO_RETRY=false
+            SET_AUTO_RETRY=true
             shift 1
             ;;
         --no-verify)
             VERIFY=false
+            SET_VERIFY=true
             shift 1
             ;;
         -r|--retries)
@@ -856,6 +932,7 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: --retries must be an integer (got '$RETRY_LIMIT')."
                 exit 1
             fi
+            SET_RETRIES=true
             shift 2
             ;;
         -l|--list|--jobs)
