@@ -43,7 +43,9 @@ IS_DARWIN=false
 ESC=$(printf '\033')
 
 # --- Dependency check ------------------------------------------------------
-for cmd in tmux at "$DATE" grep "$SED" awk; do
+# atq/atrm ship with `at` but are checked explicitly so a broken install surfaces
+# here rather than as an opaque failure inside --list / --cancel / --edit.
+for cmd in tmux at atq atrm "$DATE" grep "$SED" awk; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "Error: Required command '$cmd' is not installed or not in PATH."
         exit 1
@@ -317,9 +319,12 @@ detect_reset_epoch() {
         echo "$target"
         return 0
     elif printf '%s\n' "$clean" | grep -qiE "$dur_re"; then
-        # Duration style (Agy et al.): relative countdown such as "Resets in 1h30m".
-        raw=$(printf '%s\n' "$clean" | grep -oE 'Resets in [0-9hms]+' | head -n 1)
-        raw=${raw#Resets in }
+        # Duration style (Agy et al.): relative countdown. The time itself must be
+        # spelled "Resets in <Nh Nm Ns>" (case-insensitive) -- that literal prefix
+        # is what a NUDGE_DURATION_PATTERN extension also has to emit for the
+        # countdown to be parsed, even though the banner match is fully custom.
+        raw=$(printf '%s\n' "$clean" | grep -oiE 'Resets in [0-9hms]+' | head -n 1)
+        raw=${raw#[Rr]esets [Ii]n }
         [ -z "$raw" ] && return 1
         h=$(printf '%s\n' "$raw" | grep -oE '[0-9]+h' | grep -oE '[0-9]+'); h=${h:-0}
         m=$(printf '%s\n' "$raw" | grep -oE '[0-9]+m' | grep -oE '[0-9]+'); m=${m:-0}
@@ -367,7 +372,10 @@ pane_after_marker() {
 # Arg 1 (optional): retry limit to embed via -r.
 build_next_cmd() {
     local retry_limit="$1" cmd m
-    cmd="$SCRIPT_PATH --execute-nudge -p $(printf '%q' "$TARGET_PANE") -w $(printf '%q' "$SEND_DELAY")"
+    # %q the script path too, not just the values -- an install path with a space
+    # (e.g. "/Users/John Doe/bin/nudge") would otherwise word-split when the 'at'
+    # job's `bash -c '<path> --execute-nudge ...'` is parsed, and the job fails.
+    cmd="$(printf '%q' "$SCRIPT_PATH") --execute-nudge -p $(printf '%q' "$TARGET_PANE") -w $(printf '%q' "$SEND_DELAY")"
     for m in "${MESSAGES[@]}"; do
         cmd="$cmd -i $(printf '%q' "$m")"
     done
@@ -379,8 +387,9 @@ build_next_cmd() {
 
 # Pipe a command (arg 1) to `at`, using the remaining args as the at time-spec.
 # All nudge jobs go into the dedicated queue $AT_QUEUE (-q) so --jobs / atq can
-# list only ours. Adds the X11/DBus env exports on Linux so desktop
-# notifications work from the detached 'at' job. Echoes at's own output.
+# list only ours. Adds the X11 / Wayland / DBus env exports on Linux so desktop
+# notifications reach the user's session from the detached 'at' job. Echoes at's
+# own output.
 #
 # `at` runs jobs under /bin/sh, which may be a POSIX shell (e.g. dash) that
 # doesn't understand the bash `$'...\n...'` quoting that `printf '%q'` emits for
@@ -394,8 +403,14 @@ at_pipe() {
     if [ "$IS_DARWIN" = true ]; then
         printf '%s\n' "$job" | at -q "$AT_QUEUE" "$@" 2>&1
     else
-        printf 'export DISPLAY=%s; export DBUS_SESSION_BUS_ADDRESS=%s; %s\n' \
-            "$DISPLAY" "$DBUS_SESSION_BUS_ADDRESS" "$job" | at -q "$AT_QUEUE" "$@" 2>&1
+        # %q the env values so an unusual DISPLAY/WAYLAND_DISPLAY can't break the
+        # export line; WAYLAND_DISPLAY covers pure-Wayland sessions where notify
+        # -send needs it (DBus alone isn't always enough).
+        printf 'export DISPLAY=%s WAYLAND_DISPLAY=%s DBUS_SESSION_BUS_ADDRESS=%s; %s\n' \
+            "$(printf '%q' "${DISPLAY:-}")" \
+            "$(printf '%q' "${WAYLAND_DISPLAY:-}")" \
+            "$(printf '%q' "${DBUS_SESSION_BUS_ADDRESS:-}")" \
+            "$job" | at -q "$AT_QUEUE" "$@" 2>&1
     fi
 }
 
@@ -624,16 +639,21 @@ manage_jobs_fzf() {
         echo "No pending nudge jobs (queue '$AT_QUEUE')."
         return 0
     fi
-    local self="$SCRIPT_PATH"
+    # Shell-quote $self everywhere it's embedded in an fzf action/preview string
+    # so an install path containing a space (or quote) still resolves -- fzf runs
+    # these via a shell, and unquoted "$self" would word-split. printf %q gives a
+    # form safe to paste into that shell; q holds it to keep the bind lines short.
+    local self="$SCRIPT_PATH" q
+    q=$(printf '%q' "$SCRIPT_PATH")
     "$self" --list-plain | fzf \
         --delimiter='\t' --with-nth='2..' \
         --header=$'nudge jobs\nEnter = edit    Alt-c / Del = cancel    Esc = quit' \
         --header-first \
-        --preview="$self --preview-job {1}" \
+        --preview="$q --preview-job {1}" \
         --preview-window='up:55%,wrap' \
-        --bind="enter:execute($self --edit {1})+reload($self --list-plain)" \
-        --bind="alt-c:execute-silent($self --cancel {1} >/dev/null 2>&1)+reload($self --list-plain)" \
-        --bind="del:execute-silent($self --cancel {1} >/dev/null 2>&1)+reload($self --list-plain)" \
+        --bind="enter:execute($q --edit {1})+reload($q --list-plain)" \
+        --bind="alt-c:execute-silent($q --cancel {1} >/dev/null 2>&1)+reload($q --list-plain)" \
+        --bind="del:execute-silent($q --cancel {1} >/dev/null 2>&1)+reload($q --list-plain)" \
         >/dev/null
 }
 

@@ -104,6 +104,13 @@ check "custom: NUDGE_DURATION_PATTERN detects ~now+300s" "yes" \
 check "custom: has_limit_banner sees clock extension" "0" \
     "$(NUDGE_CLOCK_PATTERN='FooCLI throttled' has_limit_banner 'FooCLI throttled until 2:00am'; echo $?)"
 
+# Duration countdown extraction is case-insensitive ("resets in" lowercase).
+now=$(date +%s)
+low=$(detect_reset_epoch "$(printf 'quota reached\nresets in 2m\n')" 2>/dev/null)
+diff=$(( ${low:-0} - now ))
+check "duration: lowercase 'resets in' parsed ~now+300s" "yes" \
+    "$([ "$diff" -ge 290 ] && [ "$diff" -le 330 ] && echo yes || echo no)"
+
 # --- build_next_cmd flag passthrough -----------------------------------------
 cmd_v=$(SCRIPT_PATH=/x TARGET_PANE="s:0.0" SEND_DELAY=0.75 NOTIFY=false VERIFY=true bash -c '
     source "'"$PRELUDE"'"; SCRIPT_PATH=/x; TARGET_PANE="s:0.0"; SEND_DELAY=0.75
@@ -116,6 +123,14 @@ cmd_nov=$(bash -c 'source "'"$PRELUDE"'"; SCRIPT_PATH=/x; TARGET_PANE="s:0.0"; S
 check "build_next_cmd: no -v when VERIFY off" "no"  "$(printf '%s' "$cmd_nov" | grep -q -- ' -v' && echo yes || echo no)"
 check "build_next_cmd: -n when NOTIFY on"     "yes" "$(printf '%s' "$cmd_nov" | grep -q -- ' -n' && echo yes || echo no)"
 check "build_next_cmd: no -r when limit empty" "no" "$(printf '%s' "$cmd_nov" | grep -q -- ' -r' && echo yes || echo no)"
+
+# A script path containing a space must survive the bash -c round-trip: the
+# emitted command, re-tokenised the way the 'at' job's bash -c does, must yield
+# the full path back as $1 (else the job runs "/opt/my" with arg "dir/nudge").
+first_arg=$(bash -c 'source "'"$PRELUDE"'"; SCRIPT_PATH="/opt/my dir/nudge"
+    TARGET_PANE="s:0.0"; SEND_DELAY=0.75; NOTIFY=false; VERIFY=false; MESSAGES=("hi")
+    cmd=$(build_next_cmd ""); eval "set -- $cmd"; printf "%s" "$1"')
+check "build_next_cmd: spaced script path round-trips" "/opt/my dir/nudge" "$first_arg"
 
 # --- prompt_options (driven via process substitution so mutations persist) ---
 # toggle auto-retry + verify on; blank count keeps default 2
