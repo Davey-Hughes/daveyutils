@@ -146,7 +146,8 @@ print_help() {
     echo ""
     echo "If essential options are omitted, the script will prompt you interactively."
     echo "  (If 'fzf' is installed, you will get a live visual preview of each pane!)"
-    echo "  After picking a pane you can set run options (fzf: press Alt-o; text menu: you'll be asked)."
+    echo "  After picking a pane you can set custom text and/or run options (fzf: Alt-Enter"
+    echo "  for text, Alt-o for options then optional text; text menu: you'll be asked for both)."
     echo ""
     echo "Environment (persistent defaults; overridden by flags, then by interactive toggles):"
     echo "  NUDGE_AUTO_RETRY=1    Enable auto-retry by default"
@@ -431,6 +432,11 @@ at_schedule_epoch() {
 # to the exact original strings with no command substitution able to fire.
 # Trimming to `--execute-nudge` first keeps the script path out of the eval
 # entirely. Each function's "$@" is local, so the caller's args are untouched.
+#
+# This safety rests on the job having been created by build_next_cmd (which %q's
+# every field). We only ever read jobs from our own queue, so that holds; a
+# hand-crafted 'at' job with an unquoted metacharacter could defeat it, but such
+# a job is the user's own doing (they can already run arbitrary code).
 
 # From a raw `at -c` dump (arg 1), recover the inner nudge command, trimmed to
 # start at `--execute-nudge`. The job body is the LAST non-empty line, wrapped
@@ -561,8 +567,8 @@ load_job() {
 # Echo "<id>\t<when>\t<pane>\t<count>" for one atq line (arg 1), pulling the
 # pane/count out of `at -c`. Missing/foreign jobs degrade to '?'.
 job_row() {
-    local id rest raw summary pane count when
-    read -r id rest <<< "$1"
+    local id raw summary pane count when
+    read -r id _ <<< "$1"
     [ -z "$id" ] && return 1
     raw=$(at -c "$id" 2>/dev/null)
     if summary=$(job_summary "$raw" 2>/dev/null); then
