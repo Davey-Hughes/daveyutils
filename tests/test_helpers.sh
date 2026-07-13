@@ -111,6 +111,33 @@ diff=$(( ${low:-0} - now ))
 check "duration: lowercase 'resets in' parsed ~now+300s" "yes" \
     "$([ "$diff" -ge 290 ] && [ "$diff" -le 330 ] && echo yes || echo no)"
 
+# --- F6: duration countdown parsing is FULLY case-insensitive -----------------
+# grep -oiE matched uppercase units, but the prefix-strip and unit greps were
+# lowercase-only, so "Resets in 1H30M" parsed as all-zeros and was rejected --
+# while has_limit_banner accepted it (--verify injects but auto-retry scheduled
+# nothing). Both mixed- and all-caps forms must now yield an epoch.
+now=$(date +%s)
+f6a=$(detect_reset_epoch "$(printf 'quota reached\nResets in 1H30M\n')" 2>/dev/null)
+diff=$(( ${f6a:-0} - now ))    # 1h30m = 5400s + 180s pad = 5580s
+check "F6: 'Resets in 1H30M' parsed (~now+5580s)" "yes" \
+    "$([ "$diff" -ge 5560 ] && [ "$diff" -le 5620 ] && echo yes || echo no)"
+now=$(date +%s)
+f6b=$(detect_reset_epoch "$(printf 'QUOTA REACHED\nRESETS IN 45M\n')" 2>/dev/null)
+diff=$(( ${f6b:-0} - now ))    # 45m = 2700s + 180s pad = 2880s
+check "F6: all-caps 'RESETS IN 45M' parsed (~now+2880s)" "yes" \
+    "$([ "$diff" -ge 2860 ] && [ "$diff" -le 2920 ] && echo yes || echo no)"
+
+# --- F9: a banner whose reset TIME sits on the FOLLOWING line ------------------
+# The clock time is grepped only from banner-matching lines (to avoid grabbing
+# stray times elsewhere in the pane); one line of trailing context (grep -A1)
+# lets a "resumes at 2:00am" on the next line parse. A banner with NO time
+# anywhere must still return nothing.
+f9=$(detect_reset_epoch "$(printf 'session limit reached, resets soon\nresumes at 2:00am\n')" 2>/dev/null)
+check "F9: reset time on next line parsed (02:03 w/ pad)" "02:03" \
+    "$(format_epoch "${f9:-0}" '%H:%M')"
+check "F9: banner with no time anywhere -> empty" "" \
+    "$(detect_reset_epoch "$(printf 'session limit reached, resets soon\nstill working\n')" 2>/dev/null)"
+
 # --- build_next_cmd flag passthrough -----------------------------------------
 cmd_v=$(SCRIPT_PATH=/x TARGET_PANE="s:0.0" SEND_DELAY=0.75 NOTIFY=false VERIFY=true bash -c '
     source "'"$PRELUDE"'"; SCRIPT_PATH=/x; TARGET_PANE="s:0.0"; SEND_DELAY=0.75
