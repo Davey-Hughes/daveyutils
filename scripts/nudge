@@ -62,6 +62,14 @@ AUTO_RETRY=false
 RETRY_LIMIT=2
 VERIFY=false
 EXECUTE_NUDGE=false
+MODE=""
+MODE_ARG=""
+
+# Dedicated 'at' queue for every nudge job. Isolates our jobs from any other
+# 'at' jobs the user has, so `atq -q n` / --jobs list only ours. Overridable
+# (mainly for tests) via NUDGE_AT_QUEUE. Must be a single lowercase letter --
+# uppercase queues mean batch jobs to `at`.
+AT_QUEUE="${NUDGE_AT_QUEUE:-n}"
 
 # --- Helpers ---------------------------------------------------------------
 
@@ -95,6 +103,13 @@ print_help() {
     echo "      --no-verify       Disable verification (overrides a NUDGE_VERIFY default)"
     echo "  -h, --help            Show this help message"
     echo ""
+    echo "Managing scheduled jobs:"
+    echo "  -l, --list, --jobs    Review pending nudge jobs (pane, time, message count)."
+    echo "                        With 'fzf' installed this is an interactive dashboard:"
+    echo "                        preview each job, and Alt-c / Del cancels the highlighted"
+    echo "                        one and refreshes the list in place."
+    echo "      --cancel <id>     Cancel one pending nudge job by its ID (from --list)."
+    echo ""
     echo "If essential options are omitted, the script will prompt you interactively."
     echo "  (If 'fzf' is installed, you will get a live visual preview of each pane!)"
     echo "  After picking a pane you can set run options (fzf: press Alt-o; text menu: you'll be asked)."
@@ -121,8 +136,10 @@ print_help() {
     echo "  # Infinite retries for a custom time, injecting custom text"
     echo "  nudge -p bot:1.0 -m \"now + 1 hour\" -i \"yes\" -r -1"
     echo ""
-    echo "Note: This script uses the 'at' daemon for background scheduling."
-    echo "      Use 'atq' to view pending jobs, and 'atrm <job_id>' to cancel them."
+    echo "Note: This script uses the 'at' daemon for background scheduling. All nudge"
+    echo "      jobs go in a dedicated queue ('${AT_QUEUE}'), so 'nudge --list' (or"
+    echo "      'atq -q ${AT_QUEUE}' manually) shows only nudge jobs. Cancel with"
+    echo "      'nudge --cancel <id>' or 'atrm <job_id>'."
     if [ "$IS_DARWIN" = true ]; then
         echo ""
         echo "macOS: the 'at' scheduler (atrun) is disabled by default, so scheduled jobs"
@@ -285,8 +302,9 @@ build_next_cmd() {
 }
 
 # Pipe a command (arg 1) to `at`, using the remaining args as the at time-spec.
-# Adds the X11/DBus env exports on Linux so desktop notifications work from the
-# detached 'at' job. Echoes at's own output.
+# All nudge jobs go into the dedicated queue $AT_QUEUE (-q) so --jobs / atq can
+# list only ours. Adds the X11/DBus env exports on Linux so desktop
+# notifications work from the detached 'at' job. Echoes at's own output.
 #
 # `at` runs jobs under /bin/sh, which may be a POSIX shell (e.g. dash) that
 # doesn't understand the bash `$'...\n...'` quoting that `printf '%q'` emits for
@@ -298,10 +316,10 @@ at_pipe() {
     local escaped=${cmd//"'"/"'\''"}
     local job="bash -c '$escaped'"
     if [ "$IS_DARWIN" = true ]; then
-        printf '%s\n' "$job" | at "$@" 2>&1
+        printf '%s\n' "$job" | at -q "$AT_QUEUE" "$@" 2>&1
     else
         printf 'export DISPLAY=%s; export DBUS_SESSION_BUS_ADDRESS=%s; %s\n' \
-            "$DISPLAY" "$DBUS_SESSION_BUS_ADDRESS" "$job" | at "$@" 2>&1
+            "$DISPLAY" "$DBUS_SESSION_BUS_ADDRESS" "$job" | at -q "$AT_QUEUE" "$@" 2>&1
     fi
 }
 
@@ -309,6 +327,187 @@ at_pipe() {
 # which both GNU and BSD `at` accept.
 at_schedule_epoch() {
     at_pipe "$2" -t "$(format_epoch "$1" '%Y%m%d%H%M')"
+}
+
+# --- Job inspection (reverse of at_pipe / build_next_cmd) -------------------
+# These recover the scheduled parameters from an `at -c <id>` dump so --jobs can
+# show what each pending job will do.
+
+# From a raw `at -c` dump (arg 1), recover the inner nudge command, trimmed to
+# start at `--execute-nudge`. The job body is the LAST non-empty line, wrapped
+# as `bash -c '<payload>'` (Linux prepends a couple of `export`s). We strip that
+# wrapper, undo the '\'' single-quote escaping at_pipe applied, then drop
+# everything before `--execute-nudge` (the script path / env). Returns 1 if the
+# dump isn't a nudge job.
+job_inner_cmd() {
+    local body line sq esc
+    body=$(printf '%s\n' "$1" | awk 'NF{last=$0} END{print last}')
+    case "$body" in
+        *"bash -c '"*"--execute-nudge"*) ;;
+        *) return 1 ;;
+    esac
+    line=${body#*bash -c \'}          # drop through the first  bash -c '
+    line=${line%\'}                   # drop the closing quote
+    sq=\'; esc="$sq\\$sq$sq"          # the 4-char  '\''  escape sequence
+    line=${line//"$esc"/"$sq"}        # undo it -> real single quotes
+    printf '%s' "--execute-nudge${line#*--execute-nudge}"
+}
+
+# Reconstruct the scheduled job's argv from an `at -c` dump WITHOUT running it.
+# `eval "set -- ..."` only assigns positional parameters -- it never executes the
+# command word -- and the payload is printf '%q'-quoted so it re-tokenizes to the
+# exact original strings (no command substitution can fire). Trimming to
+# `--execute-nudge` first keeps the script path out of the eval entirely.
+# Callers use the resulting "$@" locally (a function's positional params are its
+# own; the caller's are untouched).
+
+# Echo "<pane>\t<message-count>" for the job in an `at -c` dump (arg 1).
+# Returns 1 if it isn't a nudge job.
+job_summary() {
+    local inner; inner=$(job_inner_cmd "$1") || return 1
+    eval "set -- $inner"
+    local pane="" count=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -p) pane="${2:-}"; shift 2 ;;
+            -i) count=$((count + 1)); shift 2 ;;
+            -w|-r) shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    printf '%s\t%s' "$pane" "$count"
+}
+
+# Print a human-readable block (pane, options, each message) for the job in an
+# `at -c` dump (arg 1). Used for the fzf preview. Returns 1 if not a nudge job.
+job_detail() {
+    local inner; inner=$(job_inner_cmd "$1") || return 1
+    eval "set -- $inner"
+    local pane="" retry="" notify=false verify=false o=""
+    local -a msgs=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -p) pane="${2:-}"; shift 2 ;;
+            -i) msgs+=("${2:-}"); shift 2 ;;
+            -r) retry="${2:-}"; shift 2 ;;
+            -w) shift 2 ;;
+            -n) notify=true; shift ;;
+            -v) verify=true; shift ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$retry" ]       && o="auto-retry($retry)"
+    [ "$verify" = true ]  && o="${o:+$o, }verify"
+    [ "$notify" = true ]  && o="${o:+$o, }notify"
+    printf 'Pane:    %s\n' "$pane"
+    printf 'Options: %s\n' "${o:-none}"
+    printf 'Messages:\n'
+    local i
+    for i in "${!msgs[@]}"; do
+        printf '  %d. %s\n' "$(( i + 1 ))" "${msgs[$i]}"
+    done
+}
+
+# Format the ctime-style date `atq` prints into a short "HH:MM Mon DD". Both GNU
+# and BSD atq emit:  <id> <wday> <mon> <mday> <HH:MM:SS> <year> <queue> [user]
+# (arg 1 = a full atq line). Falls back to the line minus its id if it's shorter.
+atq_time_str() {
+    printf '%s\n' "$1" | awk '
+        NF>=6 { printf "%s %s %s", substr($5,1,5), $3, $4; next }
+        { $1=""; sub(/^[ \t]+/, ""); printf "%s", $0 }'
+}
+
+# Echo "<id>\t<when>\t<pane>\t<count>" for one atq line (arg 1), pulling the
+# pane/count out of `at -c`. Missing/foreign jobs degrade to '?'.
+job_row() {
+    local id rest raw summary pane count when
+    read -r id rest <<< "$1"
+    [ -z "$id" ] && return 1
+    raw=$(at -c "$id" 2>/dev/null)
+    if summary=$(job_summary "$raw" 2>/dev/null); then
+        pane=${summary%%$'\t'*}
+        count=${summary##*$'\t'}
+    else
+        pane="?"; count="?"
+    fi
+    when=$(atq_time_str "$1")
+    printf '%s\t%s\t%s\t%s' "$id" "$when" "${pane:-?}" "$count"
+}
+
+# Print a headed table of pending nudge jobs (queue $AT_QUEUE).
+list_jobs() {
+    local q; q=$(atq -q "$AT_QUEUE" 2>/dev/null | sort -n)
+    if [ -z "$q" ]; then
+        echo "No pending nudge jobs (queue '$AT_QUEUE')."
+        return 0
+    fi
+    printf '%-5s | %-15s | %-18s | %s\n' "ID" "Scheduled" "Pane" "Action"
+    echo "------+-----------------+--------------------+----------------------"
+    local line id when pane count
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        IFS=$'\t' read -r id when pane count <<< "$(job_row "$line")"
+        printf '%-5s | %-15s | %-18s | %s message(s)\n' "$id" "$when" "$pane" "$count"
+    done <<< "$q"
+}
+
+# Emit one tab-delimited "<id>\t<display>" line per job for fzf (id is field 1
+# so {1} resolves to it; the display carries no tabs). Used as the fzf source
+# and its reload command.
+list_plain() {
+    local line id when pane count
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        IFS=$'\t' read -r id when pane count <<< "$(job_row "$line")"
+        printf '%s\t%s  %-18s  %s msg(s)\n' "$id" "$when" "$pane" "$count"
+    done < <(atq -q "$AT_QUEUE" 2>/dev/null | sort -n)
+}
+
+# Cancel a single nudge job by id (arg 1). Guards that the id really is one of
+# our queued jobs before calling atrm, so a stray id can't remove an unrelated
+# 'at' job. Prints a friendly confirmation naming the target pane.
+cancel_job() {
+    local id="$1" pane
+    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+        echo "Error: --cancel needs a numeric job id (got '$id')." >&2
+        return 1
+    fi
+    if ! atq -q "$AT_QUEUE" 2>/dev/null | awk '{print $1}' | grep -qx "$id"; then
+        echo "Error: no pending nudge job #$id (see 'nudge --jobs')." >&2
+        return 1
+    fi
+    pane=$(job_summary "$(at -c "$id" 2>/dev/null)" 2>/dev/null)
+    pane=${pane%%$'\t'*}
+    if atrm "$id" 2>/dev/null; then
+        if [ -n "$pane" ]; then
+            echo "Cancelled nudge job #$id targeting pane $pane."
+        else
+            echo "Cancelled nudge job #$id."
+        fi
+    else
+        echo "Error: could not cancel job #$id." >&2
+        return 1
+    fi
+}
+
+# Interactive fzf dashboard over the pending jobs: preview shows exactly what
+# each job will inject; Alt-c / Del cancels the highlighted job and live-reloads
+# the list. Falls back to list_jobs (plain table) when fzf isn't installed.
+manage_jobs_fzf() {
+    if [ -z "$(atq -q "$AT_QUEUE" 2>/dev/null)" ]; then
+        echo "No pending nudge jobs (queue '$AT_QUEUE')."
+        return 0
+    fi
+    local self="$SCRIPT_PATH"
+    "$self" --list-plain | fzf \
+        --delimiter='\t' --with-nth='2..' \
+        --header=$'nudge jobs\nAlt-c / Del = cancel highlighted job    Enter / Esc = quit' \
+        --header-first \
+        --preview="$self --preview-job {1}" \
+        --preview-window='up:55%,wrap' \
+        --bind="alt-c:execute-silent($self --cancel {1} >/dev/null 2>&1)+reload($self --list-plain)" \
+        --bind="del:execute-silent($self --cancel {1} >/dev/null 2>&1)+reload($self --list-plain)" \
+        >/dev/null
 }
 
 # Prompt for one or more messages interactively; a blank line finishes.
@@ -447,6 +646,28 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
+        -l|--list|--jobs)
+            MODE="jobs"
+            shift 1
+            ;;
+        --cancel)
+            MODE="cancel"
+            MODE_ARG="${2:-}"
+            shift 1
+            [ $# -gt 0 ] && shift 1
+            ;;
+        --list-plain)
+            # Hidden: tab-delimited job list for fzf (source + reload).
+            MODE="list-plain"
+            shift 1
+            ;;
+        --preview-job)
+            # Hidden: fzf preview -- render one job's details by id.
+            MODE="preview-job"
+            MODE_ARG="${2:-}"
+            shift 1
+            [ $# -gt 0 ] && shift 1
+            ;;
         --execute-nudge)
             # Hidden internal flag used by the 'at' job to actually trigger the sequence
             EXECUTE_NUDGE=true
@@ -465,6 +686,34 @@ while [[ $# -gt 0 ]]; do
 done
 
 SCRIPT_PATH="$(script_path "$0")"
+
+# --- Job-management modes --------------------------------------------------
+# --jobs / --cancel and the two hidden fzf callbacks short-circuit here, before
+# any scheduling or interactive pane selection.
+case "$MODE" in
+    jobs)
+        if command -v fzf >/dev/null 2>&1; then
+            manage_jobs_fzf
+        else
+            list_jobs
+        fi
+        exit 0
+        ;;
+    list-plain)
+        list_plain
+        exit 0
+        ;;
+    preview-job)
+        detail=$(job_detail "$(at -c "$MODE_ARG" 2>/dev/null)") \
+            && printf '%s\n' "$detail" \
+            || echo "(job #$MODE_ARG not found or not a nudge job)"
+        exit 0
+        ;;
+    cancel)
+        cancel_job "$MODE_ARG"
+        exit $?
+        ;;
+esac
 
 # 0. HEADLESS EXECUTION (Run by 'at' when the timer fires)
 if [ "$EXECUTE_NUDGE" = true ]; then
@@ -679,7 +928,7 @@ job_id=$(printf '%s\n' "$at_output" | grep -oE 'job [0-9]+' | awk '{print $2}')
 
 if [ -n "$job_id" ]; then
     echo "Done! The injection is scheduled via the 'at' daemon (Job ID: $job_id)."
-    echo "(Use 'atq' to list scheduled jobs, and 'atrm $job_id' to cancel this specific job.)"
+    echo "(Use 'nudge --list' to review pending jobs, and 'nudge --cancel $job_id' to cancel this one.)"
 else
     # Scheduling produced no job id -> surface a useful error.
     if [ "$IS_DARWIN" = true ] && [ "$IS_GNU_DATE" = false ] && [ -z "$TARGET_EPOCH" ]; then
@@ -693,7 +942,7 @@ else
     # Fallback just in case parsing fails
     printf '%s\n' "$at_output"
     echo "Done! The injection is scheduled via the 'at' daemon."
-    echo "(Use 'atq' to list scheduled jobs, and 'atrm <job_id>' to cancel one.)"
+    echo "(Use 'nudge --list' to review pending jobs, and 'nudge --cancel <id>' to cancel one.)"
 fi
 
 # We only reach here after a successful schedule (the error branch exits above).
