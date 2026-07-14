@@ -12,3 +12,5 @@ pub trait Target {
     /// Type `text` into the target and submit it (as if Enter were pressed).
     fn send_line(&self, text: &str) -> Result<()>;
 }
+
+pub mod tmux;
