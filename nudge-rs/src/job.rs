@@ -34,7 +34,7 @@ pub struct Job {
 }
 
 /// What a caller supplies to `Queue::add` (everything but the id).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct JobSpec {
     pub target: TargetSpec,
     pub messages: Vec<String>,
