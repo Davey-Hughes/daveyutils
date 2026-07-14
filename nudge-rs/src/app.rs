@@ -245,7 +245,25 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
     schedule(&cli)
 }
 
-// pick_pane is provided in Task 6; a temporary stub keeps this compiling until then.
+/// Interactively choose a tmux pane.
 pub fn pick_pane() -> anyhow::Result<String> {
-    anyhow::bail!("no pane given (-p); interactive picker lands in a later task")
+    let panes = crate::tmux_panes::list()?;
+    if panes.is_empty() {
+        anyhow::bail!("no tmux panes found; pass -p <pane>");
+    }
+    let labels: Vec<String> = panes
+        .iter()
+        .map(|p| {
+            if p.title.is_empty() {
+                p.target.clone()
+            } else {
+                format!("{}  ({})", p.target, p.title)
+            }
+        })
+        .collect();
+    let choice = inquire::Select::new("Target pane:", labels.clone())
+        .prompt()
+        .context("pane selection cancelled")?;
+    let idx = labels.iter().position(|l| l == &choice).unwrap();
+    Ok(panes[idx].target.clone())
 }
