@@ -73,7 +73,12 @@ pub fn run(
                 dur_ext.as_deref(),
             );
             match &outcome {
-                Ok(o) => tracing::info!("nudge: fired job {} -> {:?}", job.id, o),
+                Ok(o) => {
+                    tracing::info!("nudge: fired job {} -> {:?}", job.id, o);
+                    if job.notify {
+                        crate::notify::send(&format!("nudge fired for {}", describe_pane(job)));
+                    }
+                }
                 Err(e) => tracing::warn!("nudge: job {} failed: {e}", job.id),
             }
             let retry_secs = job.settle_secs.max(MIN_RETRY_SECS);
@@ -93,5 +98,12 @@ pub fn run(
             next_wake(q.all(), &now, MAX_POLL)
         };
         std::thread::sleep(wake.max(Duration::from_millis(50)));
+    }
+}
+
+/// A short human-readable description of a job's target, for notification text.
+fn describe_pane(job: &crate::job::Job) -> String {
+    match &job.target {
+        crate::job::TargetSpec::Tmux { pane } => pane.clone(),
     }
 }

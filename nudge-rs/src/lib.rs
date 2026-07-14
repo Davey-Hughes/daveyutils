@@ -8,6 +8,7 @@ pub mod detect;
 pub mod inject;
 pub mod ipc;
 pub mod job;
+pub mod notify;
 pub mod paths;
 pub mod queue;
 pub mod register;
