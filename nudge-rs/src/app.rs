@@ -218,6 +218,7 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
     // Schedule the replacement FIRST so a failure can't lose the original.
     let new_id = match client::request(&socket(), &Request::Schedule(spec))? {
         Response::Scheduled(new_id) => new_id,
+        Response::Error(e) => bail!("failed to reschedule job {id}: {e}"),
         other => bail!("failed to reschedule job {id}: {other:?}"),
     };
     match client::request(&socket(), &Request::Cancel(id))? {

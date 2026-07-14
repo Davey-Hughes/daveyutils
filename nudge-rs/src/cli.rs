@@ -24,13 +24,17 @@ pub struct Cli {
     #[arg(short = 'w', long = "delay")]
     pub delay: Option<f64>,
 
+    /// Send a desktop notification when the injection fires.
     #[arg(short = 'n', long = "notify")]
     pub notify: bool,
+    /// Disable notifications (overrides NUDGE_NOTIFY).
     #[arg(long = "no-notify")]
     pub no_notify: bool,
 
+    /// If rate-limited, autonomously schedule another nudge (default 2 retries).
     #[arg(short = 'a', long = "auto-retry")]
     pub auto_retry: bool,
+    /// Disable auto-retry (overrides NUDGE_AUTO_RETRY).
     #[arg(long = "no-auto-retry")]
     pub no_auto_retry: bool,
 
@@ -38,8 +42,10 @@ pub struct Cli {
     #[arg(short = 'r', long = "retries")]
     pub retries: Option<i64>,
 
+    /// Before injecting, confirm the pane still shows a rate-limit banner; skip the send if not.
     #[arg(short = 'v', long = "verify")]
     pub verify: bool,
+    /// Disable verification (overrides NUDGE_VERIFY).
     #[arg(long = "no-verify")]
     pub no_verify: bool,
 

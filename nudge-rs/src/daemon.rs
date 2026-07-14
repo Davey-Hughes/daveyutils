@@ -73,13 +73,11 @@ pub fn run(
                 dur_ext.as_deref(),
             );
             match &outcome {
-                Ok(o) => {
-                    tracing::info!("nudge: fired job {} -> {:?}", job.id, o);
-                    if job.notify {
-                        crate::notify::send(&format!("nudge fired for {}", describe_pane(job)));
-                    }
-                }
+                Ok(o) => tracing::info!("nudge: fired job {} -> {:?}", job.id, o),
                 Err(e) => tracing::warn!("nudge: job {} failed: {e}", job.id),
+            }
+            if should_notify(job, &outcome) {
+                crate::notify::send(&format!("nudge fired for {}", describe_pane(job)));
             }
             let retry_secs = job.settle_secs.max(MIN_RETRY_SECS);
             let retry_at = now
@@ -105,5 +103,47 @@ pub fn run(
 fn describe_pane(job: &crate::job::Job) -> String {
     match &job.target {
         crate::job::TargetSpec::Tmux { pane } => pane.clone(),
+    }
+}
+
+/// Whether firing `job` with this `outcome` warrants a desktop notification:
+/// only when the user asked for one AND a message was actually sent.
+pub fn should_notify(
+    job: &crate::job::Job,
+    outcome: &anyhow::Result<crate::inject::InjectOutcome>,
+) -> bool {
+    job.notify && matches!(outcome, Ok(crate::inject::InjectOutcome::Sent(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_notify;
+    use crate::inject::InjectOutcome;
+    use crate::job::{JobSpec, TargetSpec};
+
+    fn job(notify: bool) -> crate::job::Job {
+        JobSpec {
+            target: TargetSpec::Tmux { pane: "p".into() },
+            messages: vec!["go".into()],
+            send_delay_secs: 0.0,
+            fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
+            notify,
+            verify: false,
+            auto_retry: false,
+            retries_left: 0,
+            settle_secs: 5.0,
+        }
+        .into_job(1)
+    }
+
+    #[test]
+    fn notifies_only_on_sent_when_opted_in() {
+        assert!(should_notify(&job(true), &Ok(InjectOutcome::Sent(1))));
+        assert!(!should_notify(
+            &job(true),
+            &Ok(InjectOutcome::SkippedVerify)
+        ));
+        assert!(!should_notify(&job(false), &Ok(InjectOutcome::Sent(1))));
+        assert!(!should_notify(&job(true), &Err(anyhow::anyhow!("boom"))));
     }
 }
