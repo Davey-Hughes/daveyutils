@@ -210,8 +210,13 @@ relative-time rejection, and `at -c` dump parsing (nudge owns its own queue now)
   per-test socket paths.
 - **CI:** `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` on
   Linux + macOS.
-- **Distribution:** `cargo install` and a Homebrew formula. One self-contained
-  binary; no coreutils, gnu-sed, fzf, or `at`.
+- **Distribution:** `cargo install`, a Homebrew formula, and an **AUR package**
+  (the primary dev machine is Arch). Ship two AUR variants: a source
+  `PKGBUILD` (`nudge`, builds from a release tarball via `cargo build
+  --release`) and optionally a `-git` variant tracking the branch; both install
+  the binary plus generated shell completions and, on Linux, register the
+  systemd `--user` unit. One self-contained binary; no coreutils, gnu-sed, fzf,
+  or `at`.
 
 ## Repo layout & phasing
 
