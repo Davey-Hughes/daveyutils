@@ -14,7 +14,7 @@ pub fn unit_text(exec: &Path) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={} --daemon\n\
+         ExecStart=\"{}\" --daemon\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
@@ -54,7 +54,12 @@ mod tests {
     #[test]
     fn unit_text_runs_the_daemon_and_is_installable() {
         let t = unit_text(Path::new("/usr/bin/nudge"));
-        assert!(t.contains("ExecStart=/usr/bin/nudge --daemon"), "got:\n{t}");
+        // The exec path is double-quoted so a path with whitespace still parses
+        // as a single program (systemd splits ExecStart on unquoted whitespace).
+        assert!(
+            t.contains("ExecStart=\"/usr/bin/nudge\" --daemon"),
+            "got:\n{t}"
+        );
         assert!(t.contains("[Install]"));
         assert!(t.contains("WantedBy=default.target"));
         assert!(t.contains("Restart=on-failure"));
@@ -81,7 +86,7 @@ mod tests {
         );
         assert!(plan.files[0]
             .1
-            .contains("ExecStart=/usr/bin/nudge --daemon"));
+            .contains("ExecStart=\"/usr/bin/nudge\" --daemon"));
         // daemon-reload then enable --now.
         assert!(plan.commands.contains(&vec![
             "systemctl".into(),
