@@ -57,7 +57,7 @@ impl Target for TmuxTarget {
     fn send_line(&self, text: &str) -> Result<()> {
         // `-l` sends the text literally so tmux doesn't interpret key names;
         // a separate `Enter` submits it.
-        self.run(&["send-keys", "-t", &self.pane, "-l", text])?;
+        self.run(&["send-keys", "-t", &self.pane, "-l", "--", text])?;
         self.run(&["send-keys", "-t", &self.pane, "Enter"])?;
         Ok(())
     }

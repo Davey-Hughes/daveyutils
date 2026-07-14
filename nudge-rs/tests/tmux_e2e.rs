@@ -34,6 +34,12 @@ impl Server {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let socket = format!("nudge-it-{}-{}", std::process::id(), n);
+        // Construct the guard before the fallible spawn so that if `new-session`
+        // fails after tmux has already started the private server process, the
+        // guard's `Drop` still kills it instead of leaking it.
+        let server = Server {
+            socket: socket.clone(),
+        };
         let ok = Command::new("tmux")
             .args([
                 "-L",
@@ -52,7 +58,7 @@ impl Server {
             .expect("spawn tmux")
             .success();
         assert!(ok, "failed to start private tmux session");
-        Server { socket }
+        server
     }
     fn target(&self) -> TmuxTarget {
         TmuxTarget::with_socket("s", &self.socket)
@@ -94,13 +100,34 @@ fn send_line_reaches_pane_and_capture_reads_it() {
     let server = Server::start();
     let target = server.target();
 
-    target.send_line("echo nudge_marker_42").unwrap();
+    // The literal typed text contains `$((6*7))`, not `42`; `nudge_marker_42`
+    // only appears in the pane if `sh` actually evaluated the echo, which
+    // requires that `Enter` was sent after the literal text.
+    target.send_line("echo nudge_marker_$((6*7))").unwrap();
     thread::sleep(Duration::from_millis(500)); // let the shell run + render
 
     let screen = target.capture().unwrap();
     assert!(
         screen.contains("nudge_marker_42"),
         "captured pane missing the marker; got:\n{screen}"
+    );
+}
+
+#[test]
+fn send_line_handles_leading_dash_message() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let target = server.target();
+    // A message starting with '-' must not be parsed as tmux flags (would Err without `--`).
+    target.send_line("-dash_marker_ok").unwrap();
+    thread::sleep(Duration::from_millis(500));
+    let screen = target.capture().unwrap();
+    assert!(
+        screen.contains("-dash_marker_ok"),
+        "leading-dash literal missing; got:\n{screen}"
     );
 }
 
@@ -119,7 +146,7 @@ fn end_to_end_injection_verifies_then_sends() {
     let job = Job {
         id: 1,
         target: TargetKind::Tmux { pane: "s".into() },
-        messages: vec!["nudge_continue_marker".into()],
+        messages: vec!["echo nudge_done_$((6*7))".into()],
         send_delay_secs: 0.0,
         fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
         notify: false,
@@ -135,7 +162,7 @@ fn end_to_end_injection_verifies_then_sends() {
     thread::sleep(Duration::from_millis(500));
     let screen = target.capture().unwrap();
     assert!(
-        screen.contains("nudge_continue_marker"),
+        screen.contains("nudge_done_42"),
         "sent message not visible in pane; got:\n{screen}"
     );
 }
