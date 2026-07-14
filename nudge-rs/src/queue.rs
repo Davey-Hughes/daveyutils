@@ -77,11 +77,11 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::Target;
+    use crate::job::TargetSpec;
 
     fn spec() -> JobSpec {
         JobSpec {
-            target: Target::Tmux {
+            target: TargetSpec::Tmux {
                 pane: "bot:0.1".into(),
             },
             messages: vec!["go".into()],
