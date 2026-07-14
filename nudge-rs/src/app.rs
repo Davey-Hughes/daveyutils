@@ -12,7 +12,7 @@ use crate::cli::{resolve_options, Cli};
 use crate::config::Toggles;
 use crate::detect::detect_reset;
 use crate::ipc::{client, Request, Response};
-use crate::job::{JobSpec, TargetSpec};
+use crate::job::{Job, JobSpec, TargetSpec};
 use crate::paths;
 use crate::target::{tmux::TmuxTarget, Target};
 use crate::timespec::parse_timespec;
@@ -103,9 +103,118 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
     }
 }
 
+/// Render pending jobs as a plain table.
+pub fn format_jobs(jobs: &[Job]) -> String {
+    if jobs.is_empty() {
+        return "no pending nudge jobs".to_string();
+    }
+    let mut out = String::from("ID   PANE                 FIRE (UTC)            MSGS\n");
+    for j in jobs {
+        let TargetSpec::Tmux { pane } = &j.target;
+        out.push_str(&format!(
+            "{:<4} {:<20} {:<20} {}\n",
+            j.id,
+            pane,
+            j.fire_at,
+            j.messages.len()
+        ));
+    }
+    out
+}
+
+fn socket() -> std::path::PathBuf {
+    paths::resolve().socket
+}
+
+/// List pending jobs (interactive picker lands in Task 6; both modes print
+/// the table for now).
+pub fn list(_plain: bool) -> anyhow::Result<()> {
+    match client::request(&socket(), &Request::List)? {
+        Response::Jobs(jobs) => {
+            print!("{}", format_jobs(&jobs));
+            Ok(())
+        }
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// Cancel a pending job by id.
+pub fn cancel(id: u64) -> anyhow::Result<()> {
+    match client::request(&socket(), &Request::Cancel(id))? {
+        Response::Cancelled(true) => {
+            println!("nudge: cancelled job {id}");
+            Ok(())
+        }
+        Response::Cancelled(false) => bail!("no pending job with id {id}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// Edit a pending job: find it via `List`, overlay explicitly-passed CLI
+/// flags onto its existing fields, `Cancel` the old job, and `Schedule` the
+/// merged spec.
+pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
+    let jobs = match client::request(&socket(), &Request::List)? {
+        Response::Jobs(j) => j,
+        other => bail!("unexpected response: {other:?}"),
+    };
+    let job = jobs
+        .into_iter()
+        .find(|j| j.id == id)
+        .ok_or_else(|| anyhow::anyhow!("no pending job with id {id}"))?;
+
+    // Overlay explicitly-passed flags onto the existing job.
+    let opts = resolve_options(cli);
+    let pane = match &cli.pane {
+        Some(p) => p.clone(),
+        None => {
+            let TargetSpec::Tmux { pane } = &job.target;
+            pane.clone()
+        }
+    };
+    let now = Zoned::now();
+    let fire_at = match &cli.time {
+        Some(_) => fire_time(cli, &pane, &now)?,
+        None => job.fire_at,
+    };
+    let messages = if cli.input.is_empty() {
+        job.messages.clone()
+    } else {
+        cli.input.clone()
+    };
+    let spec = JobSpec {
+        target: TargetSpec::Tmux { pane },
+        messages,
+        send_delay_secs: cli.delay.unwrap_or(job.send_delay_secs),
+        fire_at,
+        notify: opts.notify,
+        verify: opts.verify,
+        auto_retry: opts.auto_retry,
+        retries_left: if opts.auto_retry { opts.retries } else { 0 },
+        settle_secs: opts.settle_secs,
+    };
+
+    client::request(&socket(), &Request::Cancel(id))?;
+    match client::request(&socket(), &Request::Schedule(spec))? {
+        Response::Scheduled(new_id) => {
+            println!("nudge: edited job {id} -> {new_id}");
+            Ok(())
+        }
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
 /// Dispatch non-daemon modes.
 pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    // list / cancel / edit are added in Task 4; interactive pick in Task 6.
+    if let Some(id) = cli.cancel {
+        return cancel(id);
+    }
+    if let Some(id) = cli.edit {
+        return edit(id, &cli);
+    }
+    if cli.list || cli.list_plain {
+        return list(cli.list_plain);
+    }
     schedule(&cli)
 }
 
