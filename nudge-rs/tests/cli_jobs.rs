@@ -50,3 +50,45 @@ fn cancel_over_ipc_removes_the_job() {
     assert_eq!(resp, Response::Cancelled(true));
     assert!(queue.lock().unwrap().all().is_empty());
 }
+
+#[test]
+fn merge_edit_preserves_options_not_passed() {
+    use jiff::{civil::date, tz::TimeZone};
+
+    let now = date(2026, 7, 13)
+        .at(12, 0, 0, 0)
+        .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+        .unwrap();
+
+    // A job that had verify + notify + infinite retries.
+    let job = JobSpec {
+        target: TargetSpec::Tmux {
+            pane: "bot:0.1".into(),
+        },
+        messages: vec!["go".into()],
+        send_delay_secs: 0.5,
+        fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
+        notify: true,
+        verify: true,
+        auto_retry: true,
+        retries_left: -1,
+        settle_secs: 9.0,
+    }
+    .into_job(1);
+
+    // Edit only the time; pass no toggle flags.
+    let cli =
+        <nudge::cli::Cli as clap::Parser>::try_parse_from(["nudge", "--edit", "1", "-m", "6pm"])
+            .unwrap();
+
+    let spec = nudge::app::merge_edit(&job, &cli, &now).unwrap();
+
+    assert!(spec.verify, "verify must be preserved");
+    assert!(spec.notify, "notify must be preserved");
+    assert!(spec.auto_retry);
+    assert_eq!(spec.retries_left, -1, "infinite retries preserved");
+    assert_eq!(spec.send_delay_secs, 0.5, "delay preserved");
+    assert_eq!(spec.messages, vec!["go".to_string()], "messages preserved");
+    // Time WAS changed (6pm today or tomorrow, not the original 15:00Z).
+    assert_ne!(spec.fire_at, job.fire_at);
+}

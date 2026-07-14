@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context};
 use jiff::Zoned;
 
-use crate::cli::{resolve_options, Cli};
+use crate::cli::{resolve_options, tri, Cli};
 use crate::config::Toggles;
 use crate::detect::detect_reset;
 use crate::ipc::{client, Request, Response};
@@ -150,9 +150,58 @@ pub fn cancel(id: u64) -> anyhow::Result<()> {
     }
 }
 
+/// Merge a pending job with the edit CLI's explicitly-passed flags, preserving
+/// the job's existing values for anything not passed. Env defaults are NOT
+/// consulted (unlike a fresh schedule) — only the job + explicit flags.
+pub fn merge_edit(job: &Job, cli: &Cli, now: &Zoned) -> anyhow::Result<JobSpec> {
+    let base = Toggles {
+        notify: job.notify,
+        verify: job.verify,
+        auto_retry: job.auto_retry,
+        retries: job.retries_left,
+        settle_secs: job.settle_secs,
+    };
+    let overrides = crate::config::FlagOverrides {
+        notify: tri(cli.notify, cli.no_notify),
+        verify: tri(cli.verify, cli.no_verify),
+        auto_retry: tri(cli.auto_retry, cli.no_auto_retry),
+        retries: cli.retries,
+        settle_secs: None,
+    };
+    let opts = crate::config::resolve(&base, &overrides);
+    let pane = match &cli.pane {
+        Some(p) => p.clone(),
+        None => {
+            let TargetSpec::Tmux { pane } = &job.target;
+            pane.clone()
+        }
+    };
+    let fire_at = match &cli.time {
+        Some(_) => fire_time(cli, &pane, now)?,
+        None => job.fire_at,
+    };
+    let messages = if cli.input.is_empty() {
+        job.messages.clone()
+    } else {
+        cli.input.clone()
+    };
+    Ok(JobSpec {
+        target: TargetSpec::Tmux { pane },
+        messages,
+        send_delay_secs: cli.delay.unwrap_or(job.send_delay_secs),
+        fire_at,
+        notify: opts.notify,
+        verify: opts.verify,
+        auto_retry: opts.auto_retry,
+        retries_left: if opts.auto_retry { opts.retries } else { 0 },
+        settle_secs: opts.settle_secs,
+    })
+}
+
 /// Edit a pending job: find it via `List`, overlay explicitly-passed CLI
-/// flags onto its existing fields, `Cancel` the old job, and `Schedule` the
-/// merged spec.
+/// flags onto its existing fields (preserving anything not passed), then
+/// `Schedule` the merged spec BEFORE `Cancel`-ing the original — so a
+/// Schedule failure can never lose the job.
 pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
     let jobs = match client::request(&socket(), &Request::List)? {
         Response::Jobs(j) => j,
@@ -163,45 +212,23 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
         .find(|j| j.id == id)
         .ok_or_else(|| anyhow::anyhow!("no pending job with id {id}"))?;
 
-    // Overlay explicitly-passed flags onto the existing job.
-    let opts = resolve_options(cli);
-    let pane = match &cli.pane {
-        Some(p) => p.clone(),
-        None => {
-            let TargetSpec::Tmux { pane } = &job.target;
-            pane.clone()
-        }
-    };
     let now = Zoned::now();
-    let fire_at = match &cli.time {
-        Some(_) => fire_time(cli, &pane, &now)?,
-        None => job.fire_at,
-    };
-    let messages = if cli.input.is_empty() {
-        job.messages.clone()
-    } else {
-        cli.input.clone()
-    };
-    let spec = JobSpec {
-        target: TargetSpec::Tmux { pane },
-        messages,
-        send_delay_secs: cli.delay.unwrap_or(job.send_delay_secs),
-        fire_at,
-        notify: opts.notify,
-        verify: opts.verify,
-        auto_retry: opts.auto_retry,
-        retries_left: if opts.auto_retry { opts.retries } else { 0 },
-        settle_secs: opts.settle_secs,
-    };
+    let spec = merge_edit(&job, cli, &now)?;
 
-    client::request(&socket(), &Request::Cancel(id))?;
-    match client::request(&socket(), &Request::Schedule(spec))? {
-        Response::Scheduled(new_id) => {
-            println!("nudge: edited job {id} -> {new_id}");
-            Ok(())
+    // Schedule the replacement FIRST so a failure can't lose the original.
+    let new_id = match client::request(&socket(), &Request::Schedule(spec))? {
+        Response::Scheduled(new_id) => new_id,
+        other => bail!("failed to reschedule job {id}: {other:?}"),
+    };
+    match client::request(&socket(), &Request::Cancel(id))? {
+        Response::Cancelled(true) => {}
+        Response::Cancelled(false) => {
+            tracing::warn!("nudge: original job {id} was already gone")
         }
-        other => bail!("unexpected response: {other:?}"),
+        other => bail!("scheduled replacement {new_id} but could not cancel {id}: {other:?}"),
     }
+    println!("nudge: edited job {id} -> {new_id}");
+    Ok(())
 }
 
 /// Dispatch non-daemon modes.

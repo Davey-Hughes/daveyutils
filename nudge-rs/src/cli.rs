@@ -67,7 +67,7 @@ pub struct Cli {
     pub uninstall_daemon: bool,
 }
 
-fn tri(on: bool, off: bool) -> Option<bool> {
+pub(crate) fn tri(on: bool, off: bool) -> Option<bool> {
     if off {
         Some(false)
     } else if on {
