@@ -4,6 +4,7 @@ pub mod config;
 pub mod detect;
 pub mod inject;
 pub mod job;
+pub mod paths;
 pub mod queue;
 pub mod target;
 pub mod timespec;
