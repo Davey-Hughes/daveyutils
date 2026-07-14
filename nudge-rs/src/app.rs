@@ -1,6 +1,8 @@
 //! Command implementations for the CLI modes.
 
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
@@ -61,7 +63,13 @@ pub fn ensure_daemon(socket: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
-    std::process::Command::new(exe).arg("--daemon").spawn()?;
+    std::process::Command::new(exe)
+        .arg("--daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if client::request(socket, &Request::Ping).is_ok() {
