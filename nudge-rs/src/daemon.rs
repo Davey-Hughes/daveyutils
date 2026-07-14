@@ -11,6 +11,10 @@ use crate::paths::Paths;
 use crate::queue::Queue;
 use crate::scheduler::{apply_outcome, next_wake, plan, MAX_POLL};
 
+/// A retry never lands sooner than this, so a sub-second `settle_secs` can't
+/// create a fire-storm (esp. with infinite retries).
+const MIN_RETRY_SECS: f64 = 1.0;
+
 /// Install a tracing subscriber. Safe to call more than once (a second call is
 /// a no-op once a global subscriber exists).
 pub fn init_tracing() {
@@ -20,6 +24,8 @@ pub fn init_tracing() {
 }
 
 /// Run the daemon forever: IPC server thread + scheduler loop.
+///
+/// Call [`init_tracing`] first if you want the daemon's logs.
 pub fn run(
     paths: &Paths,
     clock_ext: Option<String>,
@@ -50,7 +56,9 @@ pub fn run(
         if !plan_now.drop_stale.is_empty() {
             let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
             for id in &plan_now.drop_stale {
-                let _ = q.remove(*id);
+                if let Err(e) = q.remove(*id) {
+                    tracing::warn!("nudge: removing stale job {id} failed: {e}");
+                }
                 tracing::info!("nudge: dropped stale job {id}");
             }
         }
@@ -68,12 +76,15 @@ pub fn run(
                 Ok(o) => tracing::info!("nudge: fired job {} -> {:?}", job.id, o),
                 Err(e) => tracing::warn!("nudge: job {} failed: {e}", job.id),
             }
+            let retry_secs = job.settle_secs.max(MIN_RETRY_SECS);
             let retry_at = now
-                .checked_add(Span::new().seconds(job.settle_secs as i64))
+                .checked_add(Span::new().milliseconds((retry_secs * 1000.0) as i64))
                 .map(|z| z.timestamp())
                 .unwrap_or(now.timestamp());
             let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = apply_outcome(&mut q, job, &outcome, retry_at);
+            if let Err(e) = apply_outcome(&mut q, job, &outcome, retry_at) {
+                tracing::warn!("nudge: persisting job {} outcome failed: {e}", job.id);
+            }
         }
 
         // 4. Sleep until the next job is due (capped).
