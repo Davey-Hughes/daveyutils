@@ -421,3 +421,54 @@ The code comment concedes this ("interactive picker lands in Task 6"), so it's a
   - **Why refuted:** The core technical fact underlying the claim is true in isolation: a Rust test function that does a bare `return` before any assertion runs is reported by libtest as "ok" (passed), not "ignored" — that part isn't disputable. But the claim fails on two counts specific to this repo:
 
 1. It's documented, intended behavior. The module doc comment at the top of tmux_e2e.rs states explicitly: "All self-
+
+
+## Follow-ups raised by the Increment 1 final review (2026-07-15)
+
+The final review of the criticals remediation found 4 Important issues (all fixed in
+`dd8a85c`, before merge) and these minors, deferred to Increment 4. Two of the
+Importants were regressions introduced *by* the remediation itself, which is why
+they are recorded here rather than dropped.
+
+### F1. `nudge-rs/tests/daemon_singleton.rs`:86 — test-quality
+**`serve_refuses_to_steal_a_live_socket` hangs instead of failing on regression.**
+
+*Failure scenario:* Mutation-tested — with `serve` reverted to an unconditional unlink, the test does not FAIL, it hangs ("running for over 60 seconds"). Old `serve` steals the socket and enters its infinite accept loop, so `expect_err` never returns. The guard does catch the regression, but as a CI timeout with no diagnostic.
+
+*Suggested fix:* Run `serve` on a thread with `recv_timeout`, as `run_refuses_to_start_while_another_daemon_holds_the_lock` already does correctly.
+
+### F2. `scripts/batch_img2pdf`:20 — correctness
+**Symlinks are invisible to both sides of the `--clean` coverage check.**
+
+*Failure scenario:* `find -type f` matches neither symlinks-to-files nor symlinks-to-dirs, and the `-mindepth 1 -type d` probe doesn't see a symlinked dir. Verified: `book/{cover.jpg, link.jpg -> elsewhere}` gives `total=1, n=1` → `folder_fully_covered` returns true → `rm -rf book/`. Blast radius is bounded (`rm -rf` does not follow symlinks, so the target survives), but `unar` can emit symlinks from zips.
+
+*Suggested fix:* Count with `find "$dir" ! -type d | wc -l` so links are included in `total`, making the folder correctly *kept*.
+
+### F3. `scripts/batch_img2pdf`:20 — usability
+**A single dotfile permanently disables `--clean` for a folder.**
+
+*Failure scenario:* `book/{cover.jpg, .DS_Store}` → `total=2, n=1` → kept forever. `.DS_Store` is ubiquitous in macOS-authored zips, so on that platform `--clean` may effectively never clean. Conservative-by-spec and not data loss, but the WARN won't tell the user a dotfile is the reason.
+
+*Suggested fix:* Name the offending files in the WARN, or ignore a small known-junk set.
+
+### F4. `tests/test_batch_img2pdf.sh`:78 — test-coverage
+**The C3 test discards stderr (`2>&1`), so the WARN is unasserted.** C3's core complaint was that the run looks like a clean success; the WARN is the fix's only user-facing signal that a folder was kept, and nothing pins it.
+
+### F5. `tests/test_jobs_e2e.sh`:31 — test-quality
+**Scoped purge leaks `at` jobs precisely when M-series id-parsing breaks.** If `schedule` queues a job but a format regression breaks the `Job ID: N` grep, `ID` is empty → nothing is remembered → the file SKIPs *and* leaks a real `at` job into queue `w` every run, accumulating. The old blanket purge covered this.
+
+*Suggested fix:* Diff `atq -q w` before/after rather than parsing nudge's stdout.
+
+### F6. `tests/test_jobs_e2e.sh`:31 — robustness
+**`remember_id` returns 1 on empty input.** `[ -n "$1" ] && ...` is the last command, so the function returns non-zero on the *expected* empty-id path. Harmless today (no `set -e` in this file), but a landmine for anyone who later adds errexit. Append `; return 0`.
+
+### F7. `nudge-rs/src/queue.rs`:87 — resource-leak
+**Pid-named temps now litter unboundedly.** A save that fails mid-write used to leave exactly one reusable `queue.json.tmp`; it now leaves a distinct `queue.json.<pid>.tmp` per crashed process, which nothing reaps.
+
+*Suggested fix:* `tempfile::NamedTempFile` in the same dir (already a dev-dep; would need promoting), or a best-effort sweep on load.
+
+### F8. `nudge-rs/tests/daemon_singleton.rs`:163 — test-quality
+**`process::exit(1)` inside a test binary.** `a_running_daemon_holds_the_lock_for_its_whole_life` runs a real `daemon::run` in-process, and its IPC thread carries the fatal-serve `std::process::exit(1)`. If that `serve` ever hits a fatal `accept()` error, the whole cargo-test binary exits 1 with no test-level attribution. Low probability, nasty to debug.
+
+### F9. `nudge-rs/src/daemon.rs`:81 — test-coverage
+**No test covers the fatal `serve` exit.** `process::exit` is untestable in-process, but the policy could be extracted (e.g. `fn on_serve_exit() -> !`) or pinned by spawning the built binary. Currently inspection-only.
