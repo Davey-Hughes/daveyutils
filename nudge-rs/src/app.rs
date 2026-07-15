@@ -58,10 +58,94 @@ pub fn fire_time(cli: &Cli, pane: &str, now: &Zoned) -> anyhow::Result<jiff::Tim
     }
 }
 
+/// What to tell a user whose resident daemon is not this build.
+///
+/// Worth spelling out, because nothing else will: the daemon is long-lived and
+/// auto-started, so rebuilding nudge does not replace it, and there is no
+/// `--stop-daemon` to do it with. Naming the command is the whole value here.
+fn stale_daemon(detail: &str) -> String {
+    format!(
+        "the nudge daemon already running is not this build ({detail}).\n\
+         It will not restart itself, so until it is stopped it is the old code \
+         that runs your jobs, whatever this binary does.\n\
+         Stop it and retry:\n    \
+         pkill -f 'nudge --daemon'\n\
+         or, if you installed it with --install-daemon:\n    \
+         systemctl --user restart nudged.service            (Linux)\n    \
+         launchctl kickstart -k gui/$UID/com.nudge.daemon   (macOS)"
+    )
+}
+
+/// Whether a failed Ping means "no daemon is there" — so start one, as nudge
+/// always has — rather than "something is there, and it is not us".
+///
+/// ENOENT (no socket file) and ECONNREFUSED (a socket file nobody is listening
+/// on) are the two shapes of not-running. Everything else means somebody
+/// answered: most of all the InvalidData of an old daemon's unit `"Pong"`,
+/// which this build cannot parse. Spawning a daemon on top of one of those
+/// only loses the singleton lock and reports `daemon did not come up`, which
+/// tells the user nothing about the daemon they actually have.
+fn daemon_not_running(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Hold a versioned Pong to this build, or explain the daemon that isn't.
+fn check_handshake(resp: Response) -> anyhow::Result<()> {
+    match resp {
+        Response::Pong { version } if version == crate::VERSION => Ok(()),
+        Response::Pong { version } => bail!(
+            "{}",
+            stale_daemon(&format!(
+                "it is running version {version}; this is {}",
+                crate::VERSION
+            ))
+        ),
+        other => bail!(
+            "{}",
+            stale_daemon(&format!("it answered a ping with {other:?}"))
+        ),
+    }
+}
+
+/// One request to a daemon we have already handshaken with.
+///
+/// A transport failure here is not a bare errno to hand the user: something is
+/// listening (it answered a Ping moments ago) and it has now either hung up
+/// mid-exchange or spoken a protocol this build does not read. That is the same
+/// wrong-build daemon `ensure_daemon` guards against, racing into the window,
+/// and it has the same remedy — so give them the remedy, not the errno. This is
+/// the `nudge: no response` that `--edit` against an old daemon used to print.
+fn request(socket: &Path, req: &Request) -> anyhow::Result<Response> {
+    client::request(socket, req).map_err(|e| match e.kind() {
+        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData => {
+            anyhow::anyhow!("{}", stale_daemon(&format!("the request failed: {e}")))
+        }
+        _ => anyhow::anyhow!("nudge daemon request failed: {e}"),
+    })
+}
+
 /// Ping the daemon; if it's not answering, start it and wait for the socket.
+///
+/// The Ping is a version handshake, not just a liveness check. A daemon from
+/// another build answers a plain "are you there?" perfectly well, so this used
+/// to adopt it and hand it requests written against code it does not run.
 pub fn ensure_daemon(socket: &Path) -> anyhow::Result<()> {
-    if client::request(socket, &Request::Ping).is_ok() {
-        return Ok(());
+    match client::request(socket, &Request::Ping) {
+        Ok(resp) => return check_handshake(resp),
+        // Nothing is listening. Starting one is ours to do, and always was.
+        Err(e) if daemon_not_running(&e) => {}
+        // Something answered, just not in a way this build understands. An old
+        // daemon's unit `"Pong"` arrives here as a parse error, which is as
+        // reliable a signal of one as the version field itself.
+        Err(e) => bail!(
+            "{}",
+            stale_daemon(&format!(
+                "it did not answer a ping this build can read: {e}"
+            ))
+        ),
     }
     let exe = std::env::current_exe()?;
     std::process::Command::new(exe)
@@ -73,8 +157,10 @@ pub fn ensure_daemon(socket: &Path) -> anyhow::Result<()> {
         .spawn()?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if client::request(socket, &Request::Ping).is_ok() {
-            return Ok(());
+        // The daemon we just spawned is this exe, so a mismatch here means
+        // somebody else won the socket — still worth saying out loud.
+        if let Ok(resp) = client::request(socket, &Request::Ping) {
+            return check_handshake(resp);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -92,7 +178,7 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
     let fire_at = fire_time(cli, &pane, &now)?;
     let spec = build_spec(&pane, fire_at, cli, &opts);
 
-    match client::request(&live_socket()?, &Request::Schedule(spec))? {
+    match request(&live_socket()?, &Request::Schedule(spec))? {
         Response::Scheduled(id) => {
             println!("nudge: scheduled job {id} for {}", fire_at);
             Ok(())
@@ -138,7 +224,7 @@ fn live_socket() -> anyhow::Result<std::path::PathBuf> {
 /// List pending jobs (interactive picker lands in Task 6; both modes print
 /// the table for now).
 pub fn list(_plain: bool) -> anyhow::Result<()> {
-    match client::request(&live_socket()?, &Request::List)? {
+    match request(&live_socket()?, &Request::List)? {
         Response::Jobs(jobs) => {
             print!("{}", format_jobs(&jobs));
             Ok(())
@@ -149,7 +235,7 @@ pub fn list(_plain: bool) -> anyhow::Result<()> {
 
 /// Cancel a pending job by id.
 pub fn cancel(id: u64) -> anyhow::Result<()> {
-    match client::request(&live_socket()?, &Request::Cancel(id))? {
+    match request(&live_socket()?, &Request::Cancel(id))? {
         Response::Cancelled(true) => {
             println!("nudge: cancelled job {id}");
             Ok(())
@@ -237,7 +323,7 @@ pub fn merge_edit(
 /// cannot half-apply: either the swap is committed or nothing is.
 pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
     let socket = live_socket()?;
-    let jobs = match client::request(&socket, &Request::List)? {
+    let jobs = match request(&socket, &Request::List)? {
         Response::Jobs(j) => j,
         other => bail!("unexpected response: {other:?}"),
     };
@@ -249,7 +335,7 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
     let now = Zoned::now();
     let spec = merge_edit(&job, cli, &now, crate::cli::default_retries())?;
 
-    match client::request(&socket, &Request::Replace { id, spec })? {
+    match request(&socket, &Request::Replace { id, spec })? {
         Response::Replaced(Some(new_id)) => {
             println!("nudge: edited job {id} -> {new_id}");
             Ok(())
@@ -312,6 +398,57 @@ pub fn print_completions(shell: clap_complete::Shell) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
+
+    /// The distinction the whole handshake rests on. Get it wrong one way and a
+    /// first-ever `nudge` stops auto-starting its daemon; wrong the other way
+    /// and we spawn a second daemon on top of an old one that is answering
+    /// perfectly well, lose the singleton lock, and report `daemon did not come
+    /// up` — which names neither the problem nor the fix.
+    #[test]
+    fn only_enoent_and_econnrefused_mean_no_daemon_is_running() {
+        for kind in [ErrorKind::NotFound, ErrorKind::ConnectionRefused] {
+            assert!(
+                daemon_not_running(&std::io::Error::new(kind, "x")),
+                "{kind:?} means nothing is listening: start one, as nudge always has"
+            );
+        }
+        // InvalidData is precisely an old daemon's unit-variant `"Pong"` failing
+        // to parse: something IS there, and starting a rival is not the answer.
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::TimedOut,
+            ErrorKind::PermissionDenied,
+        ] {
+            assert!(
+                !daemon_not_running(&std::io::Error::new(kind, "x")),
+                "{kind:?} means something answered; it must not be read as an absent daemon"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pong_from_this_build_is_accepted_and_any_other_is_not() {
+        assert!(check_handshake(Response::Pong {
+            version: crate::VERSION.to_string()
+        })
+        .is_ok());
+
+        let err = check_handshake(Response::Pong {
+            version: "0.0.1-ancient".to_string(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("0.0.1-ancient"),
+            "must name the version: {err}"
+        );
+        assert!(
+            err.contains("pkill -f 'nudge --daemon'"),
+            "must name the remedy: {err}"
+        );
+    }
 
     #[test]
     fn bash_completions_mention_the_binary() {

@@ -1,5 +1,12 @@
 //! Core library for nudge. Side-effect-free logic used by the CLI and daemon.
 
+/// This build's version, as carried in the IPC handshake.
+///
+/// The daemon is resident and auto-started: rebuilding nudge does not replace
+/// the one already running, and it will not restart itself. So the CLI asks
+/// what it is talking to rather than assuming it is itself.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod app;
 pub mod cli;
 pub mod config;

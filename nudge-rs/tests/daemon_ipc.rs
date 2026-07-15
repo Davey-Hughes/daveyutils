@@ -44,5 +44,10 @@ fn daemon_survives_a_malformed_request() {
 
     // The daemon must still be alive and answer a well-formed request.
     let resp = client::request(&socket, &Request::Ping).unwrap();
-    assert_eq!(resp, Response::Pong);
+    assert_eq!(
+        resp,
+        Response::Pong {
+            version: nudge::VERSION.to_string()
+        }
+    );
 }

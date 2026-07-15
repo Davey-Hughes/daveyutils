@@ -53,7 +53,19 @@ pub enum Response {
     Cancelled(bool),
     /// The replacement's id, or `None` if the original was already gone.
     Replaced(Option<u64>),
-    Pong,
+    /// The answering daemon's version, which is the point of the exchange.
+    ///
+    /// A Ping used to ask only "is anything there?", and an old daemon answers
+    /// that as well as a new one — so `ensure_daemon` was satisfied by a daemon
+    /// running code from before every fix the CLI assumes. Carrying the version
+    /// makes the handshake ask the question that actually matters.
+    ///
+    /// This is also why it is a struct variant: an old daemon answers the bare
+    /// unit `"Pong"`, which no longer deserializes, so a stale daemon is
+    /// detectable even though it predates the version field entirely.
+    Pong {
+        version: String,
+    },
     Error(String),
 }
 
@@ -80,7 +92,9 @@ pub fn read_msg<R: BufRead, T: DeserializeOwned>(r: &mut R) -> std::io::Result<O
 /// Apply a request to the queue and produce the response.
 pub fn handle_request(req: Request, queue: &mut Queue) -> Response {
     match req {
-        Request::Ping => Response::Pong,
+        Request::Ping => Response::Pong {
+            version: crate::VERSION.to_string(),
+        },
         Request::Schedule(spec) => match queue.add(spec) {
             Ok(id) => Response::Scheduled(id),
             Err(e) => Response::Error(e.to_string()),
@@ -163,6 +177,13 @@ mod tests {
     fn ping_pongs() {
         let dir = tempfile::tempdir().unwrap();
         let mut q = Queue::load(dir.path().join("q.json")).unwrap();
-        assert_eq!(handle_request(Request::Ping, &mut q), Response::Pong);
+        assert_eq!(
+            handle_request(Request::Ping, &mut q),
+            Response::Pong {
+                version: crate::VERSION.to_string()
+            },
+            "a Pong must name the build that sent it: the CLI has no other way \
+             to tell a resident daemon from another version apart from this one"
+        );
     }
 }
