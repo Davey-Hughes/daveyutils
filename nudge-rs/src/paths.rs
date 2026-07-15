@@ -46,11 +46,22 @@ pub fn resolve_from(
     }
 }
 
+/// The user config dir: `$XDG_CONFIG_HOME`, else `<home>/.config`.
+pub fn config_dir(home: &Path, xdg_config: Option<&Path>) -> PathBuf {
+    xdg_config
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home.join(".config"))
+}
+
 /// Resolve paths from the current environment and OS.
 pub fn resolve() -> Paths {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = match std::env::var_os("HOME") {
+        Some(h) => PathBuf::from(h),
+        None => {
+            eprintln!("nudge: warning: $HOME is unset; using '.' for state paths");
+            PathBuf::from(".")
+        }
+    };
     let xdg_state = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
     let xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let os = if cfg!(target_os = "macos") {
@@ -85,6 +96,18 @@ mod tests {
         assert_eq!(p.state_dir, Path::new("/home/d/.local/state/nudge"));
         // No XDG_RUNTIME_DIR -> socket sits in the state dir.
         assert_eq!(p.socket, Path::new("/home/d/.local/state/nudge/nudge.sock"));
+    }
+
+    #[test]
+    fn config_dir_prefers_xdg_config_home() {
+        let d = config_dir(Path::new("/home/d"), Some(Path::new("/cfg")));
+        assert_eq!(d, Path::new("/cfg"));
+    }
+
+    #[test]
+    fn config_dir_falls_back_to_home_dot_config() {
+        let d = config_dir(Path::new("/home/d"), None);
+        assert_eq!(d, Path::new("/home/d/.config"));
     }
 
     #[test]
