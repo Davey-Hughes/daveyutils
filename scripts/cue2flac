@@ -127,6 +127,7 @@ mkdir -p "$output_dir"
 
 extracted=0
 skipped=0
+failed=0
 audio_idx=0     # ordinal within the audio programme; indexes track_names
 
 for (( i = 0; i < num_tracks; i++ )); do
@@ -178,15 +179,25 @@ for (( i = 0; i < num_tracks; i++ )); do
         printf 'Track %02d: (~%s) -> %s\n' "$track_num" "$duration_str" "$outfile"
     fi
 
-    dd if="$img_file" bs=$sector_size skip="$start_sector" count="$num_sectors" status=none | \
+    # Guarded, not a bare statement: as a bare statement the pipeline is not
+    # errexit-exempt, so one bad track boundary or codec hiccup killed the whole
+    # extraction under `set -e` -- the remaining tracks were never extracted, the
+    # summary never printed, and the partial FLAC was left on disk. `pipefail`
+    # widens it to a SIGPIPE or error from `dd` alone. Warn and continue, the way
+    # every rewritten sibling script does, and report the count.
+    if dd if="$img_file" bs=$sector_size skip="$start_sector" count="$num_sectors" status=none | \
         ffmpeg -y -hide_banner -loglevel error \
             -f s16le -ar 44100 -ac 2 \
             -i pipe:0 \
             "${metadata_args[@]}" \
-            "$outfile"
-
-    (( extracted++ )) || true
+            "$outfile"; then
+        (( extracted++ )) || true
+    else
+        printf 'WARN: extraction failed for track %02d -> %s\n' "$track_num" "$outfile" >&2
+        rm -f "$outfile"
+        failed=$(( failed + 1 ))
+    fi
 done
 
 echo
-echo "Done: $extracted track(s) extracted, $skipped skipped."
+echo "Done: $extracted track(s) extracted, $skipped skipped, $failed failed."

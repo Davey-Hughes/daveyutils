@@ -127,4 +127,28 @@ check "M13: all-audio disc numbers from 01" "yes" \
 check "M13: all-audio disc metadata is 1/12" "yes" \
     "$(grep -q 'track=1/12' "$m13c/ffmpeg.log" && echo yes || echo no)"
 
+# --- M12: one failing track must not abort the extraction ---------------------
+# The `dd | ffmpeg` pipeline was a bare statement under top-level `set -e`, so a
+# single bad boundary or codec hiccup killed the whole run: later tracks were
+# never extracted, the summary never printed, and the partial FLAC was left on
+# disk. Every rewritten sibling script guarantees the opposite (warn, continue,
+# accurate summary) -- cue2flac is the one that was never rewritten.
+m12="$WORKDIR/m12"
+make_disc "$m12" 3 no
+m12out=$(FFMPEG_FAIL_MATCH="02 - " run_cue2flac "$m12" -t "$(tracklist 3)")
+m12rc=$?
+check "M12: a failing track does not abort the run" "0" "$m12rc"
+check "M12: the track before the failure was extracted" "yes" \
+    "$([ -f "$m12/out/01 - Song 01.flac" ] && echo yes || echo no)"
+check "M12: the track AFTER the failure was still extracted" "yes" \
+    "$([ -f "$m12/out/03 - Song 03.flac" ] && echo yes || echo no)"
+check "M12: the partial output of the failed track is removed" "no" \
+    "$([ -f "$m12/out/02 - Song 02.flac" ] && echo yes || echo no)"
+check "M12: the summary still prints, counting 2 extracted" "yes" \
+    "$(printf '%s' "$m12out" | grep -q '2 track(s) extracted' && echo yes || echo no)"
+check "M12: the summary reports the failure" "yes" \
+    "$(printf '%s' "$m12out" | grep -q '1 failed' && echo yes || echo no)"
+check "M12: the failure is WARNed on stderr" "yes" \
+    "$(grep -q 'WARN.*track 02' "$m12/stderr.log" && echo yes || echo no)"
+
 finish
