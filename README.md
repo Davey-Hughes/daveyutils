@@ -45,3 +45,8 @@ make help     # list targets
   nudge did not fire; `--notify` reports the same outcomes at the time.
 - `tests/` — bash test-suite (`bash tests/run.sh`); Rust tests live in `nudge-rs/`.
 - `packaging/` — Homebrew formula and AUR PKGBUILDs for `nudge`.
+- `docs/superpowers/` — the written record behind the code, and it is tracked, not
+  scratch: `specs/` (design docs — including the one for the nudge rewrite above),
+  `plans/` (the increment-by-increment implementation plans), and `reviews/` (review
+  findings and their dispositions). Worth reading before a non-trivial change, and
+  worth updating alongside one.
