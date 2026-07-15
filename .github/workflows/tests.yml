@@ -39,3 +39,47 @@ jobs:
 
       - name: Run test-suite
         run: bash tests/run.sh
+
+  # The Makefile is how every utility here gets onto a PATH, and until now no
+  # workflow ran it: `make`, `make check` and `make link` had no CI at all. A
+  # `make` that exits 0 while installing a non-functional bin/ therefore shipped
+  # green -- which is exactly how the CARGO_TARGET_DIR dangling-symlink bug got
+  # out, caught only by hand.
+  #
+  # Ubuntu only, and deliberately: `make check` also runs `cargo test`, so
+  # putting it on the macOS leg above would mean provisioning a Rust toolchain
+  # and paying for a second macOS Rust build that nudge-rs.yml already does --
+  # for zero extra bash coverage, since the suite it runs is the same one. The
+  # gap this closes is "nothing drives the Makefile", not "the Makefile is
+  # untested on macOS", so it is exercised once, here.
+  make:
+    name: make (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+
+      # `make check` runs the bash suite, which wants tmux + at (the e2e files
+      # self-skip without them -- installing them keeps `make check` here
+      # equivalent to the matrix job's run rather than a quietly emptier one).
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y tmux at
+
+      - name: make
+        run: make
+
+      # `test -x` follows the symlink, so a dangling bin/nudge fails here
+      # instead of reporting success -- precisely the failure mode the rest of
+      # CI cannot see. `test -L` pins the other half of the Makefile's promise:
+      # the scripts are symlinked, so editing one takes effect immediately.
+      - name: Installed utilities resolve
+        run: |
+          test -x bin/nudge
+          test -L bin/bisect_img
+          test -x bin/bisect_img
+          ./bin/nudge --version
+
+      # The documented entry point itself, rather than a parallel copy of what
+      # it happens to run today.
+      - name: make check
+        run: make check

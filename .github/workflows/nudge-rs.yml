@@ -1,10 +1,14 @@
 name: nudge-rs
 
+# Makefile is in the filter because it drives cargo (build-nudge, check,
+# distclean all shell out to it): editing it can break the Rust build without
+# touching a single file under nudge-rs/, and the filter as written skipped the
+# whole workflow in that case.
 on:
   push:
-    paths: ['nudge-rs/**', '.github/workflows/nudge-rs.yml']
+    paths: ['nudge-rs/**', 'Makefile', '.github/workflows/nudge-rs.yml']
   pull_request:
-    paths: ['nudge-rs/**', '.github/workflows/nudge-rs.yml']
+    paths: ['nudge-rs/**', 'Makefile', '.github/workflows/nudge-rs.yml']
 
 jobs:
   check:
