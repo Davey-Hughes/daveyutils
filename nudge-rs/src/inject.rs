@@ -8,20 +8,31 @@ use crate::job::Job;
 use crate::target::Target;
 
 /// The result of an injection attempt.
+///
+/// The two skips are separate variants because they are separate stories, and a
+/// user staring at a nudge that did not fire needs to know which one they got:
+/// "the banner was gone" says the session had already come back on its own,
+/// while "the pane changed" says *you* touched it. Collapsed into one outcome,
+/// the notification can only say "skipped", which reads uncomfortably close to
+/// the failure this whole design exists to avoid -- nudge silently not firing.
 #[derive(Debug, PartialEq, Eq)]
 pub enum InjectOutcome {
     /// Messages were sent; carries how many.
     Sent(usize),
     /// `--verify` was on and the pane no longer showed a rate-limit banner, so
     /// nothing was sent (the session was likely already resumed).
-    SkippedVerify,
+    SkippedNoBanner,
+    /// `--verify` was on and the pane had changed since the job was scheduled,
+    /// so the user has resumed this session themselves.
+    SkippedResumed,
 }
 
 /// Execute `job`'s injection against `target`.
 ///
-/// With `job.verify`, the pane is captured and checked for a rate-limit banner
-/// first; if none is present the send is skipped. Otherwise each message is
-/// typed and submitted, pausing `job.send_delay_secs` between messages.
+/// With `job.verify`, the pane is gated twice before anything is typed: it must
+/// not have moved since the job was scheduled (the recency gate), and it must
+/// still show a rate-limit banner. Otherwise each message is typed and
+/// submitted, pausing `job.send_delay_secs` between messages.
 pub fn run_injection(
     target: &dyn Target,
     job: &Job,
@@ -30,9 +41,28 @@ pub fn run_injection(
     dur_ext: Option<&str>,
 ) -> Result<InjectOutcome> {
     if job.verify {
+        // Dims first: a capture that fails is an Err (the pane is gone, tmux is
+        // down), which the caller retries or reports. It is deliberately not a
+        // skip -- an unreachable pane is a failure to say out loud, not a
+        // decision that the user resumed.
+        let now_dims = target.dims();
         let screen = target.capture()?;
+
+        // Has the pane moved since the user scheduled this? Only `Changed` --
+        // same size, different content -- stops the nudge. Everything else,
+        // including every way of being unsure, falls through to the banner
+        // check below, which is exactly what nudge did before this gate existed.
+        if crate::verify::recency(
+            job.verify_baseline(),
+            &crate::verify::fingerprint(&screen),
+            now_dims,
+        ) == crate::verify::Recency::Changed
+        {
+            return Ok(InjectOutcome::SkippedResumed);
+        }
+
         if detect_reset(&screen, now, clock_ext, dur_ext).is_none() {
-            return Ok(InjectOutcome::SkippedVerify);
+            return Ok(InjectOutcome::SkippedNoBanner);
         }
     }
 
@@ -146,7 +176,190 @@ mod tests {
     fn verify_skips_when_banner_gone() {
         let t = FakeTarget::new("all done, no limits here");
         let out = run_injection(&t, &job(true, &["go"]), &now(), None, None).unwrap();
-        assert_eq!(out, InjectOutcome::SkippedVerify);
+        assert_eq!(out, InjectOutcome::SkippedNoBanner);
         assert!(t.sent.borrow().is_empty());
+    }
+
+    // ---- the recency gate (finding I19) ----
+
+    /// The pane as it looked when the user scheduled: parked at the banner.
+    const PARKED: &str = "\
+● Working on it...
+⏸ session limit reached · resets 3:00am
+
+❯ ";
+
+    /// `job`, snapshotted against `screen` as `capture_baseline` would at
+    /// schedule time.
+    fn job_snapshotted_at(screen: &str, messages: &[&str]) -> Job {
+        Job {
+            verify_fingerprint: Some(crate::verify::fingerprint(screen)),
+            verify_dims: Some(DIMS),
+            ..job(true, messages)
+        }
+    }
+
+    /// Finding I19 itself. 23:00: Claude prints the banner, the user schedules
+    /// for 03:03. 03:01: the user resumes by hand and Claude answers. 03:03: the
+    /// 03:00 banner is *still on screen* a few lines up, so the banner check
+    /// passes and nudge types "please continue" into the session the user is
+    /// actively using -- the exact outcome `--verify` advertises it prevents.
+    #[test]
+    fn verify_skips_when_the_user_resumed_and_the_stale_banner_is_still_on_screen() {
+        let resumed = "\
+● Working on it...
+⏸ session limit reached · resets 3:00am
+● Sure -- resuming now.
+● All 40 tests pass.
+
+❯ ";
+        let t = FakeTarget::new(resumed);
+        let out = run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None)
+            .unwrap();
+        assert_eq!(
+            out,
+            InjectOutcome::SkippedResumed,
+            "the banner is still on screen, but the pane moved since we scheduled: \
+             the user resumed and nudge must not type into their live session"
+        );
+        assert!(
+            t.sent.borrow().is_empty(),
+            "nothing may be typed into a session the user already resumed"
+        );
+    }
+
+    /// The disaster guard, and the reason the polarity above is not simply
+    /// "skip whenever unsure": a pane still parked at its banner at fire time is
+    /// the whole point of the tool. If this ever goes red, the overnight nudge
+    /// silently never fires.
+    #[test]
+    fn verify_sends_when_the_pane_is_untouched_since_scheduling() {
+        let t = FakeTarget::new(PARKED);
+        let out = run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None)
+            .unwrap();
+        assert_eq!(
+            out,
+            InjectOutcome::Sent(1),
+            "an untouched pane still parked at its banner is exactly what nudge exists to resume"
+        );
+        assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
+    }
+
+    /// Why the fingerprint covers the whole capture rather than tracking the
+    /// banner's row offset. The pane is not yet full, so the resumed output
+    /// appends into blank space *below* the banner and nothing scrolls: the
+    /// banner sits at the same offset in both captures, and an offset-tracking
+    /// design would call this untouched and inject into a live session.
+    #[test]
+    fn verify_skips_when_output_appends_below_the_banner_without_scrolling() {
+        let appended = "\
+● Working on it...
+⏸ session limit reached · resets 3:00am
+● Sure -- resuming now.
+
+❯ ";
+        // The property the test rests on: the banner did not move.
+        let banner_row = |s: &str| {
+            s.lines()
+                .position(|l| l.contains("session limit reached"))
+                .unwrap()
+        };
+        assert_eq!(
+            banner_row(PARKED),
+            banner_row(appended),
+            "precondition: nothing scrolled, so the banner is at the same offset in both"
+        );
+        let t = FakeTarget::new(appended);
+        let out = run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None)
+            .unwrap();
+        assert_eq!(
+            out,
+            InjectOutcome::SkippedResumed,
+            "the banner never moved, so only a whole-capture hash can see this pane changed"
+        );
+    }
+
+    // ---- fail-open paths: each one must INJECT, never skip ----
+
+    /// The user resized the window between scheduling and firing. tmux reflowed
+    /// the capture, so the fingerprint differs for reasons that have nothing to
+    /// do with the user resuming. Unsure means inject.
+    #[test]
+    fn verify_fails_open_and_sends_when_the_pane_was_resized() {
+        let reflowed = "● Working on it... ⏸ session limit reached · resets 3:00am\n\n❯ ";
+        let t = FakeTarget::resized(
+            reflowed,
+            crate::target::PaneDims {
+                width: 120,
+                height: 24,
+            },
+        );
+        let out = run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None)
+            .unwrap();
+        assert_eq!(
+            out,
+            InjectOutcome::Sent(1),
+            "a resize reflows every line; reading that as 'the user resumed' would \
+             make a resized window silently never fire"
+        );
+    }
+
+    /// A job scheduled by a build from before this gate existed, as the daemon
+    /// reloads it from queue.json. It carries no snapshot and must behave
+    /// exactly as it did then: banner present -> inject.
+    #[test]
+    fn verify_fails_open_and_sends_for_an_old_job_with_no_baseline() {
+        let t = FakeTarget::new(PARKED);
+        let mut j = job(true, &["go"]);
+        j.verify_fingerprint = None;
+        j.verify_dims = None;
+        let out = run_injection(&t, &j, &now(), None, None).unwrap();
+        assert_eq!(
+            out,
+            InjectOutcome::Sent(1),
+            "no snapshot means no opinion about recency, which must not become a skip"
+        );
+    }
+
+    /// tmux would not say how big the pane is, so the two captures are not
+    /// comparable.
+    #[test]
+    fn verify_fails_open_and_sends_when_the_pane_dims_are_unreadable() {
+        let t = FakeTarget::with_unknown_dims("● busy\n⏸ session limit reached · resets 3:00am");
+        let out = run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None)
+            .unwrap();
+        assert_eq!(
+            out,
+            InjectOutcome::Sent(1),
+            "unknown dims means not comparable, which fails open to the banner check"
+        );
+    }
+
+    /// Fail-open reaches the banner check; it does not bypass it. An old job
+    /// whose pane shows no banner is still a skip -- just a differently-named
+    /// one.
+    #[test]
+    fn failing_open_still_runs_the_banner_check() {
+        let t = FakeTarget::new("all done, no limits here");
+        let mut j = job(true, &["go"]);
+        j.verify_fingerprint = None;
+        let out = run_injection(&t, &j, &now(), None, None).unwrap();
+        assert_eq!(out, InjectOutcome::SkippedNoBanner);
+    }
+
+    /// The gate is `--verify`'s alone: without the flag, a changed pane is not a
+    /// reason to withhold anything.
+    #[test]
+    fn a_changed_pane_does_not_gate_a_job_without_verify() {
+        let t = FakeTarget::new("totally different");
+        let j = Job {
+            verify_fingerprint: Some(crate::verify::fingerprint(PARKED)),
+            verify_dims: Some(DIMS),
+            ..job(false, &["go"])
+        };
+        assert_eq!(
+            run_injection(&t, &j, &now(), None, None).unwrap(),
+            InjectOutcome::Sent(1)
+        );
     }
 }

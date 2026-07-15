@@ -181,7 +181,7 @@ mod tests {
         assert!(should_notify(&job(true), &Ok(InjectOutcome::Sent(1))));
         assert!(!should_notify(
             &job(true),
-            &Ok(InjectOutcome::SkippedVerify)
+            &Ok(InjectOutcome::SkippedNoBanner)
         ));
         assert!(!should_notify(&job(false), &Ok(InjectOutcome::Sent(1))));
         assert!(!should_notify(&job(true), &Err(anyhow::anyhow!("boom"))));
