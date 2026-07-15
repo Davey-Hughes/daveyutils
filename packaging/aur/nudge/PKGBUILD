@@ -12,7 +12,12 @@ provides=('nudge')
 conflicts=('nudge-git')
 # Release tags are named `nudge-v$pkgver`.
 source=("$pkgname-$pkgver.tar.gz::https://github.com/Davey-Hughes/daveyutils/archive/refs/tags/nudge-v$pkgver.tar.gz")
-sha256sums=('SKIP')  # replace SKIP with the tarball sha256 on release
+# NOTE: this is an intentionally-invalid placeholder hash. It is NOT `SKIP`
+# on purpose — a source package must verify its tarball, so this is left in a
+# state that makepkg REFUSES to build until the real release-tarball sha256 is
+# filled in (`updpkgsums` after the `nudge-v$pkgver` tag exists). Do not change
+# it to `SKIP`; that would ship the package with integrity verification disabled.
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
 
 build() {
   cd "daveyutils-nudge-v$pkgver/nudge-rs"
