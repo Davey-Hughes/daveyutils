@@ -193,6 +193,24 @@ mod tests {
     }
 
     #[test]
+    fn no_auto_retry_beats_a_retry_count_in_either_order() {
+        // `-r` implies auto-retry, but only when the user did not say otherwise.
+        // Order must not matter: both spellings are the same stated intent, and
+        // clap hands them to us as flags either way.
+        for args in [
+            ["nudge", "-p", "x", "-r", "5", "--no-auto-retry"],
+            ["nudge", "-p", "x", "--no-auto-retry", "-r", "5"],
+        ] {
+            let t = resolve_flags(&env(false), &args);
+            assert!(
+                !t.auto_retry,
+                "--no-auto-retry must disable auto-retry given {args:?}"
+            );
+            assert_eq!(t.retries, 5, "the count is still recorded given {args:?}");
+        }
+    }
+
+    #[test]
     fn no_notify_beats_a_bare_notify_env() {
         // NUDGE_NOTIFY=1 in the environment, --no-notify on the command line.
         let t = resolve_flags(&env(true), &["nudge", "-p", "x", "--no-notify"]);
