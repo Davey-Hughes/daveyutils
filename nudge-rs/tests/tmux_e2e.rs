@@ -168,3 +168,178 @@ fn end_to_end_injection_verifies_then_sends() {
         "sent message not visible in pane; got:\n{screen}"
     );
 }
+
+// ---- the recency gate against a real tmux server ----
+
+/// Everything the gate's fail-open depends on rests on tmux's actual behavior
+/// here, not on our reading of the docs. `display-message` on a pane that does
+/// not exist prints the empty fields `"x"` and **exits 0** -- a missing pane is
+/// not an error to tmux. `PaneDims::parse` must reject that rather than read it
+/// as `0x0`, which would compare equal to the next unreadable pane's and turn
+/// "no idea how big this is" into a confident verdict.
+#[test]
+fn dims_reads_the_real_pane_size_and_refuses_a_pane_that_is_gone() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    assert_eq!(
+        server.target().dims(),
+        Some(nudge::target::PaneDims {
+            width: 80,
+            height: 24
+        }),
+        "the session is started -x 80 -y 24"
+    );
+
+    let gone = TmuxTarget::with_socket("no-such-pane", &server.socket);
+    assert_eq!(
+        gone.dims(),
+        None,
+        "tmux answers a missing pane with a bare \"x\" and exit 0; reading that as \
+         0x0 would manufacture comparable dims out of nothing"
+    );
+}
+
+/// The resize confound, against real tmux: the design's one known way for a
+/// fingerprint to change without the user touching anything. If `dims` did not
+/// notice a width-only resize, the reflowed capture would read as "the user
+/// resumed" and the nudge would silently never fire.
+#[test]
+fn dims_notices_a_width_only_resize() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let before = server.target().dims().unwrap();
+
+    let ok = Command::new("tmux")
+        .args([
+            "-L",
+            &server.socket,
+            "resize-window",
+            "-t",
+            "s",
+            "-x",
+            "120",
+            "-y",
+            "24",
+        ])
+        .status()
+        .unwrap()
+        .success();
+    if !ok {
+        eprintln!("skipping: this tmux cannot resize-window");
+        return;
+    }
+    thread::sleep(Duration::from_millis(300));
+
+    let after = server.target().dims().unwrap();
+    assert_ne!(
+        before, after,
+        "a width-only resize must be visible in dims: it is invisible in the capture \
+         text, which is exactly why we ask tmux instead of counting lines"
+    );
+    assert_eq!(after.width, 120);
+}
+
+/// The I19 scenario end to end against a real pane: banner staged, snapshot
+/// taken, then real output arrives (the user resuming), then fire.
+#[test]
+fn end_to_end_verify_skips_a_pane_that_moved_after_the_snapshot() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    server.stage("printf 'quota reached. Resets in 45m\\n'");
+    thread::sleep(Duration::from_millis(500));
+
+    let target = server.target();
+    // Schedule time: snapshot the pane parked at its banner.
+    let base = nudge::verify::capture_baseline(&target).expect("a live pane must snapshot");
+
+    // The user resumes by hand: real output lands, and the banner scrolls up but
+    // stays on screen -- which is the whole of finding I19.
+    server.stage("printf 'resumed by hand\\n'");
+    thread::sleep(Duration::from_millis(500));
+    let screen = target.capture().unwrap();
+    assert!(
+        screen.contains("quota reached"),
+        "precondition: the stale banner is still on screen, so the banner check \
+         alone would still inject; got:\n{screen}"
+    );
+
+    let job = Job {
+        id: 1,
+        target: TargetSpec::Tmux { pane: "s".into() },
+        messages: vec!["echo nudge_should_not_appear_$((6*7))".into()],
+        send_delay_secs: 0.0,
+        fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
+        notify: false,
+        verify: true,
+        auto_retry: false,
+        retries_left: 0,
+        settle_secs: 5.0,
+        verify_fingerprint: Some(base.fingerprint),
+        verify_dims: Some(base.dims),
+    };
+    let out = run_injection(&target, &job, &fixed_now(), None, None).unwrap();
+    assert_eq!(out, InjectOutcome::SkippedResumed);
+
+    thread::sleep(Duration::from_millis(300));
+    let after = target.capture().unwrap();
+    assert!(
+        !after.contains("nudge_should_not_appear_42"),
+        "nothing may reach a pane the user already resumed; got:\n{after}"
+    );
+}
+
+/// The other half, against a real pane: untouched since the snapshot, banner
+/// still up -> fire. This is the one that would catch the gate being wired
+/// backwards, which would make every overnight nudge silently never fire.
+#[test]
+fn end_to_end_verify_still_fires_into_a_pane_nobody_touched() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    server.stage("printf 'quota reached. Resets in 45m\\n'");
+    thread::sleep(Duration::from_millis(500));
+
+    let target = server.target();
+    let base = nudge::verify::capture_baseline(&target).expect("a live pane must snapshot");
+    // Nobody touches the pane. A parked pane is idle, and idle is byte-identical.
+    thread::sleep(Duration::from_millis(700));
+
+    let job = Job {
+        id: 1,
+        target: TargetSpec::Tmux { pane: "s".into() },
+        messages: vec!["echo nudge_fired_$((6*7))".into()],
+        send_delay_secs: 0.0,
+        fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
+        notify: false,
+        verify: true,
+        auto_retry: false,
+        retries_left: 0,
+        settle_secs: 5.0,
+        verify_fingerprint: Some(base.fingerprint),
+        verify_dims: Some(base.dims),
+    };
+    let out = run_injection(&target, &job, &fixed_now(), None, None).unwrap();
+    assert_eq!(
+        out,
+        InjectOutcome::Sent(1),
+        "an untouched pane still parked at its banner is exactly what nudge exists for"
+    );
+
+    thread::sleep(Duration::from_millis(500));
+    let after = target.capture().unwrap();
+    assert!(
+        after.contains("nudge_fired_42"),
+        "the message must reach the pane; got:\n{after}"
+    );
+}
