@@ -104,16 +104,25 @@ pub(crate) fn flag_overrides(cli: &Cli) -> FlagOverrides {
     }
 }
 
+/// The default retry budget: `NUDGE_RETRIES`, else 2.
+///
+/// Read through one function because two paths must agree on it: a fresh
+/// schedule (below) and `--edit <id> --auto-retry`, which has no budget of its
+/// own to inherit and must arm the same count a fresh schedule would.
+pub fn default_retries() -> i64 {
+    std::env::var("NUDGE_RETRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2)
+}
+
 /// The `NUDGE_*` environment defaults.
 fn env_toggles() -> Toggles {
     Toggles {
         notify: env_bool(std::env::var("NUDGE_NOTIFY").ok().as_deref()),
         verify: env_bool(std::env::var("NUDGE_VERIFY").ok().as_deref()),
         auto_retry: env_bool(std::env::var("NUDGE_AUTO_RETRY").ok().as_deref()),
-        retries: std::env::var("NUDGE_RETRIES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2),
+        retries: default_retries(),
         settle_secs: std::env::var("NUDGE_SETTLE_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -190,6 +199,17 @@ mod tests {
         let t = resolve_flags(&env(false), &["nudge", "-p", "x", "-r", "5"]);
         assert!(t.auto_retry);
         assert_eq!(t.retries, 5);
+    }
+
+    #[test]
+    fn the_edit_fallback_and_a_fresh_schedule_share_one_default() {
+        // `--edit <id> --auto-retry` arms its budget from `default_retries()`;
+        // a fresh `-p x --auto-retry` arms it from `env_toggles()`. If those
+        // ever diverge, the same flag means two different things depending on
+        // which command you reached for -- the inconsistency the edit fix
+        // exists to close. Both read the same var, so this holds whatever the
+        // ambient NUDGE_RETRIES says and mutates nothing.
+        assert_eq!(env_toggles().retries, default_retries());
     }
 
     #[test]

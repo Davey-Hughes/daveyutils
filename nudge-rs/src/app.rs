@@ -153,13 +153,30 @@ pub fn cancel(id: u64) -> anyhow::Result<()> {
 
 /// Merge a pending job with the edit CLI's explicitly-passed flags, preserving
 /// the job's existing values for anything not passed. Env defaults are NOT
-/// consulted (unlike a fresh schedule) — only the job + explicit flags.
-pub fn merge_edit(job: &Job, cli: &Cli, now: &Zoned) -> anyhow::Result<JobSpec> {
+/// consulted (unlike a fresh schedule) — only the job, the explicit flags, and
+/// `default_retries` (the caller's `NUDGE_RETRIES` default, passed in rather
+/// than read here so this stays pure and its tests cannot race the env).
+pub fn merge_edit(
+    job: &Job,
+    cli: &Cli,
+    now: &Zoned,
+    default_retries: i64,
+) -> anyhow::Result<JobSpec> {
     let base = Toggles {
         notify: job.notify,
         verify: job.verify,
         auto_retry: job.auto_retry,
-        retries: job.retries_left,
+        // A job scheduled without auto-retry stores retries_left == 0, so seeding
+        // the base straight from the job made `--edit <id> --auto-retry` (no -r)
+        // resolve to auto_retry=true with a budget of 0 — which apply_outcome
+        // reads as exhausted, deleting the job on its first fire while the CLI
+        // reported a successful edit. Fall back to the count a fresh schedule
+        // would arm; an explicit -r still overrides it below.
+        retries: if job.retries_left == 0 {
+            default_retries
+        } else {
+            job.retries_left
+        },
         settle_secs: job.settle_secs,
     };
     let overrides = crate::config::FlagOverrides {
@@ -214,7 +231,7 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no pending job with id {id}"))?;
 
     let now = Zoned::now();
-    let spec = merge_edit(&job, cli, &now)?;
+    let spec = merge_edit(&job, cli, &now, crate::cli::default_retries())?;
 
     // Schedule the replacement FIRST so a failure can't lose the original.
     let new_id = match client::request(&socket(), &Request::Schedule(spec))? {
