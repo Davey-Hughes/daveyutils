@@ -19,8 +19,10 @@ pub fn serve_once(listener: &UnixListener, queue: &Mutex<Queue>) -> std::io::Res
 /// by the daemon (increment 3b).
 ///
 /// A per-connection error (a malformed request, or a client that disconnects
-/// before reading the reply) is logged and the loop continues; only a fatal
-/// `accept()` error ends the loop.
+/// before reading the reply) is logged and the loop continues. A transient
+/// `accept()` error (a peer vanishing mid-handshake, a signal, or a momentary
+/// fd shortage) is also retried; only a genuinely fatal listener error ends the
+/// loop.
 pub fn serve(socket: &Path, queue: Arc<Mutex<Queue>>) -> std::io::Result<()> {
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir)?;
@@ -55,10 +57,24 @@ pub fn serve(socket: &Path, queue: Arc<Mutex<Queue>>) -> std::io::Result<()> {
                     tracing::warn!("nudge ipc: connection error: {e}");
                 }
             }
-            Err(e) => {
-                tracing::error!("nudge ipc: accept failed, stopping: {e}");
-                return Err(e);
-            }
+            Err(e) => match e.kind() {
+                // A peer vanished mid-handshake, or a signal interrupted us.
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted => {
+                    tracing::debug!("nudge ipc: transient accept error: {e}");
+                    continue;
+                }
+                _ => {
+                    // EMFILE/ENFILE (out of descriptors) is also transient, but
+                    // hammering accept() would spin: back off briefly and retry.
+                    if matches!(e.raw_os_error(), Some(24) | Some(23)) {
+                        tracing::warn!("nudge ipc: accept: {e}; backing off");
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        continue;
+                    }
+                    tracing::error!("nudge ipc: accept failed, stopping: {e}");
+                    return Err(e);
+                }
+            },
         }
     }
 }

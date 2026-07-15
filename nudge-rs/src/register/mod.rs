@@ -60,8 +60,11 @@ pub fn install(exec: &Path) -> anyhow::Result<()> {
     // An ad-hoc daemon (auto-started by `nudge -p ...`) still owns the socket.
     // Enabling the unit now would start a second daemon that immediately dies on
     // the singleton lock, and systemd would retry it every RestartSec forever.
+    // But if the live daemon IS our managed unit, re-running --install-daemon
+    // (e.g. after the binary moved) is idempotent and must not be blocked.
     let paths = crate::paths::resolve();
-    if std::os::unix::net::UnixStream::connect(&paths.socket).is_ok() {
+    if std::os::unix::net::UnixStream::connect(&paths.socket).is_ok() && !managed_daemon_is_active()
+    {
         anyhow::bail!(
             "a nudge daemon is already running (socket {}).\n\
              Stop it first, then re-run --install-daemon:\n  pkill -f 'nudge --daemon'",
@@ -126,6 +129,27 @@ pub fn uninstall() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Is the daemon currently answering actually our managed service (as opposed to
+/// an ad-hoc one auto-started by `nudge -p ...`)? Re-installing over our own unit
+/// is idempotent and fine; starting a unit over an ad-hoc daemon is not.
+fn managed_daemon_is_active() -> bool {
+    match Manager::current() {
+        Manager::Systemd => std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", "nudged.service"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        Manager::Launchd => std::process::Command::new("launchctl")
+            .args([
+                "print",
+                &format!("gui/{}/{}", current_uid(), launchd::LABEL),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false),
+    }
 }
 
 /// Current user's uid (via `id -u`, portable across Linux/macOS without libc).
