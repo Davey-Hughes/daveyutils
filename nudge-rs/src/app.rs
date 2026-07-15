@@ -15,16 +15,40 @@ use crate::detect::detect_reset;
 use crate::ipc::{client, Request, Response};
 use crate::job::{Job, JobSpec, TargetSpec};
 use crate::paths;
-use crate::target::{tmux::TmuxTarget, Target};
+use crate::target::{tmux::TmuxTarget, PaneDims, Target};
 use crate::timespec::parse_timespec;
 
+/// Split a `--verify` snapshot into the two fields a JobSpec stores.
+///
+/// `None` in, `None`s out — a pane that could not be snapshotted arms no
+/// recency gate, and a job with no snapshot fails open at fire time to the
+/// banner check nudge has always done. Scheduling never fails over this.
+fn baseline_fields(b: Option<crate::verify::Baseline>) -> (Option<String>, Option<PaneDims>) {
+    match b {
+        Some(b) => (Some(b.fingerprint), Some(b.dims)),
+        None => (None, None),
+    }
+}
+
 /// Assemble a JobSpec from resolved options.
-pub fn build_spec(pane: &str, fire_at: jiff::Timestamp, cli: &Cli, opts: &Toggles) -> JobSpec {
+///
+/// `baseline` is the pane snapshot the recency gate compares against at fire
+/// time; the caller takes it (only when `--verify` is on) so this stays pure.
+pub fn build_spec(
+    pane: &str,
+    fire_at: jiff::Timestamp,
+    cli: &Cli,
+    opts: &Toggles,
+    baseline: Option<crate::verify::Baseline>,
+) -> JobSpec {
     let messages = if cli.input.is_empty() {
         vec!["please continue".to_string()]
     } else {
         cli.input.clone()
     };
+    // Without --verify nothing ever reads these, and storing a snapshot for a
+    // job that will not consult one is just a stale fingerprint in queue.json.
+    let (verify_fingerprint, verify_dims) = baseline_fields(baseline.filter(|_| opts.verify));
     JobSpec {
         target: TargetSpec::Tmux {
             pane: pane.to_string(),
@@ -37,9 +61,22 @@ pub fn build_spec(pane: &str, fire_at: jiff::Timestamp, cli: &Cli, opts: &Toggle
         auto_retry: opts.auto_retry,
         retries_left: if opts.auto_retry { opts.retries } else { 0 },
         settle_secs: opts.settle_secs,
-        verify_fingerprint: None,
-        verify_dims: None,
+        verify_fingerprint,
+        verify_dims,
     }
+}
+
+/// Snapshot `pane` for the recency gate, but only when `--verify` is on.
+///
+/// The one production seam that takes a real capture for the gate. Never
+/// fallible: a pane that will not answer yields no snapshot, and a job with no
+/// snapshot fails open. `--verify` failing to arm must never be a reason the
+/// user's nudge does not get scheduled at all.
+fn snapshot_pane(pane: &str, opts: &Toggles) -> Option<crate::verify::Baseline> {
+    if !opts.verify {
+        return None;
+    }
+    crate::verify::capture_baseline(&TmuxTarget::new(pane))
 }
 
 /// Determine the fire time: explicit `-m`, else auto-detect from the pane.
@@ -178,7 +215,10 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
     let opts = resolve_options(cli);
     let now = Zoned::now();
     let fire_at = fire_time(cli, &pane, &now)?;
-    let spec = build_spec(&pane, fire_at, cli, &opts);
+    // Snapshot last, and only for --verify: this is the "before" the fire-time
+    // gate compares against, so it wants to be as close to the user's actual
+    // parked-at-the-banner pane as we can get it.
+    let spec = build_spec(&pane, fire_at, cli, &opts, snapshot_pane(&pane, &opts));
 
     match request(&live_socket()?, &Request::Schedule(spec))? {
         Response::Scheduled(id) => {
@@ -252,11 +292,16 @@ pub fn cancel(id: u64) -> anyhow::Result<()> {
 /// consulted (unlike a fresh schedule) — only the job, the explicit flags, and
 /// `default_retries` (the caller's `NUDGE_RETRIES` default, passed in rather
 /// than read here so this stays pure and its tests cannot race the env).
+/// `snapshot` is the effect `merge_edit` cannot take itself: it is handed the
+/// *resolved* pane and toggles, because an edit may move the job to a new pane
+/// (`-p`) or turn `--verify` on, and the snapshot has to describe the pane the
+/// job will actually watch. Production passes [`snapshot_pane`].
 pub fn merge_edit(
     job: &Job,
     cli: &Cli,
     now: &Zoned,
     default_retries: i64,
+    snapshot: &dyn Fn(&str, &Toggles) -> Option<crate::verify::Baseline>,
 ) -> anyhow::Result<JobSpec> {
     let base = Toggles {
         notify: job.notify,
@@ -299,6 +344,12 @@ pub fn merge_edit(
     } else {
         cli.input.clone()
     };
+    // Re-snapshot rather than carry the job's old one over. An edit is a
+    // re-schedule, and the pane the user is looking at *now* is the "before"
+    // they mean. Inheriting the original snapshot would compare the pane
+    // against however it looked hours ago, so any edit of a job whose pane had
+    // since moved would arm a gate that skips on sight.
+    let (verify_fingerprint, verify_dims) = baseline_fields(snapshot(&pane, &opts));
     Ok(JobSpec {
         target: TargetSpec::Tmux { pane },
         messages,
@@ -309,8 +360,8 @@ pub fn merge_edit(
         auto_retry: opts.auto_retry,
         retries_left: if opts.auto_retry { opts.retries } else { 0 },
         settle_secs: opts.settle_secs,
-        verify_fingerprint: None,
-        verify_dims: None,
+        verify_fingerprint,
+        verify_dims,
     })
 }
 
@@ -337,7 +388,13 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no pending job with id {id}"))?;
 
     let now = Zoned::now();
-    let spec = merge_edit(&job, cli, &now, crate::cli::default_retries())?;
+    let spec = merge_edit(
+        &job,
+        cli,
+        &now,
+        crate::cli::default_retries(),
+        &snapshot_pane,
+    )?;
 
     match request(&socket, &Request::Replace { id, spec })? {
         Response::Replaced(Some(new_id)) => {

@@ -108,14 +108,22 @@ mod tests {
             auto_retry: true,
             retries_left: -1,
             settle_secs: 5.0,
-            verify_fingerprint: None,
-            verify_dims: None,
+            verify_fingerprint: Some("c46eabc781d005dc".into()),
+            verify_dims: Some(PaneDims {
+                width: 80,
+                height: 24,
+            }),
         };
         let json = serde_json::to_string(&job).unwrap();
         let back: Job = serde_json::from_str(&json).unwrap();
         assert_eq!(job, back);
         // Target is externally tagged by `kind` for readable state files.
         assert!(json.contains(r#""kind":"Tmux""#));
+        // The snapshot is written by the CLI and read hours later by the daemon,
+        // possibly across a restart. A round-trip that silently dropped it would
+        // leave every --verify job failing open, i.e. back to the I19 bug, with
+        // nothing to show for it.
+        assert_eq!(back.verify_baseline(), job.verify_baseline());
     }
 
     /// A job written by a build that predates the recency fields, as a resident
