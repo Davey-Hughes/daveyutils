@@ -45,4 +45,22 @@ check "finish: an all-passing file exits 0" "yes" \
 tally=$(bash "$WORKDIR/failing.sh" 2>/dev/null | tail -1)
 check "finish: prints the tally before exiting" "== 0 passed, 1 failed ==" "$tally"
 
+# --- the suite's own file modes -----------------------------------------------
+# Every test_*.sh carries a `#!/usr/bin/env bash` shebang and is a runnable entry
+# point, so each must be executable -- `./tests/test_assert.sh` simply failed on
+# the ones committed 100644. run.sh invokes `bash "$t"`, so the suite itself
+# never noticed the mode drifting file by file.
+#
+# assert.sh and lib.sh are the other half of the rule: they are sourced, never
+# run, so they stay non-executable. Asserting both directions keeps this from
+# being "fixed" by chmod +x on everything.
+for t in "$HERE"/test_*.sh "$HERE"/run.sh; do
+    check "mode: $(basename "$t") is executable" "yes" \
+        "$([ -x "$t" ] && echo yes || echo no)"
+done
+for l in "$HERE"/assert.sh "$HERE"/lib.sh; do
+    check "mode: $(basename "$l") is sourced-only, not executable" "yes" \
+        "$([ -x "$l" ] && echo no || echo yes)"
+done
+
 finish
