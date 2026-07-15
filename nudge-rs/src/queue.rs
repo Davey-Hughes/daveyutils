@@ -72,6 +72,31 @@ impl Queue {
         Ok(true)
     }
 
+    /// Swap job `id` for `spec` in one transaction, returning the replacement's
+    /// id — or `None` if `id` was not there, in which case nothing changes.
+    ///
+    /// One commit, so an edit can never publish a state where both the original
+    /// and its replacement are live. Doing it as a separate `add` + `remove`
+    /// (which is what the CLI used to do over two round-trips) leaves exactly
+    /// that state in between, and anything that stops the second step — a daemon
+    /// restart, a stolen socket, a Ctrl-C — makes the message fire twice.
+    pub fn replace(&mut self, id: u64, spec: JobSpec) -> std::io::Result<Option<u64>> {
+        let mut next = self.state.clone();
+        let before = next.jobs.len();
+        next.jobs.retain(|j| j.id != id);
+        if next.jobs.len() == before {
+            // The original is gone (fired or cancelled since the caller listed
+            // it). Scheduling the replacement now would resurrect a job the user
+            // no longer has: all-or-nothing means nothing.
+            return Ok(None);
+        }
+        next.next_id += 1;
+        let new_id = next.next_id;
+        next.jobs.push(spec.into_job(new_id));
+        self.commit(next)?;
+        Ok(Some(new_id))
+    }
+
     /// Update a job's fire time and remaining retries; persist. Returns whether
     /// a job with `id` existed.
     pub fn reschedule(
@@ -250,6 +275,26 @@ mod tests {
             q.get(id).is_some(),
             "a remove that could not be persisted must not drop the job from memory"
         );
+    }
+
+    #[test]
+    fn a_failed_replace_leaves_exactly_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let mut q = Queue::load(sub.join("q.json")).unwrap();
+        let id = q.add(spec()).unwrap();
+        block_saving(&sub);
+
+        assert!(
+            q.replace(id, spec()).is_err(),
+            "save must fail for this test to mean anything"
+        );
+        // Neither leg may show. A live replacement alongside the original is the
+        // double-fire the atomic swap exists to prevent; dropping the original
+        // instead would lose the user's nudge outright.
+        assert_eq!(q.all().len(), 1, "a failed replace must not add a job");
+        assert_eq!(q.all()[0].id, id, "and must not drop the original");
     }
 
     #[test]

@@ -33,6 +33,16 @@ pub enum Request {
     Schedule(JobSpec),
     List,
     Cancel(u64),
+    /// Swap job `id` for `spec` atomically: `edit`'s whole mutation in one
+    /// request, applied under the daemon's queue lock.
+    ///
+    /// Doing it as Schedule-then-Cancel left both jobs live in between, so a
+    /// failure of the second leg fired the message twice. A round-trip cannot
+    /// half-apply, so there is no window to lose.
+    Replace {
+        id: u64,
+        spec: JobSpec,
+    },
     Ping,
 }
 
@@ -41,6 +51,8 @@ pub enum Response {
     Scheduled(u64),
     Jobs(Vec<Job>),
     Cancelled(bool),
+    /// The replacement's id, or `None` if the original was already gone.
+    Replaced(Option<u64>),
     Pong,
     Error(String),
 }
@@ -76,6 +88,10 @@ pub fn handle_request(req: Request, queue: &mut Queue) -> Response {
         Request::List => Response::Jobs(queue.all().to_vec()),
         Request::Cancel(id) => match queue.remove(id) {
             Ok(removed) => Response::Cancelled(removed),
+            Err(e) => Response::Error(e.to_string()),
+        },
+        Request::Replace { id, spec } => match queue.replace(id, spec) {
+            Ok(new_id) => Response::Replaced(new_id),
             Err(e) => Response::Error(e.to_string()),
         },
     }
