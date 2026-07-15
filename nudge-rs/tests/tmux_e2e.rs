@@ -154,6 +154,8 @@ fn end_to_end_injection_verifies_then_sends() {
         auto_retry: false,
         retries_left: 0,
         settle_secs: 5.0,
+        verify_fingerprint: None,
+        verify_dims: None,
     };
 
     let out = run_injection(&target, &job, &fixed_now(), None, None).unwrap();

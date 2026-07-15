@@ -170,6 +170,8 @@ mod tests {
             auto_retry: false,
             retries_left: 0,
             settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
         }
         .into_job(1)
     }

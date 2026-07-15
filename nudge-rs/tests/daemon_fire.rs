@@ -144,6 +144,8 @@ fn daemon_fires_a_due_job_into_the_pane() {
             auto_retry: false,
             retries_left: 0,
             settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
         })
         .unwrap();
     drop(queue); // done writing; the daemon will `Queue::load` its own handle
