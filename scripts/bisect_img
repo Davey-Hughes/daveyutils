@@ -23,8 +23,21 @@ is_landscape() {
 
 # out_prefix <path/to/image.jpg> -> "<parentdir>_<basename-without-ext>"
 # Output is flattened into one directory, so the parent name disambiguates.
+#
+# The parent is resolved to a real directory name before its basename is taken:
+# the default invocation searches ".", so `find` emits "./foo.jpg", whose lexical
+# dirname is "." -- basename "." is "." and the prefix became "._foo", writing
+# both halves out as HIDDEN dotfiles the user could not find. Resolving through
+# cd turns "." into the directory's actual name. Fall back to the lexical
+# basename when the directory doesn't exist, since the helper is also called with
+# purely notional paths. CDPATH is cleared so a relative dir can't resolve
+# somewhere else entirely.
 out_prefix() {
-    printf '%s_%s' "$(basename "$(dirname "$1")")" "$(basename "${1%.*}")"
+    local dir parent
+    dir="$(dirname "$1")"
+    parent="$(CDPATH= cd -- "$dir" 2>/dev/null && basename "$PWD")"
+    [[ -n "$parent" ]] || parent="$(basename "$dir")"
+    printf '%s_%s' "$parent" "$(basename "${1%.*}")"
 }
 
 # The ImageMagick CLI: prefer `magick`, fall back to legacy `convert`.

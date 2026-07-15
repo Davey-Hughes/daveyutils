@@ -15,8 +15,14 @@ check() {
     fi
 }
 
-# Print the tally and return non-zero if anything failed.
+# Print the tally and EXIT non-zero if anything failed.
+#
+# This terminates rather than returns so the status cannot be dropped: a caller
+# that wrote `finish; exit 0` (as test_video_pcm_to_flac.sh's bash<4.3 skip
+# branch did) would otherwise report a file with FAILing checks as exit 0, and
+# run.sh's `bash "$t" || rc=1` would call the whole suite PASSED. Every test file
+# ends with finish, so exiting here costs no expressiveness.
 finish() {
     printf '\n== %d passed, %d failed ==\n' "$PASS" "$FAIL"
-    [ "$FAIL" -eq 0 ]
+    if [ "$FAIL" -eq 0 ]; then exit 0; else exit 1; fi
 }
