@@ -10,20 +10,31 @@ pub const LABEL: &str = "com.nudge.daemon";
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
+struct KeepAlive {
+    successful_exit: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
 struct LaunchAgent {
     label: String,
     program_arguments: Vec<String>,
     run_at_load: bool,
-    keep_alive: bool,
+    keep_alive: KeepAlive,
 }
 
-/// XML plist that runs `<exec> --daemon` at load and keeps it alive.
+/// XML plist that runs `<exec> --daemon` at load and restarts it only on an
+/// unsuccessful exit. A bare `KeepAlive=true` restarts on ANY exit — including
+/// the clean exit `run` now performs when it loses the singleton lock race
+/// (see `lib::run`'s `WouldBlock` handling), which would otherwise loop forever.
 pub fn plist_bytes(exec: &Path) -> Vec<u8> {
     let agent = LaunchAgent {
         label: LABEL.to_string(),
         program_arguments: vec![exec.display().to_string(), "--daemon".to_string()],
         run_at_load: true,
-        keep_alive: true,
+        keep_alive: KeepAlive {
+            successful_exit: false,
+        },
     };
     let mut buf = Vec::new();
     plist::to_writer_xml(&mut buf, &agent).expect("serialize launchd plist");
@@ -62,9 +73,19 @@ mod tests {
         assert!(xml.contains("com.nudge.daemon"), "got:\n{xml}");
         assert!(xml.contains("/usr/local/bin/nudge"));
         assert!(xml.contains("--daemon"));
-        // RunAtLoad / KeepAlive true keys present.
         assert!(xml.contains("RunAtLoad"));
-        assert!(xml.contains("KeepAlive"));
+        // KeepAlive must restart only on an unsuccessful exit, not on ANY exit --
+        // a bare `KeepAlive=true` would restart even a clean exit (e.g. when
+        // `run` loses the singleton lock race), looping forever.
+        assert!(xml.contains("KeepAlive"), "got:\n{xml}");
+        let after_key = xml
+            .split("<key>SuccessfulExit</key>")
+            .nth(1)
+            .expect("SuccessfulExit key present");
+        assert!(
+            after_key.trim_start().starts_with("<false/>"),
+            "SuccessfulExit must be false, got:\n{xml}"
+        );
     }
 
     #[test]

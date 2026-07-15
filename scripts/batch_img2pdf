@@ -4,12 +4,26 @@
 #
 # Usage: batch_img2pdf [-o OUTDIR] [--clean] MAINDIR
 #   -o OUTDIR   where PDFs are written (default: ./pdfs)
-#   --clean     delete each source image folder after its PDF is built successfully
+#   --clean     delete each source image folder, but only when it is fully
+#               covered by its PDF (no subdirectories, no extra files); a
+#               folder with nested content the PDF didn't cover is kept
 #   MAINDIR     directory containing the *.zip archives / image folders
 #
 # Requires: unar, img2pdf, file
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# folder_fully_covered <dir> <n-images>
+# True only when <dir> has no subdirectories and holds exactly <n-images> files,
+# i.e. everything in it went into the PDF. --clean deletes the whole tree, so a
+# folder with nested content the PDF never covered must NOT be removed.
+folder_fully_covered() {
+    local dir="$1" n="$2"
+    [[ -z "$(find "$dir" -mindepth 1 -type d -print -quit)" ]] || return 1
+    local total
+    total="$(find "$dir" -type f | wc -l)"
+    [[ "$total" -eq "$n" ]]
+}
 
 OUTDIR="./pdfs"
 CLEAN=0
@@ -75,7 +89,13 @@ main() {
         printf 'pdf: %s -> %s/%s.pdf\n' "$d" "$OUTDIR" "$name"
         if img2pdf "${images[@]}" -o "$OUTDIR/$name.pdf"; then
             ok=$((ok + 1))
-            [[ "$CLEAN" -eq 1 ]] && rm -rf "$d"
+            if [[ "$CLEAN" -eq 1 ]]; then
+                if folder_fully_covered "$d" "${#images[@]}"; then
+                    rm -rf "$d"
+                else
+                    printf 'WARN: kept %s: it holds files the PDF does not cover\n' "$d" >&2
+                fi
+            fi
         else
             printf 'WARN: img2pdf failed for %s\n' "$d" >&2
             failed=$((failed + 1))

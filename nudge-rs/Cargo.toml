@@ -28,6 +28,7 @@ tracing-subscriber = "0.3"
 plist = "1"
 notify-rust = "4"
 inquire = "0.7"
+fs4 = "0.13"
 
 [dev-dependencies]
 tempfile = "3"

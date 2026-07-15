@@ -79,13 +79,21 @@ impl Queue {
         Ok(found)
     }
 
+    /// The temp file `save` writes before renaming into place. Process-unique:
+    /// two daemons sharing one temp name could truncate each other mid-write and
+    /// publish a corrupt queue.
+    fn temp_path(&self) -> std::path::PathBuf {
+        self.path
+            .with_extension(format!("json.{}.tmp", std::process::id()))
+    }
+
     /// Write to a sibling temp file then rename, so a crash never leaves a
     /// half-written queue.
     fn save(&self) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = self.temp_path();
         {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(&serde_json::to_vec_pretty(&self.state)?)?;
@@ -165,5 +173,22 @@ mod tests {
         let job = q2.get(id).unwrap();
         assert_eq!(job.fire_at, new_ts);
         assert_eq!(job.retries_left, 1);
+    }
+
+    #[test]
+    fn temp_path_is_process_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::load(dir.path().join("q.json")).unwrap();
+        let tmp = q.temp_path();
+        let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "temp file must be process-unique, got {name}"
+        );
+        assert_ne!(
+            tmp,
+            q.path.with_extension("json.tmp"),
+            "must not use the shared fixed temp name -- two daemons would truncate each other"
+        );
     }
 }

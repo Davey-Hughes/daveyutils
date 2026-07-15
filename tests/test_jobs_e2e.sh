@@ -24,22 +24,24 @@ done
 export NUDGE_AT_QUEUE=w
 AT_QUEUE=w
 # Extra throwaway queues stage "foreign" jobs (F1 preview guard, F4 cross-queue
-# note); purged alongside the main one so nothing leaks between runs.
-TEST_QUEUES="w v u"
+# note). We purge ONLY the ids this test creates -- NOT a blanket sweep of
+# queues w/v/u -- because a real `at -q w|v|u` job belonging to the user (not
+# this test) must never be deleted just for sharing a queue letter.
+CREATED_IDS=""
+remember_id() { [ -n "$1" ] && CREATED_IDS="$CREATED_IDS $1"; }
 purge() {
-    local qq
-    for qq in $TEST_QUEUES; do
-        atrm $(atq -q "$qq" 2>/dev/null | awk '{print $1}') 2>/dev/null
-    done
+    local id
+    for id in $CREATED_IDS; do atrm "$id" 2>/dev/null; done
+    CREATED_IDS=""
 }
 trap 'purge; rm -f "$PRELUDE"' EXIT
-purge
 
 # Schedule one job; echo its numeric id (empty if scheduling failed).
 schedule() { "$NUDGE" "$@" 2>/dev/null | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+'; }
 
 FAKE_PANE="e2e:0.0"
 ID=$(schedule -p "$FAKE_PANE" -m '23:59' -i 'msg one' -i "it's two" -n)
+remember_id "$ID"
 
 if [ -z "$ID" ]; then
     echo "  SKIP: environment can't queue an 'at' job (no id returned)"
@@ -77,6 +79,7 @@ check "preview: notify option" "yes" "$(printf '%s' "$prev" | grep -q 'notify' &
 # otherwise reach job_detail's eval unguarded); previewing it shows "not found".
 F1ID=$(NUDGE_AT_QUEUE=v "$NUDGE" -p 'foreign:1.1' -m '23:57' -i 'secret leak' 2>/dev/null \
     | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+')
+remember_id "$F1ID"
 if [ -n "$F1ID" ]; then
     f1prev=$("$NUDGE" --preview-job "$F1ID")
     check "F1: foreign-queue job not previewed" "yes" \
@@ -93,6 +96,7 @@ fi
 # list_jobs directly (like the table test above) to isolate the note from F5.
 F4ID=$(NUDGE_AT_QUEUE=u "$NUDGE" -p 'legacy:2.2' -m '23:56' -i 'old job' 2>/dev/null \
     | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+')
+remember_id "$F4ID"
 if [ -n "$F4ID" ]; then
     f4list=$(list_jobs)
     check "F4: --list notes an out-of-queue nudge job by id" "yes" \
@@ -105,6 +109,7 @@ fi
 
 # --- --edit (non-interactive): overlay a flag, keep the rest, swap the id -------
 NEW=$("$NUDGE" --edit "$ID" -i 'edited msg' 2>/dev/null | grep -oE 'new job #[0-9]+' | grep -oE '[0-9]+')
+remember_id "$NEW"
 check "edit: produced a new id"  "yes" "$([ -n "$NEW" ] && [ "$NEW" != "$ID" ] && echo yes || echo no)"
 check "edit: old id gone"        "yes" "$(atq -q "$NUDGE_AT_QUEUE" | awk '{print $1}' | grep -qx "$ID" && echo no || echo yes)"
 prev2=$("$NUDGE" --preview-job "${NEW:-0}")
