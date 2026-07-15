@@ -1,190 +1,193 @@
-#! /bin/fish
+#!/usr/bin/env bash
+#
+# video_pcm_to_flac - convert PCM audio streams in video files to FLAC
+# (or vice versa), batching over every file matching a glob.
+#
+# Usage: video_pcm_to_flac [OPTIONS] [-g GLOB] [-o OUTDIR] [-m N]
+#   -g, --glob GLOB        files to match (default: *.mkv)
+#   -o, --output-dir DIR   output root; a "<show>/<input>" tree is written
+#                          under it, where <show> is the current dir's
+#                          basename (default: ./ffmpeg_output)
+#   -m, --max-files N      stop after converting N files
+#       --dry-run          print what would happen; don't run ffmpeg
+#       --only-output      suppress the per-file chatter, print only paths
+#       --copy-first       remux to matroska in a pipe before re-encoding
+#                          audio, instead of doing it in one ffmpeg pass
+#       --flac-to-pcm      convert FLAC audio streams to pcm_s16le instead
+#                          of the default PCM -> FLAC direction
+#
+# Requires: fd, ffprobe, ffmpeg
 
-# USAGE: `printf "%b" "$COLOR_B\e0This is a blue text.$COLOR_RESET"`
-# printf "%b" "$BG_R\e0This is text with a red background.$COLOR_RESET"
-set COLOR_RESET "\033[0m"
+die() { printf '%s\n' "$*" >&2; exit 1; }
 
-set COLOR_K "\033[0;30m" # black
-set COLOR_R "\033[0;31m" # red
-set COLOR_G "\033[0;32m" # green
-set COLOR_Y "\033[0;33m" # yellow
-set COLOR_B "\033[0;34m" # blue
-set COLOR_M "\033[0;35m" # magenta
-set COLOR_C "\033[0;36m" # cyan
-set COLOR_W "\033[0;37m" # white
+# select_streams <ffprobe_csv> <direction>
+# ffprobe_csv: newline-separated "index,codec_name[,title]" rows (as
+# produced by `ffprobe -show_entries stream=index,codec_name:stream_tags=title
+# -of csv=print_section=0`). direction is "pcm2flac" or "flac2pcm".
+# Echoes ffmpeg "-c:<index> <target-codec>" args (space-separated, no
+# trailing space) for every stream that matches; echoes nothing if none do.
+select_streams() {
+    local csv="$1" direction="$2"
+    local -a args=()
+    local line index codec
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS=',' read -r index codec _ <<<"$line"
+        if [[ "$direction" == "pcm2flac" && "$codec" =~ ^pcm_ ]]; then
+            args+=("-c:$index" "flac")
+        elif [[ "$direction" == "flac2pcm" && "$codec" == "flac" ]]; then
+            args+=("-c:$index" "pcm_s16le")
+        fi
+    done <<<"$csv"
+    printf '%s' "${args[*]:-}"
+}
 
-# empahsized (bolded) colors
-set EM_K "\033[1;30m"
-set EM_R "\033[1;31m"
-set EM_G "\033[1;32m"
-set EM_Y "\033[1;33m"
-set EM_B "\033[1;34m"
-set EM_M "\033[1;35m"
-set EM_C "\033[1;36m"
-set EM_W "\033[1;37m"
+# stream_metadata <ffprobe_csv> <direction>
+# Echoes "-metadata:s:<index> title=<rewritten-title>" args for every
+# matched stream that has a title tag, swapping PCM<->FLAC in the text.
+stream_metadata() {
+    local csv="$1" direction="$2"
+    local -a args=()
+    local line index codec title
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS=',' read -r index codec title <<<"$line"
+        if [[ "$direction" == "pcm2flac" && "$codec" =~ ^pcm_ ]]; then
+            [[ -n "$title" ]] && args+=("-metadata:s:$index" "title=${title//PCM/FLAC}")
+        elif [[ "$direction" == "flac2pcm" && "$codec" == "flac" ]]; then
+            [[ -n "$title" ]] && args+=("-metadata:s:$index" "title=${title//FLAC/PCM}")
+        fi
+    done <<<"$csv"
+    printf '%s' "${args[*]:-}"
+}
 
-# background colors
-set BG_K "\033[40m"
-set BG_R "\033[41m"
-set BG_G "\033[42m"
-set BG_Y "\033[43m"
-set BG_B "\033[44m"
-set BG_M "\033[45m"
-set BG_C "\033[46m"
-set BG_W "\033[47m"
+# output_path <input> <outdir> <show> -> "<outdir>/<show>/<input>",
+# with any leading "./" on input dropped.
+output_path() {
+    local input="$1" outdir="$2" show="$3"
+    printf '%s/%s/%s' "$outdir" "$show" "${input#./}"
+}
 
-# usage: color_print $COLOR_R "I am red"
-# multiline: color_print $COLOR_R "I am red\n"; color_print $COLOR_B "I am blue"
-function color_print
-    printf "%b" "$argv[1]\e0$argv[2]$COLOR_RESET"
-end
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
 
-function inc -a int
-    math $int + 1
-end
+main() {
+    set -euo pipefail
 
-argparse dry-run only-output copy-first flac-to-pcm "g/glob=" "o/output-dir=" "m#max-files" -- $argv
-or exit
+    local glob="*.mkv" outdir="./ffmpeg_output" max_files=""
+    local dry_run=0 only_output=0 copy_first=0 flac_to_pcm=0
 
-if not set -q _flag_glob
-    set _flag_glob "*.mkv"
-end
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            --dry-run) dry_run=1; shift ;;
+            --only-output) only_output=1; shift ;;
+            --copy-first) copy_first=1; shift ;;
+            --flac-to-pcm) flac_to_pcm=1; shift ;;
+            -g|--glob) glob="${2:?"$1 requires an argument"}"; shift 2 ;;
+            -o|--output-dir) outdir="${2:?"$1 requires an argument"}"; shift 2 ;;
+            -m|--max-files) max_files="${2:?"$1 requires an argument"}"; shift 2 ;;
+            --) shift; break ;;
+            -*) die "unknown option: $1" ;;
+            *) shift ;;
+        esac
+    done
 
-if not set -q _flag_output_dir
-    set _flag_output_dir "/mnt/daveynet/nfs/media 0/needs_processing/ffmpeg_output/"
-end
+    command -v fd >/dev/null 2>&1 || die "fd is required."
+    command -v ffprobe >/dev/null 2>&1 || die "ffprobe is required."
+    command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is required."
 
-set error_files
+    local direction="pcm2flac"
+    [[ "$flac_to_pcm" -eq 1 ]] && direction="flac2pcm"
 
-set files_converted 0
-fd --ignore-case --glob $_flag_glob -0 | while read -z input
-    # break if max files is reached
-    if set -q _flag_max_files
-        if test $files_converted -ge $_flag_max_files
+    local show; show="$(basename "$PWD")"
+
+    local ok=0 failed=0 files_seen=0
+    local -a error_files=()
+
+    while IFS= read -r -d '' input; do
+        if [[ -n "$max_files" && "$files_seen" -ge "$max_files" ]]; then
             break
-        end
-    end
+        fi
 
-    if not set -q _flag_only_output
-        color_print $EM_Y $input\n
-    end
+        [[ "$only_output" -eq 1 ]] || printf '%s\n' "$input"
 
-    set audio_track_info (ffprobe -v error -select_streams a -show_entries stream=index,codec_name:stream_tags=title -of csv=print_section=0 "$input")
+        local csv
+        csv="$(ffprobe -v error -select_streams a \
+            -show_entries stream=index,codec_name:stream_tags=title \
+            -of csv=print_section=0 "$input")"
 
-    set audio_streams
-    set metadata
+        local audio_streams; audio_streams="$(select_streams "$csv" "$direction")"
 
-    if set -q _flag_flac_to_pcm
-        # Convert FLAC to PCM
-        for line in $audio_track_info
-            # get stream index, codec name, and title
-            set stream (string split , $line)
-
-            # if stream type is FLAC
-            if string match --quiet flac $stream[2]
-
-                # replace "FLAC" with "PCM" in stream title if title exists
-                if set -q stream[3]
-                    set stream[3] (string replace FLAC PCM $stream[3])
-                    set -a metadata -metadata:s:$stream[1] title="$stream[3]"
-                end
-
-                # set output stream to encode to pcm_s16le
-                set -a audio_streams -c:$stream[1] pcm_s16le
-            end
-        end
-
-        if not set -q audio_streams[1]
-            if not set -q _flag_only_output
-                color_print $EM_R \t"No FLAC audio streams found in "
-                color_print $COLOR_Y $input\n
-                echo
-            end
-        end
-    else
-        # Convert PCM to FLAC (default behavior)
-        for line in $audio_track_info
-            # get stream index, codec name, and title
-            set stream (string split , $line)
-
-            # if stream title is set and stream type is PCM
-            if string match --quiet --all --regex '^pcm_.*' $stream[2]
-
-                # replace "PCM" with "FLAC" in stream title if title exists
-                if set -q stream[3]
-                    set stream[3] (string replace PCM FLAC $stream[3])
-                    set -a metadata -metadata:s:$stream[1] title="$stream[3]"
-                end
-
-                # set output stream to encode to flac
-                set -a audio_streams -c:$stream[1] flac
-            end
-        end
-
-        if not set -q audio_streams[1]
-            if not set -q _flag_only_output
-                color_print $EM_R \t"No PCM audio streams found in "
-                color_print $COLOR_Y $input\n
-                echo
-            end
-        end
-    end
-
-    if not set -q audio_streams[1]
-        # Skip this file, no matching streams found
-    else
-        set files_converted (math $files_converted + 1)
-        set show_name (basename $PWD)
-        set output (realpath -m "$_flag_output_dir/$show_name/$input")
-
-        if set -q _flag_copy_first
-            function ffmpeg_command
-                ffmpeg -n -nostdin -hide_banner -v error -stats -i "$input" -map 0 -c copy -f matroska pipe: | ffmpeg -n -hide_banner -v error -stats -f matroska -i pipe: -map 0 $metadata -c copy $audio_streams "$output"
-            end
-        else
-            function ffmpeg_command
-                ffmpeg -n -nostdin -hide_banner -v error -stats -i "$input" -map 0 $metadata -c copy $audio_streams "$output"
-            end
-        end
-
-        if not set -q _flag_only_output
-            printf \t
-        end
-
-        printf "$input"\n
-
-        if not set -q _flag_dry_run
-            if test -e "$output"
-                color_print $EM_R \t"Output file already exists, skipping: "
-                color_print $COLOR_Y $output\n
-            else
-                mkdir -p (dirname "$output")
-                ffmpeg_command
-                set ffmpeg_status $status
-
-                # ffmpeg returned 0
-                set ffmpeg_status_color
-                if [ $status = 0 ]
-                    set ffmpeg_status_color $COLOR_G
+        if [[ -z "$audio_streams" ]]; then
+            if [[ "$only_output" -eq 0 ]]; then
+                if [[ "$direction" == "flac2pcm" ]]; then
+                    printf '\tNo FLAC audio streams found in %s\n\n' "$input"
                 else
-                    set ffmpeg_status_color $EM_R
-                    rm "$output"
-                    set -a error_files $input
-                end
+                    printf '\tNo PCM audio streams found in %s\n\n' "$input"
+                fi
+            fi
+            continue
+        fi
 
-                color_print $ffmpeg_status_color \t"status: "$ffmpeg_status\n\n
+        files_seen=$((files_seen + 1))
 
-                chmod -R oug+rw "$_flag_output_dir" &
-            end
-        end
+        local metadata; metadata="$(stream_metadata "$csv" "$direction")"
+        local out; out="$(output_path "$input" "$outdir" "$show")"
 
-        if not set -q _flag_only_output
-            echo
-        end
-    end
-end
+        if [[ "$only_output" -eq 0 ]]; then
+            printf '\t%s\n' "$input"
+        fi
 
-if set -q error_files[1]
-    color_print $EM_R "Errored files:"\n
-    printf %s\n $error_files
-end
+        if [[ "$dry_run" -eq 1 ]]; then
+            printf '\twould write: %s\n' "$out"
+            continue
+        fi
+
+        if [[ -e "$out" ]]; then
+            printf '\tOutput file already exists, skipping: %s\n' "$out"
+            continue
+        fi
+
+        mkdir -p "$(dirname "$out")"
+
+        # shellcheck disable=SC2086
+        if [[ "$copy_first" -eq 1 ]]; then
+            if ffmpeg -n -nostdin -hide_banner -v error -stats -i "$input" \
+                    -map 0 -c copy -f matroska pipe: \
+                | ffmpeg -n -hide_banner -v error -stats -f matroska -i pipe: \
+                    -map 0 $metadata -c copy $audio_streams "$out"; then
+                ok=$((ok + 1))
+            else
+                printf 'WARN: ffmpeg failed for %s\n' "$input" >&2
+                rm -f "$out"
+                error_files+=("$input")
+                failed=$((failed + 1))
+            fi
+        else
+            if ffmpeg -n -nostdin -hide_banner -v error -stats -i "$input" \
+                    -map 0 $metadata -c copy $audio_streams "$out"; then
+                ok=$((ok + 1))
+            else
+                printf 'WARN: ffmpeg failed for %s\n' "$input" >&2
+                rm -f "$out"
+                error_files+=("$input")
+                failed=$((failed + 1))
+            fi
+        fi
+
+        [[ "$only_output" -eq 1 ]] || echo
+    done < <(fd --ignore-case --glob "$glob" -0)
+
+    printf 'done: %d converted, %d failed\n' "$ok" "$failed"
+
+    if [[ "${#error_files[@]}" -gt 0 ]]; then
+        printf 'Errored files:\n'
+        printf '%s\n' "${error_files[@]}"
+    fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
