@@ -6,7 +6,19 @@ use crate::config::{env_bool, resolve, FlagOverrides, Toggles};
 
 /// nudge — inject messages into a tmux pane at a rate-limit reset.
 #[derive(Parser, Debug, Default)]
-#[command(name = "nudge", version, about)]
+#[command(
+    name = "nudge",
+    version,
+    about,
+    after_help = "Jobs are run by a resident daemon, started automatically on \
+first use. What it did with a job -- fired, or skipped because you had already \
+resumed the pane -- is reported in:\n    \
+<state dir>/nudge.log\n\
+where <state dir> is $XDG_STATE_HOME/nudge (default ~/.local/state/nudge) on \
+Linux, or ~/Library/Application Support/nudge on macOS. That is the place to \
+look when a nudge did not fire and you want to know why. Use --notify to be \
+told at the time instead."
+)]
 pub struct Cli {
     /// Target tmux pane (e.g. bot:0.1). Prompts interactively if omitted.
     #[arg(short, long)]

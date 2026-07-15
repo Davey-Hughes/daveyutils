@@ -190,7 +190,8 @@ fn request(socket: &Path, req: &Request) -> anyhow::Result<Response> {
 /// The Ping is a version handshake, not just a liveness check. A daemon from
 /// another build answers a plain "are you there?" perfectly well, so this used
 /// to adopt it and hand it requests written against code it does not run.
-pub fn ensure_daemon(socket: &Path) -> anyhow::Result<()> {
+pub fn ensure_daemon(paths: &paths::Paths) -> anyhow::Result<()> {
+    let socket = &paths.socket;
     match client::request(socket, &Request::Ping) {
         Ok(resp) => return check_handshake(resp),
         // Nothing is listening. Starting one is ours to do, and always was.
@@ -205,14 +206,7 @@ pub fn ensure_daemon(socket: &Path) -> anyhow::Result<()> {
             ))
         ),
     }
-    let exe = std::env::current_exe()?;
-    std::process::Command::new(exe)
-        .arg("--daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()?;
+    spawn_daemon(&std::env::current_exe()?, paths)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         // The daemon we just spawned is this exe, so a mismatch here means
@@ -223,6 +217,68 @@ pub fn ensure_daemon(socket: &Path) -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
     bail!("daemon did not come up on {}", socket.display())
+}
+
+/// The auto-started daemon's log lives here, in the state dir beside the queue.
+pub fn log_path(state_dir: &Path) -> std::path::PathBuf {
+    state_dir.join("nudge.log")
+}
+
+/// Start over rather than grow past this. See [`daemon_log`].
+const LOG_MAX_BYTES: u64 = 1 << 20;
+
+/// Open the auto-started daemon's log for append, or `None` if it cannot be.
+///
+/// The daemon is spawned in the background by whatever `nudge` command the user
+/// happened to run, so its stderr has nowhere to go by default and used to go
+/// to `/dev/null`. That silently discarded every diagnostic it has — including
+/// the `--verify` skip report, which the recency design requires be visible
+/// precisely because a silent skip is indistinguishable from nudge never having
+/// run. `--install-daemon` is unaffected: systemd and launchd capture stderr
+/// themselves, and this only redirects the daemon nudge starts for you.
+///
+/// Growth: the daemon writes a line per job fired plus the occasional error, so
+/// this is kilobytes a year in normal use — but normal use is not a bound, and
+/// an unbounded file in the state dir is a bug waiting for a loop to find it.
+/// Rotation is more machinery than the volume justifies, so the log simply
+/// starts over once it passes [`LOG_MAX_BYTES`]. That check happens only here,
+/// at spawn, so nothing ever truncates under a running daemon's append handle;
+/// and the 1 MiB it discards is thousands of lines older than the daemon the
+/// user is currently trying to explain.
+fn daemon_log(state_dir: &Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(state_dir).ok()?;
+    let path = log_path(state_dir);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX_BYTES) {
+        opts.write(true).truncate(true);
+    } else {
+        opts.append(true);
+    }
+    opts.open(&path).ok()
+}
+
+/// Start `exe --daemon` detached, with its diagnostics going to the log.
+///
+/// `exe` is a parameter rather than `current_exe()` inside because a test
+/// harness *is* `current_exe()` and would have to stub the whole spawn to work
+/// around it — leaving the one thing worth testing, where the daemon's stderr
+/// ends up, untested. Production passes its own path.
+///
+/// A log that will not open falls back to `/dev/null` rather than failing the
+/// spawn: losing the diagnostics is bad, but it is nothing next to a read-only
+/// state dir meaning no nudge ever fires again.
+pub fn spawn_daemon(exe: &Path, paths: &paths::Paths) -> std::io::Result<std::process::Child> {
+    let log = daemon_log(&paths.state_dir)
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null);
+    std::process::Command::new(exe)
+        .arg("--daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log)
+        .process_group(0)
+        .spawn()
 }
 
 /// Schedule a nudge.
@@ -277,9 +333,9 @@ pub fn format_jobs(jobs: &[Job]) -> String {
 /// socket that isn't there, and the user cannot cancel a job that queue.json
 /// still holds and that fires as soon as anything starts a daemon again.
 fn live_socket() -> anyhow::Result<std::path::PathBuf> {
-    let socket = paths::resolve().socket;
-    ensure_daemon(&socket)?;
-    Ok(socket)
+    let paths = paths::resolve();
+    ensure_daemon(&paths)?;
+    Ok(paths.socket)
 }
 
 /// List pending jobs (interactive picker lands in Task 6; both modes print
@@ -533,6 +589,66 @@ mod tests {
         assert!(
             err.contains("pkill -f 'nudge --daemon'"),
             "must name the remedy: {err}"
+        );
+    }
+
+    use std::io::Write as _;
+
+    /// The daemon appends across restarts. Nothing else restarts it, so the
+    /// last thing the *previous* daemon said is often the whole explanation
+    /// for what the user is looking at now.
+    #[test]
+    fn the_daemon_log_is_created_and_then_appended_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("nudge");
+
+        let mut first = daemon_log(&state).expect("a writable state dir must yield a log");
+        writeln!(first, "older daemon").unwrap();
+        drop(first);
+
+        let mut second = daemon_log(&state).expect("reopen");
+        writeln!(second, "this daemon").unwrap();
+        drop(second);
+
+        let text = std::fs::read_to_string(log_path(&state)).unwrap();
+        assert!(
+            text.contains("older daemon") && text.contains("this daemon"),
+            "a reopen must not truncate what the last daemon reported: {text:?}"
+        );
+    }
+
+    /// The growth bound, since there is no rotation. Checked at spawn only, so
+    /// it can never truncate under a running daemon's append handle.
+    #[test]
+    fn the_daemon_log_starts_over_once_it_grows_past_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("nudge");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(log_path(&state), vec![b'x'; (LOG_MAX_BYTES + 1) as usize]).unwrap();
+
+        let mut f = daemon_log(&state).expect("an oversized log must still open");
+        writeln!(f, "fresh start").unwrap();
+        drop(f);
+
+        let text = std::fs::read_to_string(log_path(&state)).unwrap();
+        assert_eq!(
+            text, "fresh start\n",
+            "past the cap the log starts over rather than growing forever"
+        );
+    }
+
+    /// Fail open. Losing the diagnostics is bad; a state dir that cannot be
+    /// written meaning no nudge ever fires again is very much worse.
+    #[test]
+    fn a_log_that_cannot_be_opened_does_not_stop_the_daemon_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        // A *file* where the state dir should be: create_dir_all cannot win.
+        let state = dir.path().join("blocked");
+        std::fs::write(&state, b"not a directory").unwrap();
+        assert!(
+            daemon_log(&state).is_none(),
+            "an unopenable log must degrade to None, which spawn_daemon turns \
+             into /dev/null -- never into a failure to start the daemon"
         );
     }
 
