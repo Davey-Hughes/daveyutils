@@ -2,3 +2,20 @@ tags
 
 # `make` collects every runnable utility here; put it on your PATH.
 bin/
+
+# makepkg build artifacts. The only way to validate a PKGBUILD is to run
+# `makepkg` in its own directory, and it writes all of this right next to the
+# PKGBUILD: the extracted source tree (plus a vendored cargo registry, hundreds
+# of MB), the staged package, the downloaded release tarball, and the built
+# package. All of it showed as untracked, so a routine `git add -A` committed
+# megabytes of build output.
+packaging/aur/*/src/
+packaging/aur/*/pkg/
+packaging/aur/*/*.tar.gz
+packaging/aur/*/*.pkg.tar.*
+packaging/aur/*/*.log
+
+# nudge-git's source is `git+https://github.com/Davey-Hughes/daveyutils.git`, so
+# makepkg clones this very repo to here. Left untracked it gets committed as a
+# stray gitlink -- a nested repo that breaks clones for everyone else.
+packaging/aur/nudge-git/daveyutils/

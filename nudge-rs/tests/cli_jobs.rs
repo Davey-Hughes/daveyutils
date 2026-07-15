@@ -35,13 +35,38 @@ fn spec(pane: &str) -> JobSpec {
     }
 }
 
+/// The only test for `format_jobs`, which is the whole `nudge --list` renderer.
+///
+/// It used to render id 1 into a row that also held "bot:0.1" and a 15:00
+/// timestamp, then assert `out.contains('1')` under the comment "// the id" --
+/// satisfied by the pane and the timestamp alike, so it passed with the ID
+/// column deleted from the format string outright, with the id rendered as 999,
+/// and with the count rendered as 42. Two of the three columns the test's name
+/// advertises were unverified.
+///
+/// So: fixtures that cannot match incidentally (4242 appears in no pane or
+/// timestamp), and each column pinned by position. Split on whitespace rather
+/// than asserting the padded row verbatim, so this tracks the columns' contents
+/// without breaking on a column-width change.
 #[test]
 fn format_jobs_shows_id_pane_and_count() {
-    let mut q = Queue::load(tempfile::tempdir().unwrap().path().join("q.json")).unwrap();
-    q.add(spec("bot:0.1")).unwrap();
-    let out = format_jobs(q.all());
-    assert!(out.contains("bot:0.1"), "got:\n{out}");
-    assert!(out.contains('1')); // the id
+    let mut s = spec("bot:0.1");
+    s.messages = vec!["go".into(); 11];
+    let out = format_jobs(&[s.into_job(4242)]);
+
+    let row = out
+        .lines()
+        .nth(1)
+        .unwrap_or_else(|| panic!("expected a header and one job row, got:\n{out}"));
+    let cols: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(cols.len(), 4, "ID PANE FIRE MSGS, got {cols:?}");
+    assert_eq!(cols[0], "4242", "ID column, got:\n{out}");
+    assert_eq!(cols[1], "bot:0.1", "PANE column, got:\n{out}");
+    assert_eq!(cols[2], "2026-07-13T15:00:00Z", "FIRE column, got:\n{out}");
+    assert_eq!(
+        cols[3], "11",
+        "MSGS column must be the message count, got:\n{out}"
+    );
 }
 
 #[test]

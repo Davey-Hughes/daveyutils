@@ -62,28 +62,40 @@ fn parse_named(s: &str, now: &Zoned) -> Option<Zoned> {
 }
 
 /// 24h ("14:30") or 12h ("3pm", "3:00 PM", "11:59pm").
+///
+/// Anchored over the whole input, and deliberately so: a previous unanchored
+/// search matched a meridiem anywhere in the string and grabbed the first digit
+/// run anywhere else, so "spam 5" parsed as 05:00 -- "SPAM" supplied the AM.
+/// Matching a meridiem also skipped the "must look like a 24h clock" guard, so
+/// arbitrary text scheduled a real job at a time the user never asked for.
+/// Callers pass an already-isolated token (`detect::find_clock_token` extracts
+/// one; `--time` is a whole argument), so nothing legitimate needs the slack.
 fn parse_clock(s: &str, now: &Zoned) -> Option<Zoned> {
     let up = s.to_uppercase();
-    let meridiem = Regex::new(r"(AM|PM)")
-        .unwrap()
-        .find(&up)
-        .map(|m| m.as_str());
-
-    let time_re = Regex::new(r"(\d{1,2})(?::(\d{2}))?").unwrap();
-    let caps = time_re.captures(&up)?;
+    let re = Regex::new(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?\s*$").unwrap();
+    let caps = re.captures(&up)?;
     let mut hour: i8 = caps.get(1)?.as_str().parse().ok()?;
     let minute: i8 = caps.get(2).map_or(0, |m| m.as_str().parse().unwrap_or(0));
 
-    match meridiem {
-        Some("PM") if hour < 12 => hour += 12,
-        Some("AM") if hour == 12 => hour = 0,
-        Some(_) => {}
-        None => {
-            // Bare number without a meridiem must look like a 24h clock (had a ':' or hour>12 is invalid).
-            if caps.get(2).is_none() && !up.contains(':') {
+    match caps.get(3).map(|m| m.as_str()) {
+        Some(meridiem) => {
+            // A meridiem means a 12-hour clock, so the hour must be 1..=12.
+            // Without this, "13pm" fell through every arm (`Some("PM") if hour
+            // < 12` does not match 13) and the 0..=23 check below waved it
+            // through as 13:00 -- a user typing `-m 13pm` meaning 1pm got a
+            // silently wrong job.
+            if !(1..=12).contains(&hour) {
                 return None;
             }
+            match meridiem {
+                "PM" if hour < 12 => hour += 12,
+                "AM" if hour == 12 => hour = 0,
+                _ => {}
+            }
         }
+        // A bare number with no meridiem and no minutes ("5") is not a time.
+        None if caps.get(2).is_none() => return None,
+        None => {}
     }
     if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
         return None;
@@ -184,5 +196,54 @@ mod tests {
             parse_timespec("banana", &now()),
             Err(TimespecError::Unrecognized(_))
         ));
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_meridiem_hour() {
+        // The meridiem arms never checked hour ∈ 1..=12: `Some("PM") if hour <
+        // 12` does not match 13, `Some(_) => {}` swallows it, and the 0..=23
+        // check then waves it through. A user who types `nudge -m 13pm` meaning
+        // 1pm silently gets a job at 13:00 -- no error, wrong time.
+        for spec in ["13pm", "13PM", "0am", "24am", "99pm"] {
+            assert!(
+                matches!(
+                    parse_timespec(spec, &now()),
+                    Err(TimespecError::Unrecognized(_))
+                ),
+                "{spec:?} must be rejected, got {:?}",
+                parse_timespec(spec, &now())
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_arbitrary_text_that_merely_contains_a_meridiem() {
+        // The meridiem search was unanchored over the whole uppercased string
+        // and matching one skipped the "must look like a 24h clock" guard, so
+        // "SPAM" supplied the AM and the digit-run grabbed the 5: garbage that
+        // should be Unrecognized instead scheduled a real job at a time the
+        // user never asked for.
+        for spec in ["spam 5", "3: 00", "spam 5 eggs", "eggs and ham 7"] {
+            assert!(
+                matches!(
+                    parse_timespec(spec, &now()),
+                    Err(TimespecError::Unrecognized(_))
+                ),
+                "{spec:?} must be rejected, got {:?}",
+                parse_timespec(spec, &now())
+            );
+        }
+    }
+
+    #[test]
+    fn the_legitimate_meridiem_forms_still_parse() {
+        // Guards the anchoring against over-tightening: every spelling the help
+        // text and README promise must survive.
+        assert_eq!(hm(&parse_timespec("12am", &now()).unwrap()), (0, 0));
+        assert_eq!(hm(&parse_timespec("12pm", &now()).unwrap()), (12, 0));
+        assert_eq!(hm(&parse_timespec("1pm", &now()).unwrap()), (13, 0));
+        assert_eq!(hm(&parse_timespec(" 3:05 pm ", &now()).unwrap()), (15, 5));
+        assert_eq!(hm(&parse_timespec("00:30", &now()).unwrap()), (0, 30));
+        assert_eq!(hm(&parse_timespec("23:59", &now()).unwrap()), (23, 59));
     }
 }

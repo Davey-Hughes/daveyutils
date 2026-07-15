@@ -47,6 +47,26 @@ pub fn acquire_singleton_lock(state_dir: &std::path::Path) -> std::io::Result<st
     Ok(file)
 }
 
+/// What the daemon does when its IPC server exits: say why, then take the
+/// process down.
+///
+/// A daemon with no control plane still fires jobs but can't be listed,
+/// cancelled or edited -- and the singleton lock (correctly) stops a
+/// replacement from taking over. So take the whole process down, letting the
+/// user or the service manager start a working daemon, rather than leaving a
+/// headless one injecting into panes.
+///
+/// Named, and taking the outcome as a value, so the policy is one thing in one
+/// place -- and so [`run_with`] can hand an in-process test something that does
+/// not take the *test binary* down with it.
+fn on_serve_exit(result: std::io::Result<()>) -> ! {
+    match result {
+        Ok(()) => tracing::error!("nudge: ipc server exited unexpectedly"),
+        Err(e) => tracing::error!("nudge: ipc server exited: {e}"),
+    }
+    std::process::exit(1);
+}
+
 /// Run the daemon forever: IPC server thread + scheduler loop.
 ///
 /// Call [`init_tracing`] first if you want the daemon's logs.
@@ -55,6 +75,27 @@ pub fn run(
     clock_ext: Option<String>,
     dur_ext: Option<String>,
     grace: Span,
+) -> std::io::Result<()> {
+    run_with(paths, clock_ext, dur_ext, grace, on_serve_exit)
+}
+
+/// [`run`], with the serve-exit policy injected.
+///
+/// Exists for tests that run a real daemon *in-process*. `run`'s policy is
+/// `process::exit(1)`, which is right for a daemon and wrong for a cargo test
+/// binary: a fatal `serve` there takes down every test in the file at once,
+/// exit 1, with no attribution to any test. A test passes a policy that parks
+/// instead, and then fails as a test -- on the assertion that the daemon's
+/// socket never came up.
+///
+/// The `-> !` is the point: a serve-exit policy may not return to a daemon that
+/// has already lost its control plane.
+pub fn run_with(
+    paths: &Paths,
+    clock_ext: Option<String>,
+    dur_ext: Option<String>,
+    grace: Span,
+    on_serve_exit: fn(std::io::Result<()>) -> !,
 ) -> std::io::Result<()> {
     // Refuse to start a second daemon: two schedulers on one queue.json double-fire
     // jobs and clobber each other's state.
@@ -68,18 +109,7 @@ pub fn run(
     // IPC server on its own thread.
     let q_ipc = Arc::clone(&queue);
     let socket = paths.socket.clone();
-    std::thread::spawn(move || {
-        match crate::ipc::server::serve(&socket, q_ipc) {
-            Ok(()) => tracing::error!("nudge: ipc server exited unexpectedly"),
-            Err(e) => tracing::error!("nudge: ipc server exited: {e}"),
-        }
-        // A daemon with no control plane still fires jobs but can't be listed,
-        // cancelled or edited -- and the singleton lock (correctly) stops a
-        // replacement from taking over. Take the whole process down so the user
-        // or the service manager can start a working daemon instead of leaving
-        // a headless one injecting into panes.
-        std::process::exit(1);
-    });
+    std::thread::spawn(move || on_serve_exit(crate::ipc::server::serve(&socket, q_ipc)));
 
     loop {
         let now = Zoned::now();
@@ -93,12 +123,7 @@ pub fn run(
         // 2. Drop stale jobs under the lock.
         if !plan_now.drop_stale.is_empty() {
             let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
-            for id in &plan_now.drop_stale {
-                if let Err(e) = q.remove(*id) {
-                    tracing::warn!("nudge: removing stale job {id} failed: {e}");
-                }
-                tracing::info!("nudge: dropped stale job {id}");
-            }
+            drop_stale(&mut q, &plan_now.drop_stale);
         }
 
         // 3. Fire each due job WITHOUT the lock, applying results under it.
@@ -137,6 +162,26 @@ pub fn run(
             next_wake(q.all(), &now, MAX_POLL)
         };
         std::thread::sleep(wake.max(Duration::from_millis(50)));
+    }
+}
+
+/// Drop the stale jobs in `ids`, reporting what actually happened to each.
+///
+/// Split out of `run`'s loop purely to be reachable: the log line *is* the
+/// behaviour here, and `run` is an infinite loop no test can call.
+fn drop_stale(q: &mut Queue, ids: &[u64]) {
+    for id in ids {
+        match q.remove(*id) {
+            // Only a removal that actually persisted may claim the drop.
+            Ok(true) => tracing::info!("nudge: dropped stale job {id}"),
+            // Already gone: nothing happened, so say nothing.
+            Ok(false) => {}
+            // `remove` rolls back, so the job is still live and still queued.
+            // Saying "dropped" on the next line -- as this used to,
+            // unconditionally -- tells whoever is debugging why stale jobs keep
+            // reappearing that this half worked, and sends them elsewhere.
+            Err(e) => tracing::warn!("nudge: removing stale job {id} failed: {e}"),
+        }
     }
 }
 
@@ -185,11 +230,12 @@ pub fn notification(
 
 #[cfg(test)]
 mod tests {
-    use super::notification;
+    use super::{drop_stale, notification};
     use crate::inject::InjectOutcome;
     use crate::job::{JobSpec, TargetSpec};
+    use crate::queue::Queue;
 
-    fn job(notify: bool) -> crate::job::Job {
+    fn spec(notify: bool) -> JobSpec {
         JobSpec {
             target: TargetSpec::Tmux { pane: "p".into() },
             messages: vec!["go".into()],
@@ -203,7 +249,112 @@ mod tests {
             verify_fingerprint: None,
             verify_dims: None,
         }
-        .into_job(1)
+    }
+
+    fn job(notify: bool) -> crate::job::Job {
+        spec(notify).into_job(1)
+    }
+
+    /// A sink for one thread's tracing output.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Capture {
+        type Writer = Capture;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` and return what it logged.
+    ///
+    /// `with_default` installs the subscriber for *this thread only*, so this
+    /// cannot race the rest of the binary the way a global subscriber would --
+    /// cargo runs these tests on parallel threads of one process.
+    fn logs_from(f: impl FnOnce()) -> String {
+        let cap = Capture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, f);
+        let bytes = cap.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// A queue whose parent directory is a regular file, so every persist
+    /// fails. Stands in for the ENOSPC / read-only state dir of the real
+    /// failure, and unlike a chmod'd directory it still fails as root.
+    fn block_saving(parent: &std::path::Path) {
+        std::fs::remove_dir_all(parent).unwrap();
+        std::fs::write(parent, b"not a directory").unwrap();
+    }
+
+    #[test]
+    fn a_stale_drop_that_could_not_be_persisted_is_not_logged_as_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let mut q = Queue::load(sub.join("q.json")).unwrap();
+        let id = q.add(spec(false)).unwrap();
+        block_saving(&sub);
+
+        let out = logs_from(|| drop_stale(&mut q, &[id]));
+
+        assert!(
+            out.contains("failed"),
+            "the failure must still be reported: {out}"
+        );
+        assert!(
+            q.get(id).is_some(),
+            "precondition: the job must still be live for this test to mean anything"
+        );
+        assert!(
+            !out.contains("dropped stale job"),
+            "remove failed and the job is STILL LIVE, so claiming the drop right after \
+             warning that it failed sends anyone debugging reappearing stale jobs to \
+             the wrong place: {out}"
+        );
+    }
+
+    #[test]
+    fn an_already_gone_stale_job_claims_no_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = Queue::load(dir.path().join("q.json")).unwrap();
+
+        let out = logs_from(|| drop_stale(&mut q, &[9999]));
+
+        assert!(
+            !out.contains("dropped stale job"),
+            "nothing was there to drop, so nothing was dropped: {out}"
+        );
+    }
+
+    #[test]
+    fn a_stale_drop_that_persisted_is_logged() {
+        // The other half of the claim: this must stay noisy on success, or
+        // "don't log the failure" would pass by logging nothing ever.
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = Queue::load(dir.path().join("q.json")).unwrap();
+        let id = q.add(spec(false)).unwrap();
+
+        let out = logs_from(|| drop_stale(&mut q, &[id]));
+
+        assert!(
+            out.contains("dropped stale job"),
+            "a real drop must still be reported: {out}"
+        );
+        assert!(q.get(id).is_none(), "and the job must actually be gone");
     }
 
     #[test]

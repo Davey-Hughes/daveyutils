@@ -14,27 +14,69 @@
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
 # folder_fully_covered <dir> <n-images>
-# True only when <dir> has no subdirectories and holds exactly <n-images> files,
-# i.e. everything in it went into the PDF. --clean deletes the whole tree, so a
-# folder with nested content the PDF never covered must NOT be removed.
+# True only when <dir> has no subdirectories and holds exactly <n-images>
+# entries, i.e. everything in it went into the PDF. --clean deletes the whole
+# tree, so a folder with nested content the PDF never covered must NOT be
+# removed.
+#
+# The count is `! -type d`, not `-type f`: `-type f` matches neither a
+# symlink-to-file nor a symlink-to-dir, so a symlink was invisible to BOTH
+# sides of this check -- the image scan skipped it (it never reached the PDF)
+# and the total skipped it too, so total == n said "fully covered" and the link
+# was deleted. `! -type d` counts links (and fifos, sockets) as the uncovered
+# entries they are, which keeps the folder. The subdirectory probe stays: an
+# EMPTY subdir adds nothing to the count but is still uncovered content.
 folder_fully_covered() {
     local dir="$1" n="$2"
     [[ -z "$(find "$dir" -mindepth 1 -type d -print -quit)" ]] || return 1
     local total
-    total="$(find "$dir" -type f | wc -l)"
+    total="$(find "$dir" ! -type d | wc -l)"
     [[ "$total" -eq "$n" ]]
+}
+
+# uncovered_entries <dir>
+# The entries in <dir> that did NOT go into its PDF, one path per line: every
+# top-level subdirectory (the PDF only covered top-level images, so a subdir's
+# whole tree is uncovered) and every top-level entry the image scan skipped.
+# Mirrors that scan exactly -- an entry is covered iff it is a regular file
+# (`find -type f`, which excludes symlinks) that `file` reports as an image.
+#
+# This names what kept a folder. A single .DS_Store is enough to keep one
+# forever, and .DS_Store is ubiquitous in macOS-authored zips, so "it holds
+# files the PDF does not cover" left the user with no way to see why. Naming
+# the entries -- rather than ignoring a known-junk set -- keeps --clean exactly
+# as eager as the coverage check proves is safe.
+uncovered_entries() {
+    local dir="$1" e
+    while IFS= read -r -d '' e; do
+        printf '%s\n' "$e"
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -print0)
+    while IFS= read -r -d '' e; do
+        if [[ -L "$e" ]] || ! file --mime-type -b "$e" 2>/dev/null | grep -q '^image/'; then
+            printf '%s\n' "$e"
+        fi
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 ! -type d -print0)
+    return 0
 }
 
 OUTDIR="./pdfs"
 CLEAN=0
 MAINDIR=""
+HELP=0
 
-# parse_args <args...> -> sets OUTDIR/CLEAN/MAINDIR; echoes "OUTDIR|CLEAN|MAINDIR".
+# parse_args <args...> -> sets OUTDIR/CLEAN/MAINDIR/HELP; echoes
+# "OUTDIR|CLEAN|MAINDIR".
+#
+# -h sets its own HELP flag rather than a MAINDIR="__help__" sentinel: the
+# sentinel didn't exit, so the `*)` positional branch below silently overwrote
+# it and `--clean -h book` -- a user reaching for help on the destructive flag --
+# ran the full pipeline against book/ with CLEAN=1. It also made a directory
+# legitimately named __help__ print usage instead of being processed.
 parse_args() {
-    OUTDIR="./pdfs"; CLEAN=0; MAINDIR=""
+    OUTDIR="./pdfs"; CLEAN=0; MAINDIR=""; HELP=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -h|--help) MAINDIR="__help__"; shift ;;
+            -h|--help) HELP=1; shift ;;
             -o) OUTDIR="${2:?}"; shift 2 ;;
             --clean) CLEAN=1; shift ;;
             --) shift; [[ $# -gt 0 ]] && { MAINDIR="$1"; shift; }; break ;;
@@ -52,7 +94,7 @@ usage() {
 main() {
     set -euo pipefail
     parse_args "$@" >/dev/null
-    [[ "$MAINDIR" == "__help__" ]] && { usage; exit 0; }
+    [[ "$HELP" -eq 1 ]] && { usage; exit 0; }
     [[ -n "$MAINDIR" ]] || { usage; exit 1; }
     command -v unar >/dev/null 2>&1 || die "unar is required."
     command -v img2pdf >/dev/null 2>&1 || die "img2pdf is required."
@@ -69,8 +111,14 @@ main() {
         unar -q -o "$MAINDIR" "$z" &
         pids+=("$!")
     done
+    # ${pids[@]+"${pids[@]}"}, not a bare "${pids[@]}": with no *.zip in MAINDIR
+    # (image folders already extracted -- a normal workflow) the glob doesn't
+    # expand, `break` fires and pids stays empty. On bash 4.3 and earlier --
+    # macOS ships 3.2 -- an empty array expands as if unset, so the bare form
+    # aborts here under `set -u` before any PDF is built. Guarding the expansion
+    # rather than the loop keeps the no-zip run flowing on into the PDF loop.
     local pid
-    for pid in "${pids[@]}"; do
+    for pid in "${pids[@]+"${pids[@]}"}"; do
         wait "$pid" || printf 'WARN: an archive failed to extract\n' >&2
     done
 
@@ -93,7 +141,8 @@ main() {
                 if folder_fully_covered "$d" "${#images[@]}"; then
                     rm -rf "$d"
                 else
-                    printf 'WARN: kept %s: it holds files the PDF does not cover\n' "$d" >&2
+                    printf 'WARN: kept %s: it holds files the PDF does not cover:\n' "$d" >&2
+                    uncovered_entries "$d" | sed 's/^/  /' >&2
                 fi
             fi
         else

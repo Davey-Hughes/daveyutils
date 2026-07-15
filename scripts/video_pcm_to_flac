@@ -169,11 +169,18 @@ main() {
 
         mkdir -p "$(dirname "$out")"
 
+        # ${metadata[@]+"${metadata[@]}"}, not a bare "${metadata[@]}": streams
+        # with no title tag leave the array empty (stream_metadata line 153), and
+        # on bash 4.3 -- which the version gate above still admits -- an empty
+        # array expands as if unset, so the bare form aborts the whole batch
+        # under `set -u` rather than converting a perfectly ordinary untitled
+        # file. Guarding here keeps the stated 4.3 floor honest; the real floor
+        # for the bare form was 4.4.
         if [[ "$copy_first" -eq 1 ]]; then
             if ffmpeg -n -nostdin -hide_banner -v error -stats -i "$input" \
                     -map 0 -c copy -f matroska pipe: \
                 | ffmpeg -n -hide_banner -v error -stats -f matroska -i pipe: \
-                    -map 0 "${metadata[@]}" -c copy "${audio_streams[@]}" "$out"; then
+                    -map 0 "${metadata[@]+"${metadata[@]}"}" -c copy "${audio_streams[@]}" "$out"; then
                 ok=$((ok + 1))
             else
                 printf 'WARN: ffmpeg failed for %s\n' "$input" >&2
@@ -183,7 +190,7 @@ main() {
             fi
         else
             if ffmpeg -n -nostdin -hide_banner -v error -stats -i "$input" \
-                    -map 0 "${metadata[@]}" -c copy "${audio_streams[@]}" "$out"; then
+                    -map 0 "${metadata[@]+"${metadata[@]}"}" -c copy "${audio_streams[@]}" "$out"; then
                 ok=$((ok + 1))
             else
                 printf 'WARN: ffmpeg failed for %s\n' "$input" >&2

@@ -73,7 +73,19 @@ mod tests {
         assert!(xml.contains("com.nudge.daemon"), "got:\n{xml}");
         assert!(xml.contains("/usr/local/bin/nudge"));
         assert!(xml.contains("--daemon"));
-        assert!(xml.contains("RunAtLoad"));
+        // The *value*, not the key name: plist emits a false as
+        // `<key>RunAtLoad</key><false/>`, so `xml.contains("RunAtLoad")` held
+        // just as well with run_at_load flipped off -- verified by mutation --
+        // and macOS users' daemons would silently never start at load while the
+        // macos-latest CI job stayed green.
+        let after_run_at_load = xml
+            .split("<key>RunAtLoad</key>")
+            .nth(1)
+            .expect("RunAtLoad key present");
+        assert!(
+            after_run_at_load.trim_start().starts_with("<true/>"),
+            "RunAtLoad must be true, got:\n{xml}"
+        );
         // KeepAlive must restart only on an unsuccessful exit, not on ANY exit --
         // a bare `KeepAlive=true` would restart even a clean exit (e.g. when
         // `run` loses the singleton lock race), looping forever.

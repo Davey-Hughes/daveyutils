@@ -103,6 +103,26 @@ pub fn install(exec: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What to report about the attempt to remove the registration file at `path`.
+///
+/// Pure so the claim is testable: `uninstall` itself reads $HOME and shells out
+/// to systemctl/launchctl, so it is never called by tests -- which is exactly
+/// how it shipped announcing a removal it had not performed.
+fn removal_report(path: &Path, result: std::io::Result<()>) -> String {
+    match result {
+        Ok(()) => format!("nudge: removed {}", path.display()),
+        // Not an error: --install-daemon is optional (the daemon auto-starts
+        // via ensure_daemon), so having nothing to remove is the common case.
+        // It is just not a removal, and must not be reported as one.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("nudge: no registration found at {}", path.display())
+        }
+        // The registration is still on disk and still live. Distinct from
+        // NotFound, which needs no action.
+        Err(e) => format!("nudge: could not remove {}: {e}", path.display()),
+    }
+}
+
 /// Disable and remove the daemon registration. EFFECTFUL; never called by tests.
 pub fn uninstall() -> anyhow::Result<()> {
     let home = std::env::var_os("HOME")
@@ -115,8 +135,7 @@ pub fn uninstall() -> anyhow::Result<()> {
                 .args(["--user", "disable", "--now", "nudged.service"])
                 .status();
             let unit = systemd::unit_path(&home, xdg_config.as_deref());
-            let _ = std::fs::remove_file(&unit);
-            println!("nudge: removed {}", unit.display());
+            println!("{}", removal_report(&unit, std::fs::remove_file(&unit)));
         }
         Manager::Launchd => {
             let uid = current_uid();
@@ -124,9 +143,23 @@ pub fn uninstall() -> anyhow::Result<()> {
                 .args(["bootout", &format!("gui/{uid}/{}", launchd::LABEL)])
                 .status();
             let plist = launchd::plist_path(&home);
-            let _ = std::fs::remove_file(&plist);
-            println!("nudge: removed {}", plist.display());
+            println!("{}", removal_report(&plist, std::fs::remove_file(&plist)));
         }
+    }
+
+    // Removing the registration only stops a *managed* daemon. An ad-hoc one
+    // (auto-started by `nudge -p ...`) still holds the socket and will still
+    // fire every pending job -- so leaving the command's output at "removed
+    // <unit>" tells the user the daemon is gone while it demonstrably is not.
+    // `install` pings the same socket for the same reason.
+    let paths = crate::paths::resolve();
+    if std::os::unix::net::UnixStream::connect(&paths.socket).is_ok() {
+        println!(
+            "nudge: note: a daemon is still running (socket {}) and will still fire \
+             pending jobs.\n  It was not started by the registration just removed. \
+             Stop it with:\n  pkill -f 'nudge --daemon'",
+            paths.socket.display()
+        );
     }
     Ok(())
 }
@@ -167,6 +200,65 @@ fn current_uid() -> u32 {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn uninstall_does_not_claim_a_removal_that_never_happened() {
+        // The common case: the daemon auto-starts via ensure_daemon, so a user
+        // who never ran --install-daemon has no unit file at all. `let _ =
+        // remove_file(..)` then discarded the ENOENT and printed "removed
+        // <path>" for a file that never existed, exit 0.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nudged.service");
+
+        let report = removal_report(&missing, std::fs::remove_file(&missing));
+
+        assert!(
+            !report.contains("removed"),
+            "nothing was removed, so the report must not say so: {report}"
+        );
+        assert!(
+            report.contains(&missing.display().to_string()),
+            "the report must still name the path it looked at: {report}"
+        );
+    }
+
+    #[test]
+    fn uninstall_reports_a_real_removal() {
+        // The other half: this must stay affirmative on success, or "don't
+        // claim a removal" could be satisfied by never claiming one.
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("nudged.service");
+        std::fs::write(&unit, b"[Unit]").unwrap();
+
+        let report = removal_report(&unit, std::fs::remove_file(&unit));
+
+        assert!(
+            report.contains("removed"),
+            "a real removal must be reported as one: {report}"
+        );
+        assert!(!unit.exists(), "and the file must actually be gone");
+    }
+
+    #[test]
+    fn uninstall_reports_a_removal_that_failed_for_a_real_reason() {
+        // ENOENT means "there was nothing to do"; anything else means the
+        // registration is still on disk and still live. Collapsing the two
+        // would report a permission failure as a clean no-op.
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("nudged.service");
+        std::fs::create_dir(&unit).unwrap(); // remove_file on a dir: not NotFound
+
+        let report = removal_report(&unit, std::fs::remove_file(&unit));
+
+        assert!(
+            !report.contains("nudge: removed"),
+            "the unit is still there, so this is not a removal: {report}"
+        );
+        assert!(
+            report.contains("could not"),
+            "a real failure must say so rather than read as a clean no-op: {report}"
+        );
+    }
 
     #[test]
     fn plan_for_systemd_writes_a_unit_and_enables() {
