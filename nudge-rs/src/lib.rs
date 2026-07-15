@@ -1,5 +1,12 @@
 //! Core library for nudge. Side-effect-free logic used by the CLI and daemon.
 
+/// This build's version, as carried in the IPC handshake.
+///
+/// The daemon is resident and auto-started: rebuilding nudge does not replace
+/// the one already running, and it will not restart itself. So the CLI asks
+/// what it is talking to rather than assuming it is itself.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod app;
 pub mod cli;
 pub mod config;
@@ -49,6 +56,14 @@ pub fn run(cli: cli::Cli) -> anyhow::Result<()> {
     if cli.uninstall_daemon {
         return register::uninstall();
     }
+    // Check the user's banner patterns once, here, where there is a user to
+    // tell. detect.rs can only warn-and-degrade (a panic there would kill the
+    // daemon's scheduler thread), and on this path nothing is listening to a
+    // warning: init_tracing() runs in daemon mode only.
+    detect::validate_patterns(
+        std::env::var("NUDGE_CLOCK_PATTERN").ok().as_deref(),
+        std::env::var("NUDGE_DURATION_PATTERN").ok().as_deref(),
+    )?;
     // scheduling / job-management dispatch is added in Tasks 3-4 & 6.
     app::dispatch(cli)
 }

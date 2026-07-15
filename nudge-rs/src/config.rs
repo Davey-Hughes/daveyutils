@@ -43,7 +43,14 @@ pub fn resolve(env: &Toggles, overrides: &FlagOverrides) -> Toggles {
     }
     if let Some(v) = overrides.retries {
         out.retries = v;
-        out.auto_retry = true; // setting a retry count implies auto-retry
+        // A retry count implies auto-retry -- but only as a default, never over
+        // an explicit flag. Setting this unconditionally clobbered the `false`
+        // that `--no-auto-retry` had just written, so `--retries 5
+        // --no-auto-retry` scheduled a job with auto_retry=true/retries_left=5
+        // and retried it five times for a user who asked for none.
+        if overrides.auto_retry.is_none() {
+            out.auto_retry = true;
+        }
     }
     out
 }
@@ -104,6 +111,37 @@ mod tests {
     fn setting_retries_implies_auto_retry() {
         let mut ov = no_overrides();
         ov.retries = Some(5);
+        let out = resolve(&env(), &ov);
+        assert!(out.auto_retry);
+        assert_eq!(out.retries, 5);
+    }
+
+    #[test]
+    fn an_explicit_no_auto_retry_beats_the_retries_implication() {
+        // `--retries 5 --no-auto-retry`. The count implies auto-retry only as a
+        // default; an explicitly-passed flag is the user's stated intent and must
+        // win. Clobbering it here persisted the job with auto_retry=true /
+        // retries_left=5, so the scheduler retried five times a user who asked
+        // for none -- and --no-auto-retry, the only spelling that disables it,
+        // silently did nothing whenever -r was also present.
+        let mut ov = no_overrides();
+        ov.retries = Some(5);
+        ov.auto_retry = Some(false);
+        let out = resolve(&env(), &ov);
+        assert!(
+            !out.auto_retry,
+            "--no-auto-retry must survive an explicit --retries"
+        );
+        assert_eq!(out.retries, 5, "the count itself is still honoured");
+    }
+
+    #[test]
+    fn an_explicit_auto_retry_still_wins_alongside_retries() {
+        // The mirror case: --auto-retry --retries 5 agree, and env auto_retry
+        // false must not leak through.
+        let mut ov = no_overrides();
+        ov.retries = Some(5);
+        ov.auto_retry = Some(true);
         let out = resolve(&env(), &ov);
         assert!(out.auto_retry);
         assert_eq!(out.retries, 5);

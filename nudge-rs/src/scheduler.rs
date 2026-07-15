@@ -50,7 +50,26 @@ pub fn apply_outcome(
     retry_at: jiff::Timestamp,
 ) -> std::io::Result<()> {
     match outcome {
-        Ok(InjectOutcome::Sent(_)) if job.auto_retry && job.retries_left != 0 => {
+        // A send that landed with retries still budgeted, and a send that
+        // *failed* while the user asked to retry, both reschedule -- only the
+        // reason differs. Letting Err fall through to the catch-all would
+        // delete the job, so one transient tmux error (the server restarting,
+        // the pane briefly unavailable) turned `-a -r -1` into zero retries.
+        //
+        // Ok(SkippedVerify) is deliberately excluded: the pane no longer shows
+        // a banner, so the job is done, not failed.
+        //
+        // Note the consequence of Err joining this arm: `-a -r -1` against a
+        // pane that is permanently gone now retries forever, where before it
+        // deleted the job on the first error. That is accepted, not overlooked.
+        // It is literally what `-1` asks for; it is symmetric with the Sent
+        // path, which has always retried a live pane forever on the same flag;
+        // the retry is floored at MIN_RETRY_SECS so it cannot become a spin;
+        // and `--cancel` now reaches the daemon, so the user has a way out.
+        // Silently dropping the job on one transient tmux hiccup -- the server
+        // restarting, the pane briefly unavailable -- was the worse failure,
+        // because nothing said it had happened.
+        Ok(InjectOutcome::Sent(_)) | Err(_) if job.auto_retry && job.retries_left != 0 => {
             let left = if job.retries_left > 0 {
                 job.retries_left - 1
             } else {
@@ -194,6 +213,60 @@ mod tests {
         let cur = q.get(1).unwrap().clone();
         apply_outcome(&mut q, &cur, &Ok(InjectOutcome::Sent(1)), now().timestamp()).unwrap();
         assert_eq!(q.get(1).unwrap().retries_left, -1);
+    }
+
+    /// A transient injection failure: the tmux server was restarting, or the
+    /// pane was momentarily unavailable.
+    fn inject_err() -> anyhow::Result<InjectOutcome> {
+        Err(anyhow::anyhow!("tmux send-keys: can't find pane: p"))
+    }
+
+    #[test]
+    fn apply_err_with_retries_reschedules_instead_of_deleting() {
+        let j = job(1, "2026-07-13T11:59:00Z", true, 2);
+        let (_d, mut q) = q_with(j);
+        let retry_at: jiff::Timestamp = "2026-07-13T12:05:00Z".parse().unwrap();
+        let cur = q.get(1).unwrap().clone();
+        apply_outcome(&mut q, &cur, &inject_err(), retry_at).unwrap();
+        let job = q
+            .get(1)
+            .expect("a failed injection must not delete a job the user asked to retry");
+        assert_eq!(job.retries_left, 1);
+        assert_eq!(job.fire_at, retry_at);
+    }
+
+    #[test]
+    fn apply_err_with_infinite_retries_keeps_retrying() {
+        // The README's own `nudge -p bot:0.1 -a -r -1` -- "retry forever" must
+        // not mean "deleted after the first transient tmux blip".
+        let j = job(1, "2026-07-13T11:59:00Z", true, -1);
+        let (_d, mut q) = q_with(j);
+        let cur = q.get(1).unwrap().clone();
+        apply_outcome(&mut q, &cur, &inject_err(), now().timestamp()).unwrap();
+        assert_eq!(
+            q.get(1)
+                .expect("infinite retries must survive a failure")
+                .retries_left,
+            -1
+        );
+    }
+
+    #[test]
+    fn apply_err_with_retries_exhausted_removes() {
+        let j = job(1, "2026-07-13T11:59:00Z", true, 0);
+        let (_d, mut q) = q_with(j);
+        let cur = q.get(1).unwrap().clone();
+        apply_outcome(&mut q, &cur, &inject_err(), now().timestamp()).unwrap();
+        assert!(q.get(1).is_none(), "a job out of retries is done");
+    }
+
+    #[test]
+    fn apply_err_without_auto_retry_removes() {
+        let j = job(1, "2026-07-13T11:59:00Z", false, 0);
+        let (_d, mut q) = q_with(j);
+        let cur = q.get(1).unwrap().clone();
+        apply_outcome(&mut q, &cur, &inject_err(), now().timestamp()).unwrap();
+        assert!(q.get(1).is_none(), "no retry was asked for");
     }
 
     #[test]
