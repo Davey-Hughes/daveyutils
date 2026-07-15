@@ -57,6 +57,18 @@ pub fn plan_for(
 /// Write the plan's files and run its commands. EFFECTFUL — touches the host
 /// service manager. Only ever called from an explicit CLI opt-in, never tests.
 pub fn install(exec: &Path) -> anyhow::Result<()> {
+    // An ad-hoc daemon (auto-started by `nudge -p ...`) still owns the socket.
+    // Enabling the unit now would start a second daemon that immediately dies on
+    // the singleton lock, and systemd would retry it every RestartSec forever.
+    let paths = crate::paths::resolve();
+    if std::os::unix::net::UnixStream::connect(&paths.socket).is_ok() {
+        anyhow::bail!(
+            "a nudge daemon is already running (socket {}).\n\
+             Stop it first, then re-run --install-daemon:\n  pkill -f 'nudge --daemon'",
+            paths.socket.display()
+        );
+    }
+
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("$HOME is not set"))?;
