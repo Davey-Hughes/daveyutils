@@ -15,6 +15,17 @@ pub struct Paths {
     pub socket: PathBuf,
 }
 
+/// A set-but-empty XDG variable means *unset*, per the XDG basedir spec.
+///
+/// Filtered here rather than at the `std::env::var_os` call sites because this
+/// is the seam tests can reach: `resolve()` reads the process environment and
+/// so cannot be pinned, and an empty value that slips through is silent rather
+/// than loud -- `PathBuf::from("")` is a *relative* path, so every path derived
+/// from it resolves against the caller's working directory instead of failing.
+fn non_empty(p: Option<&Path>) -> Option<&Path> {
+    p.filter(|p| !p.as_os_str().is_empty())
+}
+
 /// Resolve paths from explicit inputs (pure; used by tests and `resolve`).
 pub fn resolve_from(
     home: &Path,
@@ -23,7 +34,7 @@ pub fn resolve_from(
     os: Os,
 ) -> Paths {
     let state_dir = match os {
-        Os::Linux => xdg_state
+        Os::Linux => non_empty(xdg_state)
             .map(Path::to_path_buf)
             .unwrap_or_else(|| home.join(".local/state"))
             .join("nudge"),
@@ -33,7 +44,7 @@ pub fn resolve_from(
     // The socket belongs in a runtime dir when one exists (Linux); otherwise it
     // lives beside the state file.
     let socket_dir = match os {
-        Os::Linux => xdg_runtime
+        Os::Linux => non_empty(xdg_runtime)
             .map(Path::to_path_buf)
             .unwrap_or_else(|| state_dir.clone()),
         Os::Macos => state_dir.clone(),
@@ -48,7 +59,7 @@ pub fn resolve_from(
 
 /// The user config dir: `$XDG_CONFIG_HOME`, else `<home>/.config`.
 pub fn config_dir(home: &Path, xdg_config: Option<&Path>) -> PathBuf {
-    xdg_config
+    non_empty(xdg_config)
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.join(".config"))
 }
@@ -96,6 +107,41 @@ mod tests {
         assert_eq!(p.state_dir, Path::new("/home/d/.local/state/nudge"));
         // No XDG_RUNTIME_DIR -> socket sits in the state dir.
         assert_eq!(p.socket, Path::new("/home/d/.local/state/nudge/nudge.sock"));
+    }
+
+    #[test]
+    fn an_empty_xdg_var_means_unset_not_cwd() {
+        // A set-but-empty XDG var is common in cron jobs, systemd units and
+        // some login shells. `PathBuf::from("")` is a *relative* path, so
+        // joining onto it silently yields CWD-relative state: the CLI and the
+        // daemon then resolve the socket against their own working directory,
+        // and scheduling from ~/projects/a while listing from ~/projects/b
+        // talks to a different socket and a different queue.json. The XDG spec
+        // says an empty value must be treated as unset.
+        let p = resolve_from(
+            Path::new("/home/d"),
+            Some(Path::new("")),
+            Some(Path::new("")),
+            Os::Linux,
+        );
+        assert!(
+            p.queue.is_absolute(),
+            "empty XDG_STATE_HOME must not yield a relative queue: {:?}",
+            p.queue
+        );
+        assert!(
+            p.socket.is_absolute(),
+            "empty XDG_RUNTIME_DIR must not yield a relative socket: {:?}",
+            p.socket
+        );
+        // Empty == unset, so both must land exactly where the unset case does.
+        assert_eq!(p, resolve_from(Path::new("/home/d"), None, None, Os::Linux));
+    }
+
+    #[test]
+    fn an_empty_xdg_config_home_means_unset_not_cwd() {
+        let d = config_dir(Path::new("/home/d"), Some(Path::new("")));
+        assert_eq!(d, Path::new("/home/d/.config"));
     }
 
     #[test]
