@@ -56,7 +56,9 @@ main() {
         pids+=("$!")
     done
     local pid
-    for pid in "${pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid"; done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || printf 'WARN: an archive failed to extract\n' >&2
+    done
 
     # One PDF per image subdirectory. --clean only removes a folder whose
     # own PDF just succeeded; a failed conversion always keeps its source.

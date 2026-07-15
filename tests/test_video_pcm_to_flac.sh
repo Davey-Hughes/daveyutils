@@ -24,4 +24,11 @@ check "metadata is 2 elements (title kept whole)" "2" "${#md[@]}"
 check "metadata flag element"                     "-metadata:s:1" "${md[0]}"
 check "title element intact with spaces"           "title=Surround FLAC 5.1" "${md[1]}"
 
+# A trailing PCM stream with NO title must not make the helper return non-zero
+# (it would abort the whole batch under `set -e`).
+declare -a md_untitled
+stream_metadata md_untitled $'1,pcm_s16le,Titled PCM\n3,pcm_s24le' pcm2flac
+check "untitled trailing pcm stream -> rc 0" "0" "$?"
+check "only the titled stream got metadata" "2" "${#md_untitled[@]}"
+
 finish

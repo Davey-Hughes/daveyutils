@@ -55,11 +55,16 @@ stream_metadata() {
         [[ -n "$line" ]] || continue
         IFS=',' read -r index codec title <<<"$line"
         if [[ "$direction" == "pcm2flac" && "$codec" =~ ^pcm_ ]]; then
-            [[ -n "$title" ]] && _out+=("-metadata:s:$index" "title=${title/PCM/FLAC}")
+            if [[ -n "$title" ]]; then
+                _out+=("-metadata:s:$index" "title=${title/PCM/FLAC}")
+            fi
         elif [[ "$direction" == "flac2pcm" && "$codec" == "flac" ]]; then
-            [[ -n "$title" ]] && _out+=("-metadata:s:$index" "title=${title/FLAC/PCM}")
+            if [[ -n "$title" ]]; then
+                _out+=("-metadata:s:$index" "title=${title/FLAC/PCM}")
+            fi
         fi
     done <<<"$csv"
+    return 0
 }
 
 # output_path <input> <outdir> <show> -> "<outdir>/<show>/<input>",
