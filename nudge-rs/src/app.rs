@@ -224,10 +224,17 @@ pub fn merge_edit(
     })
 }
 
-/// Edit a pending job: find it via `List`, overlay explicitly-passed CLI
-/// flags onto its existing fields (preserving anything not passed), then
-/// `Schedule` the merged spec BEFORE `Cancel`-ing the original — so a
-/// Schedule failure can never lose the job.
+/// Edit a pending job: find it via `List`, overlay explicitly-passed CLI flags
+/// onto its existing fields (preserving anything not passed), then `Replace` it
+/// with the merged spec.
+///
+/// The mutation is one request, applied under the daemon's queue lock. It used
+/// to be Schedule-then-Cancel: scheduled first so a Schedule failure couldn't
+/// lose the job, but that leaves both jobs live in between, and a Cancel leg
+/// that never landed — daemon restarted or killed in the window, socket stolen,
+/// Ctrl-C — fired the message twice, at the old time and the new, while the
+/// error read as though the edit hadn't happened at all. A single round-trip
+/// cannot half-apply: either the swap is committed or nothing is.
 pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
     let socket = live_socket()?;
     let jobs = match client::request(&socket, &Request::List)? {
@@ -242,21 +249,17 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
     let now = Zoned::now();
     let spec = merge_edit(&job, cli, &now, crate::cli::default_retries())?;
 
-    // Schedule the replacement FIRST so a failure can't lose the original.
-    let new_id = match client::request(&socket, &Request::Schedule(spec))? {
-        Response::Scheduled(new_id) => new_id,
-        Response::Error(e) => bail!("failed to reschedule job {id}: {e}"),
-        other => bail!("failed to reschedule job {id}: {other:?}"),
-    };
-    match client::request(&socket, &Request::Cancel(id))? {
-        Response::Cancelled(true) => {}
-        Response::Cancelled(false) => {
-            tracing::warn!("nudge: original job {id} was already gone")
+    match client::request(&socket, &Request::Replace { id, spec })? {
+        Response::Replaced(Some(new_id)) => {
+            println!("nudge: edited job {id} -> {new_id}");
+            Ok(())
         }
-        other => bail!("scheduled replacement {new_id} but could not cancel {id}: {other:?}"),
+        // It fired or was cancelled between the List above and now. Nothing was
+        // scheduled in its place.
+        Response::Replaced(None) => bail!("no pending job with id {id}"),
+        Response::Error(e) => bail!("failed to edit job {id}: {e}; it is unchanged"),
+        other => bail!("failed to edit job {id}: {other:?}; it is unchanged"),
     }
-    println!("nudge: edited job {id} -> {new_id}");
-    Ok(())
 }
 
 /// Dispatch non-daemon modes.
