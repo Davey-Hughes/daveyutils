@@ -87,9 +87,26 @@ pub(crate) fn tri(on: bool, off: bool) -> Option<bool> {
     }
 }
 
-/// Env defaults (`NUDGE_*`) overlaid with the CLI's flags.
-pub fn resolve_options(cli: &Cli) -> Toggles {
-    let env = Toggles {
+/// The CLI's flags as overrides, with an absent flag left `None` so the env
+/// default survives.
+///
+/// Split out of `resolve_options` as a pure seam: this mapping is the part
+/// `cli.rs` actually owns, and testing it through the process environment means
+/// `set_var`, which races other tests in the same binary (and is UB alongside a
+/// concurrent `var`).
+pub(crate) fn flag_overrides(cli: &Cli) -> FlagOverrides {
+    FlagOverrides {
+        notify: tri(cli.notify, cli.no_notify),
+        verify: tri(cli.verify, cli.no_verify),
+        auto_retry: tri(cli.auto_retry, cli.no_auto_retry),
+        retries: cli.retries,
+        settle_secs: None,
+    }
+}
+
+/// The `NUDGE_*` environment defaults.
+fn env_toggles() -> Toggles {
+    Toggles {
         notify: env_bool(std::env::var("NUDGE_NOTIFY").ok().as_deref()),
         verify: env_bool(std::env::var("NUDGE_VERIFY").ok().as_deref()),
         auto_retry: env_bool(std::env::var("NUDGE_AUTO_RETRY").ok().as_deref()),
@@ -101,15 +118,12 @@ pub fn resolve_options(cli: &Cli) -> Toggles {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5.0),
-    };
-    let overrides = FlagOverrides {
-        notify: tri(cli.notify, cli.no_notify),
-        verify: tri(cli.verify, cli.no_verify),
-        auto_retry: tri(cli.auto_retry, cli.no_auto_retry),
-        retries: cli.retries,
-        settle_secs: None,
-    };
-    resolve(&env, &overrides)
+    }
+}
+
+/// Env defaults (`NUDGE_*`) overlaid with the CLI's flags.
+pub fn resolve_options(cli: &Cli) -> Toggles {
+    resolve(&env_toggles(), &flag_overrides(cli))
 }
 
 #[cfg(test)]
@@ -132,34 +146,56 @@ mod tests {
         assert!(c.verify);
     }
 
+    /// A stand-in for the `NUDGE_*` environment.
+    ///
+    /// These tests pass the env in explicitly rather than calling
+    /// `resolve_options`, which reads the real one. Mutating the process
+    /// environment to set up a test races every other test in this binary --
+    /// they share one process and cargo runs them on parallel threads -- and a
+    /// `set_var` concurrent with another thread's `var` is documented UB
+    /// besides. Nothing here touches process-global state, so nothing here can
+    /// race.
+    fn env(notify: bool) -> Toggles {
+        Toggles {
+            notify,
+            verify: false,
+            auto_retry: false,
+            retries: 2,
+            settle_secs: 5.0,
+        }
+    }
+
+    /// The env -> flags path `resolve_options` runs, minus the env read.
+    fn resolve_flags(env: &Toggles, args: &[&str]) -> Toggles {
+        resolve(env, &flag_overrides(&parse(args)))
+    }
+
     #[test]
-    fn no_flags_override_env_defaults() {
-        // With no CLI flags, resolve reflects the (test-provided) env absence -> false/defaults.
-        let c = parse(&["nudge", "-p", "x"]);
-        // Clear any inherited env for determinism.
-        std::env::remove_var("NUDGE_NOTIFY");
-        std::env::remove_var("NUDGE_VERIFY");
-        std::env::remove_var("NUDGE_AUTO_RETRY");
-        std::env::remove_var("NUDGE_RETRIES");
-        let t = resolve_options(&c);
+    fn no_flags_leave_the_env_defaults_alone() {
+        let t = resolve_flags(&env(false), &["nudge", "-p", "x"]);
         assert!(!t.notify);
         assert_eq!(t.retries, 2);
     }
 
     #[test]
+    fn a_bare_notify_env_survives_when_no_flag_is_given() {
+        // Pins that an absent flag maps to None, not Some(false): mapping it to
+        // Some(false) would silently override NUDGE_NOTIFY=1.
+        let t = resolve_flags(&env(true), &["nudge", "-p", "x"]);
+        assert!(t.notify);
+    }
+
+    #[test]
     fn retries_flag_implies_auto_retry() {
-        let c = parse(&["nudge", "-p", "x", "-r", "5"]);
-        let t = resolve_options(&c);
+        let t = resolve_flags(&env(false), &["nudge", "-p", "x", "-r", "5"]);
         assert!(t.auto_retry);
         assert_eq!(t.retries, 5);
     }
 
     #[test]
     fn no_notify_beats_a_bare_notify_env() {
-        std::env::set_var("NUDGE_NOTIFY", "1");
-        let c = parse(&["nudge", "-p", "x", "--no-notify"]);
-        let t = resolve_options(&c);
+        // NUDGE_NOTIFY=1 in the environment, --no-notify on the command line.
+        let t = resolve_flags(&env(true), &["nudge", "-p", "x", "--no-notify"]);
         assert!(!t.notify);
-        std::env::remove_var("NUDGE_NOTIFY");
     }
 }
