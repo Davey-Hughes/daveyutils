@@ -51,14 +51,18 @@ pub struct Cli {
     pub no_auto_retry: bool,
 
     /// Exact retry count (-1 = forever). Implies --auto-retry.
-    ///
-    /// `allow_negative_numbers` is load-bearing, not tidiness: -1 is a real
-    /// supported value (scheduler.rs keeps `retries_left == -1` infinite, and
-    /// the README advertises `-r -1`), but without this clap reads the `-1` in
-    /// `-r -1` as an unknown short flag and only the `--retries=-1` equals form
-    /// survives. This is the one numeric arg here with a legitimately negative
-    /// value -- `--cancel`/`--edit` are `u64` ids and `--delay` is a pause in
-    /// seconds, so all three are right to reject a negative.
+    //
+    // Plain `//`, not `///`: clap renders every paragraph after the first as the
+    // long help, so as a doc comment this rationale was printed to users by
+    // `nudge --help`. It is for whoever touches the attribute next.
+    //
+    // `allow_negative_numbers` is load-bearing, not tidiness: -1 is a real
+    // supported value (scheduler.rs keeps `retries_left == -1` infinite, and
+    // the README advertises `-r -1`), but without this clap reads the `-1` in
+    // `-r -1` as an unknown short flag and only the `--retries=-1` equals form
+    // survives. This is the one numeric arg here with a legitimately negative
+    // value -- `--cancel`/`--edit` are `u64` ids and `--delay` is a pause in
+    // seconds, so all three are right to reject a negative.
     #[arg(short = 'r', long = "retries", allow_negative_numbers = true)]
     pub retries: Option<i64>,
 
