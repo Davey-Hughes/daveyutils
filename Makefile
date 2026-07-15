@@ -13,8 +13,12 @@
 # `nudge` is the Rust binary from nudge-rs/ (the bash scripts/nudge is kept as
 # the reference oracle for the port and is deliberately NOT linked).
 
-BIN     := bin
-NUDGE   := nudge-rs/target/release/nudge
+BIN := bin
+# Pin cargo's output dir. An inherited CARGO_TARGET_DIR would otherwise put the
+# binary somewhere else, leaving bin/nudge dangling while make still reported
+# success -- so we pass --target-dir explicitly rather than trusting the default.
+TARGET_DIR := nudge-rs/target
+NUDGE      := $(TARGET_DIR)/release/nudge
 # Every script except the bash nudge (superseded by the Rust binary).
 SCRIPTS := $(filter-out scripts/nudge,$(wildcard scripts/*))
 
@@ -28,7 +32,9 @@ link: build-nudge | $(BIN)
 		ln -sfn "../$$s" "$(BIN)/$$(basename $$s)" && \
 		echo "  link  $(BIN)/$$(basename $$s) -> ../$$s"; \
 	done
-	@ln -sfn "../$(NUDGE)" "$(BIN)/nudge" && echo "  link  $(BIN)/nudge -> ../$(NUDGE)"
+	@ln -sfn "../$(NUDGE)" "$(BIN)/nudge"
+	@test -e "$(BIN)/nudge" || { printf 'error: %s/nudge is a dangling symlink (no binary at %s)\n' "$(BIN)" "$(NUDGE)" >&2; exit 1; }
+	@echo "  link  $(BIN)/nudge -> ../$(NUDGE)"
 	@echo
 	@echo "Add to your PATH:"
 	@echo "  export PATH=\"$(CURDIR)/$(BIN):\$$PATH\""
@@ -38,7 +44,8 @@ $(BIN):
 
 ## build-nudge: cargo build --release the nudge binary
 build-nudge:
-	@cargo build --release --manifest-path nudge-rs/Cargo.toml
+	@cargo build --release --manifest-path nudge-rs/Cargo.toml --target-dir "$(TARGET_DIR)"
+	@test -x "$(NUDGE)" || { printf 'error: cargo reported success but there is no binary at %s\n' "$(NUDGE)" >&2; exit 1; }
 
 ## clean: remove ./bin (leaves the Rust build cache alone)
 clean:
@@ -47,7 +54,7 @@ clean:
 
 ## distclean: remove ./bin and the Rust build artifacts
 distclean: clean
-	@cargo clean --manifest-path nudge-rs/Cargo.toml
+	@cargo clean --manifest-path nudge-rs/Cargo.toml --target-dir "$(TARGET_DIR)"
 	@echo "removed nudge-rs build artifacts"
 
 ## check: run the bash test-suite and the Rust tests
