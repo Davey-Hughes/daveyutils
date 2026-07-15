@@ -1,0 +1,40 @@
+# Maintainer: Davey Hughes
+pkgname=nudge
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Rate-limit auto-resumer for AI CLIs in tmux"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Davey-Hughes/daveyutils"
+license=('GPL-3.0-or-later')
+depends=('tmux')
+makedepends=('cargo')
+provides=('nudge')
+conflicts=('nudge-git')
+# Release tags are named `nudge-v$pkgver`.
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Davey-Hughes/daveyutils/archive/refs/tags/nudge-v$pkgver.tar.gz")
+# NOTE: this is an intentionally-invalid placeholder hash. It is NOT `SKIP`
+# on purpose — a source package must verify its tarball, so this is left in a
+# state that makepkg REFUSES to build until the real release-tarball sha256 is
+# filled in (`updpkgsums` after the `nudge-v$pkgver` tag exists). Do not change
+# it to `SKIP`; that would ship the package with integrity verification disabled.
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+
+build() {
+  cd "daveyutils-nudge-v$pkgver/nudge-rs"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --release --locked
+}
+
+package() {
+  cd "daveyutils-nudge-v$pkgver/nudge-rs"
+  install -Dm755 target/release/nudge "$pkgdir/usr/bin/nudge"
+  install -Dm644 ../LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  install -dm755 "$pkgdir/usr/share/bash-completion/completions"
+  target/release/nudge --completions bash > "$pkgdir/usr/share/bash-completion/completions/nudge"
+  install -dm755 "$pkgdir/usr/share/zsh/site-functions"
+  target/release/nudge --completions zsh > "$pkgdir/usr/share/zsh/site-functions/_nudge"
+  install -dm755 "$pkgdir/usr/share/fish/vendor_completions.d"
+  target/release/nudge --completions fish > "$pkgdir/usr/share/fish/vendor_completions.d/nudge.fish"
+}

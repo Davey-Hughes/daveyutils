@@ -19,6 +19,10 @@ pub mod tmux_panes;
 
 /// Dispatch a parsed CLI to the right mode.
 pub fn run(cli: cli::Cli) -> anyhow::Result<()> {
+    if let Some(shell) = cli.completions {
+        app::print_completions(shell);
+        return Ok(());
+    }
     if cli.daemon {
         daemon::init_tracing();
         let p = paths::resolve();

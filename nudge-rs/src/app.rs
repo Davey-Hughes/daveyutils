@@ -6,6 +6,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
+use clap::CommandFactory;
 use jiff::Zoned;
 
 use crate::cli::{resolve_options, tri, Cli};
@@ -267,4 +268,40 @@ pub fn pick_pane() -> anyhow::Result<String> {
         .context("pane selection cancelled")?;
     let idx = labels.iter().position(|l| l == &choice).unwrap();
     Ok(panes[idx].target.clone())
+}
+
+/// Write a shell completion script for the `nudge` binary.
+pub fn write_completions<W: std::io::Write>(shell: clap_complete::Shell, w: &mut W) {
+    clap_complete::generate(shell, &mut Cli::command(), "nudge", w);
+}
+
+/// Print a shell completion script to stdout.
+pub fn print_completions(shell: clap_complete::Shell) {
+    write_completions(shell, &mut std::io::stdout());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bash_completions_mention_the_binary() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_completions(clap_complete::Shell::Bash, &mut buf);
+        let script = String::from_utf8(buf).unwrap();
+        assert!(
+            script.contains("nudge"),
+            "completion script should mention the binary"
+        );
+        assert!(!script.is_empty());
+    }
+
+    #[test]
+    fn zsh_and_fish_generate_nonempty_scripts() {
+        for sh in [clap_complete::Shell::Zsh, clap_complete::Shell::Fish] {
+            let mut buf: Vec<u8> = Vec::new();
+            write_completions(sh, &mut buf);
+            assert!(!buf.is_empty(), "{sh} script must be non-empty");
+        }
+    }
 }
