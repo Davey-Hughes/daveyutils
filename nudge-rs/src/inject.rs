@@ -41,12 +41,33 @@ pub fn run_injection(
     dur_ext: Option<&str>,
 ) -> Result<InjectOutcome> {
     if job.verify {
-        // Dims first: a capture that fails is an Err (the pane is gone, tmux is
-        // down), which the caller retries or reports. It is deliberately not a
-        // skip -- an unreachable pane is a failure to say out loud, not a
-        // decision that the user resumed.
-        let now_dims = target.dims();
+        // Dims either side of the capture, believed only when they agree.
+        //
+        // Reading them once left a window: a resize landing between the read
+        // and the capture makes the dims describe a layout the capture no
+        // longer has. They match the baseline, so the gate thinks the two
+        // captures are comparable, while the fingerprint cannot match because
+        // every line reflowed -- Changed, i.e. "the user resumed", i.e. the
+        // nudge silently never fires. Agreement on both sides is what proves no
+        // resize straddled the capture; disagreement is precisely the state we
+        // cannot interpret, so it goes to Unknown and fails open, as does
+        // either read coming back unreadable.
+        //
+        // `capture_baseline` deliberately does NOT mirror this and must not be
+        // "made consistent" with it -- see the comment there for why its
+        // dims-then-capture order is already the safe one at schedule time.
+        //
+        // A capture that fails is an Err (the pane is gone, tmux is down),
+        // which the caller retries or reports. It is deliberately not a skip --
+        // an unreachable pane is a failure to say out loud, not a decision that
+        // the user resumed.
+        let dims_before = target.dims();
         let screen = target.capture()?;
+        let dims_after = target.dims();
+        let now_dims = match (dims_before, dims_after) {
+            (Some(before), Some(after)) if before == after => Some(before),
+            _ => None,
+        };
 
         // Has the pane moved since the user scheduled this? Only `Changed` --
         // same size, different content -- stops the nudge. Everything else,
@@ -93,14 +114,17 @@ mod tests {
     /// In-memory Target: returns a fixed screen, records what was sent.
     struct FakeTarget {
         screen: String,
-        dims: Option<crate::target::PaneDims>,
+        /// What successive `dims()` calls answer, in order; the last entry
+        /// repeats forever. A one-element script is therefore a pane whose size
+        /// is not changing, however many times it is read.
+        dims_reads: RefCell<Vec<Option<crate::target::PaneDims>>>,
         sent: RefCell<Vec<String>>,
     }
     impl FakeTarget {
         fn new(screen: &str) -> Self {
             FakeTarget {
                 screen: screen.to_string(),
-                dims: Some(DIMS),
+                dims_reads: RefCell::new(vec![Some(DIMS)]),
                 sent: RefCell::new(Vec::new()),
             }
         }
@@ -108,7 +132,7 @@ mod tests {
         /// answered with the empty fields it returns for a dead pane).
         fn with_unknown_dims(screen: &str) -> Self {
             FakeTarget {
-                dims: None,
+                dims_reads: RefCell::new(vec![None]),
                 ..FakeTarget::new(screen)
             }
         }
@@ -116,7 +140,20 @@ mod tests {
         /// different *and* so are the dims.
         fn resized(screen: &str, dims: crate::target::PaneDims) -> Self {
             FakeTarget {
-                dims: Some(dims),
+                dims_reads: RefCell::new(vec![Some(dims)]),
+                ..FakeTarget::new(screen)
+            }
+        }
+        /// A pane resized *while the capture was in flight*: a read taken before
+        /// it still answers the old size, the capture comes back already
+        /// reflowed, and a read taken after sees the new size.
+        fn resized_mid_capture(
+            screen: &str,
+            before: crate::target::PaneDims,
+            after: crate::target::PaneDims,
+        ) -> Self {
+            FakeTarget {
+                dims_reads: RefCell::new(vec![Some(before), Some(after)]),
                 ..FakeTarget::new(screen)
             }
         }
@@ -135,7 +172,12 @@ mod tests {
             Ok(())
         }
         fn dims(&self) -> Option<crate::target::PaneDims> {
-            self.dims
+            let mut reads = self.dims_reads.borrow_mut();
+            if reads.len() > 1 {
+                reads.remove(0)
+            } else {
+                reads[0]
+            }
         }
     }
 
@@ -301,6 +343,41 @@ mod tests {
             InjectOutcome::Sent(1),
             "a resize reflows every line; reading that as 'the user resumed' would \
              make a resized window silently never fire"
+        );
+    }
+
+    /// The resize that lands *between* the dims read and the capture.
+    ///
+    /// Reading dims once, before capturing, leaves a window: `dims()` answers
+    /// the size the pane had a moment ago, and the capture comes back already
+    /// reflowed. The dims then *match* the baseline -- so the gate believes the
+    /// two captures are comparable -- while the fingerprint cannot possibly
+    /// match, because every line wrapped differently. That reads as "the user
+    /// resumed" and the nudge silently never fires, which is the one failure
+    /// this design will not trade for anything.
+    ///
+    /// The window is milliseconds wide, so this is hardening rather than a bug
+    /// anyone has hit. It is also the disaster direction, and reading dims on
+    /// both sides costs one more tmux call.
+    #[test]
+    fn verify_fails_open_when_a_resize_lands_between_the_dims_read_and_the_capture() {
+        let reflowed = "● Working on it... ⏸ session limit reached · resets 3:00am\n\n❯ ";
+        let t = FakeTarget::resized_mid_capture(
+            reflowed,
+            DIMS,
+            crate::target::PaneDims {
+                width: 120,
+                height: 24,
+            },
+        );
+        let out =
+            run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None).unwrap();
+        assert_eq!(
+            out,
+            InjectOutcome::Sent(1),
+            "a resize straddling the capture makes the dims a lie: they match the \
+             baseline while the text they describe has already reflowed. Believing \
+             them turns an untouched pane into 'resumed' and never fires."
         );
     }
 
