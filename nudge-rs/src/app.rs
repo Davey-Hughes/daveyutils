@@ -92,9 +92,7 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
     let fire_at = fire_time(cli, &pane, &now)?;
     let spec = build_spec(&pane, fire_at, cli, &opts);
 
-    let paths = paths::resolve();
-    ensure_daemon(&paths.socket)?;
-    match client::request(&paths.socket, &Request::Schedule(spec))? {
+    match client::request(&live_socket()?, &Request::Schedule(spec))? {
         Response::Scheduled(id) => {
             println!("nudge: scheduled job {id} for {}", fire_at);
             Ok(())
@@ -123,14 +121,24 @@ pub fn format_jobs(jobs: &[Job]) -> String {
     out
 }
 
-fn socket() -> std::path::PathBuf {
-    paths::resolve().socket
+/// The daemon socket, with a daemon guaranteed to be answering on it.
+///
+/// Every command that talks to the queue goes through here. Jobs are persisted
+/// and outlive the daemon, so the job-management commands need a daemon exactly
+/// as `schedule` does: with one down (a reboot, or an ad-hoc daemon that exited
+/// — nothing restarts it), `--list`/`--cancel`/`--edit` otherwise die on a
+/// socket that isn't there, and the user cannot cancel a job that queue.json
+/// still holds and that fires as soon as anything starts a daemon again.
+fn live_socket() -> anyhow::Result<std::path::PathBuf> {
+    let socket = paths::resolve().socket;
+    ensure_daemon(&socket)?;
+    Ok(socket)
 }
 
 /// List pending jobs (interactive picker lands in Task 6; both modes print
 /// the table for now).
 pub fn list(_plain: bool) -> anyhow::Result<()> {
-    match client::request(&socket(), &Request::List)? {
+    match client::request(&live_socket()?, &Request::List)? {
         Response::Jobs(jobs) => {
             print!("{}", format_jobs(&jobs));
             Ok(())
@@ -141,7 +149,7 @@ pub fn list(_plain: bool) -> anyhow::Result<()> {
 
 /// Cancel a pending job by id.
 pub fn cancel(id: u64) -> anyhow::Result<()> {
-    match client::request(&socket(), &Request::Cancel(id))? {
+    match client::request(&live_socket()?, &Request::Cancel(id))? {
         Response::Cancelled(true) => {
             println!("nudge: cancelled job {id}");
             Ok(())
@@ -221,7 +229,8 @@ pub fn merge_edit(
 /// `Schedule` the merged spec BEFORE `Cancel`-ing the original — so a
 /// Schedule failure can never lose the job.
 pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
-    let jobs = match client::request(&socket(), &Request::List)? {
+    let socket = live_socket()?;
+    let jobs = match client::request(&socket, &Request::List)? {
         Response::Jobs(j) => j,
         other => bail!("unexpected response: {other:?}"),
     };
@@ -234,12 +243,12 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
     let spec = merge_edit(&job, cli, &now, crate::cli::default_retries())?;
 
     // Schedule the replacement FIRST so a failure can't lose the original.
-    let new_id = match client::request(&socket(), &Request::Schedule(spec))? {
+    let new_id = match client::request(&socket, &Request::Schedule(spec))? {
         Response::Scheduled(new_id) => new_id,
         Response::Error(e) => bail!("failed to reschedule job {id}: {e}"),
         other => bail!("failed to reschedule job {id}: {other:?}"),
     };
-    match client::request(&socket(), &Request::Cancel(id))? {
+    match client::request(&socket, &Request::Cancel(id))? {
         Response::Cancelled(true) => {}
         Response::Cancelled(false) => {
             tracing::warn!("nudge: original job {id} was already gone")
