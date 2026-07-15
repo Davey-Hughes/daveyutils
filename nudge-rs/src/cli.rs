@@ -71,6 +71,10 @@ pub struct Cli {
     /// Unregister the daemon.
     #[arg(long = "uninstall-daemon")]
     pub uninstall_daemon: bool,
+
+    /// Print a shell completion script for SHELL (bash, zsh, fish, …) to stdout.
+    #[arg(long = "completions", value_name = "SHELL")]
+    pub completions: Option<clap_complete::Shell>,
 }
 
 pub(crate) fn tri(on: bool, off: bool) -> Option<bool> {
