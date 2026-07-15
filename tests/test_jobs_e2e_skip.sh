@@ -132,4 +132,31 @@ check "an unusable 'at' reports the skip" "yes" \
     "$(printf '%s' "$skip_out" | grep -q "SKIP: environment can't queue an 'at' job" \
         && echo yes || echo no)"
 
+# --- an `at` that QUEUES but whose id won't parse is a fault, not a skip -------
+# The probe only knows an id it can grep out of at's "job N at ..." line. If that
+# message ever changes shape, the grep comes back empty -- which the skip branch
+# read as "this environment can't queue", printed the SKIP and exited 0. But at
+# exiting 0 means it ACCEPTED the job: a REAL job is now sitting in the user's
+# queue and nothing can reap it (remember_id "" is a no-op). Report that instead
+# of excusing it. The exit status is what separates the two cases -- a refusing
+# `at` writes to stderr too, so "raw output non-empty" would also fire on the
+# genuine skip above and break it.
+cat > "$WORKDIR/fakebin/at" <<'FAKE'
+#!/usr/bin/env bash
+cat >/dev/null            # swallow the job body; queue nothing (no real leak)
+echo "warning: commands will be executed using /bin/sh" >&2
+echo "job number 4242 at Wed Jul 15 23:59:00 2026" >&2   # not "job 4242 at ..."
+exit 0                    # ... but claim success: at accepted the job
+FAKE
+chmod +x "$WORKDIR/fakebin/at"
+
+unparsed_out=$(PATH="$WORKDIR/fakebin:$PATH" bash "$WORKDIR/tests/test_jobs_e2e.sh" 2>&1)
+unparsed_rc=$?
+check "an unparsable 'at' id FAILS the e2e file (not exit 0)" "yes" \
+    "$([ "$unparsed_rc" -ne 0 ] && echo yes || echo no)"
+check "an unparsable 'at' id is not excused as an unusable environment" "yes" \
+    "$(printf '%s' "$unparsed_out" | grep -q "SKIP: environment can't queue" && echo no || echo yes)"
+check "an unparsable 'at' id is reported as such" "yes" \
+    "$(printf '%s' "$unparsed_out" | grep -q 'no parsable id' && echo yes || echo no)"
+
 finish

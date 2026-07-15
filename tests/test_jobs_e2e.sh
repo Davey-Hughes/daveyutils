@@ -43,24 +43,46 @@ trap 'purge; rm -f "$PRELUDE"' EXIT
 # and silently disabled this entire file, exit 0, suite still "PASSED".
 #
 # probe_queue <queue> -- can `at` ITSELF queue a job in <queue> here?
-# Returns 0 and sets PROBE_ID when it can. The payload is `true` and we remove it
-# immediately, so it's harmless even where BSD `at` drops the relative offset and
-# schedules it for ~now. remember_id backs up the atrm in case the latter fails,
-# so the EXIT trap still reaps it.
+#   0 = yes, and PROBE_ID parsed (so we could reap it again)
+#   1 = `at` refused: nothing was queued, a real environment limit -> skippable
+#   2 = `at` ACCEPTED but printed no id we can parse -> NOT skippable, and a
+#       failure has already been recorded here (see below)
+#
+# The payload is `true` and we remove it immediately, so it's harmless even where
+# BSD `at` drops the relative offset and schedules it for ~now. remember_id backs
+# up the atrm in case the latter fails, so the EXIT trap still reaps it -- but
+# only once the id parsed: remember_id "" is a no-op. So an `at` that queues a
+# job whose id we can't grep out leaves a REAL job in the user's queue that
+# nothing can reap; skipping there would exit 0 and abandon it. at's exit status
+# is what separates that from a refusal (a refusing `at` writes to stderr too, so
+# "raw output non-empty" would misfire on the genuine, skippable case).
 PROBE_ID=""
+PROBE_RAW=""
 probe_queue() {
-    PROBE_ID=$(echo true | at -q "$1" now + 2 hours 2>&1 \
-        | grep -oE 'job [0-9]+' | grep -oE '[0-9]+')
+    local rc
+    PROBE_RAW=$(echo true | at -q "$1" now + 2 hours 2>&1)
+    rc=$?
+    PROBE_ID=$(printf '%s\n' "$PROBE_RAW" | grep -oE 'job [0-9]+' | grep -oE '[0-9]+')
     remember_id "$PROBE_ID"
-    [ -z "$PROBE_ID" ] && return 1
-    atrm "$PROBE_ID" 2>/dev/null
-    return 0
+    if [ -n "$PROBE_ID" ]; then
+        atrm "$PROBE_ID" 2>/dev/null
+        return 0
+    fi
+    [ "$rc" -ne 0 ] && return 1
+    check "probe: 'at' accepted a job in queue '$1' but printed no parsable id" \
+        "parsed" "unparsed -- at said: $PROBE_RAW"
+    return 2
 }
 
-if ! probe_queue "$AT_QUEUE"; then
-    echo "  SKIP: environment can't queue an 'at' job"
-    exit 0
-fi
+probe_queue "$AT_QUEUE"
+case $? in
+    0) ;;
+    2)  echo "  (that job is now orphaned in queue '$AT_QUEUE' and nothing here can"
+        echo "   reap it -- a fault to fix, not an environment to excuse; aborting)"
+        finish ;;   # terminates non-zero: probe_queue already recorded the failure
+    *)  echo "  SKIP: environment can't queue an 'at' job"
+        exit 0 ;;
+esac
 
 # Schedule one job; echo its numeric id (empty if scheduling failed).
 schedule() { "$NUDGE" "$@" 2>/dev/null | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+'; }
@@ -115,7 +137,8 @@ check "preview: notify option" "yes" "$(printf '%s' "$prev" | grep -q 'notify' &
 # every w-based check passing and quietly dropped F1/F4 -- 23 passed, 0 failed,
 # exit 0. Once `at` is known to work for the queue, an empty F1ID is a REAL
 # regression, so report it via check and let the file fail.
-if probe_queue v; then
+probe_queue v; f1_probe=$?
+if [ "$f1_probe" -eq 0 ]; then
     F1ID=$(NUDGE_AT_QUEUE=v "$NUDGE" -p 'foreign:1.1' -m '23:57' -i 'secret leak' 2>/dev/null \
         | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+')
     remember_id "$F1ID"
@@ -129,16 +152,17 @@ if probe_queue v; then
             "$(printf '%s' "$f1prev" | grep -q 'foreign:1.1' && echo no || echo yes)"
         atrm "$F1ID" 2>/dev/null
     fi
-else
+elif [ "$f1_probe" -eq 1 ]; then
     echo "  SKIP: F1 -- 'at' itself cannot queue in queue 'v' here"
-fi
+fi   # probe 2: probe_queue already recorded the failure; nothing to excuse
 
 # --- F4: nudge jobs OUTSIDE our queue (e.g. an older nudge on the default queue)
 # are invisible to the table and un-cancellable; list_jobs now notes them. Call
 # list_jobs directly (like the table test above) to isolate the note from F5.
 # Same direct-probe rule as F1: once `at -q u` is known to work, an empty F4ID is
 # a nudge regression, not an environment limit.
-if probe_queue u; then
+probe_queue u; f4_probe=$?
+if [ "$f4_probe" -eq 0 ]; then
     F4ID=$(NUDGE_AT_QUEUE=u "$NUDGE" -p 'legacy:2.2' -m '23:56' -i 'old job' 2>/dev/null \
         | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+')
     remember_id "$F4ID"
@@ -151,9 +175,9 @@ if probe_queue u; then
                 && printf '%s' "$f4list" | grep -qw "$F4ID" && echo yes || echo no)"
         atrm "$F4ID" 2>/dev/null
     fi
-else
+elif [ "$f4_probe" -eq 1 ]; then
     echo "  SKIP: F4 -- 'at' itself cannot queue in queue 'u' here"
-fi
+fi   # probe 2: probe_queue already recorded the failure; nothing to excuse
 
 # --- --edit (non-interactive): overlay a flag, keep the rest, swap the id -------
 NEW=$("$NUDGE" --edit "$ID" -i 'edited msg' 2>/dev/null | grep -oE 'new job #[0-9]+' | grep -oE '[0-9]+')
