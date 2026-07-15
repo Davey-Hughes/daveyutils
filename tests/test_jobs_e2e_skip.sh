@@ -27,7 +27,13 @@ for b in at atq atrm; do
 done
 
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/e2e-skip.XXXXXX")
-trap 'rm -rf "$WORKDIR"' EXIT
+# PROBE_ID is the real `at` job staged below. It is assigned BEFORE the inline
+# atrm and kept out of any command substitution so this trap can still reap it:
+# the id must outlive the subshell that created it, or a failing atrm (or a
+# SIGINT landing in the window) orphans a real job in the user's queue. Same
+# contract test_jobs_e2e.sh's remember_id/purge keeps -- see test_e2e_at_hygiene.sh.
+PROBE_ID=""
+trap 'rm -rf "$WORKDIR"; [ -n "$PROBE_ID" ] && atrm "$PROBE_ID" 2>/dev/null' EXIT
 mkdir -p "$WORKDIR/tests" "$WORKDIR/scripts"
 cp "$HERE/assert.sh" "$HERE/lib.sh" "$HERE/test_jobs_e2e.sh" "$WORKDIR/tests/"
 
@@ -45,9 +51,11 @@ check "sabotage patched all 3 at_pipe call sites" "3" \
 check "sabotaged nudge returns no job id" "yes" \
     "$("$WORKDIR/scripts/nudge" -p 'x:0.0' -m '23:59' -i probe -n 2>/dev/null \
         | grep -q 'Job ID:' && echo no || echo yes)"
+PROBE_ID=$(echo true | at -q w now + 2 hours 2>&1 | grep -oE 'job [0-9]+' | grep -oE '[0-9]+')
 check "the real 'at' still works here (so this is a nudge fault)" "yes" \
-    "$(pid=$(echo true | at -q w now + 2 hours 2>&1 | grep -oE 'job [0-9]+' | grep -oE '[0-9]+'); \
-       [ -n "$pid" ] && { atrm "$pid" 2>/dev/null; echo yes; } || echo no)"
+    "$([ -n "$PROBE_ID" ] && echo yes || echo no)"
+# The EXIT trap backs this up: if it fails here the job is still reaped.
+atrm "$PROBE_ID" 2>/dev/null
 
 out=$(bash "$WORKDIR/tests/test_jobs_e2e.sh" 2>&1)
 rc=$?
