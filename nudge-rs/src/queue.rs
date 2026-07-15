@@ -58,6 +58,27 @@ impl Queue {
         Ok(removed)
     }
 
+    /// Update a job's fire time and remaining retries; persist. Returns whether
+    /// a job with `id` existed.
+    pub fn reschedule(
+        &mut self,
+        id: u64,
+        fire_at: jiff::Timestamp,
+        retries_left: i64,
+    ) -> std::io::Result<bool> {
+        let found = if let Some(job) = self.state.jobs.iter_mut().find(|j| j.id == id) {
+            job.fire_at = fire_at;
+            job.retries_left = retries_left;
+            true
+        } else {
+            false
+        };
+        if found {
+            self.save()?;
+        }
+        Ok(found)
+    }
+
     /// Write to a sibling temp file then rename, so a crash never leaves a
     /// half-written queue.
     fn save(&self) -> std::io::Result<()> {
@@ -126,5 +147,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::load(dir.path().join("nope.json")).unwrap();
         assert!(q.all().is_empty());
+    }
+
+    #[test]
+    fn reschedule_updates_fire_time_and_retries_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.json");
+        let mut q = Queue::load(path.clone()).unwrap();
+        let id = q.add(spec()).unwrap();
+
+        let new_ts: jiff::Timestamp = "2026-07-13T16:30:00Z".parse().unwrap();
+        assert!(q.reschedule(id, new_ts, 1).unwrap());
+        assert!(!q.reschedule(9999, new_ts, 1).unwrap()); // missing id
+
+        // Persisted: reload and confirm.
+        let q2 = Queue::load(path).unwrap();
+        let job = q2.get(id).unwrap();
+        assert_eq!(job.fire_at, new_ts);
+        assert_eq!(job.retries_left, 1);
     }
 }
