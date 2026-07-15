@@ -1,6 +1,12 @@
 [package]
 name = "nudge"
-version = "0.1.0"
+# Load-bearing, not release hygiene: `crate::VERSION` is this string, and the
+# CLI/daemon handshake adopts any resident daemon reporting the same one. 0.1.0
+# predates `JobSpec::verify_fingerprint`/`verify_dims`, which serde drops
+# silently from a Schedule it does not know — so a 0.1.0 daemon adopted by this
+# build would run the old banner-only `--verify` and report success doing it.
+# Bump this whenever the IPC wire format or the daemon's behavior changes.
+version = "0.2.0"
 edition = "2021"
 description = "Rate-limit auto-resumer for AI CLIs in tmux"
 license = "GPL-3.0-or-later"

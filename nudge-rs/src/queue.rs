@@ -123,8 +123,22 @@ impl Queue {
         Ok(Some(new_id))
     }
 
-    /// Update a job's fire time and remaining retries; persist. Returns whether
-    /// a job with `id` existed.
+    /// Update a job's fire time and remaining retries, dropping any `--verify`
+    /// snapshot; persist. Returns whether a job with `id` existed.
+    ///
+    /// The snapshot goes because this is only ever called after a fire, and a
+    /// fire is nudge typing into the pane. The snapshot records the pane as the
+    /// *user* left it, so our own injection is precisely what invalidates it:
+    /// compared against it, the pane has always "changed", and the recency gate
+    /// would read that as the user resuming and skip every retry. `-a -r N -v`
+    /// could then never fire more than once, however limited the session still
+    /// was. With no snapshot the gate is `Unknown` and falls open to the banner
+    /// check -- which is all `-a` ever did here, and is the right question for a
+    /// retry to ask: is the banner *still* up?
+    ///
+    /// Re-snapshotting instead would be worse than useless: the daemon would be
+    /// fingerprinting a pane it just typed into and that is very likely
+    /// mid-response.
     pub fn reschedule(
         &mut self,
         id: u64,
@@ -137,6 +151,8 @@ impl Queue {
         };
         job.fire_at = fire_at;
         job.retries_left = retries_left;
+        job.verify_fingerprint = None;
+        job.verify_dims = None;
         self.commit(next)?;
         Ok(true)
     }
@@ -194,6 +210,8 @@ mod tests {
             auto_retry: false,
             retries_left: 2,
             settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
         }
     }
 

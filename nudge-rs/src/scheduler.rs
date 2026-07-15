@@ -56,7 +56,7 @@ pub fn apply_outcome(
         // delete the job, so one transient tmux error (the server restarting,
         // the pane briefly unavailable) turned `-a -r -1` into zero retries.
         //
-        // Ok(SkippedVerify) is deliberately excluded: the pane no longer shows
+        // Ok(SkippedNoBanner) is deliberately excluded: the pane no longer shows
         // a banner, so the job is done, not failed.
         //
         // Note the consequence of Err joining this arm: `-a -r -1` against a
@@ -121,6 +121,8 @@ mod tests {
             auto_retry,
             retries_left,
             settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
         }
         .into_job(id)
     }
@@ -180,6 +182,8 @@ mod tests {
             auto_retry: job.auto_retry,
             retries_left: job.retries_left,
             settle_secs: job.settle_secs,
+            verify_fingerprint: job.verify_fingerprint.clone(),
+            verify_dims: job.verify_dims,
         })
         .unwrap();
         (dir, q)
@@ -251,6 +255,48 @@ mod tests {
         );
     }
 
+    /// A `--verify` job's snapshot describes the pane as the *user* left it. The
+    /// moment nudge fires, that stops being true by nudge's own hand: we just
+    /// typed into the pane. Carrying the snapshot into the retry makes the
+    /// recency gate compare the pane against a baseline our own injection
+    /// invalidated, so it reports `Changed` -- "the user resumed" -- every time.
+    ///
+    /// `-a -r 2 -v` would then fire once and skip forever after, never noticing
+    /// that the injection did not take and the banner is still there, which is
+    /// the entire reason the retry exists. Dropping the snapshot on reschedule
+    /// makes each retry fail open to the banner check: exactly what `-a` did
+    /// before this gate existed.
+    #[test]
+    fn a_retry_drops_the_verify_snapshot_our_own_injection_invalidated() {
+        let mut j = job(1, "2026-07-13T11:59:00Z", true, 2);
+        j.verify = true;
+        j.verify_fingerprint = Some(crate::verify::fingerprint("parked at the banner"));
+        j.verify_dims = Some(crate::target::PaneDims {
+            width: 80,
+            height: 24,
+        });
+        let (_d, mut q) = q_with(j);
+        let cur = q.get(1).unwrap().clone();
+        assert!(cur.verify_baseline().is_some(), "precondition: armed");
+
+        let retry_at: jiff::Timestamp = "2026-07-13T12:05:00Z".parse().unwrap();
+        apply_outcome(&mut q, &cur, &Ok(InjectOutcome::Sent(1)), retry_at).unwrap();
+
+        let retried = q.get(1).expect("the retry is still queued");
+        assert_eq!(
+            retried.verify_baseline(),
+            None,
+            "the snapshot predates our own injection; comparing against it would make \
+             every retry report the user resumed, so -a -r N -v could never fire twice"
+        );
+        assert!(
+            retried.verify,
+            "--verify itself stays on: only the snapshot goes"
+        );
+        assert_eq!(retried.retries_left, 1);
+        assert_eq!(retried.fire_at, retry_at);
+    }
+
     #[test]
     fn apply_err_with_retries_exhausted_removes() {
         let j = job(1, "2026-07-13T11:59:00Z", true, 0);
@@ -277,7 +323,7 @@ mod tests {
         apply_outcome(
             &mut q,
             &cur,
-            &Ok(InjectOutcome::SkippedVerify),
+            &Ok(InjectOutcome::SkippedNoBanner),
             now().timestamp(),
         )
         .unwrap();

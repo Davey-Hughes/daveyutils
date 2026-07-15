@@ -38,5 +38,10 @@ make help     # list targets
   daemon, no `fzf`, no coreutils; it runs its own user-level scheduler). The bash
   original stays at `scripts/nudge` as the reference oracle and is **not**
   installed into `bin/`.
+  Its jobs are run by a resident daemon, auto-started on first use, which reports
+  what it did with each one — fired, or skipped because you had already resumed
+  the pane — to `<state dir>/nudge.log` (`~/.local/state/nudge/` on Linux,
+  `~/Library/Application Support/nudge/` on macOS). That is where to look when a
+  nudge did not fire; `--notify` reports the same outcomes at the time.
 - `tests/` — bash test-suite (`bash tests/run.sh`); Rust tests live in `nudge-rs/`.
 - `packaging/` — Homebrew formula and AUR PKGBUILDs for `nudge`.

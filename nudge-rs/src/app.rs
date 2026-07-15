@@ -15,16 +15,40 @@ use crate::detect::detect_reset;
 use crate::ipc::{client, Request, Response};
 use crate::job::{Job, JobSpec, TargetSpec};
 use crate::paths;
-use crate::target::{tmux::TmuxTarget, Target};
+use crate::target::{tmux::TmuxTarget, PaneDims, Target};
 use crate::timespec::parse_timespec;
 
+/// Split a `--verify` snapshot into the two fields a JobSpec stores.
+///
+/// `None` in, `None`s out — a pane that could not be snapshotted arms no
+/// recency gate, and a job with no snapshot fails open at fire time to the
+/// banner check nudge has always done. Scheduling never fails over this.
+fn baseline_fields(b: Option<crate::verify::Baseline>) -> (Option<String>, Option<PaneDims>) {
+    match b {
+        Some(b) => (Some(b.fingerprint), Some(b.dims)),
+        None => (None, None),
+    }
+}
+
 /// Assemble a JobSpec from resolved options.
-pub fn build_spec(pane: &str, fire_at: jiff::Timestamp, cli: &Cli, opts: &Toggles) -> JobSpec {
+///
+/// `baseline` is the pane snapshot the recency gate compares against at fire
+/// time; the caller takes it (only when `--verify` is on) so this stays pure.
+pub fn build_spec(
+    pane: &str,
+    fire_at: jiff::Timestamp,
+    cli: &Cli,
+    opts: &Toggles,
+    baseline: Option<crate::verify::Baseline>,
+) -> JobSpec {
     let messages = if cli.input.is_empty() {
         vec!["please continue".to_string()]
     } else {
         cli.input.clone()
     };
+    // Without --verify nothing ever reads these, and storing a snapshot for a
+    // job that will not consult one is just a stale fingerprint in queue.json.
+    let (verify_fingerprint, verify_dims) = baseline_fields(baseline.filter(|_| opts.verify));
     JobSpec {
         target: TargetSpec::Tmux {
             pane: pane.to_string(),
@@ -37,7 +61,41 @@ pub fn build_spec(pane: &str, fire_at: jiff::Timestamp, cli: &Cli, opts: &Toggle
         auto_retry: opts.auto_retry,
         retries_left: if opts.auto_retry { opts.retries } else { 0 },
         settle_secs: opts.settle_secs,
+        verify_fingerprint,
+        verify_dims,
     }
+}
+
+/// Snapshot `pane` for the recency gate, but only when `--verify` is on.
+///
+/// The one production seam that takes a real capture for the gate. Never
+/// fallible: a pane that will not answer yields no snapshot, and a job with no
+/// snapshot fails open. `--verify` failing to arm must never be a reason the
+/// user's nudge does not get scheduled at all.
+fn snapshot_pane(pane: &str, opts: &Toggles) -> Option<crate::verify::Baseline> {
+    snapshot_gate(opts, || {
+        crate::verify::capture_baseline(&TmuxTarget::new(pane))
+    })
+}
+
+/// The `--verify`-only guard around taking a capture: `take` runs only when the
+/// flag is on.
+///
+/// Split out from [`snapshot_pane`] so the guard is testable at all — its own
+/// body shells out to tmux, so nothing could assert this without a live server.
+/// Both consumers (`build_spec`, `merge_edit`) now independently drop a
+/// baseline when `--verify` is off, which is what makes the *stored* job right;
+/// what this guard alone still decides is whether nudge shells out to tmux
+/// twice for a snapshot no job will ever consult. That is invisible in the
+/// JobSpec, so it takes a test of its own.
+fn snapshot_gate(
+    opts: &Toggles,
+    take: impl FnOnce() -> Option<crate::verify::Baseline>,
+) -> Option<crate::verify::Baseline> {
+    if !opts.verify {
+        return None;
+    }
+    take()
 }
 
 /// Determine the fire time: explicit `-m`, else auto-detect from the pane.
@@ -132,7 +190,8 @@ fn request(socket: &Path, req: &Request) -> anyhow::Result<Response> {
 /// The Ping is a version handshake, not just a liveness check. A daemon from
 /// another build answers a plain "are you there?" perfectly well, so this used
 /// to adopt it and hand it requests written against code it does not run.
-pub fn ensure_daemon(socket: &Path) -> anyhow::Result<()> {
+pub fn ensure_daemon(paths: &paths::Paths) -> anyhow::Result<()> {
+    let socket = &paths.socket;
     match client::request(socket, &Request::Ping) {
         Ok(resp) => return check_handshake(resp),
         // Nothing is listening. Starting one is ours to do, and always was.
@@ -147,14 +206,7 @@ pub fn ensure_daemon(socket: &Path) -> anyhow::Result<()> {
             ))
         ),
     }
-    let exe = std::env::current_exe()?;
-    std::process::Command::new(exe)
-        .arg("--daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()?;
+    spawn_daemon(&std::env::current_exe()?, paths)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         // The daemon we just spawned is this exe, so a mismatch here means
@@ -167,6 +219,68 @@ pub fn ensure_daemon(socket: &Path) -> anyhow::Result<()> {
     bail!("daemon did not come up on {}", socket.display())
 }
 
+/// The auto-started daemon's log lives here, in the state dir beside the queue.
+pub fn log_path(state_dir: &Path) -> std::path::PathBuf {
+    state_dir.join("nudge.log")
+}
+
+/// Start over rather than grow past this. See [`daemon_log`].
+const LOG_MAX_BYTES: u64 = 1 << 20;
+
+/// Open the auto-started daemon's log for append, or `None` if it cannot be.
+///
+/// The daemon is spawned in the background by whatever `nudge` command the user
+/// happened to run, so its stderr has nowhere to go by default and used to go
+/// to `/dev/null`. That silently discarded every diagnostic it has — including
+/// the `--verify` skip report, which the recency design requires be visible
+/// precisely because a silent skip is indistinguishable from nudge never having
+/// run. `--install-daemon` is unaffected: systemd and launchd capture stderr
+/// themselves, and this only redirects the daemon nudge starts for you.
+///
+/// Growth: the daemon writes a line per job fired plus the occasional error, so
+/// this is kilobytes a year in normal use — but normal use is not a bound, and
+/// an unbounded file in the state dir is a bug waiting for a loop to find it.
+/// Rotation is more machinery than the volume justifies, so the log simply
+/// starts over once it passes [`LOG_MAX_BYTES`]. That check happens only here,
+/// at spawn, so nothing ever truncates under a running daemon's append handle;
+/// and the 1 MiB it discards is thousands of lines older than the daemon the
+/// user is currently trying to explain.
+fn daemon_log(state_dir: &Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(state_dir).ok()?;
+    let path = log_path(state_dir);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX_BYTES) {
+        opts.write(true).truncate(true);
+    } else {
+        opts.append(true);
+    }
+    opts.open(&path).ok()
+}
+
+/// Start `exe --daemon` detached, with its diagnostics going to the log.
+///
+/// `exe` is a parameter rather than `current_exe()` inside because a test
+/// harness *is* `current_exe()` and would have to stub the whole spawn to work
+/// around it — leaving the one thing worth testing, where the daemon's stderr
+/// ends up, untested. Production passes its own path.
+///
+/// A log that will not open falls back to `/dev/null` rather than failing the
+/// spawn: losing the diagnostics is bad, but it is nothing next to a read-only
+/// state dir meaning no nudge ever fires again.
+pub fn spawn_daemon(exe: &Path, paths: &paths::Paths) -> std::io::Result<std::process::Child> {
+    let log = daemon_log(&paths.state_dir)
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null);
+    std::process::Command::new(exe)
+        .arg("--daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log)
+        .process_group(0)
+        .spawn()
+}
+
 /// Schedule a nudge.
 pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
     let pane = match &cli.pane {
@@ -176,7 +290,10 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
     let opts = resolve_options(cli);
     let now = Zoned::now();
     let fire_at = fire_time(cli, &pane, &now)?;
-    let spec = build_spec(&pane, fire_at, cli, &opts);
+    // Snapshot last, and only for --verify: this is the "before" the fire-time
+    // gate compares against, so it wants to be as close to the user's actual
+    // parked-at-the-banner pane as we can get it.
+    let spec = build_spec(&pane, fire_at, cli, &opts, snapshot_pane(&pane, &opts));
 
     match request(&live_socket()?, &Request::Schedule(spec))? {
         Response::Scheduled(id) => {
@@ -216,9 +333,9 @@ pub fn format_jobs(jobs: &[Job]) -> String {
 /// socket that isn't there, and the user cannot cancel a job that queue.json
 /// still holds and that fires as soon as anything starts a daemon again.
 fn live_socket() -> anyhow::Result<std::path::PathBuf> {
-    let socket = paths::resolve().socket;
-    ensure_daemon(&socket)?;
-    Ok(socket)
+    let paths = paths::resolve();
+    ensure_daemon(&paths)?;
+    Ok(paths.socket)
 }
 
 /// List pending jobs (interactive picker lands in Task 6; both modes print
@@ -250,11 +367,16 @@ pub fn cancel(id: u64) -> anyhow::Result<()> {
 /// consulted (unlike a fresh schedule) — only the job, the explicit flags, and
 /// `default_retries` (the caller's `NUDGE_RETRIES` default, passed in rather
 /// than read here so this stays pure and its tests cannot race the env).
+/// `snapshot` is the effect `merge_edit` cannot take itself: it is handed the
+/// *resolved* pane and toggles, because an edit may move the job to a new pane
+/// (`-p`) or turn `--verify` on, and the snapshot has to describe the pane the
+/// job will actually watch. Production passes [`snapshot_pane`].
 pub fn merge_edit(
     job: &Job,
     cli: &Cli,
     now: &Zoned,
     default_retries: i64,
+    snapshot: &dyn Fn(&str, &Toggles) -> Option<crate::verify::Baseline>,
 ) -> anyhow::Result<JobSpec> {
     let base = Toggles {
         notify: job.notify,
@@ -297,6 +419,18 @@ pub fn merge_edit(
     } else {
         cli.input.clone()
     };
+    // Re-snapshot rather than carry the job's old one over. An edit is a
+    // re-schedule, and the pane the user is looking at *now* is the "before"
+    // they mean. Inheriting the original snapshot would compare the pane
+    // against however it looked hours ago, so any edit of a job whose pane had
+    // since moved would arm a gate that skips on sight.
+    //
+    // Filtered here as well as in `snapshot_pane`, and for the same reason
+    // `build_spec` filters: `snapshot` is a parameter, so "no snapshot when
+    // --verify is off" is this function's own invariant to keep and not one to
+    // borrow from whatever the caller happened to pass.
+    let (verify_fingerprint, verify_dims) =
+        baseline_fields(snapshot(&pane, &opts).filter(|_| opts.verify));
     Ok(JobSpec {
         target: TargetSpec::Tmux { pane },
         messages,
@@ -307,6 +441,8 @@ pub fn merge_edit(
         auto_retry: opts.auto_retry,
         retries_left: if opts.auto_retry { opts.retries } else { 0 },
         settle_secs: opts.settle_secs,
+        verify_fingerprint,
+        verify_dims,
     })
 }
 
@@ -333,7 +469,13 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no pending job with id {id}"))?;
 
     let now = Zoned::now();
-    let spec = merge_edit(&job, cli, &now, crate::cli::default_retries())?;
+    let spec = merge_edit(
+        &job,
+        cli,
+        &now,
+        crate::cli::default_retries(),
+        &snapshot_pane,
+    )?;
 
     match request(&socket, &Request::Replace { id, spec })? {
         Response::Replaced(Some(new_id)) => {
@@ -444,6 +586,157 @@ mod tests {
             err.contains("0.0.1-ancient"),
             "must name the version: {err}"
         );
+        assert!(
+            err.contains("pkill -f 'nudge --daemon'"),
+            "must name the remedy: {err}"
+        );
+    }
+
+    use std::io::Write as _;
+
+    /// The daemon appends across restarts. Nothing else restarts it, so the
+    /// last thing the *previous* daemon said is often the whole explanation
+    /// for what the user is looking at now.
+    #[test]
+    fn the_daemon_log_is_created_and_then_appended_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("nudge");
+
+        let mut first = daemon_log(&state).expect("a writable state dir must yield a log");
+        writeln!(first, "older daemon").unwrap();
+        drop(first);
+
+        let mut second = daemon_log(&state).expect("reopen");
+        writeln!(second, "this daemon").unwrap();
+        drop(second);
+
+        let text = std::fs::read_to_string(log_path(&state)).unwrap();
+        assert!(
+            text.contains("older daemon") && text.contains("this daemon"),
+            "a reopen must not truncate what the last daemon reported: {text:?}"
+        );
+    }
+
+    /// The growth bound, since there is no rotation. Checked at spawn only, so
+    /// it can never truncate under a running daemon's append handle.
+    #[test]
+    fn the_daemon_log_starts_over_once_it_grows_past_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("nudge");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(log_path(&state), vec![b'x'; (LOG_MAX_BYTES + 1) as usize]).unwrap();
+
+        let mut f = daemon_log(&state).expect("an oversized log must still open");
+        writeln!(f, "fresh start").unwrap();
+        drop(f);
+
+        let text = std::fs::read_to_string(log_path(&state)).unwrap();
+        assert_eq!(
+            text, "fresh start\n",
+            "past the cap the log starts over rather than growing forever"
+        );
+    }
+
+    /// Fail open. Losing the diagnostics is bad; a state dir that cannot be
+    /// written meaning no nudge ever fires again is very much worse.
+    #[test]
+    fn a_log_that_cannot_be_opened_does_not_stop_the_daemon_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        // A *file* where the state dir should be: create_dir_all cannot win.
+        let state = dir.path().join("blocked");
+        std::fs::write(&state, b"not a directory").unwrap();
+        assert!(
+            daemon_log(&state).is_none(),
+            "an unopenable log must degrade to None, which spawn_daemon turns \
+             into /dev/null -- never into a failure to start the daemon"
+        );
+    }
+
+    fn toggles(verify: bool) -> Toggles {
+        Toggles {
+            notify: false,
+            verify,
+            auto_retry: false,
+            retries: 0,
+            settle_secs: 5.0,
+        }
+    }
+
+    /// Without `--verify`, nudge must not capture the pane at all.
+    ///
+    /// `build_spec` and `merge_edit` both drop a baseline when the flag is off,
+    /// so the *stored job* is right either way and no JobSpec assertion can see
+    /// this. What is left for the guard to decide is whether scheduling shells
+    /// out to tmux twice (`display-message`, `capture-pane`) to build a
+    /// snapshot that is then thrown away — on every plain `nudge`, which is the
+    /// common case. Asserting the returned `None` would not catch that; only
+    /// counting the calls does.
+    #[test]
+    fn without_verify_no_capture_is_ever_taken() {
+        let taken = std::cell::Cell::new(false);
+        let out = snapshot_gate(&toggles(false), || {
+            taken.set(true);
+            Some(crate::verify::Baseline {
+                fingerprint: "x".into(),
+                dims: PaneDims {
+                    width: 80,
+                    height: 24,
+                },
+            })
+        });
+        assert!(
+            !taken.get(),
+            "--verify is off: nothing will ever read this snapshot, so taking it \
+             is two tmux subprocesses spent on nothing"
+        );
+        assert!(out.is_none());
+    }
+
+    /// The other half: with the flag on, the capture is taken and returned. A
+    /// guard that swallowed this would disarm the gate on every job, which
+    /// fails open — so it is silent, and only this catches it.
+    #[test]
+    fn with_verify_the_capture_is_taken_and_returned() {
+        let taken = std::cell::Cell::new(false);
+        let out = snapshot_gate(&toggles(true), || {
+            taken.set(true);
+            Some(crate::verify::Baseline {
+                fingerprint: "abc".into(),
+                dims: PaneDims {
+                    width: 80,
+                    height: 24,
+                },
+            })
+        });
+        assert!(
+            taken.get(),
+            "--verify is on: the snapshot is the gate's whole input"
+        );
+        assert_eq!(out.map(|b| b.fingerprint), Some("abc".to_string()));
+    }
+
+    /// `0.1.0` is the last version whose `JobSpec` has no `verify_fingerprint`
+    /// / `verify_dims`. Serde drops unknown fields silently and nothing in the
+    /// crate sets `deny_unknown_fields`, so a 0.1.0 daemon accepts this build's
+    /// Schedule, throws the snapshot away, and runs the banner-only logic the
+    /// recency gate exists to replace — while every report says it worked.
+    ///
+    /// The handshake is the only thing that can refuse it, and it can only do
+    /// that if this build stops calling itself 0.1.0. So the version this crate
+    /// carries is load-bearing behavior, not release hygiene: shipping the
+    /// recency gate under 0.1.0 ships it inert.
+    #[test]
+    fn the_handshake_refuses_the_pre_recency_version() {
+        let err = check_handshake(Response::Pong {
+            version: "0.1.0".to_string(),
+        })
+        .expect_err(
+            "0.1.0 predates verify_fingerprint/verify_dims: adopting that daemon \
+             silently drops the snapshot off every Schedule and runs the old \
+             banner-only check, which is the whole bug this branch fixes",
+        )
+        .to_string();
+        assert!(err.contains("0.1.0"), "must name the version: {err}");
         assert!(
             err.contains("pkill -f 'nudge --daemon'"),
             "must name the remedy: {err}"

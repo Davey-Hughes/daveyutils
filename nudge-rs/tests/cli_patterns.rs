@@ -13,6 +13,8 @@
 //! commands reach a socket, and the singleton lock is held regardless so that
 //! nothing can leave one behind.
 
+mod common;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -42,9 +44,16 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    let tmp = tempfile::tempdir().unwrap();
+    // common::short_tempdir, not tempfile::tempdir: these commands never
+    // reach the socket today (validation rejects the bad pattern first), but
+    // the fixture still resolves and creates the socket's parent dir from a
+    // HOME rooted at the tempdir, so it's exposed the moment that changes.
+    // macOS's $TMPDIR is long enough that resolve_from's suffix overflows
+    // SUN_LEN there.
+    let tmp = common::short_tempdir();
     let home = tmp.path().to_path_buf();
     let paths = child_paths(&home);
+    common::assert_socket_path_fits(&paths.socket);
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     std::fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
     let lock = nudge::daemon::acquire_singleton_lock(&paths.state_dir).unwrap();
