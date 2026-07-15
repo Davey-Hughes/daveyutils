@@ -113,7 +113,18 @@ fn a_verify_skip_lands_in_the_daemon_log() {
         return;
     }
 
-    let tmp = tempfile::tempdir().unwrap();
+    // Rooted at /tmp rather than $TMPDIR: a Unix socket path is capped at
+    // SUN_LEN (104 bytes on macOS), and this is the one test that points HOME at
+    // a tempdir, so it pays for macOS's ~55-char /var/folders/... TMPDIR *plus*
+    // the 35 chars of "Library/Application Support/nudge" that `resolve_from`
+    // appends there. Together they overflow, the daemon dies with "path must be
+    // shorter than SUN_LEN", and the skip never gets logged. A real macOS user
+    // is fine (/Users/name/... is ~55 total); this is purely the test's own path
+    // budget. Sibling tests escape it only by not setting HOME.
+    let tmp = tempfile::Builder::new()
+        .prefix("nudge-log-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let home = tmp.path().to_path_buf();
     let tmux_tmpdir = home.join("tmux");
     std::fs::create_dir_all(&tmux_tmpdir).unwrap();
