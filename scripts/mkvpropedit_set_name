@@ -47,12 +47,18 @@ main() {
     command -v mkvpropedit >/dev/null 2>&1 || die "mkvpropedit is required (install mkvtoolnix)."
     [[ -d "$dir" ]] || die "not a directory: $dir"
 
-    find "$dir" -iname '*.mkv' -print0 | while IFS= read -r -d '' f; do
-        local title
+    local ok=0 failed=0 f title
+    while IFS= read -r -d '' f; do
         title="$(derive_title "$f" "$delim" "$field")"
         printf '%s -> %s\n' "$f" "$title"
-        mkvpropedit "$f" -e info --set "title=$title"
-    done
+        if mkvpropedit "$f" -e info --set "title=$title"; then
+            ok=$((ok + 1))
+        else
+            printf 'WARN: mkvpropedit failed for %s\n' "$f" >&2
+            failed=$((failed + 1))
+        fi
+    done < <(find "$dir" -iname '*.mkv' -print0)
+    printf 'done: %d updated, %d failed\n' "$ok" "$failed"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
