@@ -56,7 +56,7 @@ pub fn apply_outcome(
         // delete the job, so one transient tmux error (the server restarting,
         // the pane briefly unavailable) turned `-a -r -1` into zero retries.
         //
-        // Ok(SkippedVerify) is deliberately excluded: the pane no longer shows
+        // Ok(SkippedNoBanner) is deliberately excluded: the pane no longer shows
         // a banner, so the job is done, not failed.
         //
         // Note the consequence of Err joining this arm: `-a -r -1` against a
@@ -281,7 +281,7 @@ mod tests {
         apply_outcome(
             &mut q,
             &cur,
-            &Ok(InjectOutcome::SkippedVerify),
+            &Ok(InjectOutcome::SkippedNoBanner),
             now().timestamp(),
         )
         .unwrap();
