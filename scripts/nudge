@@ -1067,7 +1067,7 @@ while [[ $# -gt 0 ]]; do
             require_value "$1" $#
             SEND_DELAY="$2"
             if ! [[ "$SEND_DELAY" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-                echo "Error: --delay must be a non-negative number (got '$SEND_DELAY')."
+                echo "Error: --delay must be a non-negative number (got '$SEND_DELAY')." >&2
                 exit 1
             fi
             SET_DELAY=true
@@ -1108,7 +1108,7 @@ while [[ $# -gt 0 ]]; do
             AUTO_RETRY=true
             RETRY_LIMIT="$2"
             if ! [[ "$RETRY_LIMIT" =~ ^-?[0-9]+$ ]]; then
-                echo "Error: --retries must be an integer (got '$RETRY_LIMIT')."
+                echo "Error: --retries must be an integer (got '$RETRY_LIMIT')." >&2
                 exit 1
             fi
             SET_RETRIES=true
@@ -1152,8 +1152,12 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            echo "Unknown option: $1"
-            print_help
+            # Error path: the message AND the usage it prints go to stderr, so a
+            # piped `nudge --bogus` doesn't feed the whole help text into the
+            # pipeline. A REQUESTED --help (above) is normal output and stays on
+            # stdout.
+            echo "Unknown option: $1" >&2
+            print_help >&2
             exit 1
             ;;
     esac

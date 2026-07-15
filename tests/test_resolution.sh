@@ -134,4 +134,35 @@ for f in -p --pane -m --time -i --input -w --delay -r --retries; do
         "$(case "${r#*|}" in *"requires a value"*) echo yes ;; *) echo no ;; esac)"
 done
 
+# --- the parser's error messages belong on stderr ------------------------------
+# require_value reports to stderr; the -w/-r value-regex errors and the
+# unknown-option branch reported to STDOUT. So `nudge -w abc >/dev/null` threw
+# away the reason it failed while showing nothing, and a piped `nudge --bogus`
+# fed "Unknown option" plus the whole usage text INTO the pipeline. stderr is the
+# correct stream (the F9 checks above already assume it, via 2>&1).
+#
+# Source the prelude with the given args, capturing one stream and discarding the
+# other. `2>&1 1>/dev/null` duplicates stderr onto the capture pipe first, THEN
+# sends stdout to /dev/null -- order matters.
+parse_stdout() { bash -c 'source "$1" "${@:2}" 2>/dev/null'      _ "$PRELUDE" "$@"; }
+parse_stderr() { bash -c 'source "$1" "${@:2}" 2>&1 1>/dev/null' _ "$PRELUDE" "$@"; }
+
+check "streams: -w value error on stderr"      "yes" \
+    "$(parse_stderr -w abc | grep -q 'must be a non-negative number' && echo yes || echo no)"
+check "streams: -w value error NOT on stdout"  "yes" \
+    "$(parse_stdout -w abc | grep -q 'must be a non-negative number' && echo no || echo yes)"
+check "streams: -r value error on stderr"      "yes" \
+    "$(parse_stderr -r xyz | grep -q 'must be an integer' && echo yes || echo no)"
+check "streams: -r value error NOT on stdout"  "yes" \
+    "$(parse_stdout -r xyz | grep -q 'must be an integer' && echo no || echo yes)"
+check "streams: unknown-option error on stderr" "yes" \
+    "$(parse_stderr --bogus | grep -q 'Unknown option' && echo yes || echo no)"
+check "streams: unknown-option error NOT on stdout" "yes" \
+    "$(parse_stdout --bogus | grep -q 'Unknown option' && echo no || echo yes)"
+check "streams: unknown-option usage NOT on stdout either" "yes" \
+    "$(parse_stdout --bogus | grep -q 'Usage: nudge' && echo no || echo yes)"
+# ... while a REQUESTED help is normal output and must stay on stdout.
+check "streams: -h help still on stdout" "yes" \
+    "$(parse_stdout -h | grep -q 'Usage: nudge' && echo yes || echo no)"
+
 finish
