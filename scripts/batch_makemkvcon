@@ -1,7 +1,57 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# batch_makemkvcon - rip every Blu-ray/DVD disc image under a directory to MKV.
+#
+# Usage: batch_makemkvcon [-o OUTDIR] [-l MINLENGTH] [SEARCH_DIR]
+#   -o OUTDIR      output root; each disc gets a subdir here (default: .)
+#   -l MINLENGTH   makemkvcon --minlength (default: 0)
+#   SEARCH_DIR     where to look for *index.bdmv (default: .)
+#
+# Requires: makemkvcon
 
-find . -iname "*index.bdmv" ! -path "*/BACKUP/*" -print0 | while read -d $'\0' file; do 
-  outpath="/media/media 0/needs_processing/converted blu-ray discs/$(echo $file | cut -d'/' -f2)"; 
-  mkdir "$outpath"; 
-  makemkvcon mkv file:"$file" all "$outpath" --minlength=0 --robot; 
-done
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# disc_subdir <path-to-index.bdmv> -> the disc's own directory name.
+# For "<root>/<disc>/BDMV/.../index.bdmv" this is "<disc>".
+disc_subdir() {
+    local p="${1#./}"      # drop a leading ./
+    printf '%s' "${p%%/BDMV/*}"
+}
+
+usage() {
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+    set -euo pipefail
+    local outdir="." minlength=0 search="."
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            -o) outdir="${2:?}"; shift 2 ;;
+            -l) minlength="${2:?}"; shift 2 ;;
+            --) shift; break ;;
+            -*) die "unknown option: $1" ;;
+            *) search="$1"; shift ;;
+        esac
+    done
+    command -v makemkvcon >/dev/null 2>&1 || die "makemkvcon is required."
+    [[ -d "$search" ]] || die "not a directory: $search"
+
+    local ok=0 failed=0
+    while IFS= read -r -d '' file; do
+        sub="$(disc_subdir "$file")"; dest="$outdir/$sub"; mkdir -p "$dest"
+        printf 'ripping %s -> %s\n' "$file" "$dest"
+        if makemkvcon mkv "file:$search/$file" all "$dest" "--minlength=$minlength" --robot; then
+            ok=$((ok + 1))
+        else
+            printf 'WARN: makemkvcon failed for %s\n' "$file" >&2
+            failed=$((failed + 1))
+        fi
+    done < <(cd "$search" && find . -iname '*index.bdmv' ! -path '*/BACKUP/*' -print0)
+    printf 'done: %d ripped, %d failed\n' "$ok" "$failed"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
