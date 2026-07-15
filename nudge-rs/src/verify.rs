@@ -84,6 +84,23 @@ pub struct Baseline {
 /// time. Scheduling must not fail because the recency gate could not arm — the
 /// user asked for a nudge, and a nudge with a degraded `--verify` is strictly
 /// better than no job at all.
+///
+/// **The dims-then-capture order is load-bearing** and is not the mistake it
+/// looks like next to `run_injection`, which reads dims on both sides of its
+/// capture. Consider a resize straddling the two calls here:
+///
+/// - As written, we store the OLD dims with a NEW (reflowed) capture. At fire
+///   time the pane reads at its new size, which does not equal the stored dims
+///   → `Unknown` → fail open → inject. Safe.
+/// - Reversed (capture, then dims) we would store the NEW dims with an OLD
+///   capture. At fire time the dims *match*, so the fingerprint is trusted —
+///   and it compares a pre-reflow hash against a post-reflow capture, which
+///   differs → `Changed` → **skip**. The nudge silently never fires.
+///
+/// So a resize racing this function can only ever produce a baseline that
+/// fails open, never one that skips. Reading dims twice here would be safe too
+/// (disagreement → no baseline → fail open), but it buys nothing the ordering
+/// does not already guarantee.
 pub fn capture_baseline(target: &dyn Target) -> Option<Baseline> {
     let dims = target.dims()?;
     let text = target.capture().ok()?;
