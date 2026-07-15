@@ -214,8 +214,8 @@ mod tests {
 
 ❯ ";
         let t = FakeTarget::new(resumed);
-        let out = run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None)
-            .unwrap();
+        let out =
+            run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None).unwrap();
         assert_eq!(
             out,
             InjectOutcome::SkippedResumed,
@@ -235,8 +235,8 @@ mod tests {
     #[test]
     fn verify_sends_when_the_pane_is_untouched_since_scheduling() {
         let t = FakeTarget::new(PARKED);
-        let out = run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None)
-            .unwrap();
+        let out =
+            run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None).unwrap();
         assert_eq!(
             out,
             InjectOutcome::Sent(1),
@@ -270,8 +270,8 @@ mod tests {
             "precondition: nothing scrolled, so the banner is at the same offset in both"
         );
         let t = FakeTarget::new(appended);
-        let out = run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None)
-            .unwrap();
+        let out =
+            run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None).unwrap();
         assert_eq!(
             out,
             InjectOutcome::SkippedResumed,
@@ -294,8 +294,8 @@ mod tests {
                 height: 24,
             },
         );
-        let out = run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None)
-            .unwrap();
+        let out =
+            run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None).unwrap();
         assert_eq!(
             out,
             InjectOutcome::Sent(1),
@@ -326,8 +326,8 @@ mod tests {
     #[test]
     fn verify_fails_open_and_sends_when_the_pane_dims_are_unreadable() {
         let t = FakeTarget::with_unknown_dims("● busy\n⏸ session limit reached · resets 3:00am");
-        let out = run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None)
-            .unwrap();
+        let out =
+            run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None).unwrap();
         assert_eq!(
             out,
             InjectOutcome::Sent(1),

@@ -289,7 +289,10 @@ mod tests {
             "the snapshot predates our own injection; comparing against it would make \
              every retry report the user resumed, so -a -r N -v could never fire twice"
         );
-        assert!(retried.verify, "--verify itself stays on: only the snapshot goes");
+        assert!(
+            retried.verify,
+            "--verify itself stays on: only the snapshot goes"
+        );
         assert_eq!(retried.retries_left, 1);
         assert_eq!(retried.fire_at, retry_at);
     }

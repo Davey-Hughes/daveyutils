@@ -178,7 +178,10 @@ mod tests {
         // capture that failed. Must behave exactly as today.
         assert_eq!(recency(None, &fingerprint("y"), Some(d)), Recency::Unknown);
         // Dims unreadable now -> not comparable.
-        assert_eq!(recency(base.clone(), &fingerprint("y"), None), Recency::Unknown);
+        assert_eq!(
+            recency(base.clone(), &fingerprint("y"), None),
+            Recency::Unknown
+        );
         // Resized: the capture reflowed, so a differing fingerprint says
         // nothing about whether the user resumed.
         assert_eq!(

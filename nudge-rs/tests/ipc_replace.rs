@@ -128,3 +128,50 @@ fn replace_of_an_unknown_id_changes_nothing() {
     assert_eq!(q.all().len(), 1, "nothing must have been added");
     assert_eq!(q.all()[0].id, 1, "the untouched original");
 }
+
+/// `--edit` re-snapshots the pane and ships the new baseline inside the
+/// `Replace` spec. If the op drops it in transit the replacement lands with no
+/// baseline and silently fails open -- `--verify` degrades back to the
+/// positionally-blind check of finding I19, with nothing to show for it.
+///
+/// Raw JSON on purpose, like the tests above: this asserts the wire format
+/// carries the fields, not merely that our own serializer round-trips.
+#[test]
+fn replace_carries_the_verify_snapshot_to_the_daemon() {
+    let (_dir, socket, queue) = serving_queue("old:0.0");
+
+    let fp = nudge::verify::fingerprint("⏸ session limit reached · resets 3:00am");
+    let snapshotted = JobSpec {
+        verify: true,
+        verify_fingerprint: Some(fp.clone()),
+        verify_dims: Some(nudge::target::PaneDims {
+            width: 80,
+            height: 24,
+        }),
+        ..spec("new:0.0")
+    };
+    let new_spec = serde_json::to_string(&snapshotted).unwrap();
+    assert!(
+        new_spec.contains(&fp),
+        "precondition: the fingerprint is on the wire"
+    );
+
+    let resp = round_trip(
+        &socket,
+        &format!(r#"{{"op":"Replace","data":{{"id":1,"spec":{new_spec}}}}}"#),
+    );
+    assert_eq!(resp, r#"{"Replaced":2}"#);
+
+    let q = queue.lock().unwrap();
+    assert_eq!(
+        q.all()[0].verify_baseline(),
+        Some((
+            fp,
+            nudge::target::PaneDims {
+                width: 80,
+                height: 24
+            }
+        )),
+        "an edited --verify job must reach the daemon still holding its new baseline"
+    );
+}
