@@ -16,6 +16,12 @@ struct State {
 pub struct Queue {
     path: PathBuf,
     state: State,
+    /// Saves attempted since `load`, counted only to drive [`Queue::fail_nth_save`].
+    #[cfg(test)]
+    saves: std::cell::Cell<u64>,
+    /// Which save to refuse, if any. See [`Queue::fail_nth_save`].
+    #[cfg(test)]
+    fail_save_at: Option<u64>,
 }
 
 impl Queue {
@@ -27,7 +33,27 @@ impl Queue {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(e) => return Err(e),
         };
-        Ok(Queue { path, state })
+        Ok(Queue {
+            path,
+            state,
+            #[cfg(test)]
+            saves: std::cell::Cell::new(0),
+            #[cfg(test)]
+            fail_save_at: None,
+        })
+    }
+
+    /// Test-only: refuse the `n`th save this queue attempts (1-based, counted
+    /// from `load`).
+    ///
+    /// Making the state dir unwritable can only fail *every* save, and so only
+    /// ever reaches the first one — which is the one failure an operation built
+    /// from two commits survives cleanly, because it errors before commit #1
+    /// lands. The interesting state is the other one: commit #1 landed and
+    /// commit #2 could not. Only a seam that picks the save can reach it.
+    #[cfg(test)]
+    fn fail_nth_save(&mut self, n: u64) {
+        self.fail_save_at = Some(n);
     }
 
     pub fn all(&self) -> &[Job] {
@@ -127,6 +153,16 @@ impl Queue {
     /// leaves a half-written queue. Takes the state explicitly because it
     /// persists the *candidate*, before `commit` adopts it.
     fn save(&self, state: &State) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            let n = self.saves.get() + 1;
+            self.saves.set(n);
+            if self.fail_save_at == Some(n) {
+                return Err(std::io::Error::other(format!(
+                    "save #{n} refused by the test seam"
+                )));
+            }
+        }
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -290,11 +326,67 @@ mod tests {
             q.replace(id, spec()).is_err(),
             "save must fail for this test to mean anything"
         );
-        // Neither leg may show. A live replacement alongside the original is the
-        // double-fire the atomic swap exists to prevent; dropping the original
-        // instead would lose the user's nudge outright.
+        // Note the modest claim: this covers the case where the FIRST save
+        // fails, so it pins rollback, not atomicity. `block_saving` cannot fail
+        // any later save, and an add-then-remove replace passes this test — it
+        // errors on its own first commit, before either leg lands. The shape
+        // that admits the double-fire is "commit #1 landed, commit #2's save
+        // failed", and it takes the save seam to reach:
+        // `a_replace_leaves_exactly_one_job_whichever_save_fails` is that test.
         assert_eq!(q.all().len(), 1, "a failed replace must not add a job");
         assert_eq!(q.all()[0].id, id, "and must not drop the original");
+    }
+
+    /// `replace` must be ONE commit, and this is what pins it.
+    ///
+    /// The double-fire I10 exists to eliminate is a live replacement alongside
+    /// the original. A `replace` built from `add` + `remove` publishes exactly
+    /// that between its two commits, so anything that stops the second — here a
+    /// failed save, in the field a daemon restart or a full disk — leaves the
+    /// message scheduled twice, at the old time and the new. It is the same bug
+    /// the CLI used to have over two round-trips, just moved into the queue.
+    ///
+    /// So walk the save that fails across `replace`'s whole span. One commit
+    /// means one save, so every failure point either leaves the original (the
+    /// swap never happened) or the replacement (it did) — and never both,
+    /// whatever the outcome. A two-commit `replace` cannot satisfy that: it has
+    /// a failure point where both are live.
+    #[test]
+    fn a_replace_leaves_exactly_one_job_whichever_save_fails() {
+        for fail_at in [2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut q = Queue::load(dir.path().join("q.json")).unwrap();
+            let id = q.add(spec()).unwrap(); // save #1
+            q.fail_nth_save(fail_at);
+
+            let outcome = q.replace(id, spec());
+
+            assert_eq!(
+                q.all().len(),
+                1,
+                "fail_at={fail_at}: a replace left {} jobs live. Exactly one may \
+                 survive: the original AND its replacement both pending is the \
+                 double-fire, and neither loses the user's nudge outright",
+                q.all().len()
+            );
+            match outcome {
+                // The swap committed: only the replacement is live.
+                Ok(Some(new_id)) => assert_eq!(
+                    q.all()[0].id,
+                    new_id,
+                    "fail_at={fail_at}: a replace that reported success must leave \
+                     its replacement, not the original"
+                ),
+                Ok(None) => panic!("fail_at={fail_at}: the original was there to replace"),
+                // It did not: only the original is, untouched.
+                Err(_) => assert_eq!(
+                    q.all()[0].id,
+                    id,
+                    "fail_at={fail_at}: a replace that could not be persisted must \
+                     leave the original"
+                ),
+            }
+        }
     }
 
     #[test]
