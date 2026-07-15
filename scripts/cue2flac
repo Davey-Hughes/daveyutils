@@ -76,6 +76,7 @@ msf_to_sectors() {
 img_file=""
 tracks=()       # "type sector" pairs
 cur_type=""
+num_audio=0     # AUDIO tracks only -- what a pasted tracklist actually lists
 
 while IFS= read -r line; do
     # Strip leading/trailing whitespace and carriage returns
@@ -91,6 +92,12 @@ while IFS= read -r line; do
 
     elif [[ "$line" =~ ^INDEX[[:space:]]+0?1[[:space:]]+([0-9]+:[0-9]+:[0-9]+) ]]; then
         tracks+=("${cur_type} $(msf_to_sectors "${BASH_REMATCH[1]}")")
+        # Spelled as a full `if`, not `[[ ... ]] && ...`: as the last command of
+        # this branch the latter returns 1 on a non-audio track, and `set -e`
+        # would take the whole script down on the first data track.
+        if [[ "$cur_type" == "AUDIO" ]]; then
+            num_audio=$(( num_audio + 1 ))
+        fi
     fi
 done < "$cue_file"
 
@@ -105,16 +112,22 @@ fi
 img_size=$(stat -c%s "$img_file" 2>/dev/null || stat -f%z "$img_file")
 total_sectors=$(( img_size / sector_size ))
 
-# Validate tracklist count if provided.
+# Validate the tracklist against the AUDIO tracks, not every CUE track: a
+# tracklist pasted from VGMdb lists the audio programme, and data tracks are
+# skipped. Counting all tracks made the two documented features mutually
+# unusable -- a mixed-mode disc (MODE1 data track 1 + 12 audio tracks) rejected
+# the matching 12-name paste with "12 names but CUE has 13 tracks", and the only
+# workaround was to pad a dummy name for the data track.
 num_tracks=${#tracks[@]}
-if [[ ${#track_names[@]} -gt 0 && ${#track_names[@]} -ne $num_tracks ]]; then
-    die "Error: Tracklist has ${#track_names[@]} names but CUE has $num_tracks tracks."
+if [[ ${#track_names[@]} -gt 0 && ${#track_names[@]} -ne $num_audio ]]; then
+    die "Error: Tracklist has ${#track_names[@]} names but CUE has $num_audio audio tracks."
 fi
 
 mkdir -p "$output_dir"
 
 extracted=0
 skipped=0
+audio_idx=0     # ordinal within the audio programme; indexes track_names
 
 for (( i = 0; i < num_tracks; i++ )); do
     read -r type start_sector <<< "${tracks[$i]}"
@@ -125,6 +138,8 @@ for (( i = 0; i < num_tracks; i++ )); do
         (( skipped++ )) || true
         continue
     fi
+
+    audio_idx=$(( audio_idx + 1 ))
 
     # End sector is the start of the next track, or end of file.
     if (( i + 1 < num_tracks )); then
@@ -137,11 +152,15 @@ for (( i = 0; i < num_tracks; i++ )); do
     duration_secs=$(( num_sectors / 75 ))
     duration_str=$(printf '%d:%02d' $(( duration_secs / 60 )) $(( duration_secs % 60 )))
 
-    # Build metadata args.
-    metadata_args=(-metadata track="$track_num/$num_tracks")
+    # Build metadata args. The track tag numbers the audio programme (audio 1 of
+    # 12), not the raw CUE index -- which wrote "2/13" onto what is really audio
+    # track 1 of 12 on a mixed-mode disc. Filenames and the progress lines above
+    # deliberately keep the DISC track number, so they stay consistent with each
+    # other and with the "(skipping non-audio)" line.
+    metadata_args=(-metadata track="$audio_idx/$num_audio")
     title=""
     if [[ ${#track_names[@]} -gt 0 ]]; then
-        title="${track_names[$i]}"
+        title="${track_names[$(( audio_idx - 1 ))]}"
         metadata_args+=(-metadata title="$title")
     fi
 
