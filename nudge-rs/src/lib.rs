@@ -8,6 +8,7 @@ pub mod ipc;
 pub mod job;
 pub mod paths;
 pub mod queue;
+pub mod register;
 pub mod scheduler;
 pub mod target;
 pub mod timespec;
