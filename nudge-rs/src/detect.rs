@@ -29,6 +29,18 @@ fn build_re(base: &str, ext: Option<&str>) -> Regex {
     Regex::new(&pattern).expect("valid built-in banner regex")
 }
 
+/// Which banner shape a match came from — it decides how the countdown token
+/// after the banner is read, not which banner wins.
+#[derive(Clone, Copy)]
+enum Shape {
+    /// "... Resets in 1h30m / 45m", or a fully custom NUDGE_DURATION_PATTERN
+    /// banner (e.g. "out of credits, back in 20m") whose countdown need not
+    /// follow the literal word "resets".
+    Duration,
+    /// "... resets 3:00pm" / "... try again at 4pm".
+    Clock,
+}
+
 /// Returns the padded absolute reset time, or `None` if no banner is present.
 pub fn detect_reset(
     pane_text: &str,
@@ -38,29 +50,45 @@ pub fn detect_reset(
 ) -> Option<Zoned> {
     let clean = strip_ansi_escapes::strip_str(pane_text);
 
-    // Duration shape: "... Resets in 1h30m / 45m" or a fully custom
-    // NUDGE_DURATION_PATTERN banner (e.g. "out of credits, back in 20m") whose
-    // countdown need not follow the literal word "resets". Scan only the text
-    // *after* the banner match: a captured pane includes scrollback, and an
-    // unrelated duration-shaped substring earlier in the pane (e.g. "16
-    // minutes ago" in a shell prompt) must not be mistaken for the banner's
-    // own countdown.
-    if let Some(m) = duration_re(dur_ext).find(&clean) {
-        if let Some(spec) = find_duration_token(&clean[m.end()..]) {
-            if let Ok(z) = parse_timespec(&spec, now) {
-                return z.checked_add(PADDING_MINUTES.minutes()).ok();
-            }
-        }
-    }
+    // A captured pane is chronological top-to-bottom, so the banner *lowest* on
+    // screen is the live one. `Regex::find` is leftmost, and checking one shape
+    // before the other imposes an order unrelated to the pane — either way a
+    // superseded banner still on screen would beat the current one and the
+    // nudge would fire hours early. Collect every banner of both shapes and
+    // walk them bottom-up instead, so recency alone decides.
+    let mut banners: Vec<(usize, usize, Shape)> = Vec::new();
+    banners.extend(
+        duration_re(dur_ext)
+            .find_iter(&clean)
+            .map(|m| (m.start(), m.end(), Shape::Duration)),
+    );
+    banners.extend(
+        clock_re(clock_ext)
+            .find_iter(&clean)
+            .map(|m| (m.start(), m.end(), Shape::Clock)),
+    );
+    // Bottom-up. sort_by_key is stable, so two shapes matching at the same
+    // offset keep the duration-first order callers have always seen.
+    banners.sort_by_key(|b| std::cmp::Reverse(b.0));
 
-    // Clock shape: "... resets 3:00pm" / "... try again at 4pm". Same
-    // scrollback-safety scoping as the duration branch above.
-    if let Some(m) = clock_re(clock_ext).find(&clean) {
-        if let Some(tok) = find_clock_token(&clean[m.end()..]) {
-            if let Ok(z) = parse_timespec(&tok, now) {
+    for (_, end, shape) in banners {
+        // Scan only the text *after* the banner match: a captured pane includes
+        // scrollback, and an unrelated duration-shaped substring earlier in the
+        // pane (e.g. "16 minutes ago" in a shell prompt) must not be mistaken
+        // for the banner's own countdown.
+        let rest = &clean[end..];
+        let token = match shape {
+            Shape::Duration => find_duration_token(rest),
+            Shape::Clock => find_clock_token(rest),
+        };
+        if let Some(token) = token {
+            if let Ok(z) = parse_timespec(&token, now) {
                 return z.checked_add(PADDING_MINUTES.minutes()).ok();
             }
         }
+        // This banner carried no parseable countdown (a bare "quota reached"
+        // with the time on a line the capture cut off). Fall back to the next
+        // one up rather than giving up on the pane entirely.
     }
 
     None
@@ -158,5 +186,37 @@ mod tests {
         let z = detect_reset(pane, &now(), None, None).unwrap();
         // 15:00 + 3m padding = 15:03, NOT derived from the 9:15 scrollback time.
         assert_eq!((z.hour(), z.minute()), (15, 3));
+    }
+
+    #[test]
+    fn newest_of_two_duration_banners_wins() {
+        // A pane is chronological top-to-bottom: the stale 45m banner scrolled
+        // up the screen is superseded by the live 3h one below it.
+        let pane =
+            "quota reached. Resets in 45m\n... hours of work ...\nquota reached. Resets in 3h";
+        let z = detect_reset(pane, &now(), None, None).unwrap();
+        // now 10:00 + 3h + 3m padding = 13:03, NOT the stale banner's 10:48.
+        assert_eq!((z.hour(), z.minute()), (13, 3));
+    }
+
+    #[test]
+    fn later_clock_banner_beats_earlier_duration_banner() {
+        // Shape must not decide precedence: the clock banner sits lower on
+        // screen, so it is the live one even though the duration branch used to
+        // run first unconditionally.
+        let pane = "quota reached. Resets in 45m\nlater output\ncurrent session resets 3:00pm";
+        let z = detect_reset(pane, &now(), None, None).unwrap();
+        // 15:00 + 3m padding = 15:03, NOT the stale duration banner's 10:48.
+        assert_eq!((z.hour(), z.minute()), (15, 3));
+    }
+
+    #[test]
+    fn later_duration_banner_beats_earlier_clock_banner() {
+        // The mirror case, so "last banner wins" is not accidentally satisfied
+        // by simply flipping the hardcoded branch order.
+        let pane = "current session resets 3:00pm\nlater output\nquota reached. Resets in 45m";
+        let z = detect_reset(pane, &now(), None, None).unwrap();
+        // now 10:00 + 45m + 3m padding = 10:48, NOT the stale clock banner's 15:03.
+        assert_eq!((z.hour(), z.minute()), (10, 48));
     }
 }
