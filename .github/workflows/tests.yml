@@ -32,9 +32,14 @@ jobs:
           HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
         run: brew install tmux bash
 
+      # Every script, not just nudge. The other six were covered only
+      # incidentally, by test files that source them -- and cue2flac was not
+      # covered at all until it got a test file, so a stray quote or missing
+      # `fi` in it reached main with CI green. Sourcing is a side effect, not a
+      # syntax check; this is the one that is actually about syntax.
       - name: Syntax check
         run: |
-          bash -n scripts/nudge
+          for f in scripts/*; do bash -n "$f"; done
           for f in tests/*.sh; do bash -n "$f"; done
 
       - name: Run test-suite
