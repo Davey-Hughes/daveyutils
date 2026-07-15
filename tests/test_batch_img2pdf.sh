@@ -83,9 +83,21 @@ mkdir -p "$c3/main/book/chapter1"
 : >"$c3/main/book/cover.jpg"
 : >"$c3/main/book/chapter1/p1.jpg"
 ( cd "$c3" && PATH="$STUBDIR:$PATH" UNAR_LOG=/dev/null IMG2PDF_LOG=/dev/null \
-    bash "$HERE/../scripts/batch_img2pdf" --clean -o "$c3/out" main ) >/dev/null 2>&1
+    bash "$HERE/../scripts/batch_img2pdf" --clean -o "$c3/out" main ) \
+    >"$c3/stdout.log" 2>"$c3/stderr.log"
 check "C3: nested unconverted image survives --clean" "yes" \
     "$([ -f "$c3/main/book/chapter1/p1.jpg" ] && echo yes || echo no)"
+# C3's core complaint was that the run "looks like a clean success" -- the exit
+# status and the `done: 1 pdfs, 0 failed` summary are both indistinguishable
+# from a run that cleaned. This WARN is the ONLY user-facing signal that a
+# folder was kept, so it needs pinning: the earlier `2>&1` discarded stderr and
+# left the whole fix unasserted. (F4)
+check "C3: the run still reports the PDF as a success on stdout" "yes" \
+    "$(grep -q 'done: 1 pdfs, 0 failed' "$c3/stdout.log" && echo yes || echo no)"
+check "C3: stderr WARNs that the folder was kept" "yes" \
+    "$(grep -q 'WARN: kept main/book' "$c3/stderr.log" && echo yes || echo no)"
+check "C3: the WARN names the uncovered subdirectory" "yes" \
+    "$(grep -q 'main/book/chapter1' "$c3/stderr.log" && echo yes || echo no)"
 rm -rf "$c3"
 
 # --- C3 sanity: a fully-covered folder (no subdirs) is still cleaned --------
