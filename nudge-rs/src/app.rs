@@ -73,10 +73,29 @@ pub fn build_spec(
 /// snapshot fails open. `--verify` failing to arm must never be a reason the
 /// user's nudge does not get scheduled at all.
 fn snapshot_pane(pane: &str, opts: &Toggles) -> Option<crate::verify::Baseline> {
+    snapshot_gate(opts, || {
+        crate::verify::capture_baseline(&TmuxTarget::new(pane))
+    })
+}
+
+/// The `--verify`-only guard around taking a capture: `take` runs only when the
+/// flag is on.
+///
+/// Split out from [`snapshot_pane`] so the guard is testable at all — its own
+/// body shells out to tmux, so nothing could assert this without a live server.
+/// Both consumers (`build_spec`, `merge_edit`) now independently drop a
+/// baseline when `--verify` is off, which is what makes the *stored* job right;
+/// what this guard alone still decides is whether nudge shells out to tmux
+/// twice for a snapshot no job will ever consult. That is invisible in the
+/// JobSpec, so it takes a test of its own.
+fn snapshot_gate(
+    opts: &Toggles,
+    take: impl FnOnce() -> Option<crate::verify::Baseline>,
+) -> Option<crate::verify::Baseline> {
     if !opts.verify {
         return None;
     }
-    crate::verify::capture_baseline(&TmuxTarget::new(pane))
+    take()
 }
 
 /// Determine the fire time: explicit `-m`, else auto-detect from the pane.
@@ -349,7 +368,13 @@ pub fn merge_edit(
     // they mean. Inheriting the original snapshot would compare the pane
     // against however it looked hours ago, so any edit of a job whose pane had
     // since moved would arm a gate that skips on sight.
-    let (verify_fingerprint, verify_dims) = baseline_fields(snapshot(&pane, &opts));
+    //
+    // Filtered here as well as in `snapshot_pane`, and for the same reason
+    // `build_spec` filters: `snapshot` is a parameter, so "no snapshot when
+    // --verify is off" is this function's own invariant to keep and not one to
+    // borrow from whatever the caller happened to pass.
+    let (verify_fingerprint, verify_dims) =
+        baseline_fields(snapshot(&pane, &opts).filter(|_| opts.verify));
     Ok(JobSpec {
         target: TargetSpec::Tmux { pane },
         messages,
@@ -509,6 +534,69 @@ mod tests {
             err.contains("pkill -f 'nudge --daemon'"),
             "must name the remedy: {err}"
         );
+    }
+
+    fn toggles(verify: bool) -> Toggles {
+        Toggles {
+            notify: false,
+            verify,
+            auto_retry: false,
+            retries: 0,
+            settle_secs: 5.0,
+        }
+    }
+
+    /// Without `--verify`, nudge must not capture the pane at all.
+    ///
+    /// `build_spec` and `merge_edit` both drop a baseline when the flag is off,
+    /// so the *stored job* is right either way and no JobSpec assertion can see
+    /// this. What is left for the guard to decide is whether scheduling shells
+    /// out to tmux twice (`display-message`, `capture-pane`) to build a
+    /// snapshot that is then thrown away — on every plain `nudge`, which is the
+    /// common case. Asserting the returned `None` would not catch that; only
+    /// counting the calls does.
+    #[test]
+    fn without_verify_no_capture_is_ever_taken() {
+        let taken = std::cell::Cell::new(false);
+        let out = snapshot_gate(&toggles(false), || {
+            taken.set(true);
+            Some(crate::verify::Baseline {
+                fingerprint: "x".into(),
+                dims: PaneDims {
+                    width: 80,
+                    height: 24,
+                },
+            })
+        });
+        assert!(
+            !taken.get(),
+            "--verify is off: nothing will ever read this snapshot, so taking it \
+             is two tmux subprocesses spent on nothing"
+        );
+        assert!(out.is_none());
+    }
+
+    /// The other half: with the flag on, the capture is taken and returned. A
+    /// guard that swallowed this would disarm the gate on every job, which
+    /// fails open — so it is silent, and only this catches it.
+    #[test]
+    fn with_verify_the_capture_is_taken_and_returned() {
+        let taken = std::cell::Cell::new(false);
+        let out = snapshot_gate(&toggles(true), || {
+            taken.set(true);
+            Some(crate::verify::Baseline {
+                fingerprint: "abc".into(),
+                dims: PaneDims {
+                    width: 80,
+                    height: 24,
+                },
+            })
+        });
+        assert!(
+            taken.get(),
+            "--verify is on: the snapshot is the gate's whole input"
+        );
+        assert_eq!(out.map(|b| b.fingerprint), Some("abc".to_string()));
     }
 
     /// `0.1.0` is the last version whose `JobSpec` has no `verify_fingerprint`

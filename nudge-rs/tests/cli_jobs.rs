@@ -257,22 +257,34 @@ fn edit_snapshots_the_new_pane_when_the_job_is_moved() {
 }
 
 /// `--edit 1 --no-verify` turns the gate off, so no snapshot is taken or kept.
+///
+/// The closure hands back a snapshot *unconditionally*, which is the point:
+/// this must hold because `merge_edit` drops it, not because the caller was
+/// polite enough not to offer one. It used to be checked against a stub that
+/// hard-coded `o.verify.then(...)` — so the assertion below passed on the
+/// strength of the stub's own `if`, and `merge_edit` could have stored the
+/// snapshot on a `verify: false` job forever without the test noticing. That
+/// left the property resting entirely on a guard inside `snapshot_pane`, one
+/// layer up and invisible from here.
 #[test]
 fn edit_with_no_verify_drops_the_snapshot() {
     let job = verify_job_snapshotted_at("bot:0.1", "parked");
     let cli =
         <nudge::cli::Cli as clap::Parser>::try_parse_from(["nudge", "--edit", "1", "--no-verify"])
             .unwrap();
-    // snapshot_pane returns None when verify resolves off; model that here.
-    let respects_opts = |_p: &str, o: &Toggles| {
-        o.verify.then(|| Baseline {
+    let always_snapshots = |_p: &str, _o: &Toggles| {
+        Some(Baseline {
             fingerprint: "x".into(),
             dims: dims(80),
         })
     };
-    let spec = nudge::app::merge_edit(&job, &cli, &noon(), 2, &respects_opts).unwrap();
+    let spec = nudge::app::merge_edit(&job, &cli, &noon(), 2, &always_snapshots).unwrap();
     assert!(!spec.verify);
-    assert_eq!(spec.verify_fingerprint, None);
+    assert_eq!(
+        spec.verify_fingerprint, None,
+        "--no-verify means nothing consults a snapshot, so storing one only \
+         leaves a stale fingerprint in queue.json"
+    );
     assert_eq!(spec.verify_dims, None);
 }
 
