@@ -15,7 +15,12 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 # derive_title <filename> [delim] [field]
 derive_title() {
     local base="${1##*/}"
-    base="${base%.mkv}"
+    # Strip the extension case-insensitively: `find -iname '*.mkv'` matches any
+    # case, so a case-sensitive `${base%.mkv}` would leave ".MKV" on the name and
+    # bake it into the title tag. The explicit class is the exact inverse of the
+    # find pattern -- unlike `${base%.*}` it can only ever remove a .mkv suffix,
+    # never truncate a name that doesn't have one.
+    base="${base%.[Mm][Kk][Vv]}"
     local delim="${2:-}" field="${3:-}" name="$base"
     if [[ -n "$delim" && -n "$field" ]]; then
         name="$(printf '%s' "$base" | cut -d"$delim" -f"$field")"

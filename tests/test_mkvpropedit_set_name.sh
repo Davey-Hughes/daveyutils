@@ -11,6 +11,14 @@ check "default: path stripped"      "Pilot"              "$(derive_title '/a/b/P
 check "field 3 (old -d - -f 3)"     "Pilot"              "$(derive_title 'Show - S01 - Pilot.mkv' '-' 3)"
 check "field 2 trimmed"             "S01"                "$(derive_title 'Show - S01 - Pilot.mkv' '-' 2)"
 
+# `find -iname '*.mkv'` matches case-insensitively, so the extension strip must
+# too -- otherwise an uppercase-extension file (Windows rippers, older MakeMKV)
+# gets ".MKV" written INTO its title tag, and mkvpropedit exits 0 so the summary
+# reports it as a success. The stray extension also lands in the -d/-f cut field.
+check "default: uppercase .MKV stripped" "Movie" "$(derive_title 'Movie.MKV')"
+check "default: mixed-case .Mkv stripped" "Movie" "$(derive_title 'Movie.Mkv')"
+check "field 3 with uppercase .MKV"      "Pilot" "$(derive_title 'Show - S01 - Pilot.MKV' '-' 3)"
+
 # --- batch resilience: one failing mkvpropedit must not abort the batch -------
 # A stub `mkvpropedit` on PATH fails for b.mkv only. Both files must still be
 # attempted (the loop must not run in a lost subshell, and a single failure
