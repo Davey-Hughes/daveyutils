@@ -62,13 +62,21 @@ uncovered_entries() {
 OUTDIR="./pdfs"
 CLEAN=0
 MAINDIR=""
+HELP=0
 
-# parse_args <args...> -> sets OUTDIR/CLEAN/MAINDIR; echoes "OUTDIR|CLEAN|MAINDIR".
+# parse_args <args...> -> sets OUTDIR/CLEAN/MAINDIR/HELP; echoes
+# "OUTDIR|CLEAN|MAINDIR".
+#
+# -h sets its own HELP flag rather than a MAINDIR="__help__" sentinel: the
+# sentinel didn't exit, so the `*)` positional branch below silently overwrote
+# it and `--clean -h book` -- a user reaching for help on the destructive flag --
+# ran the full pipeline against book/ with CLEAN=1. It also made a directory
+# legitimately named __help__ print usage instead of being processed.
 parse_args() {
-    OUTDIR="./pdfs"; CLEAN=0; MAINDIR=""
+    OUTDIR="./pdfs"; CLEAN=0; MAINDIR=""; HELP=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -h|--help) MAINDIR="__help__"; shift ;;
+            -h|--help) HELP=1; shift ;;
             -o) OUTDIR="${2:?}"; shift 2 ;;
             --clean) CLEAN=1; shift ;;
             --) shift; [[ $# -gt 0 ]] && { MAINDIR="$1"; shift; }; break ;;
@@ -86,7 +94,7 @@ usage() {
 main() {
     set -euo pipefail
     parse_args "$@" >/dev/null
-    [[ "$MAINDIR" == "__help__" ]] && { usage; exit 0; }
+    [[ "$HELP" -eq 1 ]] && { usage; exit 0; }
     [[ -n "$MAINDIR" ]] || { usage; exit 1; }
     command -v unar >/dev/null 2>&1 || die "unar is required."
     command -v img2pdf >/dev/null 2>&1 || die "img2pdf is required."

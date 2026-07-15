@@ -164,4 +164,37 @@ check "F3: the WARN does not name the image the PDF did cover" "yes" \
     "$(grep -q 'cover\.jpg' "$f3/stderr.log" && echo no || echo yes)"
 rm -rf "$f3"
 
+# --- M11: -h must print usage and exit, not set a sentinel ---------------------
+# `-h` set MAINDIR="__help__" and kept parsing, so the `*) MAINDIR="$1"`
+# positional branch silently overwrote it: `--clean -h book` -- a user reaching
+# for help ON THE DESTRUCTIVE FLAG -- failed the `__help__` check and ran the
+# full pipeline against book/ with CLEAN=1. Order-dependent too: `book -h` DID
+# print usage. Every sibling script does `-h|--help) usage; exit 0 ;;` inline.
+m11=$(mktemp -d "${TMPDIR:-/tmp}/img2pdf-m11.XXXXXX")
+mkdir -p "$m11/main/flat"
+: >"$m11/main/flat/p1.jpg"
+m11out=$( cd "$m11" && PATH="$STUBDIR:$PATH" UNAR_LOG=/dev/null IMG2PDF_LOG=/dev/null \
+    bash "$HERE/../scripts/batch_img2pdf" --clean -h main 2>/dev/null )
+m11rc=$?
+check "M11: '--clean -h DIR' prints usage" "yes" \
+    "$(printf '%s' "$m11out" | grep -q 'Usage: batch_img2pdf' && echo yes || echo no)"
+check "M11: '--clean -h DIR' exits 0" "0" "$m11rc"
+check "M11: '--clean -h DIR' does NOT run the destructive pipeline" "yes" \
+    "$([ -f "$m11/main/flat/p1.jpg" ] && echo yes || echo no)"
+
+# The other order already worked; it must keep working.
+m11out2=$( cd "$m11" && PATH="$STUBDIR:$PATH" bash "$HERE/../scripts/batch_img2pdf" main -h 2>/dev/null )
+check "M11: 'DIR -h' still prints usage" "yes" \
+    "$(printf '%s' "$m11out2" | grep -q 'Usage: batch_img2pdf' && echo yes || echo no)"
+
+# And a directory legitimately named __help__ must be processed, not treated as
+# a request for help -- the sentinel made its name magic.
+mkdir -p "$m11/__help__/flat"
+: >"$m11/__help__/flat/p1.jpg"
+m11out3=$( cd "$m11" && PATH="$STUBDIR:$PATH" UNAR_LOG=/dev/null IMG2PDF_LOG=/dev/null \
+    bash "$HERE/../scripts/batch_img2pdf" -o "$m11/out3" __help__ 2>/dev/null )
+check "M11: a directory named __help__ is processed, not treated as -h" "yes" \
+    "$(printf '%s' "$m11out3" | grep -q 'done: 1 pdfs, 0 failed' && echo yes || echo no)"
+rm -rf "$m11"
+
 finish
