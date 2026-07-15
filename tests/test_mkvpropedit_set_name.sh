@@ -19,6 +19,38 @@ check "default: uppercase .MKV stripped" "Movie" "$(derive_title 'Movie.MKV')"
 check "default: mixed-case .Mkv stripped" "Movie" "$(derive_title 'Movie.Mkv')"
 check "field 3 with uppercase .MKV"      "Pilot" "$(derive_title 'Show - S01 - Pilot.MKV' '-' 3)"
 
+# --- argument validation: a value-taking flag must fail LOUDLY -----------------
+# `-d` as the final argument left `${2:-}` empty and then ran `shift 2` with
+# $#==1, which returns non-zero. As the last command of a case branch inside the
+# while body (not a condition context) that tripped `set -e`: the script exited 1
+# printing NOTHING at all, and the "-d requires -f" validation was never reached.
+# The mirror case (-f without -d) was accepted and then silently ignored by
+# derive_title's guard, retitling every file with the full basename.
+SCRIPT="$HERE/../scripts/mkvpropedit_set_name"
+
+# run_parse <args...> -> "<rc>|<stderr>"; stdout discarded.
+run_parse() {
+    local err rc
+    err=$(bash "$SCRIPT" "$@" 2>&1 >/dev/null)
+    rc=$?
+    printf '%s|%s' "$rc" "$err"
+}
+
+check "parse: -d with no value exits non-zero" "yes" \
+    "$(r=$(run_parse -d); [ "${r%%|*}" -ne 0 ] && echo yes || echo no)"
+check "parse: -d with no value explains itself" "yes" \
+    "$(r=$(run_parse -d); case "${r#*|}" in *"-d requires an argument"*) echo yes ;; *) echo no ;; esac)"
+check "parse: -f with no value exits non-zero" "yes" \
+    "$(r=$(run_parse -f); [ "${r%%|*}" -ne 0 ] && echo yes || echo no)"
+check "parse: -f with no value explains itself" "yes" \
+    "$(r=$(run_parse -f); case "${r#*|}" in *"-f requires an argument"*) echo yes ;; *) echo no ;; esac)"
+check "parse: trailing -d after a dir exits non-zero" "yes" \
+    "$(r=$(run_parse . -d); [ "${r%%|*}" -ne 0 ] && echo yes || echo no)"
+check "parse: -f without -d is rejected, not ignored" "yes" \
+    "$(r=$(run_parse -f 3 .); case "${r#*|}" in *"-f requires -d"*) echo yes ;; *) echo no ;; esac)"
+check "parse: -d without -f is rejected" "yes" \
+    "$(r=$(run_parse -d - .); case "${r#*|}" in *"-d requires -f"*) echo yes ;; *) echo no ;; esac)"
+
 # --- batch resilience: one failing mkvpropedit must not abort the batch -------
 # A stub `mkvpropedit` on PATH fails for b.mkv only. Both files must still be
 # attempted (the loop must not run in a lost subshell, and a single failure

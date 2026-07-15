@@ -41,14 +41,25 @@ main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) usage; exit 0 ;;
-            -d) delim="${2:-}"; shift 2 ;;
-            -f) field="${2:-}"; shift 2 ;;
+            -d)
+                [[ $# -ge 2 ]] || die "-d requires an argument"
+                delim="$2"
+                shift 2
+                ;;
+            -f)
+                [[ $# -ge 2 ]] || die "-f requires an argument"
+                field="$2"
+                shift 2
+                ;;
             --) shift; [[ $# -gt 0 ]] && { dir="$1"; shift; }; break ;;
             -*) die "unknown option: $1" ;;
             *) dir="$1"; shift ;;
         esac
     done
+    # Both halves are needed or neither: -f alone was accepted and then silently
+    # ignored by derive_title's guard, retitling every file with the full basename.
     [[ -n "$delim" && -z "$field" ]] && die "-d requires -f"
+    [[ -n "$field" && -z "$delim" ]] && die "-f requires -d"
     command -v mkvpropedit >/dev/null 2>&1 || die "mkvpropedit is required (install mkvtoolnix)."
     [[ -d "$dir" ]] || die "not a directory: $dir"
 
