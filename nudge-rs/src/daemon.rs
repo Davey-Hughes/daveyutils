@@ -69,9 +69,16 @@ pub fn run(
     let q_ipc = Arc::clone(&queue);
     let socket = paths.socket.clone();
     std::thread::spawn(move || {
-        if let Err(e) = crate::ipc::server::serve(&socket, q_ipc) {
-            tracing::error!("nudge ipc server exited: {e}");
+        match crate::ipc::server::serve(&socket, q_ipc) {
+            Ok(()) => tracing::error!("nudge: ipc server exited unexpectedly"),
+            Err(e) => tracing::error!("nudge: ipc server exited: {e}"),
         }
+        // A daemon with no control plane still fires jobs but can't be listed,
+        // cancelled or edited -- and the singleton lock (correctly) stops a
+        // replacement from taking over. Take the whole process down so the user
+        // or the service manager can start a working daemon instead of leaving
+        // a headless one injecting into panes.
+        std::process::exit(1);
     });
 
     loop {

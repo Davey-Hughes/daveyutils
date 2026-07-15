@@ -5,6 +5,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 
 use nudge::daemon::acquire_singleton_lock;
+use nudge::paths::Paths;
 use nudge::queue::Queue;
 
 #[test]
@@ -69,4 +70,46 @@ fn serve_reclaims_a_stale_socket_file() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(ok, "serve must reclaim a stale socket file and bind");
+}
+
+/// The three tests above exercise `acquire_singleton_lock` directly. Nothing
+/// pins the wiring in `daemon::run` itself: if the acquire call were removed,
+/// or its `Result` silently discarded instead of propagated with `?`, every
+/// other test here would still pass. This test proves `run` refuses to start
+/// while another daemon holds the lock, by holding the lock externally first
+/// and asserting `run` returns `WouldBlock` instead of proceeding into its loop.
+#[test]
+fn run_refuses_to_start_while_another_daemon_holds_the_lock() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Simulate a daemon already running: hold the singleton lock.
+    let _held = acquire_singleton_lock(dir.path()).expect("first lock");
+
+    let paths = Paths {
+        state_dir: dir.path().to_path_buf(),
+        queue: dir.path().join("queue.json"),
+        socket: dir.path().join("nudge.sock"),
+    };
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let r = nudge::daemon::run(&paths, None, None, jiff::ToSpan::hours(6));
+        let _ = tx.send(r.map(|_| ()).map_err(|e| e.kind()));
+    });
+
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Err(kind)) => assert_eq!(
+            kind,
+            std::io::ErrorKind::WouldBlock,
+            "run must refuse with WouldBlock while another daemon holds the lock"
+        ),
+        Ok(Ok(())) => panic!("run returned Ok — it must refuse while the lock is held"),
+        Err(_) => panic!(
+            "run did NOT refuse: it started a second daemon while the lock was held \
+             (is `run` still taking the singleton lock, and binding it to a named \
+             variable so it isn't dropped immediately?)"
+        ),
+    }
 }
