@@ -1,8 +1,8 @@
 # daveyutils
 
-Random command-line utilities. Each script has a `--help`; run it for usage.
+Random command-line utilities. Each one has a `--help`; run it for usage.
 
-| Script | Does | Requires |
+| Utility | Does | Requires |
 |--------|------|----------|
 | `cue2flac` | Split a CUE/BIN disc image into per-track FLAC files | `ffmpeg` |
 | `batch_img2pdf` | Unzip image archives and make one PDF per folder | `unar`, `img2pdf`, `file` |
@@ -10,6 +10,33 @@ Random command-line utilities. Each script has a `--help`; run it for usage.
 | `video_pcm_to_flac` | Convert PCM⇄FLAC audio streams in MKVs | `fd`, `ffprobe`, `ffmpeg` |
 | `batch_makemkvcon` | Rip every Blu-ray/DVD disc image under a directory to MKV | `makemkvcon` |
 | `mkvpropedit_set_name` | Set each MKV's title tag from its filename | `mkvpropedit` |
-| `nudge` | Rate-limit auto-resumer for AI CLIs in tmux | `tmux`, `at` |
+| `nudge` | Rate-limit auto-resumer for AI CLIs in tmux (Rust — see `nudge-rs/`) | `tmux` |
 
-All scripts are `bash` and live in `scripts/`. Tests are in `tests/` — run `bash tests/run.sh`.
+## Install
+
+`make` collects every utility into `./bin` (gitignored). Put that on your PATH once:
+
+```sh
+make
+export PATH="$PWD/bin:$PATH"     # add to your shell rc
+```
+
+The bash scripts are **symlinked**, so editing one takes effect immediately.
+`nudge` is built from `nudge-rs/` (`cargo build --release`) and linked in.
+
+```sh
+make          # build nudge + link everything into ./bin
+make check    # run the bash and Rust test suites
+make clean    # remove ./bin
+make help     # list targets
+```
+
+## Layout
+
+- `scripts/` — the bash utilities.
+- `nudge-rs/` — the Rust `nudge` (a rewrite of the original bash version: no `at`
+  daemon, no `fzf`, no coreutils; it runs its own user-level scheduler). The bash
+  original stays at `scripts/nudge` as the reference oracle and is **not**
+  installed into `bin/`.
+- `tests/` — bash test-suite (`bash tests/run.sh`); Rust tests live in `nudge-rs/`.
+- `packaging/` — Homebrew formula and AUR PKGBUILDs for `nudge`.
