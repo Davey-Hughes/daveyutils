@@ -121,6 +121,8 @@ mod tests {
             auto_retry,
             retries_left,
             settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
         }
         .into_job(id)
     }
@@ -180,6 +182,8 @@ mod tests {
             auto_retry: job.auto_retry,
             retries_left: job.retries_left,
             settle_secs: job.settle_secs,
+            verify_fingerprint: job.verify_fingerprint.clone(),
+            verify_dims: job.verify_dims,
         })
         .unwrap();
         (dir, q)

@@ -37,6 +37,8 @@ pub fn build_spec(pane: &str, fire_at: jiff::Timestamp, cli: &Cli, opts: &Toggle
         auto_retry: opts.auto_retry,
         retries_left: if opts.auto_retry { opts.retries } else { 0 },
         settle_secs: opts.settle_secs,
+        verify_fingerprint: None,
+        verify_dims: None,
     }
 }
 
@@ -307,6 +309,8 @@ pub fn merge_edit(
         auto_retry: opts.auto_retry,
         retries_left: if opts.auto_retry { opts.retries } else { 0 },
         settle_secs: opts.settle_secs,
+        verify_fingerprint: None,
+        verify_dims: None,
     })
 }
 

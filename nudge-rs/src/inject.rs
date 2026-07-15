@@ -63,16 +63,39 @@ mod tests {
     /// In-memory Target: returns a fixed screen, records what was sent.
     struct FakeTarget {
         screen: String,
+        dims: Option<crate::target::PaneDims>,
         sent: RefCell<Vec<String>>,
     }
     impl FakeTarget {
         fn new(screen: &str) -> Self {
             FakeTarget {
                 screen: screen.to_string(),
+                dims: Some(DIMS),
                 sent: RefCell::new(Vec::new()),
             }
         }
+        /// A pane whose size tmux will not report (it went away, or tmux
+        /// answered with the empty fields it returns for a dead pane).
+        fn with_unknown_dims(screen: &str) -> Self {
+            FakeTarget {
+                dims: None,
+                ..FakeTarget::new(screen)
+            }
+        }
+        /// The same pane, resized: tmux reflows the capture, so the text is
+        /// different *and* so are the dims.
+        fn resized(screen: &str, dims: crate::target::PaneDims) -> Self {
+            FakeTarget {
+                dims: Some(dims),
+                ..FakeTarget::new(screen)
+            }
+        }
     }
+
+    const DIMS: crate::target::PaneDims = crate::target::PaneDims {
+        width: 80,
+        height: 24,
+    };
     impl Target for FakeTarget {
         fn capture(&self) -> anyhow::Result<String> {
             Ok(self.screen.clone())
@@ -80,6 +103,9 @@ mod tests {
         fn send_line(&self, text: &str) -> anyhow::Result<()> {
             self.sent.borrow_mut().push(text.to_string());
             Ok(())
+        }
+        fn dims(&self) -> Option<crate::target::PaneDims> {
+            self.dims
         }
     }
 
@@ -95,6 +121,8 @@ mod tests {
             auto_retry: false,
             retries_left: 0,
             settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
         }
     }
 

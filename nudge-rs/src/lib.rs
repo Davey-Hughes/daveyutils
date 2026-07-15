@@ -22,6 +22,7 @@ pub mod register;
 pub mod scheduler;
 pub mod target;
 pub mod timespec;
+pub mod verify;
 pub mod tmux_panes;
 
 /// Dispatch a parsed CLI to the right mode.

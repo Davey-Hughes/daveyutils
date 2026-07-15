@@ -21,6 +21,8 @@ fn spec(pane: &str) -> JobSpec {
         auto_retry: false,
         retries_left: 0,
         settle_secs: 5.0,
+        verify_fingerprint: None,
+        verify_dims: None,
     }
 }
 
@@ -142,6 +144,8 @@ fn merge_edit_preserves_options_not_passed() {
         auto_retry: true,
         retries_left: -1,
         settle_secs: 9.0,
+        verify_fingerprint: None,
+        verify_dims: None,
     }
     .into_job(1);
 
