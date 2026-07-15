@@ -183,12 +183,25 @@ impl Queue {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = self.temp_path();
-        {
+        let written = (|| -> std::io::Result<()> {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(&serde_json::to_vec_pretty(state)?)?;
-            f.sync_all()?;
+            f.sync_all()
+        })();
+        // A successful rename consumes the temp; every other path orphans it.
+        // Reap it here rather than sweeping the directory later: this is the
+        // call that created the file and it is named for this process, so
+        // removing it by exact path cannot touch a *live* daemon's temp -- a
+        // sweep matching `queue.json.*.tmp` could, and truncating another
+        // writer's in-flight temp is the corruption the process-unique name
+        // exists to prevent. Uniqueness is untouched; this only adds cleanup.
+        let result = written.and_then(|()| std::fs::rename(&tmp, &self.path));
+        if result.is_err() {
+            // Best-effort: if this fails too, the orphan is exactly the single
+            // file this pid would have reused anyway.
+            let _ = std::fs::remove_file(&tmp);
         }
-        std::fs::rename(&tmp, &self.path)
+        result
     }
 }
 
@@ -424,6 +437,47 @@ mod tests {
         assert_eq!(
             after.retries_left, before.retries_left,
             "retries must not drift"
+        );
+    }
+
+    /// Every `.tmp` sibling of `path` left in `dir`.
+    fn temps_in(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
+    /// A save that dies *after* writing the temp must reap it.
+    ///
+    /// `block_saving` and `fail_nth_save` both fail before the temp exists, so
+    /// neither can reach this: the temp is only orphaned when the write lands
+    /// and the rename does not. A directory sitting where queue.json belongs
+    /// does exactly that -- write fine, rename EISDIR -- and stands in for the
+    /// real ENOSPC/EROFS/EXDEV cases.
+    ///
+    /// Pid-unique naming bounds a *single* process to one orphan, since it
+    /// reuses the name; the unbounded growth is one file per crashed pid, with
+    /// nothing to reap them.
+    #[test]
+    fn a_save_that_fails_after_writing_the_temp_reaps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.json");
+        // Load first: with a directory already in place, `load` itself would
+        // fail (EISDIR) and never reach a save.
+        let mut q = Queue::load(path.clone()).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(
+            q.add(spec()).is_err(),
+            "the rename must fail for this test to mean anything"
+        );
+        assert_eq!(
+            temps_in(dir.path()),
+            Vec::<String>::new(),
+            "a save that failed must not leave its temp behind: nothing reaps these, \
+             so one accumulates per crashed process"
         );
     }
 
