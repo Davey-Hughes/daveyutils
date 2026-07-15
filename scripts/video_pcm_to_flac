@@ -42,23 +42,24 @@ select_streams() {
     printf '%s' "${args[*]:-}"
 }
 
-# stream_metadata <ffprobe_csv> <direction>
-# Echoes "-metadata:s:<index> title=<rewritten-title>" args for every
-# matched stream that has a title tag, swapping PCM<->FLAC in the text.
+# stream_metadata <array-name> <ffprobe_csv> <direction>
+# Populates the named array with `-metadata:s:<idx>` `title=<swapped>` pairs
+# for each converted stream that has a title tag, swapping PCM<->FLAC in the
+# text (first occurrence only, matching fish's `string replace`).
 stream_metadata() {
-    local csv="$1" direction="$2"
-    local -a args=()
+    local -n _out="$1"
+    _out=()
+    local csv="$2" direction="$3"
     local line index codec title
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         IFS=',' read -r index codec title <<<"$line"
         if [[ "$direction" == "pcm2flac" && "$codec" =~ ^pcm_ ]]; then
-            [[ -n "$title" ]] && args+=("-metadata:s:$index" "title=${title//PCM/FLAC}")
+            [[ -n "$title" ]] && _out+=("-metadata:s:$index" "title=${title/PCM/FLAC}")
         elif [[ "$direction" == "flac2pcm" && "$codec" == "flac" ]]; then
-            [[ -n "$title" ]] && args+=("-metadata:s:$index" "title=${title//FLAC/PCM}")
+            [[ -n "$title" ]] && _out+=("-metadata:s:$index" "title=${title/FLAC/PCM}")
         fi
     done <<<"$csv"
-    printf '%s' "${args[*]:-}"
 }
 
 # output_path <input> <outdir> <show> -> "<outdir>/<show>/<input>",
@@ -114,13 +115,20 @@ main() {
         [[ "$only_output" -eq 1 ]] || printf '%s\n' "$input"
 
         local csv
-        csv="$(ffprobe -v error -select_streams a \
-            -show_entries stream=index,codec_name:stream_tags=title \
-            -of csv=print_section=0 "$input")"
+        if ! csv="$(ffprobe -v error -select_streams a \
+                -show_entries stream=index,codec_name:stream_tags=title \
+                -of csv=print_section=0 "$input")"; then
+            printf 'WARN: ffprobe failed for %s\n' "$input" >&2
+            error_files+=("$input")
+            failed=$((failed + 1))
+            continue
+        fi
 
-        local audio_streams; audio_streams="$(select_streams "$csv" "$direction")"
+        local streams; streams="$(select_streams "$csv" "$direction")"
+        local -a audio_streams=()
+        [[ -n "$streams" ]] && read -ra audio_streams <<<"$streams"
 
-        if [[ -z "$audio_streams" ]]; then
+        if [[ "${#audio_streams[@]}" -eq 0 ]]; then
             if [[ "$only_output" -eq 0 ]]; then
                 if [[ "$direction" == "flac2pcm" ]]; then
                     printf '\tNo FLAC audio streams found in %s\n\n' "$input"
@@ -133,12 +141,12 @@ main() {
 
         files_seen=$((files_seen + 1))
 
-        local metadata; metadata="$(stream_metadata "$csv" "$direction")"
+        local -a metadata=()
+        stream_metadata metadata "$csv" "$direction"
         local out; out="$(output_path "$input" "$outdir" "$show")"
 
-        if [[ "$only_output" -eq 0 ]]; then
-            printf '\t%s\n' "$input"
-        fi
+        [[ "$only_output" -eq 0 ]] && printf '\t'
+        printf '%s\n' "$input"
 
         if [[ "$dry_run" -eq 1 ]]; then
             printf '\twould write: %s\n' "$out"
@@ -152,12 +160,11 @@ main() {
 
         mkdir -p "$(dirname "$out")"
 
-        # shellcheck disable=SC2086
         if [[ "$copy_first" -eq 1 ]]; then
             if ffmpeg -n -nostdin -hide_banner -v error -stats -i "$input" \
                     -map 0 -c copy -f matroska pipe: \
                 | ffmpeg -n -hide_banner -v error -stats -f matroska -i pipe: \
-                    -map 0 $metadata -c copy $audio_streams "$out"; then
+                    -map 0 "${metadata[@]}" -c copy "${audio_streams[@]}" "$out"; then
                 ok=$((ok + 1))
             else
                 printf 'WARN: ffmpeg failed for %s\n' "$input" >&2
@@ -167,7 +174,7 @@ main() {
             fi
         else
             if ffmpeg -n -nostdin -hide_banner -v error -stats -i "$input" \
-                    -map 0 $metadata -c copy $audio_streams "$out"; then
+                    -map 0 "${metadata[@]}" -c copy "${audio_streams[@]}" "$out"; then
                 ok=$((ok + 1))
             else
                 printf 'WARN: ffmpeg failed for %s\n' "$input" >&2

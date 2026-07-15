@@ -15,4 +15,13 @@ check "flac->pcm selects flac stream" "-c:1 pcm_s16le" "$(select_streams "$csv2"
 
 check "output path joins show + input" "/out/MyShow/ep01.mkv" "$(output_path './ep01.mkv' /out MyShow)"
 
+# stream_metadata populates a real array by nameref; a title containing
+# spaces must survive as a single argv element (not be word-split).
+csv3=$'1,pcm_s16le,Surround PCM 5.1\n2,aac,Stereo'
+declare -a md
+stream_metadata md "$csv3" pcm2flac
+check "metadata is 2 elements (title kept whole)" "2" "${#md[@]}"
+check "metadata flag element"                     "-metadata:s:1" "${md[0]}"
+check "title element intact with spaces"           "title=Surround FLAC 5.1" "${md[1]}"
+
 finish
