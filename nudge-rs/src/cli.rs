@@ -42,7 +42,7 @@ pub struct Cli {
     #[arg(short = 'r', long = "retries")]
     pub retries: Option<i64>,
 
-    /// Before injecting, confirm the pane still shows a rate-limit banner; skip the send if not.
+    /// Don't inject if you already resumed: skip unless the pane is untouched since scheduling and still shows a rate-limit banner.
     #[arg(short = 'v', long = "verify")]
     pub verify: bool,
     /// Disable verification (overrides NUDGE_VERIFY).
