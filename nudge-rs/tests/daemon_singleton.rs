@@ -113,3 +113,50 @@ fn run_refuses_to_start_while_another_daemon_holds_the_lock() {
         ),
     }
 }
+
+/// The test above exercises the CONTENDED path (lock already held before `run`
+/// starts), which errors out before the binding's drop timing matters — it
+/// can't tell `let _lock = acquire_singleton_lock(..)?;` apart from
+/// `let _ = acquire_singleton_lock(..)?;`, because in Rust `let _ = expr;`
+/// drops the temporary immediately while `let _lock = expr;` keeps it alive
+/// for the rest of the scope. If `run` ever regresses to the latter, the lock
+/// is released the instant it's taken and a running daemon holds no lock at
+/// all: the double-daemon data-loss defect reopens silently. This test
+/// exercises the UNCONTENDED path: a daemon that starts clean and runs must
+/// still hold the lock for as long as it's alive.
+#[test]
+fn a_running_daemon_holds_the_lock_for_its_whole_life() {
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("nudge.sock");
+    let paths = Paths {
+        state_dir: dir.path().to_path_buf(),
+        queue: dir.path().join("queue.json"),
+        socket: socket.clone(),
+    };
+
+    std::thread::spawn(move || {
+        let _ = nudge::daemon::run(&paths, None, None, jiff::ToSpan::hours(6));
+    });
+
+    // Wait until it's actually up (its socket appears / accepts).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && UnixStream::connect(&socket).is_err() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        UnixStream::connect(&socket).is_ok(),
+        "daemon under test never came up"
+    );
+
+    // THE POINT: while that daemon runs, its singleton lock must still be
+    // held. If `run` bound the lock to `let _` it would already be released
+    // here and this would succeed -- silently reopening the double-daemon
+    // defect.
+    assert!(
+        acquire_singleton_lock(dir.path()).is_err(),
+        "a running daemon must hold the singleton lock for its whole lifetime \
+         (is it bound to a NAMED variable, not `let _`?)"
+    );
+}
