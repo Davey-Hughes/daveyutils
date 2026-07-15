@@ -28,7 +28,12 @@ AT_QUEUE=w
 # queues w/v/u -- because a real `at -q w|v|u` job belonging to the user (not
 # this test) must never be deleted just for sharing a queue letter.
 CREATED_IDS=""
-remember_id() { [ -n "$1" ] && CREATED_IDS="$CREATED_IDS $1"; }
+remember_id() {
+    case "$1" in
+        "") ;;                              # nothing to record: expected, not an error
+        *)  CREATED_IDS="$CREATED_IDS $1" ;;
+    esac
+}
 purge() {
     local id
     for id in $CREATED_IDS; do atrm "$id" 2>/dev/null; done
@@ -57,6 +62,23 @@ remember_new_in() {
         printf '%s\n' "$QUEUE_SNAPSHOT" | grep -qx "$id" || remember_id "$id"
     done
 }
+
+# remember_id's contract: it must SUCCEED on the expected-empty path. Written as
+# `[ -n "$1" ] && CREATED_IDS=...` the test was the last command, so the function
+# returned 1 exactly when handed an empty id -- the normal, expected case for a
+# probe whose id didn't parse, and now for every remember_id "$ID" that
+# remember_new_in backs up. Harmless while nothing in this file uses errexit, but
+# a landmine: the first `set -e`, or the first caller that writes
+# `if remember_id ...`, turns the expected path into an abort. Pinned here, next
+# to the definition, because nothing else can source this file to reach it.
+remember_id ""
+check "F6: remember_id succeeds on the expected-empty path" "0" "$?"
+remember_id "F6PROBE"
+check "F6: remember_id still succeeds on a real id" "0" "$?"
+check "F6: ... and actually recorded it" "yes" \
+    "$(case " $CREATED_IDS " in *" F6PROBE "*) echo yes ;; *) echo no ;; esac)"
+CREATED_IDS=""   # F6PROBE is not a real at id -- never hand it to purge
+
 trap 'purge; rm -f "$PRELUDE"' EXIT
 
 # Decide skippability by probing `at` DIRECTLY -- never through nudge. Grepping
