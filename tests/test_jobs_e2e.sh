@@ -34,6 +34,29 @@ purge() {
     for id in $CREATED_IDS; do atrm "$id" 2>/dev/null; done
     CREATED_IDS=""
 }
+
+# Parsing an id out of NUDGE's stdout is not enough to OWN the job it queued.
+# Any M-series change to finalize_schedule's success message empties the
+# "Job ID: N" grep -- and nudge has still queued a REAL job, which remember_id
+# then never records and purge can never reap. It leaked on every run,
+# accumulating in the user's queue 'w'. (The other half of this was already
+# closed: an empty id is now reported as the regression it is rather than
+# excused with a SKIP -- but reporting it did nothing about the spooled job.)
+#
+# So own jobs by what actually landed in the queue, not by what nudge said:
+# snapshot the queue, run the command, and adopt every id that appeared. That
+# keeps the I17 guarantee exact -- a job the user already had in w/v/u was in
+# the snapshot, so it is never adopted and never reaped.
+ids_in() { atq -q "$1" 2>/dev/null | awk '{print $1}' | sort; }
+QUEUE_SNAPSHOT=""
+snapshot_queue() { QUEUE_SNAPSHOT=$(ids_in "$1"); }
+# remember_new_in <queue> -- adopt every id in <queue> absent from the snapshot.
+remember_new_in() {
+    local id
+    for id in $(ids_in "$1"); do
+        printf '%s\n' "$QUEUE_SNAPSHOT" | grep -qx "$id" || remember_id "$id"
+    done
+}
 trap 'purge; rm -f "$PRELUDE"' EXIT
 
 # Decide skippability by probing `at` DIRECTLY -- never through nudge. Grepping
@@ -60,10 +83,14 @@ PROBE_ID=""
 PROBE_RAW=""
 probe_queue() {
     local rc
+    snapshot_queue "$1"
     PROBE_RAW=$(echo true | at -q "$1" now + 2 hours 2>&1)
     rc=$?
     PROBE_ID=$(printf '%s\n' "$PROBE_RAW" | grep -oE 'job [0-9]+' | grep -oE '[0-9]+')
     remember_id "$PROBE_ID"
+    # Adopt it even when the id didn't parse: `at` may have queued it anyway,
+    # and an unparsed id is exactly the case that used to strand a real job.
+    remember_new_in "$1"
     if [ -n "$PROBE_ID" ]; then
         atrm "$PROBE_ID" 2>/dev/null
         return 0
@@ -88,8 +115,10 @@ esac
 schedule() { "$NUDGE" "$@" 2>/dev/null | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+'; }
 
 FAKE_PANE="e2e:0.0"
+snapshot_queue "$AT_QUEUE"
 ID=$(schedule -p "$FAKE_PANE" -m '23:59' -i 'msg one' -i "it's two" -n)
 remember_id "$ID"
+remember_new_in "$AT_QUEUE"
 
 # `at` demonstrably works here, so an empty ID is a REAL nudge regression rather
 # than an unusable environment: report it as a failure instead of excusing it.
@@ -139,9 +168,11 @@ check "preview: notify option" "yes" "$(printf '%s' "$prev" | grep -q 'notify' &
 # regression, so report it via check and let the file fail.
 probe_queue v; f1_probe=$?
 if [ "$f1_probe" -eq 0 ]; then
+    snapshot_queue v
     F1ID=$(NUDGE_AT_QUEUE=v "$NUDGE" -p 'foreign:1.1' -m '23:57' -i 'secret leak' 2>/dev/null \
         | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+')
     remember_id "$F1ID"
+    remember_new_in v
     check "F1: nudge staged a job in queue 'v' (at itself can)" "yes" \
         "$([ -n "$F1ID" ] && echo yes || echo no)"
     if [ -n "$F1ID" ]; then
@@ -163,9 +194,11 @@ fi   # probe 2: probe_queue already recorded the failure; nothing to excuse
 # a nudge regression, not an environment limit.
 probe_queue u; f4_probe=$?
 if [ "$f4_probe" -eq 0 ]; then
+    snapshot_queue u
     F4ID=$(NUDGE_AT_QUEUE=u "$NUDGE" -p 'legacy:2.2' -m '23:56' -i 'old job' 2>/dev/null \
         | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+')
     remember_id "$F4ID"
+    remember_new_in u
     check "F4: nudge staged a job in queue 'u' (at itself can)" "yes" \
         "$([ -n "$F4ID" ] && echo yes || echo no)"
     if [ -n "$F4ID" ]; then
@@ -180,8 +213,10 @@ elif [ "$f4_probe" -eq 1 ]; then
 fi   # probe 2: probe_queue already recorded the failure; nothing to excuse
 
 # --- --edit (non-interactive): overlay a flag, keep the rest, swap the id -------
+snapshot_queue "$AT_QUEUE"
 NEW=$("$NUDGE" --edit "$ID" -i 'edited msg' 2>/dev/null | grep -oE 'new job #[0-9]+' | grep -oE '[0-9]+')
 remember_id "$NEW"
+remember_new_in "$AT_QUEUE"
 check "edit: produced a new id"  "yes" "$([ -n "$NEW" ] && [ "$NEW" != "$ID" ] && echo yes || echo no)"
 check "edit: old id gone"        "yes" "$(atq -q "$NUDGE_AT_QUEUE" | awk '{print $1}' | grep -qx "$ID" && echo no || echo yes)"
 prev2=$("$NUDGE" --preview-job "${NEW:-0}")
@@ -192,8 +227,12 @@ check "edit: original pane kept"  "yes" "$(printf '%s' "$prev2" | grep -q "$FAKE
 # at_pipe's exit status IS at's; finalize_schedule ignored it and fell through to
 # "Done!" on a garbled time (exit 0, nothing queued). It must now fail non-zero.
 f3before=$(atq -q "$NUDGE_AT_QUEUE" | wc -l | tr -d ' ')
+snapshot_queue "$NUDGE_AT_QUEUE"
 f3out=$("$NUDGE" -p "$FAKE_PANE" -m 'garbagetime' -i x 2>/dev/null)
 f3rc=$?
+# Adopt anything it queued: the check below asserts it queued nothing, and a
+# regression that breaks that assertion must not also strand the job it spooled.
+remember_new_in "$NUDGE_AT_QUEUE"
 f3after=$(atq -q "$NUDGE_AT_QUEUE" | wc -l | tr -d ' ')
 check "F3: garbage -m exits non-zero"    "yes" "$([ "$f3rc" -ne 0 ] && echo yes || echo no)"
 check "F3: no false 'Done!' on stdout"   "yes" "$(printf '%s' "$f3out" | grep -q 'Done!' && echo no || echo yes)"
