@@ -12,21 +12,47 @@ const PADDING_MINUTES: i64 = 3;
 /// Built-in clock-shape banner alternation, optionally extended by the user's
 /// `NUDGE_CLOCK_PATTERN`.
 fn clock_re(ext: Option<&str>) -> Regex {
-    build_re(r"(?:session limit|current session).*resets", ext)
+    build_re(
+        "NUDGE_CLOCK_PATTERN",
+        r"(?:session limit|current session).*resets",
+        ext,
+    )
 }
 
 /// Built-in duration-shape banner alternation, optionally extended by
 /// `NUDGE_DURATION_PATTERN`.
 fn duration_re(ext: Option<&str>) -> Regex {
-    build_re(r"quota reached", ext)
+    build_re("NUDGE_DURATION_PATTERN", r"quota reached", ext)
 }
 
-fn build_re(base: &str, ext: Option<&str>) -> Regex {
-    let pattern = match ext {
-        Some(e) if !e.is_empty() => format!("(?i)(?:{base}|{e})"),
-        _ => format!("(?i)(?:{base})"),
+/// The built-in `base` alone. `base` is a literal in this module, so this is
+/// the one compile that genuinely cannot fail.
+fn builtin_re(base: &str) -> Regex {
+    Regex::new(&format!("(?i)(?:{base})")).expect("valid built-in banner regex")
+}
+
+/// `base`, extended with the user's `ext` pattern from `var` when it compiles.
+///
+/// `ext` is raw env input interpolated into a regex, so it is routinely
+/// invalid: `(`, `*` and `a[b` all read as plain text to someone writing a
+/// banner phrase. Nothing user-supplied may panic here — detect_reset runs on
+/// the daemon's scheduler thread, where a panic takes down every pending job.
+/// An unusable extension degrades to the built-in banner with a warning naming
+/// the variable to fix.
+fn build_re(var: &str, base: &str, ext: Option<&str>) -> Regex {
+    let Some(e) = ext.filter(|e| !e.is_empty()) else {
+        return builtin_re(base);
     };
-    Regex::new(&pattern).expect("valid built-in banner regex")
+    match Regex::new(&format!("(?i)(?:{base}|{e})")) {
+        Ok(re) => re,
+        Err(err) => {
+            tracing::warn!(
+                "nudge: ignoring invalid {var}={e:?} ({err}); \
+                 falling back to the built-in banner pattern"
+            );
+            builtin_re(base)
+        }
+    }
 }
 
 /// Which banner shape a match came from — it decides how the countdown token
@@ -186,6 +212,29 @@ mod tests {
         let z = detect_reset(pane, &now(), None, None).unwrap();
         // 15:00 + 3m padding = 15:03, NOT derived from the 9:15 scrollback time.
         assert_eq!((z.hour(), z.minute()), (15, 3));
+    }
+
+    #[test]
+    fn invalid_extension_pattern_falls_back_to_the_builtin() {
+        // A user writing a banner phrase reasonably types regex metacharacters
+        // as plain text. None of these may panic: detect_reset runs in the CLI
+        // *and* on the daemon's scheduler thread, where a panic kills every
+        // pending job.
+        for bad in ["codex (", "*", "a[b"] {
+            let z = detect_reset("current session resets 3:00pm", &now(), Some(bad), None);
+            assert_eq!(
+                z.map(|z| (z.hour(), z.minute())),
+                Some((15, 3)),
+                "clock ext {bad:?} must fall back to the built-in banner"
+            );
+
+            let d = detect_reset("quota reached. Resets in 45m", &now(), None, Some(bad));
+            assert_eq!(
+                d.map(|z| (z.hour(), z.minute())),
+                Some((10, 48)),
+                "duration ext {bad:?} must fall back to the built-in banner"
+            );
+        }
     }
 
     #[test]
