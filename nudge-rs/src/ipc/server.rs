@@ -207,6 +207,14 @@ mod tests {
         }
     }
 
+    /// What this build answers a Ping with.
+    fn pong() -> String {
+        serde_json::to_string(&Response::Pong {
+            version: crate::VERSION.to_string(),
+        })
+        .unwrap()
+    }
+
     /// Send one raw JSON line; return the raw reply (empty on EOF).
     fn round_trip(socket: &Path, line: &str) -> String {
         let stream = UnixStream::connect(socket).expect("connect");
@@ -246,7 +254,7 @@ mod tests {
         for i in 1..=2 {
             assert_eq!(
                 round_trip(&socket, r#"{"op":"Ping"}"#),
-                r#""Pong""#,
+                pong(),
                 "ping {i}: a refused worker thread must not cost us the daemon"
             );
         }
@@ -272,7 +280,7 @@ mod tests {
         );
 
         // At the cap the next client is still answered correctly...
-        assert_eq!(round_trip(&socket, r#"{"op":"Ping"}"#), r#""Pong""#);
+        assert_eq!(round_trip(&socket, r#"{"op":"Ping"}"#), pong());
         // ...but not by a thread we cannot afford. Unbounded, a flood of
         // stalled peers walks the daemon into TasksMax/RLIMIT_NPROC, and past
         // that the scheduler cannot fork tmux either: the daemon stops firing

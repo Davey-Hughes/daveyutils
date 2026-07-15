@@ -79,7 +79,12 @@ fn a_client_that_never_sends_a_newline_does_not_wedge_the_server() {
         "a stuck client wedged the control plane: Ping never came back",
     )
     .expect("Ping failed");
-    assert_eq!(resp, Response::Pong);
+    assert_eq!(
+        resp,
+        Response::Pong {
+            version: nudge::VERSION.to_string()
+        }
+    );
 
     drop(wedger);
 }

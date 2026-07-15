@@ -83,7 +83,13 @@ fn recording_daemon(socket: &Path) -> Arc<Mutex<Vec<String>>> {
             recorded.lock().unwrap().push(op.clone());
 
             let reply = match op.as_str() {
-                "Ping" => serde_json::to_string(&Response::Pong).unwrap(),
+                // A stand-in for THIS build, so it answers the versioned
+                // Pong: an old daemon's bare "Pong" is now refused outright,
+                // which tests/cli_daemon_version.rs is where we pin.
+                "Ping" => serde_json::to_string(&Response::Pong {
+                    version: nudge::VERSION.to_string(),
+                })
+                .unwrap(),
                 "List" => serde_json::to_string(&Response::Jobs(vec![job()])).unwrap(),
                 // The daemon's answer to an atomic replace: the new job's id.
                 "Replace" => r#"{"Replaced":6}"#.to_string(),
