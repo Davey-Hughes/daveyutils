@@ -36,9 +36,17 @@ printf '%s\n' "$*" >> "$UNAR_LOG"
 exit 1
 STUB
 
+# Report image/* for image extensions only. A blanket "image/jpeg" would make
+# the stub call a .DS_Store an image too, which no real `file` does -- and the
+# --clean coverage tests below turn on exactly that distinction (an entry the
+# image scan skipped is an entry the PDF does not cover).
 cat > "$STUBDIR/file" <<'STUB'
 #!/usr/bin/env bash
-printf 'image/jpeg\n'
+for path in "$@"; do :; done   # the path is the last argument
+case "$path" in
+    *.jpg|*.jpeg|*.png) printf 'image/jpeg\n' ;;
+    *) printf 'application/octet-stream\n' ;;
+esac
 STUB
 
 cat > "$STUBDIR/img2pdf" <<'STUB'
@@ -89,5 +97,35 @@ mkdir -p "$c3b/main/flat"
 check "C3: fully-covered folder is still removed by --clean" "no" \
     "$([ -d "$c3b/main/flat" ] && echo yes || echo no)"
 rm -rf "$c3b"
+
+# --- F2: symlinks must not be invisible to the --clean coverage check ---------
+# `find -type f` matches NEITHER a symlink-to-file nor a symlink-to-dir, so a
+# symlink was missed by both sides of the check: the image scan skipped it (so
+# it never reached the PDF) AND the `total` count skipped it, giving total == n
+# -> "fully covered" -> rm -rf. The `-mindepth 1 -type d` probe doesn't see a
+# symlinked dir either. Blast radius is bounded (rm -rf doesn't follow a
+# symlink, so the target survives) but `unar` can emit symlinks from zips, and
+# a --clean that deletes an entry the PDF never covered is the C3 defect again.
+# Counting with `! -type d` includes links, so the folder is correctly KEPT.
+for f2case in file dir; do
+    f2=$(mktemp -d "${TMPDIR:-/tmp}/img2pdf-f2.XXXXXX")
+    mkdir -p "$f2/main/book" "$f2/outside"
+    : >"$f2/main/book/cover.jpg"
+    : >"$f2/outside/real.jpg"
+    if [ "$f2case" = file ]; then
+        ln -s ../../outside/real.jpg "$f2/main/book/link.jpg"
+        f2link="$f2/main/book/link.jpg"
+    else
+        ln -s ../../outside "$f2/main/book/linkdir"
+        f2link="$f2/main/book/linkdir"
+    fi
+    ( cd "$f2" && PATH="$STUBDIR:$PATH" UNAR_LOG=/dev/null IMG2PDF_LOG=/dev/null \
+        bash "$HERE/../scripts/batch_img2pdf" --clean -o "$f2/out" main ) >/dev/null 2>&1
+    check "F2: folder holding an uncovered symlink-to-$f2case survives --clean" "yes" \
+        "$([ -d "$f2/main/book" ] && echo yes || echo no)"
+    check "F2: the symlink-to-$f2case itself survives" "yes" \
+        "$([ -L "$f2link" ] && echo yes || echo no)"
+    rm -rf "$f2"
+done
 
 finish

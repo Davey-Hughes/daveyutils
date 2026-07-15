@@ -14,14 +14,23 @@
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
 # folder_fully_covered <dir> <n-images>
-# True only when <dir> has no subdirectories and holds exactly <n-images> files,
-# i.e. everything in it went into the PDF. --clean deletes the whole tree, so a
-# folder with nested content the PDF never covered must NOT be removed.
+# True only when <dir> has no subdirectories and holds exactly <n-images>
+# entries, i.e. everything in it went into the PDF. --clean deletes the whole
+# tree, so a folder with nested content the PDF never covered must NOT be
+# removed.
+#
+# The count is `! -type d`, not `-type f`: `-type f` matches neither a
+# symlink-to-file nor a symlink-to-dir, so a symlink was invisible to BOTH
+# sides of this check -- the image scan skipped it (it never reached the PDF)
+# and the total skipped it too, so total == n said "fully covered" and the link
+# was deleted. `! -type d` counts links (and fifos, sockets) as the uncovered
+# entries they are, which keeps the folder. The subdirectory probe stays: an
+# EMPTY subdir adds nothing to the count but is still uncovered content.
 folder_fully_covered() {
     local dir="$1" n="$2"
     [[ -z "$(find "$dir" -mindepth 1 -type d -print -quit)" ]] || return 1
     local total
-    total="$(find "$dir" -type f | wc -l)"
+    total="$(find "$dir" ! -type d | wc -l)"
     [[ "$total" -eq "$n" ]]
 }
 
