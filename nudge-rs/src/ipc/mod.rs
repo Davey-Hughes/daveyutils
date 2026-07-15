@@ -5,11 +5,27 @@ pub mod client;
 pub mod server;
 
 use std::io::{BufRead, Write};
+use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::job::{Job, JobSpec};
 use crate::queue::Queue;
+
+/// Read/write timeout for one IPC exchange, applied on both ends.
+///
+/// The protocol is one line in, one line out, between two processes on the same
+/// machine, so a peer this slow has stopped participating. Without it:
+///
+/// - the server blocks in `read_line` forever, and because `serve` handles
+///   connections serially that wedges accept() and with it every later
+///   `--list`/`--cancel`/schedule;
+/// - the client hangs the CLI instead of reporting an error.
+///
+/// This bounds a *stalled* peer, not a slow-drip one (the timeout is per read,
+/// so a byte every 4s would still hold a connection). Serving each connection
+/// on its own thread is the fuller fix; this closes the wedge at far less risk.
+pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(tag = "op", content = "data")]
