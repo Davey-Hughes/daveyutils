@@ -511,6 +511,34 @@ mod tests {
         );
     }
 
+    /// `0.1.0` is the last version whose `JobSpec` has no `verify_fingerprint`
+    /// / `verify_dims`. Serde drops unknown fields silently and nothing in the
+    /// crate sets `deny_unknown_fields`, so a 0.1.0 daemon accepts this build's
+    /// Schedule, throws the snapshot away, and runs the banner-only logic the
+    /// recency gate exists to replace — while every report says it worked.
+    ///
+    /// The handshake is the only thing that can refuse it, and it can only do
+    /// that if this build stops calling itself 0.1.0. So the version this crate
+    /// carries is load-bearing behavior, not release hygiene: shipping the
+    /// recency gate under 0.1.0 ships it inert.
+    #[test]
+    fn the_handshake_refuses_the_pre_recency_version() {
+        let err = check_handshake(Response::Pong {
+            version: "0.1.0".to_string(),
+        })
+        .expect_err(
+            "0.1.0 predates verify_fingerprint/verify_dims: adopting that daemon \
+             silently drops the snapshot off every Schedule and runs the old \
+             banner-only check, which is the whole bug this branch fixes",
+        )
+        .to_string();
+        assert!(err.contains("0.1.0"), "must name the version: {err}");
+        assert!(
+            err.contains("pkill -f 'nudge --daemon'"),
+            "must name the remedy: {err}"
+        );
+    }
+
     #[test]
     fn bash_completions_mention_the_binary() {
         let mut buf: Vec<u8> = Vec::new();

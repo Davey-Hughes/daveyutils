@@ -62,13 +62,13 @@ fn job() -> nudge::job::Job {
     .into_job(1)
 }
 
-/// A stand-in for a nudge daemon built before this increment.
+/// A stand-in for a nudge daemon built before this increment, answering `pong`
+/// to a Ping.
 ///
-/// Faithful in the two ways that matter: it answers Ping with the bare
-/// `"Pong"` unit variant, and it has never heard of `Replace`, so it hangs up
-/// on one without replying — which is exactly the `nudge: no response` the
-/// user hit.
-fn old_daemon(socket: &Path) {
+/// Faithful in the two ways that matter: it answers Ping however its build did,
+/// and it has never heard of `Replace`, so it hangs up on one without replying
+/// — which is exactly the `nudge: no response` the user hit.
+fn old_daemon(socket: &Path, pong: &'static str) {
     let listener = UnixListener::bind(socket).unwrap();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -81,7 +81,7 @@ fn old_daemon(socket: &Path) {
                 Err(_) => continue,
             };
             let reply = match v["op"].as_str().unwrap_or("?") {
-                "Ping" => r#""Pong""#.to_string(),
+                "Ping" => pong.to_string(),
                 "List" => serde_json::json!({ "Jobs": [job()] }).to_string(),
                 "Cancel" => r#"{"Cancelled":true}"#.to_string(),
                 // An op from the future. The old daemon's `read_msg` fails to
@@ -94,14 +94,21 @@ fn old_daemon(socket: &Path) {
     });
 }
 
+/// The bare unit `"Pong"` of a daemon built before the version handshake.
+const UNVERSIONED_PONG: &str = r#""Pong""#;
+
+/// A well-formed Pong from the *versioned* daemon that shipped immediately
+/// before the recency gate. It parses; only the version gives it away.
+const PRE_RECENCY_PONG: &str = r#"{"Pong":{"version":"0.1.0"}}"#;
+
 struct Fixture {
     home: std::path::PathBuf,
     _tmp: tempfile::TempDir,
     _lock: std::fs::File,
 }
 
-/// An isolated state dir with an OLD daemon answering on its socket.
-fn with_old_daemon() -> Fixture {
+/// An isolated state dir with an OLD daemon answering `pong` on its socket.
+fn with_old_daemon(pong: &'static str) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().to_path_buf();
     let paths = child_paths(&home);
@@ -111,7 +118,7 @@ fn with_old_daemon() -> Fixture {
     // Belt and braces: no real daemon can survive this test even if the CLI
     // tries to start one.
     let lock = nudge::daemon::acquire_singleton_lock(&paths.state_dir).unwrap();
-    old_daemon(&paths.socket);
+    old_daemon(&paths.socket, pong);
 
     Fixture {
         home,
@@ -163,7 +170,7 @@ fn assert_actionable(what: &str, out: &Output) {
 fn edit_against_an_old_daemon_says_what_to_do_about_it() {
     // Pre-fix this was `nudge: no response`: the old daemon has no Replace, so
     // it hung up, and the CLI reported the EOF and nothing more.
-    let f = with_old_daemon();
+    let f = with_old_daemon(UNVERSIONED_PONG);
     let out = run_nudge(&f.home, &["--edit", "1", "-m", "now + 3 hours"]);
     assert_actionable("edit", &out);
 }
@@ -173,14 +180,37 @@ fn list_against_an_old_daemon_is_refused_not_silently_served() {
     // The quiet half of the finding, and the worse one. Pre-fix this exited 0
     // and printed the table -- served by the OLD daemon's code, so every fix in
     // this increment was inert and nothing said so.
-    let f = with_old_daemon();
+    let f = with_old_daemon(UNVERSIONED_PONG);
     let out = run_nudge(&f.home, &["--list"]);
     assert_actionable("list", &out);
 }
 
 #[test]
 fn cancel_against_an_old_daemon_is_refused_not_silently_served() {
-    let f = with_old_daemon();
+    let f = with_old_daemon(UNVERSIONED_PONG);
     let out = run_nudge(&f.home, &["--cancel", "1"]);
     assert_actionable("cancel", &out);
+}
+
+/// The daemon that would have made the recency gate ship INERT, and the reason
+/// the version bump is part of the fix rather than release hygiene.
+///
+/// The handshake landed in the *previous* increment, so the daemon a user
+/// already has resident answers a perfectly well-formed `Pong { version }`.
+/// Nothing bumped Cargo.toml since, so that version is `0.1.0` — and if this
+/// build also calls itself `0.1.0`, the handshake matches, adopts it, and hands
+/// it a `Schedule` carrying `verify_fingerprint`/`verify_dims`. That daemon's
+/// `JobSpec` has neither field, nothing in the crate sets `deny_unknown_fields`,
+/// and serde drops unknown fields without a word: the job fires with the old
+/// banner-only logic — I19 unfixed — while the CLI prints `scheduled job N` and
+/// `-v --help` promises recency checking. Silent, and exactly the upgrade path
+/// a `make` takes.
+///
+/// The wire format changed, so the version has to change with it. This is the
+/// only thing standing between the user and that daemon.
+#[test]
+fn a_daemon_from_before_the_recency_fields_is_refused_not_adopted() {
+    let f = with_old_daemon(PRE_RECENCY_PONG);
+    let out = run_nudge(&f.home, &["--list"]);
+    assert_actionable("list against a pre-recency 0.1.0 daemon", &out);
 }
