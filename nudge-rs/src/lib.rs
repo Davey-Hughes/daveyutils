@@ -56,6 +56,14 @@ pub fn run(cli: cli::Cli) -> anyhow::Result<()> {
     if cli.uninstall_daemon {
         return register::uninstall();
     }
+    // Check the user's banner patterns once, here, where there is a user to
+    // tell. detect.rs can only warn-and-degrade (a panic there would kill the
+    // daemon's scheduler thread), and on this path nothing is listening to a
+    // warning: init_tracing() runs in daemon mode only.
+    detect::validate_patterns(
+        std::env::var("NUDGE_CLOCK_PATTERN").ok().as_deref(),
+        std::env::var("NUDGE_DURATION_PATTERN").ok().as_deref(),
+    )?;
     // scheduling / job-management dispatch is added in Tasks 3-4 & 6.
     app::dispatch(cli)
 }
