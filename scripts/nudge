@@ -1026,27 +1026,48 @@ if [ "${1:-}" != "--execute-nudge" ]; then
 fi
 
 # --- Argument parsing ------------------------------------------------------
+# Every value-taking branch must `require_value` before `shift 2`: in bash
+# `shift 2` with only one arg left is a FAILING no-op that shifts nothing, so an
+# omitted value (`nudge -p`) would re-enter the same branch forever at 100% CPU
+# -- and -i would append an empty MESSAGES element per iteration until the OOM
+# killer stepped in. Same hazard the payload walkers guard with `shift 2 ||
+# return 1`; here we can report it properly instead. (--cancel / --edit /
+# --preview-job take an OPTIONAL value and already guard with `[ $# -ge 2 ]`.)
+#
+# require_value <flag> <remaining-arg-count>
+# The count must be passed in ($# is per-function in bash, and bash 3.2 -- what
+# macOS ships -- has no namerefs to read the caller's).
+require_value() {
+    [ "$2" -ge 2 ] && return 0
+    echo "Error: $1 requires a value." >&2
+    exit 1
+}
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         -p|--pane)
+            require_value "$1" $#
             TARGET_PANE="$2"
             SET_PANE=true
             shift 2
             ;;
         -m|--time)
+            require_value "$1" $#
             TARGET_TIME="$2"
             SET_TIME=true
             shift 2
             ;;
         -i|--input)
+            require_value "$1" $#
             MESSAGES+=("$2")
             SET_MESSAGES=true
             shift 2
             ;;
         -w|--delay)
+            require_value "$1" $#
             SEND_DELAY="$2"
             if ! [[ "$SEND_DELAY" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-                echo "Error: --delay must be a non-negative number (got '$SEND_DELAY')."
+                echo "Error: --delay must be a non-negative number (got '$SEND_DELAY')." >&2
                 exit 1
             fi
             SET_DELAY=true
@@ -1083,10 +1104,11 @@ while [[ $# -gt 0 ]]; do
             shift 1
             ;;
         -r|--retries)
+            require_value "$1" $#
             AUTO_RETRY=true
             RETRY_LIMIT="$2"
             if ! [[ "$RETRY_LIMIT" =~ ^-?[0-9]+$ ]]; then
-                echo "Error: --retries must be an integer (got '$RETRY_LIMIT')."
+                echo "Error: --retries must be an integer (got '$RETRY_LIMIT')." >&2
                 exit 1
             fi
             SET_RETRIES=true
@@ -1130,8 +1152,12 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            echo "Unknown option: $1"
-            print_help
+            # Error path: the message AND the usage it prints go to stderr, so a
+            # piped `nudge --bogus` doesn't feed the whole help text into the
+            # pipeline. A REQUESTED --help (above) is normal output and stays on
+            # stdout.
+            echo "Unknown option: $1" >&2
+            print_help >&2
             exit 1
             ;;
     esac

@@ -21,8 +21,10 @@ check "output path joins show + input" "/out/MyShow/ep01.mkv" "$(output_path './
 # select_streams/output_path checks above are plain bash and still run.
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
     printf '  skip: %s needs bash 4.3+ (namerefs); this is bash %s\n' "$(basename "$0")" "$BASH_VERSION"
+    # finish terminates with the tally's status. The `exit 0` that used to follow
+    # it discarded that status, so on macOS's system bash 3.2 a genuine failure
+    # in the checks above reported PASSED.
     finish
-    exit 0
 fi
 
 # stream_metadata populates a real array by nameref; a title containing
