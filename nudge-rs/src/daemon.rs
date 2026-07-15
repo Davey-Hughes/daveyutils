@@ -11,6 +11,10 @@ use crate::paths::Paths;
 use crate::queue::Queue;
 use crate::scheduler::{apply_outcome, next_wake, plan, MAX_POLL};
 
+/// A retry never lands sooner than this, so a sub-second `settle_secs` can't
+/// create a fire-storm (esp. with infinite retries).
+const MIN_RETRY_SECS: f64 = 1.0;
+
 /// Install a tracing subscriber. Safe to call more than once (a second call is
 /// a no-op once a global subscriber exists).
 pub fn init_tracing() {
@@ -20,6 +24,8 @@ pub fn init_tracing() {
 }
 
 /// Run the daemon forever: IPC server thread + scheduler loop.
+///
+/// Call [`init_tracing`] first if you want the daemon's logs.
 pub fn run(
     paths: &Paths,
     clock_ext: Option<String>,
@@ -50,7 +56,9 @@ pub fn run(
         if !plan_now.drop_stale.is_empty() {
             let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
             for id in &plan_now.drop_stale {
-                let _ = q.remove(*id);
+                if let Err(e) = q.remove(*id) {
+                    tracing::warn!("nudge: removing stale job {id} failed: {e}");
+                }
                 tracing::info!("nudge: dropped stale job {id}");
             }
         }
@@ -68,12 +76,18 @@ pub fn run(
                 Ok(o) => tracing::info!("nudge: fired job {} -> {:?}", job.id, o),
                 Err(e) => tracing::warn!("nudge: job {} failed: {e}", job.id),
             }
+            if should_notify(job, &outcome) {
+                crate::notify::send(&format!("nudge fired for {}", describe_pane(job)));
+            }
+            let retry_secs = job.settle_secs.max(MIN_RETRY_SECS);
             let retry_at = now
-                .checked_add(Span::new().seconds(job.settle_secs as i64))
+                .checked_add(Span::new().milliseconds((retry_secs * 1000.0) as i64))
                 .map(|z| z.timestamp())
                 .unwrap_or(now.timestamp());
             let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = apply_outcome(&mut q, job, &outcome, retry_at);
+            if let Err(e) = apply_outcome(&mut q, job, &outcome, retry_at) {
+                tracing::warn!("nudge: persisting job {} outcome failed: {e}", job.id);
+            }
         }
 
         // 4. Sleep until the next job is due (capped).
@@ -82,5 +96,54 @@ pub fn run(
             next_wake(q.all(), &now, MAX_POLL)
         };
         std::thread::sleep(wake.max(Duration::from_millis(50)));
+    }
+}
+
+/// A short human-readable description of a job's target, for notification text.
+fn describe_pane(job: &crate::job::Job) -> String {
+    match &job.target {
+        crate::job::TargetSpec::Tmux { pane } => pane.clone(),
+    }
+}
+
+/// Whether firing `job` with this `outcome` warrants a desktop notification:
+/// only when the user asked for one AND a message was actually sent.
+pub fn should_notify(
+    job: &crate::job::Job,
+    outcome: &anyhow::Result<crate::inject::InjectOutcome>,
+) -> bool {
+    job.notify && matches!(outcome, Ok(crate::inject::InjectOutcome::Sent(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_notify;
+    use crate::inject::InjectOutcome;
+    use crate::job::{JobSpec, TargetSpec};
+
+    fn job(notify: bool) -> crate::job::Job {
+        JobSpec {
+            target: TargetSpec::Tmux { pane: "p".into() },
+            messages: vec!["go".into()],
+            send_delay_secs: 0.0,
+            fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
+            notify,
+            verify: false,
+            auto_retry: false,
+            retries_left: 0,
+            settle_secs: 5.0,
+        }
+        .into_job(1)
+    }
+
+    #[test]
+    fn notifies_only_on_sent_when_opted_in() {
+        assert!(should_notify(&job(true), &Ok(InjectOutcome::Sent(1))));
+        assert!(!should_notify(
+            &job(true),
+            &Ok(InjectOutcome::SkippedVerify)
+        ));
+        assert!(!should_notify(&job(false), &Ok(InjectOutcome::Sent(1))));
+        assert!(!should_notify(&job(true), &Err(anyhow::anyhow!("boom"))));
     }
 }
