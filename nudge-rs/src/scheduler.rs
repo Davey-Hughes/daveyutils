@@ -58,6 +58,17 @@ pub fn apply_outcome(
         //
         // Ok(SkippedVerify) is deliberately excluded: the pane no longer shows
         // a banner, so the job is done, not failed.
+        //
+        // Note the consequence of Err joining this arm: `-a -r -1` against a
+        // pane that is permanently gone now retries forever, where before it
+        // deleted the job on the first error. That is accepted, not overlooked.
+        // It is literally what `-1` asks for; it is symmetric with the Sent
+        // path, which has always retried a live pane forever on the same flag;
+        // the retry is floored at MIN_RETRY_SECS so it cannot become a spin;
+        // and `--cancel` now reaches the daemon, so the user has a way out.
+        // Silently dropping the job on one transient tmux hiccup -- the server
+        // restarting, the pane briefly unavailable -- was the worse failure,
+        // because nothing said it had happened.
         Ok(InjectOutcome::Sent(_)) | Err(_) if job.auto_retry && job.retries_left != 0 => {
             let left = if job.retries_left > 0 {
                 job.retries_left - 1
