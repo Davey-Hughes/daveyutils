@@ -35,9 +35,7 @@ make help     # list targets
 
 - `scripts/` — the bash utilities.
 - `nudge-rs/` — the Rust `nudge` (a rewrite of the original bash version: no `at`
-  daemon, no `fzf`, no coreutils; it runs its own user-level scheduler). The bash
-  original stays at `scripts/nudge` as the reference oracle and is **not**
-  installed into `bin/`.
+  daemon, no `fzf`, no coreutils; it runs its own user-level scheduler).
   Its jobs are run by a resident daemon, auto-started on first use, which reports
   what it did with each one — fired, or skipped because you had already resumed
   the pane — to `<state dir>/nudge.log` (`~/.local/state/nudge/` on Linux,

@@ -10,8 +10,7 @@
 #   export PATH="/path/to/daveyutils/bin:$PATH"
 #
 # The bash scripts are SYMLINKED, so editing one takes effect immediately.
-# `nudge` is the Rust binary from nudge-rs/ (the bash scripts/nudge is kept as
-# the reference oracle for the port and is deliberately NOT linked).
+# `nudge` is the Rust binary from nudge-rs/, built and linked separately below.
 
 BIN := bin
 # Pin cargo's output dir. An inherited CARGO_TARGET_DIR would otherwise put the
@@ -19,8 +18,7 @@ BIN := bin
 # success -- so we pass --target-dir explicitly rather than trusting the default.
 TARGET_DIR := nudge-rs/target
 NUDGE      := $(TARGET_DIR)/release/nudge
-# Every script except the bash nudge (superseded by the Rust binary).
-SCRIPTS := $(filter-out scripts/nudge,$(wildcard scripts/*))
+SCRIPTS := $(wildcard scripts/*)
 
 .PHONY: all link build-nudge clean distclean check help
 

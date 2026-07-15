@@ -5,8 +5,8 @@ on:
   pull_request:
 
 jobs:
-  nudge:
-    name: nudge test-suite (${{ matrix.os }})
+  scripts:
+    name: bash test-suite (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -15,28 +15,28 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y tmux at
+      # No Linux install step: with the bash nudge gone the suite is hermetic.
+      # tmux and `at` were only ever here for nudge's e2e files, which went with
+      # it -- nothing left in tests/ invokes either. The media scripts' own
+      # dependencies (ffmpeg, img2pdf, ...) are stubbed on PATH by the tests, so
+      # they are not installed here either, and never were.
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        # Silence the runner's pre-installed untrusted tap (aws/tap) warning --
-        # irrelevant here since tmux/bash come from homebrew/core. BSD `at`
-        # (/usr/bin/at) already ships with macOS, so only tmux + bash are
-        # needed. macOS ships bash 3.2 (Apple froze it for GPLv3 reasons);
-        # the media scripts need 4.3+ for namerefs, and homebrew's bin is
-        # ahead of /bin on the runner PATH so `env bash` picks up the newer
-        # one.
+        # bash, and only bash: macOS ships 3.2 (Apple froze it for GPLv3
+        # reasons) and the media scripts need 4.3+ for namerefs. Homebrew's bin
+        # is ahead of /bin on the runner PATH, so `env bash` picks up the newer
+        # one. Silence the runner's pre-installed untrusted tap (aws/tap)
+        # warning -- irrelevant here since bash comes from homebrew/core.
         env:
           HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
-        run: brew install tmux bash
+        run: brew install bash
 
-      # Every script, not just nudge. The other six were covered only
-      # incidentally, by test files that source them -- and cue2flac was not
-      # covered at all until it got a test file, so a stray quote or missing
-      # `fi` in it reached main with CI green. Sourcing is a side effect, not a
-      # syntax check; this is the one that is actually about syntax.
+      # Every script, unconditionally. Most are covered only incidentally, by
+      # test files that source them -- and cue2flac was not covered at all until
+      # it got a test file, so a stray quote or missing `fi` in it reached main
+      # with CI green. Sourcing is a side effect, not a syntax check; this is the
+      # one that is actually about syntax.
       - name: Syntax check
         run: |
           for f in scripts/*; do bash -n "$f"; done
@@ -64,11 +64,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
 
-      # `make check` runs the bash suite, which wants tmux + at (the e2e files
-      # self-skip without them -- installing them keeps `make check` here
-      # equivalent to the matrix job's run rather than a quietly emptier one).
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y tmux at
+      # tmux is for `cargo test`, NOT for the bash suite: `make check` runs both,
+      # and nudge-rs's tests drive a real tmux server. The bash half needs
+      # nothing (see the matrix job). `at` is gone entirely -- it went with the
+      # bash nudge, and nothing in either suite queues a job now.
+      - name: Install tmux (for nudge-rs's tests)
+        run: sudo apt-get update && sudo apt-get install -y tmux
 
       - name: make
         run: make

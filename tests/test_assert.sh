@@ -51,16 +51,22 @@ check "finish: prints the tally before exiting" "== 0 passed, 1 failed ==" "$tal
 # the ones committed 100644. run.sh invokes `bash "$t"`, so the suite itself
 # never noticed the mode drifting file by file.
 #
-# assert.sh and lib.sh are the other half of the rule: they are sourced, never
-# run, so they stay non-executable. Asserting both directions keeps this from
-# being "fixed" by chmod +x on everything.
+# assert.sh is the other half of the rule: it is sourced, never run, so it stays
+# non-executable. Asserting both directions keeps this from being "fixed" by
+# chmod +x on everything.
+#
+# NB: assert.sh is named explicitly rather than globbed. A `-x` check against a
+# path that does not exist is false, and so would PASS this assertion vacuously
+# -- which is how a stale entry here (lib.sh, deleted with the bash nudge) would
+# have gone on "passing" while asserting nothing. The existence check below pins
+# that the subject is really there.
 for t in "$HERE"/test_*.sh "$HERE"/run.sh; do
     check "mode: $(basename "$t") is executable" "yes" \
         "$([ -x "$t" ] && echo yes || echo no)"
 done
-for l in "$HERE"/assert.sh "$HERE"/lib.sh; do
-    check "mode: $(basename "$l") is sourced-only, not executable" "yes" \
-        "$([ -x "$l" ] && echo no || echo yes)"
-done
+check "mode: assert.sh exists" "yes" \
+    "$([ -f "$HERE/assert.sh" ] && echo yes || echo no)"
+check "mode: assert.sh is sourced-only, not executable" "yes" \
+    "$([ -x "$HERE/assert.sh" ] && echo no || echo yes)"
 
 finish
