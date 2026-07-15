@@ -10,4 +10,7 @@ check "1.0 is not"         "no"   "$(is_landscape 1.0  && echo yes || echo no)"
 check "0.75 is not"        "no"   "$(is_landscape 0.75 && echo yes || echo no)"
 check "2 is landscape"     "yes"  "$(is_landscape 2    && echo yes || echo no)"
 
+check "out_prefix flattens with parent"  "sub_photo"  "$(out_prefix '/a/sub/photo.jpg')"
+check "out_prefix strips extension"      "b_x"        "$(out_prefix 'b/x.jpeg')"
+
 finish
