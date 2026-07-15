@@ -31,10 +31,12 @@ QUEUES="w v u"
 REAL_ATRM=$(command -v atrm)
 
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/at-hygiene.XXXXXX")
-# GUARD_ID is our own probe job (below), hoisted out of its substitution so this
-# trap can reap it -- the very pattern this file exists to enforce.
+# GUARD_ID is our own probe job (below) and USER_ID the simulated user job of the
+# I17 check, both hoisted out of their substitutions so this trap can reap them
+# -- the very pattern this file exists to enforce.
 GUARD_ID=""
-trap 'rm -rf "$WORKDIR"; [ -n "$GUARD_ID" ] && atrm "$GUARD_ID" 2>/dev/null' EXIT
+USER_ID=""
+trap 'rm -rf "$WORKDIR"; for _id in $GUARD_ID $USER_ID; do atrm "$_id" 2>/dev/null; done' EXIT
 
 mkdir -p "$WORKDIR/bin"
 cat > "$WORKDIR/bin/atrm" <<FAKE
@@ -101,5 +103,59 @@ for f in test_jobs_e2e_skip.sh test_jobs_e2e.sh; do
     check "$f leaves no 'at' job behind when an atrm hiccups" "" "$leaked"
     for tok in $leaked; do atrm "${tok#*:}" 2>/dev/null; done
 done
+
+# --- F5: a nudge whose id no longer parses must still not leak -----------------
+# The scoped purge only knows ids grepped out of NUDGE's own stdout. A format
+# regression in finalize_schedule's success message empties that grep -- and
+# nudge has STILL queued a real job, which nothing can then reap. It leaks on
+# every run, accumulating in the user's queue 'w'. The old blanket purge covered
+# this; the scoped purge that replaced it (rightly -- see I17) must cover it too,
+# by diffing the queue around each schedule instead of trusting the id parse.
+#
+# Increment 3 closed the OTHER half of F5: the file now reports an empty id as
+# the nudge regression it is, rather than excusing itself with a SKIP and
+# exiting 0. But reporting it did nothing about the job already in the spool.
+#
+# Here `at` works perfectly and nudge queues perfectly -- only the success
+# message changed shape. From the outside: any M-series formatting change.
+mkdir -p "$WORKDIR/scripts" "$WORKDIR/tests"
+cp "$HERE/assert.sh" "$HERE/lib.sh" "$HERE/test_jobs_e2e.sh" "$WORKDIR/tests/"
+sed 's/(Job ID: \$SCHEDULED_JOB_ID)/(JobRef #$SCHEDULED_JOB_ID)/' "$HERE/../scripts/nudge" \
+    > "$WORKDIR/scripts/nudge"
+chmod +x "$WORKDIR/scripts/nudge"
+# Guards: if the sabotage stopped applying, or nudge stopped queueing, this test
+# proves nothing -- fail loudly here rather than passing on a vacuous run.
+check "F5: id-format sabotage applied" "1" \
+    "$(grep -c 'JobRef #' "$WORKDIR/scripts/nudge" | tr -d ' ')"
+check "F5: the sabotaged nudge reports no parsable 'Job ID:'" "yes" \
+    "$(grep -c 'Job ID: \$SCHEDULED_JOB_ID' "$WORKDIR/scripts/nudge" | tr -d ' ' \
+        | grep -qx 0 && echo yes || echo no)"
+
+before=$(queue_census)
+bash "$WORKDIR/tests/test_jobs_e2e.sh" >/dev/null 2>&1
+f5rc=$?
+f5_leaked=$(census_added "$before" "$(queue_census)")
+check "F5: the id-format regression is still REPORTED (not skipped)" "yes" \
+    "$([ "$f5rc" -ne 0 ] && echo yes || echo no)"
+check "F5: ... and it leaks no 'at' job while reporting it" "" "$f5_leaked"
+# Reap whatever leaked, so even a FAILING run of this test leaves the spool clean.
+for tok in $f5_leaked; do atrm "${tok#*:}" 2>/dev/null; done
+
+# --- I17 must survive that fix: a user's own job in 'w' is NOT ours to reap ----
+# Adopting "every id that appeared in the queue" is only safe because a job the
+# user ALREADY had is in the snapshot and so is never adopted. That distinction
+# is the whole reason the blanket purge was replaced: `at` supports queues a-z as
+# a plain user choice, and the old sweep destroyed real jobs in w/v/u with no
+# prompt and no record. Over-adopting would silently reopen that.
+USER_ID=$(echo true | at -q w now + 4 hours 2>&1 | grep -oE 'job [0-9]+' | grep -oE '[0-9]+')
+if [ -n "$USER_ID" ]; then
+    bash "$HERE/test_jobs_e2e.sh" >/dev/null 2>&1
+    check "I17: a user's pre-existing queue-'w' job survives the e2e run" "yes" \
+        "$(queue_census | grep -qw "w:$USER_ID" && echo yes || echo no)"
+    atrm "$USER_ID" 2>/dev/null   # the EXIT trap backs this up
+    USER_ID=""
+else
+    echo "  SKIP: I17 -- can't stage a queue-'w' job here"
+fi
 
 finish

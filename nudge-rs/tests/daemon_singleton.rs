@@ -26,16 +26,43 @@ fn second_lock_attempt_fails_while_first_is_held() {
 
 #[test]
 fn serve_refuses_to_steal_a_live_socket() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("nudge.sock");
 
     // A "live daemon" already listening on the socket.
     let live = UnixListener::bind(&socket).unwrap();
 
+    // `serve` runs on a thread with a deadline rather than inline, for the same
+    // reason `run_refuses_to_start_while_another_daemon_holds_the_lock` does.
+    // Called inline, this test could only ever HANG on a regression: a `serve`
+    // that unlinks unconditionally BINDS successfully and enters its infinite
+    // accept loop, so `expect_err` never returns. The guard did catch the
+    // regression -- as a CI timeout with no diagnostic, no assertion message,
+    // and no `test result:` line to attribute it to this test at all.
     let queue = Arc::new(Mutex::new(Queue::load(dir.path().join("q.json")).unwrap()));
-    let err = nudge::ipc::server::serve(&socket, queue)
-        .expect_err("serve must refuse to bind over a live socket instead of stealing it");
-    let _ = err;
+    let (tx, rx) = mpsc::channel();
+    let s = socket.clone();
+    std::thread::spawn(move || {
+        let r = nudge::ipc::server::serve(&s, queue);
+        let _ = tx.send(r.map(|_| ()).map_err(|e| e.kind()));
+    });
+
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Err(kind)) => assert_eq!(
+            kind,
+            std::io::ErrorKind::AddrInUse,
+            "serve must refuse a live socket with AddrInUse"
+        ),
+        Ok(Ok(())) => panic!("serve returned Ok — it must refuse to bind over a live socket"),
+        Err(_) => panic!(
+            "serve did NOT refuse: it stole the live socket and entered its accept loop \
+             (does it still probe the socket with UnixStream::connect before unlinking, \
+             and only unlink when nothing answers?)"
+        ),
+    }
 
     // The original listener must still own a working socket.
     assert!(
@@ -137,7 +164,18 @@ fn a_running_daemon_holds_the_lock_for_its_whole_life() {
     };
 
     std::thread::spawn(move || {
-        let _ = nudge::daemon::run(&paths, None, None, jiff::ToSpan::hours(6));
+        // `run_with`, not `run`: this is a real daemon running IN THIS PROCESS,
+        // and `run`'s serve-exit policy is `process::exit(1)`. A fatal accept
+        // error there would take the whole cargo test binary down -- every test
+        // in this file, exit 1, attributed to nothing. Parking instead leaves
+        // the failure to be reported as what it is: the "daemon under test
+        // never came up" assertion below.
+        let _ = nudge::daemon::run_with(&paths, None, None, jiff::ToSpan::hours(6), |result| {
+            eprintln!("in-process daemon's ipc server exited: {result:?}");
+            loop {
+                std::thread::park();
+            }
+        });
     });
 
     // Wait until it's actually up (its socket appears / accepts).

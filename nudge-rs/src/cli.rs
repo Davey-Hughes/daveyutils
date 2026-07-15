@@ -51,7 +51,19 @@ pub struct Cli {
     pub no_auto_retry: bool,
 
     /// Exact retry count (-1 = forever). Implies --auto-retry.
-    #[arg(short = 'r', long = "retries")]
+    //
+    // Plain `//`, not `///`: clap renders every paragraph after the first as the
+    // long help, so as a doc comment this rationale was printed to users by
+    // `nudge --help`. It is for whoever touches the attribute next.
+    //
+    // `allow_negative_numbers` is load-bearing, not tidiness: -1 is a real
+    // supported value (scheduler.rs keeps `retries_left == -1` infinite, and
+    // the README advertises `-r -1`), but without this clap reads the `-1` in
+    // `-r -1` as an unknown short flag and only the `--retries=-1` equals form
+    // survives. This is the one numeric arg here with a legitimately negative
+    // value -- `--cancel`/`--edit` are `u64` ids and `--delay` is a pause in
+    // seconds, so all three are right to reject a negative.
+    #[arg(short = 'r', long = "retries", allow_negative_numbers = true)]
     pub retries: Option<i64>,
 
     /// Don't inject if you already resumed: skip unless the pane is untouched since scheduling and still shows a rate-limit banner.
@@ -61,11 +73,17 @@ pub struct Cli {
     #[arg(long = "no-verify")]
     pub no_verify: bool,
 
-    /// Review pending jobs (interactive).
+    /// Review pending jobs.
     #[arg(short = 'l', long, visible_alias = "jobs")]
     pub list: bool,
-    /// Review pending jobs as a plain table (non-interactive).
-    #[arg(long = "list-plain")]
+    /// Deprecated alias for --list; both print the same table.
+    ///
+    /// Hidden rather than removed: it has shipped, so anything scripted around
+    /// it keeps working. It never had a behaviour of its own -- `app::list`
+    /// ignored the flag -- and an interactive picker to be the "plain"
+    /// alternative *to* does not exist yet. If one lands, this is where the
+    /// distinction becomes real and the flag comes back out of hiding.
+    #[arg(long = "list-plain", hide = true)]
     pub list_plain: bool,
     /// Cancel a pending job by id.
     #[arg(long = "cancel", value_name = "ID")]
@@ -165,6 +183,82 @@ mod tests {
         assert_eq!(c.input, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(c.delay, Some(0.5));
         assert!(c.verify);
+    }
+
+    /// The shipped `--help` and completions are generated from these doc
+    /// comments, so a doc comment here is the product, not a note to the next
+    /// reader. `--list` advertised "(interactive)" and `--list-plain`
+    /// advertised a "plain table (non-interactive)" alternative to it, but
+    /// `app::list` ignores the flag and both spellings print the same static
+    /// table. Asserted through clap's own view of the arg rather than the
+    /// rendered help, which wraps at terminal width and would make this a test
+    /// of line breaking.
+    fn arg_help(name: &str) -> String {
+        let cmd = <Cli as clap::CommandFactory>::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == name)
+            .unwrap_or_else(|| panic!("no --{name} arg"));
+        arg.get_help().map(|h| h.to_string()).unwrap_or_default()
+    }
+
+    #[test]
+    fn the_help_does_not_promise_a_list_picker_that_does_not_exist() {
+        assert!(
+            !arg_help("list").to_lowercase().contains("interactive"),
+            "--list prints a static table; promising an interactive picker in the \
+             shipped --help sends users looking for a feature that is not there: {:?}",
+            arg_help("list")
+        );
+    }
+
+    #[test]
+    fn list_plain_is_not_advertised_as_a_distinct_behaviour() {
+        let cmd = <Cli as clap::CommandFactory>::command();
+        let plain = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "list_plain")
+            .expect("--list-plain must still exist");
+        assert!(
+            plain.is_hide_set(),
+            "--list-plain does exactly what --list does, so advertising it as a \
+             separate mode describes a distinction the code does not make"
+        );
+    }
+
+    #[test]
+    fn list_plain_still_parses_for_anyone_who_scripted_it() {
+        // Hidden, not removed: it has shipped, and breaking a script to tidy
+        // the help text trades one problem for a worse one.
+        assert!(parse(&["nudge", "--list-plain"]).list_plain);
+    }
+
+    #[test]
+    fn retries_accepts_minus_one_in_every_spelling() {
+        // README:35 advertises `nudge -p bot:0.1 -a -r -1 -v` ("retry forever"),
+        // and scheduler.rs honours `retries_left == -1`. Without
+        // `allow_negative_numbers` clap reads `-1` as an unknown short flag, so
+        // the documented feature is reachable only through the undiscoverable
+        // `--retries=-1` equals form. Parsed through the real parser: a
+        // hand-built `Cli { retries: Some(-1), .. }` would pass while the CLI
+        // still rejected every spelling a user can type.
+        for args in [
+            &["nudge", "-r", "-1"][..],
+            &["nudge", "--retries", "-1"][..],
+            &["nudge", "--retries=-1"][..],
+        ] {
+            let c = Cli::try_parse_from(args)
+                .unwrap_or_else(|e| panic!("{args:?} must parse, got:\n{e}"));
+            assert_eq!(c.retries, Some(-1), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn retries_still_takes_a_positive_count_and_still_demands_a_value() {
+        // allow_negative_numbers must not turn `-r` into a value-less flag, nor
+        // swallow a following flag as its value.
+        assert_eq!(parse(&["nudge", "-r", "5"]).retries, Some(5));
+        assert!(Cli::try_parse_from(["nudge", "-r"]).is_err());
     }
 
     /// A stand-in for the `NUDGE_*` environment.
