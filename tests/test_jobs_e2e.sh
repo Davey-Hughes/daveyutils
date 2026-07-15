@@ -42,17 +42,25 @@ trap 'purge; rm -f "$PRELUDE"' EXIT
 # success message, -q handling or the -p/-m/-i/-n parse branches emptied the grep
 # and silently disabled this entire file, exit 0, suite still "PASSED".
 #
-# The payload is `true` and we remove it immediately, so it's harmless even where
-# BSD `at` drops the relative offset and schedules it for ~now. remember_id backs
-# up the atrm in case the latter fails, so the EXIT trap still reaps it.
-probe_id=$(echo true | at -q "$AT_QUEUE" now + 2 hours 2>&1 \
-    | grep -oE 'job [0-9]+' | grep -oE '[0-9]+')
-remember_id "$probe_id"
-if [ -z "$probe_id" ]; then
+# probe_queue <queue> -- can `at` ITSELF queue a job in <queue> here?
+# Returns 0 and sets PROBE_ID when it can. The payload is `true` and we remove it
+# immediately, so it's harmless even where BSD `at` drops the relative offset and
+# schedules it for ~now. remember_id backs up the atrm in case the latter fails,
+# so the EXIT trap still reaps it.
+PROBE_ID=""
+probe_queue() {
+    PROBE_ID=$(echo true | at -q "$1" now + 2 hours 2>&1 \
+        | grep -oE 'job [0-9]+' | grep -oE '[0-9]+')
+    remember_id "$PROBE_ID"
+    [ -z "$PROBE_ID" ] && return 1
+    atrm "$PROBE_ID" 2>/dev/null
+    return 0
+}
+
+if ! probe_queue "$AT_QUEUE"; then
     echo "  SKIP: environment can't queue an 'at' job"
     exit 0
 fi
-atrm "$probe_id" 2>/dev/null
 
 # Schedule one job; echo its numeric id (empty if scheduling failed).
 schedule() { "$NUDGE" "$@" 2>/dev/null | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+'; }
@@ -99,34 +107,52 @@ check "preview: notify option" "yes" "$(printf '%s' "$prev" | grep -q 'notify' &
 # --- F1: --preview-job must validate queue membership before the at -c eval -----
 # A nudge-shaped job in ANOTHER queue must NOT be rendered (its at -c body would
 # otherwise reach job_detail's eval unguarded); previewing it shows "not found".
-F1ID=$(NUDGE_AT_QUEUE=v "$NUDGE" -p 'foreign:1.1' -m '23:57' -i 'secret leak' 2>/dev/null \
-    | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+')
-remember_id "$F1ID"
-if [ -n "$F1ID" ]; then
-    f1prev=$("$NUDGE" --preview-job "$F1ID")
-    check "F1: foreign-queue job not previewed" "yes" \
-        "$(printf '%s' "$f1prev" | grep -q 'not found or not a nudge job' && echo yes || echo no)"
-    check "F1: foreign pane not leaked into preview" "yes" \
-        "$(printf '%s' "$f1prev" | grep -q 'foreign:1.1' && echo no || echo yes)"
-    atrm "$F1ID" 2>/dev/null
+#
+# Staging feasibility is decided by probing `at -q v` DIRECTLY, for the same
+# reason the whole-file skip is: an empty F1ID from grepping NUDGE's stdout could
+# not tell "this environment has no usable queue 'v'" from "nudge can no longer
+# schedule onto another queue". A regression scoped to the non-'w' queues left
+# every w-based check passing and quietly dropped F1/F4 -- 23 passed, 0 failed,
+# exit 0. Once `at` is known to work for the queue, an empty F1ID is a REAL
+# regression, so report it via check and let the file fail.
+if probe_queue v; then
+    F1ID=$(NUDGE_AT_QUEUE=v "$NUDGE" -p 'foreign:1.1' -m '23:57' -i 'secret leak' 2>/dev/null \
+        | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+')
+    remember_id "$F1ID"
+    check "F1: nudge staged a job in queue 'v' (at itself can)" "yes" \
+        "$([ -n "$F1ID" ] && echo yes || echo no)"
+    if [ -n "$F1ID" ]; then
+        f1prev=$("$NUDGE" --preview-job "$F1ID")
+        check "F1: foreign-queue job not previewed" "yes" \
+            "$(printf '%s' "$f1prev" | grep -q 'not found or not a nudge job' && echo yes || echo no)"
+        check "F1: foreign pane not leaked into preview" "yes" \
+            "$(printf '%s' "$f1prev" | grep -q 'foreign:1.1' && echo no || echo yes)"
+        atrm "$F1ID" 2>/dev/null
+    fi
 else
-    echo "  SKIP: F1 -- couldn't stage a job in queue 'v'"
+    echo "  SKIP: F1 -- 'at' itself cannot queue in queue 'v' here"
 fi
 
 # --- F4: nudge jobs OUTSIDE our queue (e.g. an older nudge on the default queue)
 # are invisible to the table and un-cancellable; list_jobs now notes them. Call
 # list_jobs directly (like the table test above) to isolate the note from F5.
-F4ID=$(NUDGE_AT_QUEUE=u "$NUDGE" -p 'legacy:2.2' -m '23:56' -i 'old job' 2>/dev/null \
-    | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+')
-remember_id "$F4ID"
-if [ -n "$F4ID" ]; then
-    f4list=$(list_jobs)
-    check "F4: --list notes an out-of-queue nudge job by id" "yes" \
-        "$(printf '%s' "$f4list" | grep -q "outside queue '$AT_QUEUE'" \
-            && printf '%s' "$f4list" | grep -qw "$F4ID" && echo yes || echo no)"
-    atrm "$F4ID" 2>/dev/null
+# Same direct-probe rule as F1: once `at -q u` is known to work, an empty F4ID is
+# a nudge regression, not an environment limit.
+if probe_queue u; then
+    F4ID=$(NUDGE_AT_QUEUE=u "$NUDGE" -p 'legacy:2.2' -m '23:56' -i 'old job' 2>/dev/null \
+        | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+')
+    remember_id "$F4ID"
+    check "F4: nudge staged a job in queue 'u' (at itself can)" "yes" \
+        "$([ -n "$F4ID" ] && echo yes || echo no)"
+    if [ -n "$F4ID" ]; then
+        f4list=$(list_jobs)
+        check "F4: --list notes an out-of-queue nudge job by id" "yes" \
+            "$(printf '%s' "$f4list" | grep -q "outside queue '$AT_QUEUE'" \
+                && printf '%s' "$f4list" | grep -qw "$F4ID" && echo yes || echo no)"
+        atrm "$F4ID" 2>/dev/null
+    fi
 else
-    echo "  SKIP: F4 -- couldn't stage a job in queue 'u'"
+    echo "  SKIP: F4 -- 'at' itself cannot queue in queue 'u' here"
 fi
 
 # --- --edit (non-interactive): overlay a flag, keep the rest, swap the id -------
