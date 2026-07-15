@@ -9,20 +9,55 @@ use crate::timespec::parse_timespec;
 /// Padding added to every detected reset time to absorb scheduler latency.
 const PADDING_MINUTES: i64 = 3;
 
+/// The built-in clock-shape banner alternation.
+const CLOCK_BASE: &str = r"(?:session limit|current session).*resets";
+
+/// The built-in duration-shape banner alternation.
+const DURATION_BASE: &str = r"quota reached";
+
 /// Built-in clock-shape banner alternation, optionally extended by the user's
 /// `NUDGE_CLOCK_PATTERN`.
 fn clock_re(ext: Option<&str>) -> Regex {
-    build_re(
-        "NUDGE_CLOCK_PATTERN",
-        r"(?:session limit|current session).*resets",
-        ext,
-    )
+    build_re("NUDGE_CLOCK_PATTERN", CLOCK_BASE, ext)
 }
 
 /// Built-in duration-shape banner alternation, optionally extended by
 /// `NUDGE_DURATION_PATTERN`.
 fn duration_re(ext: Option<&str>) -> Regex {
-    build_re("NUDGE_DURATION_PATTERN", r"quota reached", ext)
+    build_re("NUDGE_DURATION_PATTERN", DURATION_BASE, ext)
+}
+
+/// The one place a `base`/`ext` pair becomes a regex, so that what
+/// [`validate_patterns`] checks is exactly what [`build_re`] will build.
+fn compile(base: &str, ext: &str) -> Result<Regex, regex::Error> {
+    Regex::new(&format!("(?i)(?:{base}|{ext})"))
+}
+
+/// Reject a `NUDGE_*_PATTERN` the CLI cannot use, naming the variable.
+///
+/// [`build_re`] must never fail — it runs on the daemon's scheduler thread,
+/// where a panic kills every pending job — so it degrades to the built-in
+/// pattern and warns. But `init_tracing()` only runs in daemon mode, so on the
+/// CLI path there is no subscriber to carry that warning and it is discarded;
+/// in the auto-started daemon stderr is /dev/null. The typo was therefore
+/// silently ignored, and all the user saw was `no rate-limit banner detected in
+/// <pane>` — pointing at the pane, when the fault is in their environment.
+///
+/// So the CLI, which has a user to talk to, checks up front and says so. The
+/// daemon keeps the warn-and-degrade: a bad pattern still must not kill it.
+pub fn validate_patterns(clock_ext: Option<&str>, dur_ext: Option<&str>) -> anyhow::Result<()> {
+    for (var, base, ext) in [
+        ("NUDGE_CLOCK_PATTERN", CLOCK_BASE, clock_ext),
+        ("NUDGE_DURATION_PATTERN", DURATION_BASE, dur_ext),
+    ] {
+        // Unset and empty both mean "no extension", which is the common case.
+        if let Some(e) = ext.filter(|e| !e.is_empty()) {
+            if let Err(err) = compile(base, e) {
+                anyhow::bail!("invalid {var}={e:?}: {err}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The built-in `base` alone. `base` is a literal in this module, so this is
@@ -43,7 +78,7 @@ fn build_re(var: &str, base: &str, ext: Option<&str>) -> Regex {
     let Some(e) = ext.filter(|e| !e.is_empty()) else {
         return builtin_re(base);
     };
-    match Regex::new(&format!("(?i)(?:{base}|{e})")) {
+    match compile(base, e) {
         Ok(re) => re,
         Err(err) => {
             tracing::warn!(
@@ -212,6 +247,34 @@ mod tests {
         let z = detect_reset(pane, &now(), None, None).unwrap();
         // 15:00 + 3m padding = 15:03, NOT derived from the 9:15 scrollback time.
         assert_eq!((z.hour(), z.minute()), (15, 3));
+    }
+
+    #[test]
+    fn validate_patterns_names_the_variable_that_is_wrong() {
+        // The daemon must degrade, but the CLI has a user standing right there
+        // and should say so. Same metacharacter typos as the fallback test.
+        for bad in ["codex (", "*", "a[b"] {
+            let e = validate_patterns(Some(bad), None).unwrap_err().to_string();
+            assert!(
+                e.contains("invalid NUDGE_CLOCK_PATTERN"),
+                "clock ext {bad:?} must be reported against its own variable, got: {e}"
+            );
+
+            let e = validate_patterns(None, Some(bad)).unwrap_err().to_string();
+            assert!(
+                e.contains("invalid NUDGE_DURATION_PATTERN"),
+                "duration ext {bad:?} must be reported against its own variable, got: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_patterns_accepts_what_detect_reset_accepts() {
+        // Whatever this passes, `build_re` must actually be able to use -- and
+        // unset/empty is the overwhelmingly common case and not an error.
+        assert!(validate_patterns(None, None).is_ok());
+        assert!(validate_patterns(Some(""), Some("")).is_ok());
+        assert!(validate_patterns(Some("rate limited"), Some("out of credits")).is_ok());
     }
 
     #[test]
