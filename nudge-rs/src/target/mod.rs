@@ -3,8 +3,9 @@
 
 use anyhow::Result;
 
-/// A place nudge can read from and type into. `job::Target` is the serializable
-/// *descriptor* of one of these; this trait is the runtime *behavior*.
+/// A place nudge can read from and type into. `job::TargetSpec` is the
+/// serializable *descriptor* of one of these; this trait is the runtime
+/// *behavior*.
 pub trait Target {
     /// Capture the target's current visible screen text.
     fn capture(&self) -> Result<String>;

@@ -4,14 +4,25 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind")]
-pub enum Target {
+pub enum TargetSpec {
     Tmux { pane: String },
+}
+
+impl TargetSpec {
+    /// Build the live, connectable target this descriptor names.
+    pub fn connect(&self) -> Box<dyn crate::target::Target> {
+        match self {
+            TargetSpec::Tmux { pane } => {
+                Box::new(crate::target::tmux::TmuxTarget::new(pane.clone()))
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Job {
     pub id: u64,
-    pub target: Target,
+    pub target: TargetSpec,
     pub messages: Vec<String>,
     pub send_delay_secs: f64,
     pub fire_at: jiff::Timestamp,
@@ -23,9 +34,9 @@ pub struct Job {
 }
 
 /// What a caller supplies to `Queue::add` (everything but the id).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct JobSpec {
-    pub target: Target,
+    pub target: TargetSpec,
     pub messages: Vec<String>,
     pub send_delay_secs: f64,
     pub fire_at: jiff::Timestamp,
@@ -61,7 +72,7 @@ mod tests {
     fn job_roundtrips_through_json() {
         let job = Job {
             id: 7,
-            target: Target::Tmux {
+            target: TargetSpec::Tmux {
                 pane: "bot:0.1".into(),
             },
             messages: vec!["please continue".into()],

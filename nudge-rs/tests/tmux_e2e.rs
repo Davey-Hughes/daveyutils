@@ -9,7 +9,7 @@ use std::{thread, time::Duration};
 
 use jiff::{civil::date, tz::TimeZone};
 use nudge::inject::{run_injection, InjectOutcome};
-use nudge::job::{Job, Target as TargetKind};
+use nudge::job::{Job, TargetSpec};
 use nudge::target::{tmux::TmuxTarget, Target};
 
 fn tmux_available() -> bool {
@@ -145,7 +145,7 @@ fn end_to_end_injection_verifies_then_sends() {
     let target = server.target();
     let job = Job {
         id: 1,
-        target: TargetKind::Tmux { pane: "s".into() },
+        target: TargetSpec::Tmux { pane: "s".into() },
         messages: vec!["echo nudge_done_$((6*7))".into()],
         send_delay_secs: 0.0,
         fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
