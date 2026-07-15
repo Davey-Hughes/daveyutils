@@ -51,14 +51,83 @@ fn cancel_over_ipc_removes_the_job() {
     assert!(queue.lock().unwrap().all().is_empty());
 }
 
-#[test]
-fn merge_edit_preserves_options_not_passed() {
+fn noon() -> jiff::Zoned {
     use jiff::{civil::date, tz::TimeZone};
-
-    let now = date(2026, 7, 13)
+    date(2026, 7, 13)
         .at(12, 0, 0, 0)
         .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
-        .unwrap();
+        .unwrap()
+}
+
+fn cli(args: &[&str]) -> nudge::cli::Cli {
+    <nudge::cli::Cli as clap::Parser>::try_parse_from(args).unwrap()
+}
+
+/// A job scheduled *without* auto-retry: `build_spec` stores retries_left == 0.
+fn no_retry_job(id: u64) -> nudge::job::Job {
+    JobSpec {
+        auto_retry: false,
+        retries_left: 0,
+        ..spec("bot:0.1")
+    }
+    .into_job(id)
+}
+
+#[test]
+fn edit_turning_on_auto_retry_gets_the_default_budget() {
+    // `nudge --edit 5 --auto-retry` with no -r. merge_edit seeds its base from
+    // the job, and a job scheduled without auto-retry holds retries_left == 0 --
+    // so the replacement was stored with auto_retry=true and a budget of 0.
+    // apply_outcome guards on `auto_retry && retries_left != 0`, so that job is
+    // REMOVED on its first fire and never retries, while the CLI cheerfully
+    // prints "edited job 5 -> 6". The flag must arm retries here exactly as it
+    // does on a fresh schedule.
+    let spec = nudge::app::merge_edit(
+        &no_retry_job(5),
+        &cli(&["nudge", "--edit", "5", "-a"]),
+        &noon(),
+        2,
+    )
+    .unwrap();
+    assert!(spec.auto_retry, "the flag was passed");
+    assert_eq!(
+        spec.retries_left, 2,
+        "--auto-retry on a job with no budget must fall back to the default \
+         count, not 0 -- auto_retry=true with 0 retries never retries"
+    );
+}
+
+#[test]
+fn edit_auto_retry_with_an_explicit_count_uses_that_count() {
+    // The explicit -r is the user's stated intent and must beat the fallback.
+    let spec = nudge::app::merge_edit(
+        &no_retry_job(5),
+        &cli(&["nudge", "--edit", "5", "-a", "-r", "7"]),
+        &noon(),
+        2,
+    )
+    .unwrap();
+    assert!(spec.auto_retry);
+    assert_eq!(spec.retries_left, 7);
+}
+
+#[test]
+fn edit_without_auto_retry_keeps_a_no_retry_job_at_zero() {
+    // The fallback must not arm retries on a job the user never asked to retry.
+    let spec = nudge::app::merge_edit(
+        &no_retry_job(5),
+        &cli(&["nudge", "--edit", "5", "-m", "6pm"]),
+        &noon(),
+        2,
+    )
+    .unwrap();
+    assert!(!spec.auto_retry);
+    assert_eq!(spec.retries_left, 0);
+}
+
+#[test]
+fn merge_edit_preserves_options_not_passed() {
+    let now = noon();
 
     // A job that had verify + notify + infinite retries.
     let job = JobSpec {
@@ -81,7 +150,7 @@ fn merge_edit_preserves_options_not_passed() {
         <nudge::cli::Cli as clap::Parser>::try_parse_from(["nudge", "--edit", "1", "-m", "6pm"])
             .unwrap();
 
-    let spec = nudge::app::merge_edit(&job, &cli, &now).unwrap();
+    let spec = nudge::app::merge_edit(&job, &cli, &now, 2).unwrap();
 
     assert!(spec.verify, "verify must be preserved");
     assert!(spec.notify, "notify must be preserved");
