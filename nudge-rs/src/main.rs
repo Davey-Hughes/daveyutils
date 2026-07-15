@@ -1,4 +1,10 @@
+use clap::Parser;
+use nudge::cli::Cli;
+
 fn main() {
-    eprintln!("nudge: CLI not implemented yet (core-library increment)");
-    std::process::exit(1);
+    let cli = Cli::parse();
+    if let Err(e) = nudge::run(cli) {
+        eprintln!("nudge: {e}");
+        std::process::exit(1);
+    }
 }
