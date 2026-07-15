@@ -18,6 +18,8 @@
 //! pointed at an isolated HOME/XDG state dir. The singleton lock is held so that
 //! even if the CLI did try to spawn a daemon, it could not survive.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -109,9 +111,14 @@ struct Fixture {
 
 /// An isolated state dir with an OLD daemon answering `pong` on its socket.
 fn with_old_daemon(pong: &'static str) -> Fixture {
-    let tmp = tempfile::tempdir().unwrap();
+    // common::short_tempdir, not tempfile::tempdir: this test binds a real
+    // socket under a HOME rooted at the tempdir, and macOS's $TMPDIR is long
+    // enough that resolve_from's "Library/Application Support/nudge" suffix
+    // overflows SUN_LEN (this is the fixture that failed CI on macOS).
+    let tmp = common::short_tempdir();
     let home = tmp.path().to_path_buf();
     let paths = child_paths(&home);
+    common::assert_socket_path_fits(&paths.socket);
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     std::fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
 

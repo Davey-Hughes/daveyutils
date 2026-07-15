@@ -24,6 +24,8 @@
 //! Single test in this file on purpose: it sets process-wide env, which the
 //! daemon inherits and which no sibling test may race.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -113,18 +115,13 @@ fn a_verify_skip_lands_in_the_daemon_log() {
         return;
     }
 
-    // Rooted at /tmp rather than $TMPDIR: a Unix socket path is capped at
-    // SUN_LEN (104 bytes on macOS), and this is the one test that points HOME at
-    // a tempdir, so it pays for macOS's ~55-char /var/folders/... TMPDIR *plus*
-    // the 35 chars of "Library/Application Support/nudge" that `resolve_from`
-    // appends there. Together they overflow, the daemon dies with "path must be
-    // shorter than SUN_LEN", and the skip never gets logged. A real macOS user
-    // is fine (/Users/name/... is ~55 total); this is purely the test's own path
-    // budget. Sibling tests escape it only by not setting HOME.
-    let tmp = tempfile::Builder::new()
-        .prefix("nudge-log-")
-        .tempdir_in("/tmp")
-        .unwrap();
+    // See common::short_tempdir for why this can't be tempfile::tempdir():
+    // this is the one test in this file that points HOME at a tempdir, and
+    // paying macOS's long $TMPDIR here overflows SUN_LEN, so the daemon dies
+    // with "path must be shorter than SUN_LEN" and the skip never gets
+    // logged. Sibling tests in other files escape it only by not setting HOME
+    // or by not deriving a socket path from resolve_from at all.
+    let tmp = common::short_tempdir();
     let home = tmp.path().to_path_buf();
     let tmux_tmpdir = home.join("tmux");
     std::fs::create_dir_all(&tmux_tmpdir).unwrap();
@@ -146,6 +143,7 @@ fn a_verify_skip_lands_in_the_daemon_log() {
         Some(&home.join("run")),
         os(),
     );
+    common::assert_socket_path_fits(&paths.socket);
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     std::fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
 

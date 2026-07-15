@@ -15,6 +15,8 @@
 //! is the point, since it is what makes "no daemon is listening when the CLI
 //! starts" true, and a server bound up front would let the pre-fix code pass.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
@@ -77,9 +79,14 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    let tmp = tempfile::tempdir().unwrap();
+    // common::short_tempdir, not tempfile::tempdir: the stand-in daemon below
+    // binds a real socket, under a HOME rooted at the tempdir, and macOS's
+    // $TMPDIR is long enough that resolve_from's suffix overflows SUN_LEN
+    // there.
+    let tmp = common::short_tempdir();
     let home = tmp.path().to_path_buf();
     let paths = child_paths(&home);
+    common::assert_socket_path_fits(&paths.socket);
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     std::fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
 
