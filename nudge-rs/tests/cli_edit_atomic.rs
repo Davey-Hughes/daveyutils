@@ -13,7 +13,10 @@
 //!
 //! Hermetic: a recording stand-in daemon on a tempdir socket answers the real
 //! binary, which is pointed at an isolated HOME/XDG state dir. Nothing is
-//! spawned — the stand-in answers Ping, so `ensure_daemon` never starts one.
+//! spawned — the stand-in answers Ping, so `ensure_daemon` never starts one —
+//! and the singleton lock is held so that stays true even if it ever doesn't.
+//! Relying on the stand-in alone would mean a real daemon, spawned into a
+//! tempdir that is then deleted, running forever on the developer's machine.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -111,6 +114,12 @@ fn edit_mutates_the_queue_in_one_atomic_request() {
     let paths = child_paths(home);
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     std::fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
+
+    // Leak-proof by construction, as cli_no_daemon.rs already is: hold the
+    // singleton lock so that a daemon this test never means to start cannot
+    // survive being started. The stand-in answering Ping is what stops one
+    // being spawned; this is what stops that being the only thing.
+    let _lock = nudge::daemon::acquire_singleton_lock(&paths.state_dir).unwrap();
 
     let ops = recording_daemon(&paths.socket);
 
