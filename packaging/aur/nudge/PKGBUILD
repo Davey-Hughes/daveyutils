@@ -22,6 +22,7 @@ sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
 build() {
   cd "daveyutils-nudge-v$pkgver/nudge-rs"
   export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
   cargo build --release --locked
 }
 
