@@ -93,12 +93,7 @@ pub fn run(
         // 2. Drop stale jobs under the lock.
         if !plan_now.drop_stale.is_empty() {
             let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
-            for id in &plan_now.drop_stale {
-                if let Err(e) = q.remove(*id) {
-                    tracing::warn!("nudge: removing stale job {id} failed: {e}");
-                }
-                tracing::info!("nudge: dropped stale job {id}");
-            }
+            drop_stale(&mut q, &plan_now.drop_stale);
         }
 
         // 3. Fire each due job WITHOUT the lock, applying results under it.
@@ -137,6 +132,26 @@ pub fn run(
             next_wake(q.all(), &now, MAX_POLL)
         };
         std::thread::sleep(wake.max(Duration::from_millis(50)));
+    }
+}
+
+/// Drop the stale jobs in `ids`, reporting what actually happened to each.
+///
+/// Split out of `run`'s loop purely to be reachable: the log line *is* the
+/// behaviour here, and `run` is an infinite loop no test can call.
+fn drop_stale(q: &mut Queue, ids: &[u64]) {
+    for id in ids {
+        match q.remove(*id) {
+            // Only a removal that actually persisted may claim the drop.
+            Ok(true) => tracing::info!("nudge: dropped stale job {id}"),
+            // Already gone: nothing happened, so say nothing.
+            Ok(false) => {}
+            // `remove` rolls back, so the job is still live and still queued.
+            // Saying "dropped" on the next line -- as this used to,
+            // unconditionally -- tells whoever is debugging why stale jobs keep
+            // reappearing that this half worked, and sends them elsewhere.
+            Err(e) => tracing::warn!("nudge: removing stale job {id} failed: {e}"),
+        }
     }
 }
 
@@ -185,11 +200,12 @@ pub fn notification(
 
 #[cfg(test)]
 mod tests {
-    use super::notification;
+    use super::{drop_stale, notification};
     use crate::inject::InjectOutcome;
     use crate::job::{JobSpec, TargetSpec};
+    use crate::queue::Queue;
 
-    fn job(notify: bool) -> crate::job::Job {
+    fn spec(notify: bool) -> JobSpec {
         JobSpec {
             target: TargetSpec::Tmux { pane: "p".into() },
             messages: vec!["go".into()],
@@ -203,7 +219,112 @@ mod tests {
             verify_fingerprint: None,
             verify_dims: None,
         }
-        .into_job(1)
+    }
+
+    fn job(notify: bool) -> crate::job::Job {
+        spec(notify).into_job(1)
+    }
+
+    /// A sink for one thread's tracing output.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Capture {
+        type Writer = Capture;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` and return what it logged.
+    ///
+    /// `with_default` installs the subscriber for *this thread only*, so this
+    /// cannot race the rest of the binary the way a global subscriber would --
+    /// cargo runs these tests on parallel threads of one process.
+    fn logs_from(f: impl FnOnce()) -> String {
+        let cap = Capture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, f);
+        let bytes = cap.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// A queue whose parent directory is a regular file, so every persist
+    /// fails. Stands in for the ENOSPC / read-only state dir of the real
+    /// failure, and unlike a chmod'd directory it still fails as root.
+    fn block_saving(parent: &std::path::Path) {
+        std::fs::remove_dir_all(parent).unwrap();
+        std::fs::write(parent, b"not a directory").unwrap();
+    }
+
+    #[test]
+    fn a_stale_drop_that_could_not_be_persisted_is_not_logged_as_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let mut q = Queue::load(sub.join("q.json")).unwrap();
+        let id = q.add(spec(false)).unwrap();
+        block_saving(&sub);
+
+        let out = logs_from(|| drop_stale(&mut q, &[id]));
+
+        assert!(
+            out.contains("failed"),
+            "the failure must still be reported: {out}"
+        );
+        assert!(
+            q.get(id).is_some(),
+            "precondition: the job must still be live for this test to mean anything"
+        );
+        assert!(
+            !out.contains("dropped stale job"),
+            "remove failed and the job is STILL LIVE, so claiming the drop right after \
+             warning that it failed sends anyone debugging reappearing stale jobs to \
+             the wrong place: {out}"
+        );
+    }
+
+    #[test]
+    fn an_already_gone_stale_job_claims_no_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = Queue::load(dir.path().join("q.json")).unwrap();
+
+        let out = logs_from(|| drop_stale(&mut q, &[9999]));
+
+        assert!(
+            !out.contains("dropped stale job"),
+            "nothing was there to drop, so nothing was dropped: {out}"
+        );
+    }
+
+    #[test]
+    fn a_stale_drop_that_persisted_is_logged() {
+        // The other half of the claim: this must stay noisy on success, or
+        // "don't log the failure" would pass by logging nothing ever.
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = Queue::load(dir.path().join("q.json")).unwrap();
+        let id = q.add(spec(false)).unwrap();
+
+        let out = logs_from(|| drop_stale(&mut q, &[id]));
+
+        assert!(
+            out.contains("dropped stale job"),
+            "a real drop must still be reported: {out}"
+        );
+        assert!(q.get(id).is_none(), "and the job must actually be gone");
     }
 
     #[test]
