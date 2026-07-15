@@ -67,4 +67,27 @@ check "batch: summary reports 1 pdf, 0 failed" "yes" \
 check "batch: warns on stderr for the failed archive" "yes" \
     "$(grep -q 'WARN: an archive failed to extract' "$WORKDIR/stderr.log" && echo yes || echo no)"
 
+# --- C3: --clean must not delete folders holding unconverted nested images ----
+# Layout: book/cover.jpg + book/chapter1/p1.jpg. Only cover.jpg goes into the
+# PDF (the image scan is -maxdepth 1), so rm -rf book/ would destroy chapter1/.
+c3=$(mktemp -d "${TMPDIR:-/tmp}/img2pdf-c3.XXXXXX")
+mkdir -p "$c3/main/book/chapter1"
+: >"$c3/main/book/cover.jpg"
+: >"$c3/main/book/chapter1/p1.jpg"
+( cd "$c3" && PATH="$STUBDIR:$PATH" UNAR_LOG=/dev/null IMG2PDF_LOG=/dev/null \
+    bash "$HERE/../scripts/batch_img2pdf" --clean -o "$c3/out" main ) >/dev/null 2>&1
+check "C3: nested unconverted image survives --clean" "yes" \
+    "$([ -f "$c3/main/book/chapter1/p1.jpg" ] && echo yes || echo no)"
+rm -rf "$c3"
+
+# --- C3 sanity: a fully-covered folder (no subdirs) is still cleaned --------
+c3b=$(mktemp -d "${TMPDIR:-/tmp}/img2pdf-c3b.XXXXXX")
+mkdir -p "$c3b/main/flat"
+: >"$c3b/main/flat/p1.jpg"
+( cd "$c3b" && PATH="$STUBDIR:$PATH" UNAR_LOG=/dev/null IMG2PDF_LOG=/dev/null \
+    bash "$HERE/../scripts/batch_img2pdf" --clean -o "$c3b/out" main ) >/dev/null 2>&1
+check "C3: fully-covered folder is still removed by --clean" "no" \
+    "$([ -d "$c3b/main/flat" ] && echo yes || echo no)"
+rm -rf "$c3b"
+
 finish
