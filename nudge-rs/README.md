@@ -76,4 +76,8 @@ cargo test
 cargo run -- --help
 ```
 
-The bash predecessor lives at `scripts/nudge` (kept as the reference oracle).
+`cargo test` drives a real `tmux` server, so tmux must be installed.
+
+This started life as a bash script at `scripts/nudge`. That original was kept as
+a reference oracle for the duration of the port and removed once the rewrite
+overtook it.
