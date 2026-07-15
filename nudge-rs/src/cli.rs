@@ -51,7 +51,15 @@ pub struct Cli {
     pub no_auto_retry: bool,
 
     /// Exact retry count (-1 = forever). Implies --auto-retry.
-    #[arg(short = 'r', long = "retries")]
+    ///
+    /// `allow_negative_numbers` is load-bearing, not tidiness: -1 is a real
+    /// supported value (scheduler.rs keeps `retries_left == -1` infinite, and
+    /// the README advertises `-r -1`), but without this clap reads the `-1` in
+    /// `-r -1` as an unknown short flag and only the `--retries=-1` equals form
+    /// survives. This is the one numeric arg here with a legitimately negative
+    /// value -- `--cancel`/`--edit` are `u64` ids and `--delay` is a pause in
+    /// seconds, so all three are right to reject a negative.
+    #[arg(short = 'r', long = "retries", allow_negative_numbers = true)]
     pub retries: Option<i64>,
 
     /// Don't inject if you already resumed: skip unless the pane is untouched since scheduling and still shows a rate-limit banner.
@@ -165,6 +173,34 @@ mod tests {
         assert_eq!(c.input, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(c.delay, Some(0.5));
         assert!(c.verify);
+    }
+
+    #[test]
+    fn retries_accepts_minus_one_in_every_spelling() {
+        // README:35 advertises `nudge -p bot:0.1 -a -r -1 -v` ("retry forever"),
+        // and scheduler.rs honours `retries_left == -1`. Without
+        // `allow_negative_numbers` clap reads `-1` as an unknown short flag, so
+        // the documented feature is reachable only through the undiscoverable
+        // `--retries=-1` equals form. Parsed through the real parser: a
+        // hand-built `Cli { retries: Some(-1), .. }` would pass while the CLI
+        // still rejected every spelling a user can type.
+        for args in [
+            &["nudge", "-r", "-1"][..],
+            &["nudge", "--retries", "-1"][..],
+            &["nudge", "--retries=-1"][..],
+        ] {
+            let c = Cli::try_parse_from(args)
+                .unwrap_or_else(|e| panic!("{args:?} must parse, got:\n{e}"));
+            assert_eq!(c.retries, Some(-1), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn retries_still_takes_a_positive_count_and_still_demands_a_value() {
+        // allow_negative_numbers must not turn `-r` into a value-less flag, nor
+        // swallow a following flag as its value.
+        assert_eq!(parse(&["nudge", "-r", "5"]).retries, Some(5));
+        assert!(Cli::try_parse_from(["nudge", "-r"]).is_err());
     }
 
     /// A stand-in for the `NUDGE_*` environment.
