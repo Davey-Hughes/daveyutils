@@ -26,12 +26,22 @@ pub fn run(cli: cli::Cli) -> anyhow::Result<()> {
     if cli.daemon {
         daemon::init_tracing();
         let p = paths::resolve();
-        return Ok(daemon::run(
+        return match daemon::run(
             &p,
             std::env::var("NUDGE_CLOCK_PATTERN").ok(),
             std::env::var("NUDGE_DURATION_PATTERN").ok(),
             jiff::ToSpan::hours(6),
-        )?);
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Another daemon already owns this state. That is not a failure:
+                // exiting non-zero makes systemd's Restart=on-failure retry every
+                // RestartSec forever against a lock it can never win.
+                eprintln!("nudge: {e}");
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        };
     }
     if cli.install_daemon {
         return register::install(&std::env::current_exe()?);
