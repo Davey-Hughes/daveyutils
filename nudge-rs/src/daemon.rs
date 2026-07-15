@@ -47,6 +47,26 @@ pub fn acquire_singleton_lock(state_dir: &std::path::Path) -> std::io::Result<st
     Ok(file)
 }
 
+/// What the daemon does when its IPC server exits: say why, then take the
+/// process down.
+///
+/// A daemon with no control plane still fires jobs but can't be listed,
+/// cancelled or edited -- and the singleton lock (correctly) stops a
+/// replacement from taking over. So take the whole process down, letting the
+/// user or the service manager start a working daemon, rather than leaving a
+/// headless one injecting into panes.
+///
+/// Named, and taking the outcome as a value, so the policy is one thing in one
+/// place -- and so [`run_with`] can hand an in-process test something that does
+/// not take the *test binary* down with it.
+fn on_serve_exit(result: std::io::Result<()>) -> ! {
+    match result {
+        Ok(()) => tracing::error!("nudge: ipc server exited unexpectedly"),
+        Err(e) => tracing::error!("nudge: ipc server exited: {e}"),
+    }
+    std::process::exit(1);
+}
+
 /// Run the daemon forever: IPC server thread + scheduler loop.
 ///
 /// Call [`init_tracing`] first if you want the daemon's logs.
@@ -55,6 +75,27 @@ pub fn run(
     clock_ext: Option<String>,
     dur_ext: Option<String>,
     grace: Span,
+) -> std::io::Result<()> {
+    run_with(paths, clock_ext, dur_ext, grace, on_serve_exit)
+}
+
+/// [`run`], with the serve-exit policy injected.
+///
+/// Exists for tests that run a real daemon *in-process*. `run`'s policy is
+/// `process::exit(1)`, which is right for a daemon and wrong for a cargo test
+/// binary: a fatal `serve` there takes down every test in the file at once,
+/// exit 1, with no attribution to any test. A test passes a policy that parks
+/// instead, and then fails as a test -- on the assertion that the daemon's
+/// socket never came up.
+///
+/// The `-> !` is the point: a serve-exit policy may not return to a daemon that
+/// has already lost its control plane.
+pub fn run_with(
+    paths: &Paths,
+    clock_ext: Option<String>,
+    dur_ext: Option<String>,
+    grace: Span,
+    on_serve_exit: fn(std::io::Result<()>) -> !,
 ) -> std::io::Result<()> {
     // Refuse to start a second daemon: two schedulers on one queue.json double-fire
     // jobs and clobber each other's state.
@@ -68,18 +109,7 @@ pub fn run(
     // IPC server on its own thread.
     let q_ipc = Arc::clone(&queue);
     let socket = paths.socket.clone();
-    std::thread::spawn(move || {
-        match crate::ipc::server::serve(&socket, q_ipc) {
-            Ok(()) => tracing::error!("nudge: ipc server exited unexpectedly"),
-            Err(e) => tracing::error!("nudge: ipc server exited: {e}"),
-        }
-        // A daemon with no control plane still fires jobs but can't be listed,
-        // cancelled or edited -- and the singleton lock (correctly) stops a
-        // replacement from taking over. Take the whole process down so the user
-        // or the service manager can start a working daemon instead of leaving
-        // a headless one injecting into panes.
-        std::process::exit(1);
-    });
+    std::thread::spawn(move || on_serve_exit(crate::ipc::server::serve(&socket, q_ipc)));
 
     loop {
         let now = Zoned::now();

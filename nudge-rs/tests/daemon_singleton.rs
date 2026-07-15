@@ -137,7 +137,18 @@ fn a_running_daemon_holds_the_lock_for_its_whole_life() {
     };
 
     std::thread::spawn(move || {
-        let _ = nudge::daemon::run(&paths, None, None, jiff::ToSpan::hours(6));
+        // `run_with`, not `run`: this is a real daemon running IN THIS PROCESS,
+        // and `run`'s serve-exit policy is `process::exit(1)`. A fatal accept
+        // error there would take the whole cargo test binary down -- every test
+        // in this file, exit 1, attributed to nothing. Parking instead leaves
+        // the failure to be reported as what it is: the "daemon under test
+        // never came up" assertion below.
+        let _ = nudge::daemon::run_with(&paths, None, None, jiff::ToSpan::hours(6), |result| {
+            eprintln!("in-process daemon's ipc server exited: {result:?}");
+            loop {
+                std::thread::park();
+            }
+        });
     });
 
     // Wait until it's actually up (its socket appears / accepts).
