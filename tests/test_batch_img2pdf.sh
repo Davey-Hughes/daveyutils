@@ -5,6 +5,32 @@ source "$HERE/assert.sh"
 # shellcheck disable=SC1090
 source "$HERE/../scripts/batch_img2pdf"
 
+# nounset_unsafe_expansions <file> <array> -- how many times <file> expands
+# "${<array>[@]}" in the BARE form, i.e. not wrapped in the
+# ${<array>[@]+"${<array>[@]}"} guard.
+#
+# On bash < 4.4 -- including the 3.2 macOS ships, which this repo targets -- an
+# EMPTY array expands as though it were UNSET, so a bare "${a[@]}" under `set -u`
+# aborts with "a[@]: unbound variable". bash 4.4 made ${a[@]} unconditionally
+# exempt from nounset, so this cannot be reproduced at runtime on any bash the
+# suite runs on. Verified on bash 5.3: an empty array, and even a never-declared
+# one, expand silently under `set -u`, and neither `shopt -s compat43` nor
+# BASH_COMPAT=4.3 restores the old rule -- while a scalar still aborts, so it is
+# not that `set -u` is inactive. There is no runtime pin to be had here, so pin
+# the idiom in the source instead.
+#
+# Each guarded occurrence contains exactly one bare occurrence as a substring,
+# so the unguarded count is simply (all - guarded). Full-line comments are
+# dropped first: the scripts' own comments explain the fix by NAMING the bare
+# form, and prose is not an expansion.
+nounset_unsafe_expansions() {
+    local file="$1" arr="$2" code all guarded
+    code=$(sed 's/^[[:space:]]*#.*$//' "$file")
+    all=$(printf '%s\n' "$code" | grep -o -F "\${$arr[@]}" | wc -l | tr -d ' ')
+    guarded=$(printf '%s\n' "$code" | grep -o -F "\${$arr[@]+\"\${$arr[@]}\"}" | wc -l | tr -d ' ')
+    printf '%s' "$(( all - guarded ))"
+}
+
 check "defaults"          "./pdfs|0|book"     "$(parse_args book)"
 check "custom outdir"     "/tmp/out|0|book"   "$(parse_args -o /tmp/out book)"
 check "clean opt-in"      "./pdfs|1|book"     "$(parse_args --clean book)"
@@ -196,5 +222,32 @@ m11out3=$( cd "$m11" && PATH="$STUBDIR:$PATH" UNAR_LOG=/dev/null IMG2PDF_LOG=/de
 check "M11: a directory named __help__ is processed, not treated as -h" "yes" \
     "$(printf '%s' "$m11out3" | grep -q 'done: 1 pdfs, 0 failed' && echo yes || echo no)"
 rm -rf "$m11"
+
+# --- M9: the pids expansion must survive a run with no zips -------------------
+# `batch_img2pdf DIR` where DIR holds already-extracted image folders and no
+# *.zip is a normal workflow: the glob doesn't expand, `break` fires, and `pids`
+# stays empty. Line 59's bare "${pids[@]}" under `set -u` then aborts on bash
+# 4.3 and earlier -- macOS's 3.2 included -- BEFORE any PDF is built. The author
+# already knows the idiom: select_streams guards with "${args[*]:-}", and
+# `images`, `error_files` and `audio_streams` are all length-guarded; `pids` was
+# the one that was missed.
+check "M9: no nounset-unsafe \"\${pids[@]}\" expansion (bash < 4.4 / macOS 3.2)" "0" \
+    "$(nounset_unsafe_expansions "$HERE/../scripts/batch_img2pdf" pids)"
+
+# Companion to the pin above. This cannot go RED on bash >= 4.4 (see
+# nounset_unsafe_expansions), but it does guard the FIX: the finding's suggested
+# `[[ ${#pids[@]} -gt 0 ]] || return` would return from main() and skip the PDF
+# loop entirely, turning a portability fix into a "builds nothing" bug. This
+# asserts the no-zip run still reaches the PDF loop and still waits on real pids.
+m9=$(mktemp -d "${TMPDIR:-/tmp}/img2pdf-m9.XXXXXX")
+mkdir -p "$m9/main/flat"
+: >"$m9/main/flat/p1.jpg"
+m9out=$( cd "$m9" && PATH="$STUBDIR:$PATH" UNAR_LOG=/dev/null IMG2PDF_LOG="$m9/img2pdf.log" \
+    bash "$HERE/../scripts/batch_img2pdf" -o "$m9/out" main 2>/dev/null )
+check "M9: a directory with no zips still builds its PDFs" "yes" \
+    "$(printf '%s' "$m9out" | grep -q 'done: 1 pdfs, 0 failed' && echo yes || echo no)"
+check "M9: the PDF loop really ran (img2pdf invoked)" "yes" \
+    "$(grep -q 'p1\.jpg' "$m9/img2pdf.log" && echo yes || echo no)"
+rm -rf "$m9"
 
 finish
