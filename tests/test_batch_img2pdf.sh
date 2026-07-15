@@ -128,4 +128,28 @@ for f2case in file dir; do
     rm -rf "$f2"
 done
 
+# --- F3: the WARN must name what kept the folder ------------------------------
+# `book/{cover.jpg, .DS_Store}` -> total=2, n=1 -> kept, and kept forever.
+# That is the correct, safe direction and it stays -- but .DS_Store is
+# ubiquitous in macOS-authored zips, so on that platform --clean may effectively
+# never clean, and "it holds files the PDF does not cover" never told the user a
+# dotfile was the reason. Naming the entries is the fix; an ignore-list is NOT,
+# because it would make --clean delete a folder the coverage check did not prove
+# safe -- the C3 data-loss defect. Keeping the folder is always the safe way to
+# be wrong; the user can act on a name, and cannot act on silence.
+f3=$(mktemp -d "${TMPDIR:-/tmp}/img2pdf-f3.XXXXXX")
+mkdir -p "$f3/main/book"
+: >"$f3/main/book/cover.jpg"
+: >"$f3/main/book/.DS_Store"
+( cd "$f3" && PATH="$STUBDIR:$PATH" UNAR_LOG=/dev/null IMG2PDF_LOG=/dev/null \
+    bash "$HERE/../scripts/batch_img2pdf" --clean -o "$f3/out" main ) \
+    >/dev/null 2>"$f3/stderr.log"
+check "F3: folder holding a dotfile is still kept" "yes" \
+    "$([ -d "$f3/main/book" ] && echo yes || echo no)"
+check "F3: the WARN names the dotfile that kept it" "yes" \
+    "$(grep -q '\.DS_Store' "$f3/stderr.log" && echo yes || echo no)"
+check "F3: the WARN does not name the image the PDF did cover" "yes" \
+    "$(grep -q 'cover\.jpg' "$f3/stderr.log" && echo no || echo yes)"
+rm -rf "$f3"
+
 finish

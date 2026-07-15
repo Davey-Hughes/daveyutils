@@ -34,6 +34,31 @@ folder_fully_covered() {
     [[ "$total" -eq "$n" ]]
 }
 
+# uncovered_entries <dir>
+# The entries in <dir> that did NOT go into its PDF, one path per line: every
+# top-level subdirectory (the PDF only covered top-level images, so a subdir's
+# whole tree is uncovered) and every top-level entry the image scan skipped.
+# Mirrors that scan exactly -- an entry is covered iff it is a regular file
+# (`find -type f`, which excludes symlinks) that `file` reports as an image.
+#
+# This names what kept a folder. A single .DS_Store is enough to keep one
+# forever, and .DS_Store is ubiquitous in macOS-authored zips, so "it holds
+# files the PDF does not cover" left the user with no way to see why. Naming
+# the entries -- rather than ignoring a known-junk set -- keeps --clean exactly
+# as eager as the coverage check proves is safe.
+uncovered_entries() {
+    local dir="$1" e
+    while IFS= read -r -d '' e; do
+        printf '%s\n' "$e"
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -print0)
+    while IFS= read -r -d '' e; do
+        if [[ -L "$e" ]] || ! file --mime-type -b "$e" 2>/dev/null | grep -q '^image/'; then
+            printf '%s\n' "$e"
+        fi
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 ! -type d -print0)
+    return 0
+}
+
 OUTDIR="./pdfs"
 CLEAN=0
 MAINDIR=""
@@ -102,7 +127,8 @@ main() {
                 if folder_fully_covered "$d" "${#images[@]}"; then
                     rm -rf "$d"
                 else
-                    printf 'WARN: kept %s: it holds files the PDF does not cover\n' "$d" >&2
+                    printf 'WARN: kept %s: it holds files the PDF does not cover:\n' "$d" >&2
+                    uncovered_entries "$d" | sed 's/^/  /' >&2
                 fi
             fi
         else
