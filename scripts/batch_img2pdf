@@ -1,51 +1,87 @@
-#!/bin/zsh
+#!/usr/bin/env bash
+#
+# batch_img2pdf - unzip image archives in a directory and make one PDF per folder.
+#
+# Usage: batch_img2pdf [-o OUTDIR] [--clean] MAINDIR
+#   -o OUTDIR   where PDFs are written (default: ./pdfs)
+#   --clean     delete each source image folder after its PDF is built successfully
+#   MAINDIR     directory containing the *.zip archives / image folders
+#
+# Requires: unar, img2pdf, file
 
-### Converts directories of images to PDFs
+die() { printf '%s\n' "$*" >&2; exit 1; }
 
-# get name of main directory
-maindir=$1
-shift
+OUTDIR="./pdfs"
+CLEAN=0
+MAINDIR=""
 
-# unzip each zip file in directory
-echo "Unzipping every archive in $maindir..."
+# parse_args <args...> -> sets OUTDIR/CLEAN/MAINDIR; echoes "OUTDIR|CLEAN|MAINDIR".
+parse_args() {
+    OUTDIR="./pdfs"; CLEAN=0; MAINDIR=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) MAINDIR="__help__"; shift ;;
+            -o) OUTDIR="${2:?}"; shift 2 ;;
+            --clean) CLEAN=1; shift ;;
+            --) shift; [[ $# -gt 0 ]] && { MAINDIR="$1"; shift; }; break ;;
+            -*) die "unknown option: $1" ;;
+            *) MAINDIR="$1"; shift ;;
+        esac
+    done
+    printf '%s|%s|%s' "$OUTDIR" "$CLEAN" "$MAINDIR"
+}
 
-cd "$maindir"
+usage() {
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+}
 
-for zipf in *.zip; do
-  unar -q "$zipf" &
-done
+main() {
+    set -euo pipefail
+    parse_args "$@" >/dev/null
+    [[ "$MAINDIR" == "__help__" ]] && { usage; exit 0; }
+    [[ -n "$MAINDIR" ]] || { usage; exit 1; }
+    command -v unar >/dev/null 2>&1 || die "unar is required."
+    command -v img2pdf >/dev/null 2>&1 || die "img2pdf is required."
+    command -v file >/dev/null 2>&1 || die "file is required."
+    [[ -d "$MAINDIR" ]] || die "not a directory: $MAINDIR"
 
-# wait for all unzips to finish
-wait
+    mkdir -p "$OUTDIR"
 
-echo "Done unzipping"
+    # Unzip every archive (in parallel), then wait for all of them.
+    local -a pids=()
+    local z
+    for z in "$MAINDIR"/*.zip; do
+        [[ -e "$z" ]] || break
+        unar -q -o "$MAINDIR" "$z" &
+        pids+=("$!")
+    done
+    local pid
+    for pid in "${pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid"; done
 
-# convert all images in each directory to pdf
-echo "Converting directores to pdfs"
+    # One PDF per image subdirectory. --clean only removes a folder whose
+    # own PDF just succeeded; a failed conversion always keeps its source.
+    local ok=0 failed=0
+    local d
+    while IFS= read -r -d '' d; do
+        local -a images=()
+        local img
+        while IFS= read -r -d '' img; do
+            if file --mime-type -b "$img" | grep -q '^image/'; then images+=("$img"); fi
+        done < <(find "$d" -maxdepth 1 -type f -print0 | sort -z)
+        [[ ${#images[@]} -gt 0 ]] || continue
+        local name; name="$(basename "$d")"
+        printf 'pdf: %s -> %s/%s.pdf\n' "$d" "$OUTDIR" "$name"
+        if img2pdf "${images[@]}" -o "$OUTDIR/$name.pdf"; then
+            ok=$((ok + 1))
+            [[ "$CLEAN" -eq 1 ]] && rm -rf "$d"
+        else
+            printf 'WARN: img2pdf failed for %s\n' "$d" >&2
+            failed=$((failed + 1))
+        fi
+    done < <(find "$MAINDIR" -mindepth 1 -maxdepth 1 -type d -print0)
+    printf 'done: %d pdfs, %d failed\n' "$ok" "$failed"
+}
 
-dirs=$(find . -not -path '.' -not -path '..' -not -path './zips' -type d)
-pdfsdir="../../pdfs/$maindir/chapters"
-mkdir -p "$pdfsdir"
-
-for dirname in $dirs; do
-  { cd "$dirname"
-    images=$(find . -type f -print0 | xargs -0 file --mime-type | grep -F 'image/' | cut -d ':' -f 1 | sort)
-    img2pdf $images -o "../$pdfsdir/$dirname.pdf" || echo "$dirname"
-    cd ..
-  }
-done
-
-# wait for all pdf conversions to finish
-wait
-
-echo "Done converting all pdfs"
-
-# remove all directories
-echo "Removing all directories"
-for dirname in $dirs; do
-  rm -rf $dirname &
-done
-
-wait
-
-echo "Done!"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
