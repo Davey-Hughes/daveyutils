@@ -22,8 +22,14 @@ pub struct Paths {
 /// so cannot be pinned, and an empty value that slips through is silent rather
 /// than loud -- `PathBuf::from("")` is a *relative* path, so every path derived
 /// from it resolves against the caller's working directory instead of failing.
-fn non_empty(p: Option<&Path>) -> Option<&Path> {
-    p.filter(|p| !p.as_os_str().is_empty())
+/// The XDG spec requires a *relative* value be ignored too ("must be absolute...
+/// otherwise consider the path invalid and ignore it"), and a relative one lands
+/// in exactly the same silent failure as an empty one: state and socket resolve
+/// against the caller's cwd, so scheduling from one directory and listing from
+/// another talk to different queues. `Path::new("").is_absolute()` is false, so
+/// this strictly subsumes the empty check.
+fn usable(p: Option<&Path>) -> Option<&Path> {
+    p.filter(|p| p.is_absolute())
 }
 
 /// Resolve paths from explicit inputs (pure; used by tests and `resolve`).
@@ -34,7 +40,7 @@ pub fn resolve_from(
     os: Os,
 ) -> Paths {
     let state_dir = match os {
-        Os::Linux => non_empty(xdg_state)
+        Os::Linux => usable(xdg_state)
             .map(Path::to_path_buf)
             .unwrap_or_else(|| home.join(".local/state"))
             .join("nudge"),
@@ -44,7 +50,7 @@ pub fn resolve_from(
     // The socket belongs in a runtime dir when one exists (Linux); otherwise it
     // lives beside the state file.
     let socket_dir = match os {
-        Os::Linux => non_empty(xdg_runtime)
+        Os::Linux => usable(xdg_runtime)
             .map(Path::to_path_buf)
             .unwrap_or_else(|| state_dir.clone()),
         Os::Macos => state_dir.clone(),
@@ -59,7 +65,7 @@ pub fn resolve_from(
 
 /// The user config dir: `$XDG_CONFIG_HOME`, else `<home>/.config`.
 pub fn config_dir(home: &Path, xdg_config: Option<&Path>) -> PathBuf {
-    non_empty(xdg_config)
+    usable(xdg_config)
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.join(".config"))
 }
@@ -136,6 +142,36 @@ mod tests {
         );
         // Empty == unset, so both must land exactly where the unset case does.
         assert_eq!(p, resolve_from(Path::new("/home/d"), None, None, Os::Linux));
+    }
+
+    #[test]
+    fn a_relative_xdg_var_means_unset_too() {
+        // The spec says the value "must be absolute... otherwise consider the
+        // path invalid and ignore it". A relative one is not merely invalid, it
+        // lands in the identical silent failure as the empty case: state and
+        // socket resolve against the caller's cwd. Filtering only the empty
+        // string leaves exactly that hole open on a rarer input.
+        let p = resolve_from(
+            Path::new("/home/d"),
+            Some(Path::new("state")),
+            Some(Path::new("run")),
+            Os::Linux,
+        );
+        assert!(
+            p.queue.is_absolute(),
+            "relative XDG_STATE_HOME must not yield a relative queue: {:?}",
+            p.queue
+        );
+        assert!(
+            p.socket.is_absolute(),
+            "relative XDG_RUNTIME_DIR must not yield a relative socket: {:?}",
+            p.socket
+        );
+        assert_eq!(p, resolve_from(Path::new("/home/d"), None, None, Os::Linux));
+        assert_eq!(
+            config_dir(Path::new("/home/d"), Some(Path::new("cfg"))),
+            Path::new("/home/d/.config"),
+        );
     }
 
     #[test]

@@ -14,7 +14,10 @@ if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
     echo "Usage: cue2flac <file.cue> [output_dir] [-t <tracklist>]"
     echo
     echo "Extracts audio tracks from a CUE/BIN disc image into FLAC files."
-    echo "Data tracks (MODE1/MODE2) are skipped."
+    echo "Data tracks (MODE1/MODE2) are skipped. On a mixed-mode disc the two"
+    echo "numbers legitimately differ: filenames keep the disc track number,"
+    echo "while tags number the audio programme (so track 2 of the disc can be"
+    echo "'02 - Opening.flac' tagged 1/3)."
     echo
     echo "  output_dir      Directory for output files (default: current directory)"
     echo "  -t <tracklist>  Track names as a multi-line string (paste from VGMdb etc.)"

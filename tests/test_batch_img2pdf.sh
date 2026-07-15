@@ -20,12 +20,19 @@ source "$HERE/../scripts/batch_img2pdf"
 # the idiom in the source instead.
 #
 # Each guarded occurrence contains exactly one bare occurrence as a substring,
-# so the unguarded count is simply (all - guarded). Full-line comments are
-# dropped first: the scripts' own comments explain the fix by NAMING the bare
-# form, and prose is not an expansion.
+# so the unguarded count is simply (all - guarded). Comments are dropped first:
+# the scripts' own comments explain the fix by NAMING the bare form, and prose
+# is not an expansion.
+#
+# Trailing comments are stripped only from a `#` that follows whitespace. The
+# obvious `s/#.*$//` is worse than the bug it fixes: `${#pids[@]}` contains a
+# `#`, so stripping from any `#` truncates real code and can hide a bare
+# expansion later on the line -- trading a false positive (loud, safe) for a
+# false negative (silent, unsafe). `${#` is preceded by `{`, never whitespace,
+# so the anchored form leaves it alone.
 nounset_unsafe_expansions() {
     local file="$1" arr="$2" code all guarded
-    code=$(sed 's/^[[:space:]]*#.*$//' "$file")
+    code=$(sed -e 's/^[[:space:]]*#.*$//' -e 's/[[:space:]]#.*$//' "$file")
     all=$(printf '%s\n' "$code" | grep -o -F "\${$arr[@]}" | wc -l | tr -d ' ')
     guarded=$(printf '%s\n' "$code" | grep -o -F "\${$arr[@]+\"\${$arr[@]}\"}" | wc -l | tr -d ' ')
     printf '%s' "$(( all - guarded ))"
