@@ -1,1 +1,4 @@
 tags
+
+# `make` collects every runnable utility here; put it on your PATH.
+bin/
