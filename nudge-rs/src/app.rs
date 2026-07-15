@@ -338,9 +338,13 @@ fn live_socket() -> anyhow::Result<std::path::PathBuf> {
     Ok(paths.socket)
 }
 
-/// List pending jobs (interactive picker lands in Task 6; both modes print
-/// the table for now).
-pub fn list(_plain: bool) -> anyhow::Result<()> {
+/// List pending jobs.
+///
+/// Takes no `plain` flag on purpose: it had one, ignored it, and the help text
+/// promised an interactive `--list` on the strength of it. There is one
+/// renderer; when a picker lands, that is when this grows a parameter that
+/// means something.
+pub fn list() -> anyhow::Result<()> {
     match request(&live_socket()?, &Request::List)? {
         Response::Jobs(jobs) => {
             print!("{}", format_jobs(&jobs));
@@ -499,7 +503,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
         return edit(id, &cli);
     }
     if cli.list || cli.list_plain {
-        return list(cli.list_plain);
+        return list();
     }
     schedule(&cli)
 }
