@@ -36,6 +36,24 @@ purge() {
 }
 trap 'purge; rm -f "$PRELUDE"' EXIT
 
+# Decide skippability by probing `at` DIRECTLY -- never through nudge. Grepping
+# nudge's own output for "Job ID: N" could not tell an unusable `at` from a
+# REGRESSED nudge: any break in at_pipe, at_schedule_epoch, finalize_schedule's
+# success message, -q handling or the -p/-m/-i/-n parse branches emptied the grep
+# and silently disabled this entire file, exit 0, suite still "PASSED".
+#
+# The payload is `true` and we remove it immediately, so it's harmless even where
+# BSD `at` drops the relative offset and schedules it for ~now. remember_id backs
+# up the atrm in case the latter fails, so the EXIT trap still reaps it.
+probe_id=$(echo true | at -q "$AT_QUEUE" now + 2 hours 2>&1 \
+    | grep -oE 'job [0-9]+' | grep -oE '[0-9]+')
+remember_id "$probe_id"
+if [ -z "$probe_id" ]; then
+    echo "  SKIP: environment can't queue an 'at' job"
+    exit 0
+fi
+atrm "$probe_id" 2>/dev/null
+
 # Schedule one job; echo its numeric id (empty if scheduling failed).
 schedule() { "$NUDGE" "$@" 2>/dev/null | grep -oE 'Job ID: [0-9]+' | grep -oE '[0-9]+'; }
 
@@ -43,9 +61,13 @@ FAKE_PANE="e2e:0.0"
 ID=$(schedule -p "$FAKE_PANE" -m '23:59' -i 'msg one' -i "it's two" -n)
 remember_id "$ID"
 
+# `at` demonstrably works here, so an empty ID is a REAL nudge regression rather
+# than an unusable environment: report it as a failure instead of excusing it.
+check "schedule: nudge queued a job and reported its id" "yes" \
+    "$([ -n "$ID" ] && echo yes || echo no)"
 if [ -z "$ID" ]; then
-    echo "  SKIP: environment can't queue an 'at' job (no id returned)"
-    exit 0
+    echo "  (every check below needs that job; aborting this file)"
+    finish   # terminates non-zero: the check above already recorded the failure
 fi
 
 # --- --list-plain: real atq -> our row parser (the macOS-format check) ---------
