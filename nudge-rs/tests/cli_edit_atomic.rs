@@ -18,6 +18,8 @@
 //! Relying on the stand-in alone would mean a real daemon, spawned into a
 //! tempdir that is then deleted, running forever on the developer's machine.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -59,6 +61,8 @@ fn job() -> nudge::job::Job {
         auto_retry: false,
         retries_left: 0,
         settle_secs: 5.0,
+        verify_fingerprint: None,
+        verify_dims: None,
     }
     .into_job(1)
 }
@@ -109,9 +113,14 @@ fn recording_daemon(socket: &Path) -> Arc<Mutex<Vec<String>>> {
 
 #[test]
 fn edit_mutates_the_queue_in_one_atomic_request() {
-    let tmp = tempfile::tempdir().unwrap();
+    // common::short_tempdir, not tempfile::tempdir: this test binds a real
+    // socket under a HOME rooted at the tempdir, and macOS's $TMPDIR is long
+    // enough that resolve_from's "Library/Application Support/nudge" suffix
+    // overflows SUN_LEN there.
+    let tmp = common::short_tempdir();
     let home = tmp.path();
     let paths = child_paths(home);
+    common::assert_socket_path_fits(&paths.socket);
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     std::fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
 

@@ -111,11 +111,14 @@ pub fn run(
                 dur_ext.as_deref(),
             );
             match &outcome {
-                Ok(o) => tracing::info!("nudge: fired job {} -> {:?}", job.id, o),
+                // Not "fired": two of the three outcomes deliberately send
+                // nothing, and a log that calls a skip a fire is how you spend
+                // an evening looking for an injection that never happened.
+                Ok(o) => tracing::info!("nudge: job {} -> {:?}", job.id, o),
                 Err(e) => tracing::warn!("nudge: job {} failed: {e}", job.id),
             }
-            if should_notify(job, &outcome) {
-                crate::notify::send(&format!("nudge fired for {}", describe_pane(job)));
+            if let Some(body) = notification(job, &outcome) {
+                crate::notify::send(&body);
             }
             let retry_secs = job.settle_secs.max(MIN_RETRY_SECS);
             let retry_at = now
@@ -144,18 +147,45 @@ fn describe_pane(job: &crate::job::Job) -> String {
     }
 }
 
-/// Whether firing `job` with this `outcome` warrants a desktop notification:
-/// only when the user asked for one AND a message was actually sent.
-pub fn should_notify(
+/// What to tell the user about firing `job`, or `None` for nothing.
+///
+/// `--notify` is still the opt-in, but it no longer means "tell me only when a
+/// message went out". A `--verify` skip used to be silent, and silence is
+/// indistinguishable from nudge never having run — which is precisely the
+/// failure the recency design exists to prevent, so it is the outcome that most
+/// needs saying out loud. Each skip names its own reason, because they have
+/// different remedies: "the banner is gone" means the session came back on its
+/// own and there was nothing to do; "the pane changed" means you resumed it
+/// yourself, and is also the sentence that explains an unexpected skip.
+///
+/// An `Err` stays silent: it is logged at warn, it may still be retried, and a
+/// notification would announce a job as finished when it is not.
+pub fn notification(
     job: &crate::job::Job,
     outcome: &anyhow::Result<crate::inject::InjectOutcome>,
-) -> bool {
-    job.notify && matches!(outcome, Ok(crate::inject::InjectOutcome::Sent(_)))
+) -> Option<String> {
+    use crate::inject::InjectOutcome::*;
+    if !job.notify {
+        return None;
+    }
+    let pane = describe_pane(job);
+    match outcome {
+        Ok(Sent(_)) => Some(format!("nudge fired for {pane}")),
+        Ok(SkippedNoBanner) => Some(format!(
+            "nudge skipped {pane}: the rate-limit banner is gone, so the session had \
+             already resumed"
+        )),
+        Ok(SkippedResumed) => Some(format!(
+            "nudge skipped {pane}: the pane changed since you scheduled, so you had \
+             already resumed this session"
+        )),
+        Err(_) => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::should_notify;
+    use super::notification;
     use crate::inject::InjectOutcome;
     use crate::job::{JobSpec, TargetSpec};
 
@@ -170,18 +200,68 @@ mod tests {
             auto_retry: false,
             retries_left: 0,
             settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
         }
         .into_job(1)
     }
 
     #[test]
-    fn notifies_only_on_sent_when_opted_in() {
-        assert!(should_notify(&job(true), &Ok(InjectOutcome::Sent(1))));
-        assert!(!should_notify(
-            &job(true),
-            &Ok(InjectOutcome::SkippedVerify)
-        ));
-        assert!(!should_notify(&job(false), &Ok(InjectOutcome::Sent(1))));
-        assert!(!should_notify(&job(true), &Err(anyhow::anyhow!("boom"))));
+    fn notifies_on_sent_when_opted_in_and_never_when_not() {
+        assert!(notification(&job(true), &Ok(InjectOutcome::Sent(1)))
+            .unwrap()
+            .contains("fired"));
+        assert_eq!(notification(&job(false), &Ok(InjectOutcome::Sent(1))), None);
+        assert_eq!(
+            notification(&job(false), &Ok(InjectOutcome::SkippedResumed)),
+            None,
+            "--notify is still the opt-in: a skip does not create a notification \
+             the user never asked for"
+        );
+    }
+
+    /// A skip used to be silent. That is indistinguishable, from the outside,
+    /// from nudge never having run -- which is the failure this whole design is
+    /// built to avoid, so it is the one outcome that most needs saying out loud.
+    #[test]
+    fn a_skip_is_reported_and_names_which_skip_it_was() {
+        let banner = notification(&job(true), &Ok(InjectOutcome::SkippedNoBanner)).expect(
+            "a skip must be visible: silence here reads exactly like the nudge \
+             never firing at all",
+        );
+        let resumed = notification(&job(true), &Ok(InjectOutcome::SkippedResumed)).expect(
+            "a skip must be visible: silence here reads exactly like the nudge \
+             never firing at all",
+        );
+
+        for msg in [&banner, &resumed] {
+            assert!(msg.contains("skipped"), "must say it skipped: {msg}");
+            assert!(msg.contains('p'), "must name the pane: {msg}");
+        }
+        assert_ne!(
+            banner, resumed,
+            "the two skips have different remedies -- 'the banner was gone' means the \
+             session came back on its own, 'the pane changed' means you touched it -- \
+             so a user staring at a nudge that did not fire must be able to tell them apart"
+        );
+        assert!(
+            resumed.contains("resumed") || resumed.contains("changed"),
+            "the resumed skip must say why: {resumed}"
+        );
+        assert!(
+            banner.contains("banner"),
+            "the no-banner skip must say why: {banner}"
+        );
+    }
+
+    /// An error is not a skip. It is already logged at warn, it may still be
+    /// retried, and dressing it up as a notification would tell the user the job
+    /// is finished when it is not.
+    #[test]
+    fn a_failure_is_not_notified() {
+        assert_eq!(
+            notification(&job(true), &Err(anyhow::anyhow!("boom"))),
+            None
+        );
     }
 }

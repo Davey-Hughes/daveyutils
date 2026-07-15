@@ -6,7 +6,19 @@ use crate::config::{env_bool, resolve, FlagOverrides, Toggles};
 
 /// nudge — inject messages into a tmux pane at a rate-limit reset.
 #[derive(Parser, Debug, Default)]
-#[command(name = "nudge", version, about)]
+#[command(
+    name = "nudge",
+    version,
+    about,
+    after_help = "Jobs are run by a resident daemon, started automatically on \
+first use. What it did with a job -- fired, or skipped because you had already \
+resumed the pane -- is reported in:\n    \
+<state dir>/nudge.log\n\
+where <state dir> is $XDG_STATE_HOME/nudge (default ~/.local/state/nudge) on \
+Linux, or ~/Library/Application Support/nudge on macOS. That is the place to \
+look when a nudge did not fire and you want to know why. Use --notify to be \
+told at the time instead."
+)]
 pub struct Cli {
     /// Target tmux pane (e.g. bot:0.1). Prompts interactively if omitted.
     #[arg(short, long)]
@@ -42,7 +54,7 @@ pub struct Cli {
     #[arg(short = 'r', long = "retries")]
     pub retries: Option<i64>,
 
-    /// Before injecting, confirm the pane still shows a rate-limit banner; skip the send if not.
+    /// Don't inject if you already resumed: skip unless the pane is untouched since scheduling and still shows a rate-limit banner.
     #[arg(short = 'v', long = "verify")]
     pub verify: bool,
     /// Disable verification (overrides NUDGE_VERIFY).
