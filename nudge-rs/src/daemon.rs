@@ -23,6 +23,30 @@ pub fn init_tracing() {
         .try_init();
 }
 
+/// Take the daemon singleton lock: an exclusive, non-blocking advisory lock on
+/// `<state_dir>/nudge.lock`. The returned File MUST be held for the daemon's
+/// lifetime — dropping it releases the lock. The OS releases it automatically if
+/// the process dies, so a crashed daemon never wedges the next one.
+pub fn acquire_singleton_lock(state_dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use fs4::fs_std::FileExt;
+    std::fs::create_dir_all(state_dir)?;
+    let path = state_dir.join("nudge.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    let acquired = file.try_lock_exclusive()?;
+    if !acquired {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!("another nudge daemon already holds {}", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
 /// Run the daemon forever: IPC server thread + scheduler loop.
 ///
 /// Call [`init_tracing`] first if you want the daemon's logs.
@@ -32,6 +56,13 @@ pub fn run(
     dur_ext: Option<String>,
     grace: Span,
 ) -> std::io::Result<()> {
+    // Refuse to start a second daemon: two schedulers on one queue.json double-fire
+    // jobs and clobber each other's state.
+    let _lock = acquire_singleton_lock(&paths.state_dir).map_err(|e| {
+        tracing::error!("nudge: not starting: {e}");
+        e
+    })?;
+
     let queue = Arc::new(Mutex::new(Queue::load(paths.queue.clone())?));
 
     // IPC server on its own thread.

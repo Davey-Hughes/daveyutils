@@ -85,7 +85,11 @@ impl Queue {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = self.path.with_extension("json.tmp");
+        // Process-unique: two daemons sharing one temp name can truncate each
+        // other mid-write and publish a corrupt queue.
+        let tmp = self
+            .path
+            .with_extension(format!("json.{}.tmp", std::process::id()));
         {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(&serde_json::to_vec_pretty(&self.state)?)?;
@@ -165,5 +169,30 @@ mod tests {
         let job = q2.get(id).unwrap();
         assert_eq!(job.fire_at, new_ts);
         assert_eq!(job.retries_left, 1);
+    }
+
+    #[test]
+    fn save_uses_a_process_unique_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.json");
+        let mut q = Queue::load(path.clone()).unwrap();
+        q.add(spec()).unwrap();
+        // The old fixed sibling name must not be what we write: two daemons
+        // sharing `q.json.tmp` could truncate each other mid-write.
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the fixed shared temp name must not be left behind"
+        );
+        // And no temp files should survive a successful save.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 }
