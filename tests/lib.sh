@@ -9,25 +9,8 @@
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 NUDGE="$HERE/../scripts/nudge"
 
-PASS=0
-FAIL=0
-
-# check <description> <expected> <actual>
-check() {
-    if [ "$2" = "$3" ]; then
-        printf '  ok  : %s\n' "$1"
-        PASS=$((PASS + 1))
-    else
-        printf '  FAIL: %s\n        expected [%s]\n        actual   [%s]\n' "$1" "$2" "$3"
-        FAIL=$((FAIL + 1))
-    fi
-}
-
-# Print the tally and return non-zero if anything failed.
-finish() {
-    printf '\n== %d passed, %d failed ==\n' "$PASS" "$FAIL"
-    [ "$FAIL" -eq 0 ]
-}
+# shellcheck disable=SC1091
+source "$HERE/assert.sh"
 
 # Extract the script's top matter -- tool resolution, helper functions, the
 # env-var default block, and argument parsing -- but WITHOUT the tmux/at

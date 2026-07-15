@@ -1,25 +1,90 @@
-#!/bin/zsh
+#!/usr/bin/env bash
+#
+# bisect_img - split landscape-orientation JPEGs into left/right halves.
+#
+# Usage: bisect_img [-o OUTDIR] [DIR]
+#   DIR        directory to search recursively for *.jpg (default: .)
+#   -o OUTDIR  directory to write output into (default: .)
+#
+# Each landscape image (width > height) is split into two files, flattened
+# into OUTDIR (so the parent directory name disambiguates same-named
+# images from different source directories):
+#   <parent>_<name>-1.jpg (left half) and <parent>_<name>-2.jpg (right half).
+# Requires: ImageMagick (magick or convert)
 
-### Bisect landscape orientation images and save both files
+die() { printf '%s\n' "$*" >&2; exit 1; }
 
-find . -name '*.jpg' -print0 | while read -d $'\0' f; do
-  out="$(basename "$(dirname $f)")_"$(basename $f)""
-  out="${out%.*}"
-  aspect="$(convert $f -format '%[fx:w/h]' info:)"
-  if [[ $aspect -gt 1 ]]; then
-    # cp "$f" "./$out-base.jpg"
-    imgformat="$(convert $f -format '%m' info:)"
+# is_landscape <aspect-float> -> 0 (true) if aspect > 1, 1 (false) otherwise.
+# Uses awk for the float comparison; `[[ $aspect -gt 1 ]]` only supports
+# integers and silently mis-evaluates values like 1.33.
+is_landscape() {
+    awk -v a="$1" 'BEGIN { exit !(a > 1) }'
+}
 
-    # if [[ $imgformat == "JPEG" ]]; then
-    if [[ "1" == "2" ]]; then
-      width="$(convert $f -format '%[fx:w]' info:)"
-      leftwidth=$(( width / 2 ))
-      rightwidth=$(( width - leftwidth ))
-      sem -j+0 "$(jpegtran -perfect -crop $leftwidth -outfile "$out-1.jpg" "$f" && jpegtran -perfect -crop $rightwidth+$leftwidth -outfile "$out-0.jpg" "$f")"
+# out_prefix <path/to/image.jpg> -> "<parentdir>_<basename-without-ext>"
+# Output is flattened into one directory, so the parent name disambiguates.
+out_prefix() {
+    printf '%s_%s' "$(basename "$(dirname "$1")")" "$(basename "${1%.*}")"
+}
 
-    else
-      sem -j+0 "$(convert -crop 50%x100% +repage -quality 100 "$f" "$out-%d.jpg" && mv "$out-0.jpg" "$out-2.jpg")"
-    fi
+# The ImageMagick CLI: prefer `magick`, fall back to legacy `convert`.
+_im() {
+    if command -v magick >/dev/null 2>&1; then magick "$@"; else convert "$@"; fi
+}
 
-  fi
-done
+usage() {
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+    set -euo pipefail
+    local dir="." outdir="."
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            -o)
+                [[ $# -ge 2 ]] || die "-o requires an argument"
+                outdir="$2"
+                shift 2
+                ;;
+            --) shift; [[ $# -gt 0 ]] && { dir="$1"; shift; }; break ;;
+            -*) die "unknown option: $1" ;;
+            *) dir="$1"; shift ;;
+        esac
+    done
+    command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1 \
+        || die "ImageMagick is required (magick or convert)."
+    [[ -d "$dir" ]] || die "not a directory: $dir"
+    mkdir -p "$outdir"
+
+    local ok=0 failed=0
+    while IFS= read -r -d '' f; do
+        local aspect out
+        aspect="$(_im "$f" -format '%[fx:w/h]' info: 2>/dev/null)" || {
+            printf 'WARN: could not read %s\n' "$f" >&2
+            failed=$((failed + 1))
+            continue
+        }
+        is_landscape "$aspect" || continue
+
+        out="$outdir/$(out_prefix "$f")"
+        printf 'bisect %s\n' "$f"
+        if ! _im "$f" -crop '50%x100%' +repage -quality 100 "${out}-%d.jpg"; then
+            printf 'WARN: crop failed for %s\n' "$f" >&2
+            failed=$((failed + 1))
+            continue
+        fi
+        # ImageMagick numbers the two crops 0 (left half) and 1 (right
+        # half); rename to -1.jpg (left) / -2.jpg (right). Move the
+        # higher-numbered file out of the way first so the -0 -> -1 rename
+        # below can't clobber it.
+        [[ -f "${out}-1.jpg" ]] && mv "${out}-1.jpg" "${out}-2.jpg"
+        [[ -f "${out}-0.jpg" ]] && mv "${out}-0.jpg" "${out}-1.jpg"
+        ok=$((ok + 1))
+    done < <(find "$dir" -iname '*.jpg' -print0)
+    printf 'done: %d bisected, %d failed\n' "$ok" "$failed"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
