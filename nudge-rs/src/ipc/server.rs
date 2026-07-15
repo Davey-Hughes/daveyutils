@@ -180,7 +180,15 @@ fn handle_conn(stream: &UnixStream, queue: &Mutex<Queue>) -> std::io::Result<()>
         None => return Ok(()),
     };
     let resp: Response = {
-        let mut q = queue.lock().expect("queue mutex poisoned");
+        // Tolerate poison, as daemon.rs does at all four of its lock sites: the
+        // state behind this lock is a queue of real jobs that will fire, and a
+        // thread that panicked while holding it does not make them less real.
+        // Refusing here is worse than useless -- the worker panics, so `serve`
+        // accepts every connection and answers none, and never returns, so the
+        // fatal exit that would replace this daemon never runs. The user gets a
+        // daemon that fires jobs, cannot be listed or cancelled, and cannot be
+        // superseded (the singleton lock is doing its job).
+        let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
         handle_request(req, &mut q)
     };
     write_msg(&mut &*stream, &resp)
@@ -225,18 +233,29 @@ mod tests {
         resp.trim().to_string()
     }
 
-    fn serving(
+    /// Serve `queue` on a socket under `dir`, and wait until it is bound.
+    fn serve_on(
+        dir: &Path,
+        queue: Arc<Mutex<Queue>>,
         builder: impl Fn() -> std::thread::Builder + Send + 'static,
         max_workers: usize,
-    ) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("nudge.sock");
-        let queue = Arc::new(Mutex::new(Queue::load(dir.path().join("q.json")).unwrap()));
+    ) -> std::path::PathBuf {
+        let socket = dir.join("nudge.sock");
         let s = socket.clone();
         std::thread::spawn(move || {
             let _ = serve_with(&s, queue, builder, max_workers);
         });
         wait_until(|| socket.exists(), "the socket to be bound");
+        socket
+    }
+
+    fn serving(
+        builder: impl Fn() -> std::thread::Builder + Send + 'static,
+        max_workers: usize,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Arc::new(Mutex::new(Queue::load(dir.path().join("q.json")).unwrap()));
+        let socket = serve_on(dir.path(), queue, builder, max_workers);
         (dir, socket)
     }
 
@@ -289,6 +308,42 @@ mod tests {
             spawned.load(Ordering::SeqCst),
             1,
             "the worker cap must bound threads in flight"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_queue_mutex_still_gets_answered() {
+        // Poisoning is not hypothetical: any panic under the queue lock does
+        // it, and it is permanent. `daemon::run` tolerates it at all four of
+        // its own lock sites for exactly that reason -- the state behind the
+        // lock is a queue of jobs, and a panicking thread does not make those
+        // jobs any less real.
+        //
+        // Refusing it HERE was the worst place to do it: the worker panics, so
+        // `serve` accepts every connection and answers none -- and never
+        // returns, so daemon.rs's fatal exit never fires. Ping times out, the
+        // CLI reports no daemon, `ensure_daemon` spawns a second one, that one
+        // loses the singleton lock, and the user gets `daemon did not come up`
+        // forever with a daemon still firing jobs at them.
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Arc::new(Mutex::new(Queue::load(dir.path().join("q.json")).unwrap()));
+
+        let q = Arc::clone(&queue);
+        let _ = std::thread::spawn(move || {
+            let _guard = q.lock().unwrap();
+            panic!("poisoning the queue mutex (this panic is the test's fixture)");
+        })
+        .join();
+        assert!(
+            queue.is_poisoned(),
+            "the fixture must actually poison the mutex"
+        );
+
+        let socket = serve_on(dir.path(), queue, worker_builder, MAX_WORKERS);
+        assert_eq!(
+            round_trip(&socket, r#"{"op":"Ping"}"#),
+            pong(),
+            "a poisoned queue mutex must not cost the daemon its control plane"
         );
     }
 }
