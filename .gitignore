@@ -19,3 +19,8 @@ packaging/aur/*/*.log
 # makepkg clones this very repo to here. Left untracked it gets committed as a
 # stray gitlink -- a nested repo that breaks clones for everyone else.
 packaging/aur/nudge-git/daveyutils/
+
+# Specs, plans, and review findings. Kept on disk as a working record, but not
+# tracked -- they were purged from the history, and leaving them untracked would
+# let a routine `git add -A` put them straight back.
+docs/
