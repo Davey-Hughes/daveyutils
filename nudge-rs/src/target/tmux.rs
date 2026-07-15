@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use std::process::{Command, Output};
 
-use super::Target;
+use super::{PaneDims, Target};
 
 /// A specific tmux pane, addressed by tmux's target syntax (e.g. "bot:0.1").
 /// An optional server socket (`tmux -L <socket>`) supports non-default servers
@@ -60,5 +60,26 @@ impl Target for TmuxTarget {
         self.run(&["send-keys", "-t", &self.pane, "-l", "--", text])?;
         self.run(&["send-keys", "-t", &self.pane, "Enter"])?;
         Ok(())
+    }
+
+    /// Ask tmux for the pane's size rather than inferring it from the capture.
+    ///
+    /// The capture cannot answer this. Height is recoverable from the line
+    /// count, but width is invisible in the text — nothing in a capture
+    /// distinguishes an 80-column pane from a 200-column one holding the same
+    /// short lines. A width-only resize still reflows any wrapped line, so
+    /// deriving dims from the capture would miss exactly the resize that
+    /// changes the fingerprint, and skip. tmux knows; ask it.
+    fn dims(&self) -> Option<PaneDims> {
+        let out = self
+            .run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &self.pane,
+                "#{pane_width}x#{pane_height}",
+            ])
+            .ok()?;
+        PaneDims::parse(&String::from_utf8_lossy(&out.stdout))
     }
 }

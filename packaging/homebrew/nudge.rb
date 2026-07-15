@@ -5,7 +5,7 @@ class Nudge < Formula
   head "https://github.com/Davey-Hughes/daveyutils.git", branch: "main"
 
   # On the first tagged release, add:
-  #   url "https://github.com/Davey-Hughes/daveyutils/archive/refs/tags/nudge-v0.1.0.tar.gz"
+  #   url "https://github.com/Davey-Hughes/daveyutils/archive/refs/tags/nudge-v0.2.0.tar.gz"
   #   sha256 "..."
 
   depends_on "rust" => :build
