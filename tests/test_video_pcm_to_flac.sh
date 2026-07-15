@@ -15,6 +15,16 @@ check "flac->pcm selects flac stream" "-c:1 pcm_s16le" "$(select_streams "$csv2"
 
 check "output path joins show + input" "/out/MyShow/ep01.mkv" "$(output_path './ep01.mkv' /out MyShow)"
 
+# stream_metadata uses `local -n` (namerefs), which needs bash 4.3+; macOS
+# ships bash 3.2, where merely calling it errors out ("local: -n: invalid
+# option"). Skip the nameref-dependent checks below on old bash -- the
+# select_streams/output_path checks above are plain bash and still run.
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    printf '  skip: %s needs bash 4.3+ (namerefs); this is bash %s\n' "$(basename "$0")" "$BASH_VERSION"
+    finish
+    exit 0
+fi
+
 # stream_metadata populates a real array by nameref; a title containing
 # spaces must survive as a single argv element (not be word-split).
 csv3=$'1,pcm_s16le,Surround PCM 5.1\n2,aac,Stereo'

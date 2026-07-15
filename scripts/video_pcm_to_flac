@@ -16,7 +16,7 @@
 #       --flac-to-pcm      convert FLAC audio streams to pcm_s16le instead
 #                          of the default PCM -> FLAC direction
 #
-# Requires: fd, ffprobe, ffmpeg
+# Requires: fd, ffprobe, ffmpeg, bash 4.3+
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
@@ -80,6 +80,10 @@ usage() {
 
 main() {
     set -euo pipefail
+
+    if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+        die "requires bash 4.3+ (namerefs); this is bash $BASH_VERSION. macOS ships 3.2 — install a newer bash (brew install bash)."
+    fi
 
     local glob="*.mkv" outdir="./ffmpeg_output" max_files=""
     local dry_run=0 only_output=0 copy_first=0 flac_to_pcm=0
