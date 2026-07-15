@@ -1,7 +1,60 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# mkvpropedit_set_name - set each MKV's title tag from its filename.
+#
+# Usage: mkvpropedit_set_name [-d DELIM] [-f FIELD] [DIR]
+#   -d DELIM   split the basename on DELIM to pick the title (requires -f)
+#   -f FIELD   1-based field to use as the title
+#   DIR        directory to search recursively (default: .)
+#
+# With no -d/-f, the title is the basename without its .mkv extension.
+# Requires: mkvpropedit (mkvtoolnix)
 
-find . -iname "*.mkv" -print0 | while read -d $'\0' name; do
-  epname="$(basename "$(echo $name | cut -d'-' -f3 | awk '{$1=$1};1')" .mkv)";
-  echo $epname;
-  mkvpropedit "$name" -e info --set "title=$epname";
-done
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# derive_title <filename> [delim] [field]
+derive_title() {
+    local base="${1##*/}"
+    base="${base%.mkv}"
+    local delim="${2:-}" field="${3:-}" name="$base"
+    if [[ -n "$delim" && -n "$field" ]]; then
+        name="$(printf '%s' "$base" | cut -d"$delim" -f"$field")"
+    fi
+    # trim surrounding whitespace
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    printf '%s' "$name"
+}
+
+usage() {
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+    set -euo pipefail
+    local delim="" field="" dir="."
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            -d) delim="${2:-}"; shift 2 ;;
+            -f) field="${2:-}"; shift 2 ;;
+            --) shift; break ;;
+            -*) die "unknown option: $1" ;;
+            *) dir="$1"; shift ;;
+        esac
+    done
+    [[ -n "$delim" && -z "$field" ]] && die "-d requires -f"
+    command -v mkvpropedit >/dev/null 2>&1 || die "mkvpropedit is required (install mkvtoolnix)."
+    [[ -d "$dir" ]] || die "not a directory: $dir"
+
+    find "$dir" -iname '*.mkv' -print0 | while IFS= read -r -d '' f; do
+        local title
+        title="$(derive_title "$f" "$delim" "$field")"
+        printf '%s -> %s\n' "$f" "$title"
+        mkvpropedit "$f" -e info --set "title=$title"
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
