@@ -60,7 +60,9 @@ fn socket_roundtrip_schedule_list_cancel() {
 
     assert_eq!(
         one_shot(&listener, &socket, &queue, Request::Ping),
-        Response::Pong
+        Response::Pong {
+            version: nudge::VERSION.to_string()
+        }
     );
 
     match one_shot(&listener, &socket, &queue, Request::Schedule(spec())) {
