@@ -38,7 +38,7 @@ main() {
             -h|--help) usage; exit 0 ;;
             -d) delim="${2:-}"; shift 2 ;;
             -f) field="${2:-}"; shift 2 ;;
-            --) shift; break ;;
+            --) shift; [[ $# -gt 0 ]] && { dir="$1"; shift; }; break ;;
             -*) die "unknown option: $1" ;;
             *) dir="$1"; shift ;;
         esac
