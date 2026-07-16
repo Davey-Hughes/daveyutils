@@ -196,11 +196,15 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
 fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     let form = &model.form;
     let picker = form.picker.as_ref().unwrap();
-    // Preview on top (a fixed glimpse), the search + fuzzy list below it (grows,
-    // so it gets the room on a tall terminal).
+    // Preview on top grows to fill the space; the search + list below is sized to
+    // its content (search line + matches + 2 borders), capped at two-thirds so a
+    // short filtered list leaves no empty gap and a long list can't crowd out the
+    // preview. This keeps the two balanced as the match count changes.
+    let content_h = picker.matches.len().max(1) as u16 + 3;
+    let picker_h = content_h.min(area.height.saturating_mul(2) / 3).max(5);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(3)])
+        .constraints([Constraint::Min(5), Constraint::Length(picker_h)])
         .split(area);
     let preview_area = rows[0];
     let picker_area = rows[1];
@@ -413,10 +417,11 @@ mod tests {
         });
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();
-        // tabs row 0, body rows 1..18; the picker splits body into preview
-        // (rows 1..10) then the search+list block (border at row 11, "> cl"
-        // search line at row 12); x = left border(1) + "> "(2) + "cl"(2).
+        // The preview grows on top and the content-sized picker block sits at the
+        // bottom; the "> cl" search line lands on row 15 here. x = left border(1)
+        // + "> "(2) + "cl"(2) = 5. (Row tracks the layout; x is the contract.)
         let pos = term.get_cursor_position().unwrap();
-        assert_eq!((pos.x, pos.y), (5, 12), "cursor sits just after '> cl'");
+        assert_eq!(pos.x, 5, "cursor sits just after '> cl'");
+        assert_eq!(pos.y, 15, "on the picker's search line");
     }
 }
