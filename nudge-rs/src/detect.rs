@@ -102,13 +102,31 @@ enum Shape {
     Clock,
 }
 
-/// Returns the padded absolute reset time, or `None` if no banner is present.
+/// What `detect_reset` concluded about a pane.
+///
+/// `Option<Zoned>` cannot express the third outcome. A weekly banner whose reset
+/// day we cannot read is not "no banner" — reporting it as such prints `no
+/// rate-limit banner detected in <pane>`, blaming the pane for a gap in this
+/// parser. It is a distinct answer with a distinct remedy, so it gets a variant.
+#[derive(Debug)]
+pub enum Detection {
+    /// No rate-limit banner in the pane.
+    None,
+    /// A banner, and the padded absolute reset time it names.
+    Reset(Zoned),
+    /// A weekly banner whose reset day this parser does not understand.
+    /// Carries the offending text verbatim so the report *is* the bug capture.
+    Unreadable { banner: String, gap: String },
+}
+
+/// Returns the padded absolute reset time, or `Detection::None` if no banner is
+/// present.
 pub fn detect_reset(
     pane_text: &str,
     now: &Zoned,
     clock_ext: Option<&str>,
     dur_ext: Option<&str>,
-) -> Option<Zoned> {
+) -> Detection {
     let clean = strip_ansi_escapes::strip_str(pane_text);
 
     // A captured pane is chronological top-to-bottom, so the banner *lowest* on
@@ -144,7 +162,9 @@ pub fn detect_reset(
         };
         if let Some(token) = token {
             if let Ok(z) = parse_timespec(&token, now) {
-                return z.checked_add(PADDING_MINUTES.minutes()).ok();
+                if let Ok(padded) = z.checked_add(PADDING_MINUTES.minutes()) {
+                    return Detection::Reset(padded);
+                }
             }
         }
         // This banner carried no parseable countdown (a bare "quota reached"
@@ -152,7 +172,7 @@ pub fn detect_reset(
         // one up rather than giving up on the pane entirely.
     }
 
-    None
+    Detection::None
 }
 
 /// Extract the first "3pm" / "3:00 PM" / "14:30" token from the text.
@@ -186,10 +206,18 @@ mod tests {
             .unwrap()
     }
 
+    /// Unwrap a `Detection::Reset`, or fail naming what came back instead.
+    fn reset_of(d: Detection) -> jiff::Zoned {
+        match d {
+            Detection::Reset(z) => z,
+            other => panic!("expected Detection::Reset, got {other:?}"),
+        }
+    }
+
     #[test]
     fn detects_claude_clock_banner_with_padding() {
         let pane = "Approaching usage limit — current session resets 3:00pm";
-        let z = detect_reset(pane, &now(), None, None).unwrap();
+        let z = reset_of(detect_reset(pane, &now(), None, None));
         // 15:00 + 3 minutes padding.
         assert_eq!((z.hour(), z.minute()), (15, 3));
     }
@@ -197,7 +225,7 @@ mod tests {
     #[test]
     fn detects_agy_duration_banner_with_padding() {
         let pane = "quota reached. Resets in 1h30m";
-        let z = detect_reset(pane, &now(), None, None).unwrap();
+        let z = reset_of(detect_reset(pane, &now(), None, None));
         // now 10:00 + 1h30m + 3m padding = 11:33.
         assert_eq!((z.hour(), z.minute()), (11, 33));
     }
@@ -205,28 +233,40 @@ mod tests {
     #[test]
     fn duration_is_case_insensitive() {
         let pane = "QUOTA REACHED — RESETS IN 45M";
-        let z = detect_reset(pane, &now(), None, None).unwrap();
+        let z = reset_of(detect_reset(pane, &now(), None, None));
         assert_eq!((z.hour(), z.minute()), (10, 48));
     }
 
     #[test]
     fn ignores_ansi_colour_codes() {
         let pane = "\x1b[31mquota reached\x1b[0m Resets in 45m";
-        assert!(detect_reset(pane, &now(), None, None).is_some());
+        assert!(matches!(
+            detect_reset(pane, &now(), None, None),
+            Detection::Reset(_)
+        ));
     }
 
     #[test]
     fn custom_patterns_extend_detection() {
         let clock = "codex is rate limited — try again at 4pm";
-        assert!(detect_reset(clock, &now(), Some("rate limited"), None).is_some());
+        assert!(matches!(
+            detect_reset(clock, &now(), Some("rate limited"), None),
+            Detection::Reset(_)
+        ));
 
         let dur = "out of credits, back in 20m";
-        assert!(detect_reset(dur, &now(), None, Some("out of credits")).is_some());
+        assert!(matches!(
+            detect_reset(dur, &now(), None, Some("out of credits")),
+            Detection::Reset(_)
+        ));
     }
 
     #[test]
     fn no_banner_returns_none() {
-        assert!(detect_reset("all good here", &now(), None, None).is_none());
+        assert!(matches!(
+            detect_reset("all good here", &now(), None, None),
+            Detection::None
+        ));
     }
 
     #[test]
@@ -234,7 +274,7 @@ mod tests {
         // A scrollback line with a duration-shaped phrase ABOVE the real banner
         // must not hijack the reset time.
         let pane = "commit abc123 16 minutes ago\nquota reached. Resets in 45m";
-        let z = detect_reset(pane, &now(), None, None).unwrap();
+        let z = reset_of(detect_reset(pane, &now(), None, None));
         // now 10:00 + 45m + 3m padding = 10:48, NOT 10:00 + 16m + 3m.
         assert_eq!((z.hour(), z.minute()), (10, 48));
     }
@@ -244,7 +284,7 @@ mod tests {
         // A scrollback clock time ABOVE the real banner must not hijack the
         // reset time either.
         let pane = "started at 9:15\ncurrent session resets 3:00pm";
-        let z = detect_reset(pane, &now(), None, None).unwrap();
+        let z = reset_of(detect_reset(pane, &now(), None, None));
         // 15:00 + 3m padding = 15:03, NOT derived from the 9:15 scrollback time.
         assert_eq!((z.hour(), z.minute()), (15, 3));
     }
@@ -284,17 +324,27 @@ mod tests {
         // *and* on the daemon's scheduler thread, where a panic kills every
         // pending job.
         for bad in ["codex (", "*", "a[b"] {
-            let z = detect_reset("current session resets 3:00pm", &now(), Some(bad), None);
+            let z = reset_of(detect_reset(
+                "current session resets 3:00pm",
+                &now(),
+                Some(bad),
+                None,
+            ));
             assert_eq!(
-                z.map(|z| (z.hour(), z.minute())),
-                Some((15, 3)),
+                (z.hour(), z.minute()),
+                (15, 3),
                 "clock ext {bad:?} must fall back to the built-in banner"
             );
 
-            let d = detect_reset("quota reached. Resets in 45m", &now(), None, Some(bad));
+            let d = reset_of(detect_reset(
+                "quota reached. Resets in 45m",
+                &now(),
+                None,
+                Some(bad),
+            ));
             assert_eq!(
-                d.map(|z| (z.hour(), z.minute())),
-                Some((10, 48)),
+                (d.hour(), d.minute()),
+                (10, 48),
                 "duration ext {bad:?} must fall back to the built-in banner"
             );
         }
@@ -306,7 +356,7 @@ mod tests {
         // up the screen is superseded by the live 3h one below it.
         let pane =
             "quota reached. Resets in 45m\n... hours of work ...\nquota reached. Resets in 3h";
-        let z = detect_reset(pane, &now(), None, None).unwrap();
+        let z = reset_of(detect_reset(pane, &now(), None, None));
         // now 10:00 + 3h + 3m padding = 13:03, NOT the stale banner's 10:48.
         assert_eq!((z.hour(), z.minute()), (13, 3));
     }
@@ -317,7 +367,7 @@ mod tests {
         // screen, so it is the live one even though the duration branch used to
         // run first unconditionally.
         let pane = "quota reached. Resets in 45m\nlater output\ncurrent session resets 3:00pm";
-        let z = detect_reset(pane, &now(), None, None).unwrap();
+        let z = reset_of(detect_reset(pane, &now(), None, None));
         // 15:00 + 3m padding = 15:03, NOT the stale duration banner's 10:48.
         assert_eq!((z.hour(), z.minute()), (15, 3));
     }
@@ -327,8 +377,26 @@ mod tests {
         // The mirror case, so "last banner wins" is not accidentally satisfied
         // by simply flipping the hardcoded branch order.
         let pane = "current session resets 3:00pm\nlater output\nquota reached. Resets in 45m";
-        let z = detect_reset(pane, &now(), None, None).unwrap();
+        let z = reset_of(detect_reset(pane, &now(), None, None));
         // now 10:00 + 45m + 3m padding = 10:48, NOT the stale clock banner's 15:03.
         assert_eq!((z.hour(), z.minute()), (10, 48));
+    }
+
+    /// The enum's whole point: "no banner" and "a banner I can't read" are
+    /// different answers, and a caller must be able to tell them apart.
+    #[test]
+    fn detection_distinguishes_absent_from_unreadable() {
+        assert!(matches!(
+            detect_reset("all good here", &now(), None, None),
+            Detection::None
+        ));
+        assert!(matches!(
+            detect_reset("current session resets 3:00pm", &now(), None, None),
+            Detection::Reset(_)
+        ));
+        // The third answer, Detection::Unreadable, gets real coverage when the
+        // weekly shape lands and detect_reset actually produces it (Task 4). No
+        // production path constructs it yet, so asserting on a hand-built value
+        // here would only re-check the compiler; left to the shape that earns it.
     }
 }

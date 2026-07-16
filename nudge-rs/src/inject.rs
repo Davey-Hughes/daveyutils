@@ -82,7 +82,14 @@ pub fn run_injection(
             return Ok(InjectOutcome::SkippedResumed);
         }
 
-        if detect_reset(&screen, now, clock_ext, dur_ext).is_none() {
+        // Detection::Unreadable counts as banner-present, i.e. inject. Something
+        // limit-shaped is still on screen and we could not read its reset day;
+        // per this module's polarity, every ambiguity resolves toward inject,
+        // because a false skip is the nudge silently never firing.
+        if matches!(
+            detect_reset(&screen, now, clock_ext, dur_ext),
+            crate::detect::Detection::None
+        ) {
             return Ok(InjectOutcome::SkippedNoBanner);
         }
     }
