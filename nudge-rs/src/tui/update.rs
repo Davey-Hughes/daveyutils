@@ -203,6 +203,8 @@ fn enter_edit(model: &mut Model, job: &Job) {
         focus: FormField::Pane,
         mode: Mode::Editing(job.id),
         nav_mode: super::model::VimMode::Insert,
+        cursor: 0,
+        pending_op: None,
         carried: Some(CarriedEdit {
             fire_at: job.fire_at,
             messages: job.messages.clone(),
@@ -235,6 +237,15 @@ fn move_focus(form: &mut super::model::Form, delta: i32) {
     let n = FORM_ORDER.len() as i32;
     let next = (i + delta).rem_euclid(n) as usize;
     form.focus = FORM_ORDER[next];
+    // Land the edit cursor at the end of the new field's text (0 for non-text)
+    // and drop any half-typed operator — it doesn't carry across fields.
+    form.cursor = form.text_len();
+    // In Normal the cursor sits ON a char, so pull it back off the append slot;
+    // otherwise the first x/D/i after a field change is an off-by-one no-op.
+    if form.nav_mode == super::model::VimMode::Normal {
+        clamp_cursor_normal(form);
+    }
+    form.pending_op = None;
 }
 
 /// Change the focused field's value (←→ or h/l): cycle the selected pane or the
@@ -252,13 +263,10 @@ fn change_value(model: &mut Model, dir: i32) -> Vec<Effect> {
             capture_selected(&mut model.form, model.now)
         }
         FormField::When => {
-            let prev = model.form.when;
+            // The selector ring is Keep/Auto only — Manual is entered by typing,
+            // so change_value never reaches it (When-while-Manual is a text field
+            // where h/l move the cursor instead).
             model.form.when = cycle_when(model.form.when, dir, model.form.mode);
-            // Leaving Manual drops any typed time, so "manual_time is non-empty"
-            // always means Manual — the invariant the type/erase edits rely on.
-            if prev == WhenMode::Manual && model.form.when != WhenMode::Manual {
-                model.form.manual_time.clear();
-            }
             if model.form.when == WhenMode::Auto {
                 capture_selected(&mut model.form, model.now)
             } else {
@@ -270,107 +278,213 @@ fn change_value(model: &mut Model, dir: i32) -> Vec<Effect> {
 }
 
 /// Handle a key on the New-nudge form. Modal, vim-style: the form opens in
-/// `Insert` so typing edits the focused text field. Keys that mean the same in
-/// both modes — leaving the tab, arrow navigation, Space toggles, Enter — are
-/// handled first; the rest branch on `nav_mode`.
+/// `Insert`. On the text fields (message, When-while-Manual) the modes act as a
+/// vim line editor with a cursor; on the selector fields (pane, toggles,
+/// When-as-Auto/Keep) `h/l`/`←→` cycle the value. Keys that mean the same
+/// everywhere (leave the tab, ↑↓ fields, Enter) are handled first.
 fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
     use super::model::VimMode;
-    // Computed before any focus-changing arm runs; those arms all `return`, so
-    // focus is still the field the user is on when the mode match reads this.
-    // A field the user types into: the message, or the When field once it's in
-    // Manual (where typing edits the time inline).
-    let is_text = model.form.focus == FormField::Message
-        || (model.form.focus == FormField::When && model.form.when == WhenMode::Manual);
+    let text = model.form.focused_text().is_some();
 
-    // --- keys shared by Insert and Normal ---
+    // --- universal keys (both modes, any field) ---
+    // These leave the field (or the tab), so a half-typed operator is abandoned;
+    // Up/Down clear it via move_focus, the rest clear it here so a stale `d`
+    // can't eat the next keypress after a round-trip.
     match code {
         KeyCode::Tab => {
+            model.form.pending_op = None;
             model.tab = Tab::Jobs;
-            return vec![];
-        }
-        KeyCode::Down => {
-            move_focus(&mut model.form, 1);
             return vec![];
         }
         KeyCode::Up => {
             move_focus(&mut model.form, -1);
             return vec![];
         }
-        KeyCode::Left => return change_value(model, -1),
-        KeyCode::Right => return change_value(model, 1),
-        // Space toggles a flag field; on a text field it falls through so Insert
-        // can type a literal space into the message.
-        KeyCode::Char(' ')
-            if matches!(
-                model.form.focus,
-                FormField::Verify | FormField::Notify | FormField::AutoRetry
-            ) =>
-        {
-            match model.form.focus {
-                FormField::Verify => model.form.verify = !model.form.verify,
-                FormField::Notify => model.form.notify = !model.form.notify,
-                FormField::AutoRetry => model.form.auto_retry = !model.form.auto_retry,
-                _ => {}
-            }
+        KeyCode::Down => {
+            move_focus(&mut model.form, 1);
             return vec![];
         }
         // Enter opens the picker on the Pane field, otherwise schedules.
-        KeyCode::Enter if model.form.focus == FormField::Pane => return open_picker(model),
-        KeyCode::Enter => return submit(model),
+        KeyCode::Enter if model.form.focus == FormField::Pane => {
+            model.form.pending_op = None;
+            return open_picker(model);
+        }
+        KeyCode::Enter => {
+            model.form.pending_op = None;
+            return submit(model);
+        }
         _ => {}
     }
 
-    // --- mode-specific keys ---
     match model.form.nav_mode {
-        VimMode::Insert => match code {
-            // Esc drops to Normal — it does NOT leave the tab (that's Normal's Esc).
-            KeyCode::Esc => {
-                model.form.nav_mode = VimMode::Normal;
-                vec![]
-            }
-            KeyCode::Backspace => {
-                edit_text(&mut model.form, |s| {
-                    s.pop();
-                });
-                vec![]
-            }
-            // `/` opens the pane picker unless you're typing into a text field.
-            KeyCode::Char('/') if !is_text => open_picker(model),
-            KeyCode::Char(c) => {
-                edit_text(&mut model.form, |s| s.push(c));
-                vec![]
-            }
-            _ => vec![],
-        },
-        VimMode::Normal => match code {
-            KeyCode::Char('j') => {
-                move_focus(&mut model.form, 1);
-                vec![]
-            }
-            KeyCode::Char('k') => {
-                move_focus(&mut model.form, -1);
-                vec![]
-            }
-            KeyCode::Char('h') => change_value(model, -1),
-            KeyCode::Char('l') => change_value(model, 1),
-            // The usual vim ways back into Insert.
-            KeyCode::Char('i' | 'a' | 'A' | 'I') => {
-                model.form.nav_mode = VimMode::Insert;
-                vec![]
-            }
-            KeyCode::Char('/') => open_picker(model),
-            KeyCode::Char('q') => {
-                model.should_quit = true;
-                vec![]
-            }
-            // Esc from Normal leaves the form for the Jobs tab.
-            KeyCode::Esc => {
-                model.tab = Tab::Jobs;
-                vec![]
-            }
-            _ => vec![],
-        },
+        VimMode::Insert => insert_key(model, code, text),
+        VimMode::Normal => normal_key(model, code, text),
     }
+}
+
+/// Insert mode: type into the focused text field at the cursor. On selector
+/// fields, `←→` still cycle the value and Space toggles a flag.
+fn insert_key(model: &mut Model, code: KeyCode, text: bool) -> Vec<Effect> {
+    match code {
+        // Esc drops to Normal — it does NOT leave the tab (that's Normal's Esc).
+        // The cursor steps left onto a character, as vim does leaving insert.
+        KeyCode::Esc => {
+            model.form.nav_mode = super::model::VimMode::Normal;
+            clamp_cursor_normal(&mut model.form);
+            vec![]
+        }
+        KeyCode::Left if text => {
+            cursor_left(&mut model.form);
+            vec![]
+        }
+        KeyCode::Right if text => {
+            cursor_right_insert(&mut model.form);
+            vec![]
+        }
+        KeyCode::Left => change_value(model, -1),
+        KeyCode::Right => change_value(model, 1),
+        KeyCode::Backspace => {
+            backspace(&mut model.form);
+            vec![]
+        }
+        KeyCode::Char(' ') if is_flag(model.form.focus) => {
+            toggle_flag(&mut model.form);
+            vec![]
+        }
+        // `/` opens the pane picker unless you're typing into a text field.
+        KeyCode::Char('/') if !text => open_picker(model),
+        // Typing on the When field starts (or continues) the manual time: any
+        // text switches it out of Auto/Keep into Manual, at a fresh cursor.
+        KeyCode::Char(c) if model.form.focus == FormField::When => {
+            if model.form.when != WhenMode::Manual {
+                model.form.when = WhenMode::Manual;
+                model.form.cursor = 0;
+            }
+            insert_char(&mut model.form, c);
+            vec![]
+        }
+        KeyCode::Char(c) if text => {
+            insert_char(&mut model.form, c);
+            vec![]
+        }
+        _ => vec![],
+    }
+}
+
+/// Normal mode: vim motions/operators on a text field; value cycling on a
+/// selector field. `j/k` move between fields either way.
+fn normal_key(model: &mut Model, code: KeyCode, text: bool) -> Vec<Effect> {
+    // A pending operator (`d`/`c`) consumes this key as its motion.
+    if let Some(op) = model.form.pending_op.take() {
+        return apply_operator(model, op, code);
+    }
+    match code {
+        KeyCode::Char('j') => {
+            move_focus(&mut model.form, 1);
+            vec![]
+        }
+        KeyCode::Char('k') => {
+            move_focus(&mut model.form, -1);
+            vec![]
+        }
+        KeyCode::Char('i') => enter_insert(model, InsertAt::Here),
+        KeyCode::Char('a') => enter_insert(model, InsertAt::After),
+        KeyCode::Char('A') => enter_insert(model, InsertAt::End),
+        KeyCode::Char('I') => enter_insert(model, InsertAt::Start),
+        KeyCode::Char('/') => open_picker(model),
+        KeyCode::Char('q') => {
+            model.should_quit = true;
+            vec![]
+        }
+        // Esc from Normal leaves the form for the Jobs tab.
+        KeyCode::Esc => {
+            model.tab = Tab::Jobs;
+            vec![]
+        }
+        _ if text => normal_text_key(model, code),
+        _ => normal_selector_key(model, code),
+    }
+}
+
+/// Normal-mode keys on a text field: cursor motions, single-key deletes, and the
+/// `d`/`c` operators (which stash `pending_op` for the next key).
+fn normal_text_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
+    let chars: Vec<char> = model.form.focused_text().unwrap_or("").chars().collect();
+    let cur = model.form.cursor.min(chars.len());
+    match code {
+        KeyCode::Char('h') | KeyCode::Left => cursor_left(&mut model.form),
+        KeyCode::Char('l') | KeyCode::Right | KeyCode::Char(' ') => {
+            cursor_right_normal(&mut model.form)
+        }
+        KeyCode::Char('0') | KeyCode::Home => model.form.cursor = 0,
+        KeyCode::Char('$') | KeyCode::End => model.form.cursor = chars.len().saturating_sub(1),
+        KeyCode::Char('w') => {
+            model.form.cursor = next_word(&chars, cur).min(chars.len().saturating_sub(1))
+        }
+        KeyCode::Char('b') => model.form.cursor = prev_word(&chars, cur),
+        // x deletes the char under the cursor; D/C delete to end (C then inserts).
+        KeyCode::Char('x') => {
+            delete_char_range(&mut model.form, cur, cur + 1);
+            clamp_cursor_normal(&mut model.form);
+        }
+        KeyCode::Char('D') => {
+            delete_char_range(&mut model.form, cur, chars.len());
+            clamp_cursor_normal(&mut model.form);
+        }
+        KeyCode::Char('C') => {
+            delete_char_range(&mut model.form, cur, chars.len());
+            model.form.nav_mode = super::model::VimMode::Insert;
+        }
+        KeyCode::Char(c @ ('d' | 'c')) => model.form.pending_op = Some(c),
+        _ => {}
+    }
+    vec![]
+}
+
+/// Normal-mode keys on a selector field: cycle the value or toggle a flag.
+fn normal_selector_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
+    match code {
+        KeyCode::Char('h') | KeyCode::Left => change_value(model, -1),
+        KeyCode::Char('l') | KeyCode::Right => change_value(model, 1),
+        KeyCode::Char(' ') if is_flag(model.form.focus) => {
+            toggle_flag(&mut model.form);
+            vec![]
+        }
+        _ => vec![],
+    }
+}
+
+/// Complete a `d`/`c` operator with `code` as its motion. Deletes the motion's
+/// char range (whole line when the operator key repeats, e.g. `dd`); `c` then
+/// enters Insert. An unrecognized motion cancels the operator.
+fn apply_operator(model: &mut Model, op: char, code: KeyCode) -> Vec<Effect> {
+    let Some(text) = model.form.focused_text() else {
+        return vec![];
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let cur = model.form.cursor.min(n);
+    let range = match code {
+        // `dd` / `cc` — the whole line.
+        KeyCode::Char(c) if c == op => Some((0, n)),
+        KeyCode::Char('w') => Some((cur, next_word(&chars, cur))),
+        KeyCode::Char('b') => Some((prev_word(&chars, cur), cur)),
+        KeyCode::Char('0') | KeyCode::Home => Some((0, cur)),
+        KeyCode::Char('$') | KeyCode::End => Some((cur, n)),
+        KeyCode::Char('h') | KeyCode::Left => Some((cur.saturating_sub(1), cur)),
+        KeyCode::Char('l') | KeyCode::Right => Some((cur, (cur + 1).min(n))),
+        _ => None, // unrecognized motion cancels the operator
+    };
+    let Some((a, b)) = range else {
+        return vec![];
+    };
+    delete_char_range(&mut model.form, a, b);
+    if op == 'c' {
+        model.form.nav_mode = super::model::VimMode::Insert;
+    } else {
+        clamp_cursor_normal(&mut model.form);
+    }
+    vec![]
 }
 
 /// Emit a capture of the selected pane and mark the time, clearing the stale
@@ -501,44 +615,185 @@ fn picker_filter(model: &mut Model, edit: impl FnOnce(&mut String)) -> Vec<Effec
     }
 }
 
-/// Keep is only offered while editing; new nudges cycle Auto<->Manual only.
+/// The selector ring for the When field: Keep/Auto while editing, Auto alone for
+/// a new nudge. Manual is deliberately excluded — you enter it by typing a time
+/// (and leave it by erasing), so it is never reached by cycling.
 fn cycle_when(cur: WhenMode, dir: i32, mode: super::model::Mode) -> WhenMode {
     let opts: &[WhenMode] = match mode {
-        super::model::Mode::Editing(_) => &[WhenMode::Keep, WhenMode::Auto, WhenMode::Manual],
-        super::model::Mode::New => &[WhenMode::Auto, WhenMode::Manual],
+        super::model::Mode::Editing(_) => &[WhenMode::Keep, WhenMode::Auto],
+        super::model::Mode::New => &[WhenMode::Auto],
     };
     let i = opts.iter().position(|w| *w == cur).unwrap_or(0) as i32;
     opts[((i + dir).rem_euclid(opts.len() as i32)) as usize]
 }
 
-/// Apply `f` to whichever text buffer the focused field owns, if any.
-///
-/// Editing the When field's time keeps the mode in sync with the text: any text
-/// means Manual, empty means Auto — so typing a time overrides auto-detect and
-/// erasing it snaps back (`Keep` is reached only via the explicit `h/l` cycle).
-fn edit_text(form: &mut super::model::Form, f: impl FnOnce(&mut String)) {
+fn is_flag(f: FormField) -> bool {
+    matches!(
+        f,
+        FormField::Verify | FormField::Notify | FormField::AutoRetry
+    )
+}
+
+fn toggle_flag(form: &mut super::model::Form) {
     match form.focus {
-        FormField::When => {
-            // Sync the mode only when the buffer actually changed (the callers
-            // are push/pop, so a length change is a real edit). A no-op Backspace
-            // on an empty field must not silently flip Keep → Auto.
-            let before = form.manual_time.len();
-            f(&mut form.manual_time);
-            if form.manual_time.len() != before {
-                form.when = if form.manual_time.is_empty() {
-                    WhenMode::Auto
-                } else {
-                    WhenMode::Manual
-                };
-            }
-        }
+        FormField::Verify => form.verify = !form.verify,
+        FormField::Notify => form.notify = !form.notify,
+        FormField::AutoRetry => form.auto_retry = !form.auto_retry,
+        _ => {}
+    }
+}
+
+/// Where `i`/`a`/`A`/`I` place the cursor before entering Insert.
+enum InsertAt {
+    Here,
+    After,
+    End,
+    Start,
+}
+
+fn enter_insert(model: &mut Model, at: InsertAt) -> Vec<Effect> {
+    let len = model.form.text_len();
+    if model.form.focused_text().is_some() {
+        model.form.cursor = match at {
+            InsertAt::Here => model.form.cursor.min(len),
+            InsertAt::After => (model.form.cursor + 1).min(len),
+            InsertAt::End => len,
+            InsertAt::Start => 0,
+        };
+    }
+    model.form.nav_mode = super::model::VimMode::Insert;
+    vec![]
+}
+
+// --- text field editing (operates on the focused buffer + cursor) ---
+
+fn cursor_left(form: &mut super::model::Form) {
+    form.cursor = form.cursor.saturating_sub(1);
+}
+
+/// Insert mode lets the cursor sit one past the last char (append position).
+fn cursor_right_insert(form: &mut super::model::Form) {
+    form.cursor = (form.cursor + 1).min(form.text_len());
+}
+
+/// Normal mode keeps the cursor on a character (never past the last one).
+fn cursor_right_normal(form: &mut super::model::Form) {
+    form.cursor = (form.cursor + 1).min(form.text_len().saturating_sub(1));
+}
+
+/// Pull the cursor back onto a character (used when leaving Insert / after a
+/// delete): clamp to the last char, or 0 for an empty field.
+fn clamp_cursor_normal(form: &mut super::model::Form) {
+    form.cursor = form.cursor.min(form.text_len().saturating_sub(1));
+}
+
+/// Byte offset of char index `idx` in `s` (its length when `idx` is past the end).
+fn char_byte(s: &str, idx: usize) -> usize {
+    s.char_indices().nth(idx).map_or(s.len(), |(b, _)| b)
+}
+
+/// Apply `f` to (the focused text buffer, the cursor). Editing the When field's
+/// time keeps the mode in sync: empty means Auto, any text means Manual — so
+/// erasing a time snaps back to auto-detect. Callers only run this in a text
+/// context, so `Keep` (a selector state) is never touched here.
+fn edit_focused(form: &mut super::model::Form, f: impl FnOnce(&mut String, &mut usize)) {
+    match form.focus {
         FormField::Message => {
             if let MessageField::Editable(s) = &mut form.message {
-                f(s);
+                f(s, &mut form.cursor);
             }
+        }
+        FormField::When if form.when == WhenMode::Manual => {
+            f(&mut form.manual_time, &mut form.cursor);
+            form.when = if form.manual_time.is_empty() {
+                WhenMode::Auto
+            } else {
+                WhenMode::Manual
+            };
         }
         _ => {}
     }
+}
+
+fn insert_char(form: &mut super::model::Form, c: char) {
+    edit_focused(form, |s, cur| {
+        let at = char_byte(s, *cur);
+        s.insert(at, c);
+        *cur += 1;
+    });
+}
+
+fn backspace(form: &mut super::model::Form) {
+    edit_focused(form, |s, cur| {
+        if *cur > 0 {
+            let start = char_byte(s, *cur - 1);
+            let end = char_byte(s, *cur);
+            s.replace_range(start..end, "");
+            *cur -= 1;
+        }
+    });
+}
+
+/// Delete char range `[a, b)` from the focused buffer and leave the cursor at `a`.
+fn delete_char_range(form: &mut super::model::Form, a: usize, b: usize) {
+    edit_focused(form, |s, cur| {
+        let n = s.chars().count();
+        let (a, b) = (a.min(n), b.min(n));
+        if a < b {
+            let (ba, bb) = (char_byte(s, a), char_byte(s, b));
+            s.replace_range(ba..bb, "");
+        }
+        *cur = a;
+    });
+}
+
+/// vim word class: word chars (alphanumeric + `_`), whitespace, or punctuation.
+fn char_class(c: char) -> u8 {
+    if c.is_whitespace() {
+        0
+    } else if c.is_alphanumeric() || c == '_' {
+        1
+    } else {
+        2
+    }
+}
+
+/// Char index of the next word start (vim `w`): skip the current run, then spaces.
+fn next_word(chars: &[char], i: usize) -> usize {
+    let n = chars.len();
+    if i >= n {
+        return n;
+    }
+    let mut j = i;
+    let cls = char_class(chars[j]);
+    if cls != 0 {
+        while j < n && char_class(chars[j]) == cls {
+            j += 1;
+        }
+    }
+    while j < n && char_class(chars[j]) == 0 {
+        j += 1;
+    }
+    j
+}
+
+/// Char index of the previous word start (vim `b`): skip spaces back, then the run.
+fn prev_word(chars: &[char], i: usize) -> usize {
+    if i == 0 {
+        return 0;
+    }
+    let mut j = i - 1;
+    while j > 0 && char_class(chars[j]) == 0 {
+        j -= 1;
+    }
+    if char_class(chars[j]) == 0 {
+        return 0;
+    }
+    let cls = char_class(chars[j]);
+    while j > 0 && char_class(chars[j - 1]) == cls {
+        j -= 1;
+    }
+    j
 }
 
 fn submit(model: &mut Model) -> Vec<Effect> {
@@ -826,24 +1081,30 @@ mod tests {
         m.form.focus = FormField::When;
         m.form.when = WhenMode::Manual;
         m.form.manual_time = "in 90".into();
+        m.form.cursor = 5; // at the end
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(' ')));
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('m')));
         assert_eq!(m.form.manual_time, "in 90 m");
     }
 
     #[test]
-    fn cycling_off_manual_clears_the_typed_time() {
-        // New nudge: h/l toggles Auto ⇄ Manual; leaving Manual drops the text so
-        // "has text" always means Manual.
+    fn hl_move_the_cursor_within_a_manual_time() {
+        // When it's Manual, the When field is a text field: h/l move the cursor
+        // (they no longer cycle the mode), and inserts land at the cursor.
         let mut m = form_model();
         m.form.focus = FormField::When;
         m.form.when = WhenMode::Manual;
         m.form.manual_time = "3pm".into();
-        // Normal-mode `l` cycles the When mode (New: Auto ⇄ Manual).
+        m.form.cursor = 3;
         m.form.nav_mode = VimMode::Normal;
-        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('l')));
-        assert_eq!(m.form.when, WhenMode::Auto);
-        assert_eq!(m.form.manual_time, "", "leaving Manual clears the time");
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('h')));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('h')));
+        assert_eq!(m.form.cursor, 1, "h moves left, staying on a char");
+        assert_eq!(m.form.when, WhenMode::Manual, "h does not cycle the mode");
+        // Insert before the cursor: "3" | "pm" -> "3<X>pm".
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('i')));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('0')));
+        assert_eq!(m.form.manual_time, "30pm");
     }
 
     #[test]
@@ -852,6 +1113,196 @@ mod tests {
         m.form.focus = FormField::Verify;
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(' ')));
         assert!(m.form.verify);
+    }
+
+    /// A Normal-mode message field at a given cursor, for the vim-editing tests.
+    fn msg_normal(text: &str, cursor: usize) -> Model {
+        let mut m = form_model();
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable(text.into());
+        m.form.cursor = cursor;
+        m.form.nav_mode = VimMode::Normal;
+        m
+    }
+
+    fn press(m: &mut Model, c: char) {
+        update(m, Msg::Key(crossterm::event::KeyCode::Char(c)));
+    }
+
+    #[test]
+    fn normal_hl_0_dollar_move_the_cursor() {
+        let mut m = msg_normal("hello", 0);
+        press(&mut m, '$');
+        assert_eq!(m.form.cursor, 4, "$ goes to the last char");
+        press(&mut m, 'h');
+        assert_eq!(m.form.cursor, 3, "h moves left");
+        press(&mut m, '0');
+        assert_eq!(m.form.cursor, 0, "0 goes to the start");
+        press(&mut m, 'l');
+        assert_eq!(m.form.cursor, 1, "l moves right");
+        // l stops on the last char, never past it.
+        for _ in 0..10 {
+            press(&mut m, 'l');
+        }
+        assert_eq!(m.form.cursor, 4, "l never moves past the last char");
+    }
+
+    #[test]
+    fn normal_wb_move_by_word() {
+        let mut m = msg_normal("hello world", 0);
+        press(&mut m, 'w');
+        assert_eq!(m.form.cursor, 6, "w jumps to the next word");
+        press(&mut m, 'b');
+        assert_eq!(m.form.cursor, 0, "b jumps back to the word start");
+    }
+
+    #[test]
+    fn x_deletes_the_char_under_the_cursor() {
+        let mut m = msg_normal("abc", 1);
+        press(&mut m, 'x');
+        assert_eq!(m.form.message, MessageField::Editable("ac".into()));
+        assert_eq!(m.form.cursor, 1, "cursor stays on a char");
+    }
+
+    #[test]
+    fn cap_d_deletes_to_end_of_line() {
+        let mut m = msg_normal("hello", 2);
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('D')));
+        assert_eq!(m.form.message, MessageField::Editable("he".into()));
+        assert_eq!(m.form.cursor, 1);
+    }
+
+    #[test]
+    fn cap_c_changes_to_end_then_inserts() {
+        let mut m = msg_normal("hello", 2);
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('C')));
+        assert_eq!(m.form.message, MessageField::Editable("he".into()));
+        assert_eq!(m.form.nav_mode, VimMode::Insert, "C enters Insert");
+        press(&mut m, 'y');
+        assert_eq!(m.form.message, MessageField::Editable("hey".into()));
+    }
+
+    #[test]
+    fn dd_clears_the_whole_line() {
+        let mut m = msg_normal("hello", 3);
+        press(&mut m, 'd');
+        assert_eq!(m.form.pending_op, Some('d'), "d waits for a motion");
+        press(&mut m, 'd');
+        assert_eq!(m.form.message, MessageField::Editable(String::new()));
+        assert_eq!(m.form.cursor, 0);
+        assert_eq!(m.form.pending_op, None);
+    }
+
+    #[test]
+    fn dw_deletes_a_word_and_db_deletes_the_one_before() {
+        let mut m = msg_normal("foo bar", 0);
+        press(&mut m, 'd');
+        press(&mut m, 'w');
+        assert_eq!(m.form.message, MessageField::Editable("bar".into()));
+
+        let mut m2 = msg_normal("foo bar baz", 8); // cursor on the "baz" b
+        press(&mut m2, 'd');
+        press(&mut m2, 'b');
+        assert_eq!(m2.form.message, MessageField::Editable("foo baz".into()));
+    }
+
+    #[test]
+    fn an_operator_then_a_bad_motion_cancels_harmlessly() {
+        let mut m = msg_normal("hello", 2);
+        press(&mut m, 'd');
+        press(&mut m, 'z'); // not a motion
+        assert_eq!(m.form.message, MessageField::Editable("hello".into()));
+        assert_eq!(m.form.pending_op, None, "the operator is cancelled");
+    }
+
+    #[test]
+    fn insert_keys_land_at_the_right_place() {
+        // i — before the cursor.
+        let mut m = msg_normal("cat", 1);
+        press(&mut m, 'i');
+        press(&mut m, 'X');
+        assert_eq!(m.form.message, MessageField::Editable("cXat".into()));
+        // a — after the cursor.
+        let mut m = msg_normal("cat", 1);
+        press(&mut m, 'a');
+        press(&mut m, 'X');
+        assert_eq!(m.form.message, MessageField::Editable("caXt".into()));
+        // A — at the end.
+        let mut m = msg_normal("cat", 1);
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('A')));
+        press(&mut m, 'X');
+        assert_eq!(m.form.message, MessageField::Editable("catX".into()));
+        // I — at the start.
+        let mut m = msg_normal("cat", 1);
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('I')));
+        press(&mut m, 'X');
+        assert_eq!(m.form.message, MessageField::Editable("Xcat".into()));
+    }
+
+    #[test]
+    fn insert_backspace_deletes_before_the_cursor() {
+        let mut m = form_model();
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable("abc".into());
+        m.form.cursor = 2; // between b and c
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Backspace));
+        assert_eq!(m.form.message, MessageField::Editable("ac".into()));
+        assert_eq!(m.form.cursor, 1);
+    }
+
+    #[test]
+    fn changing_field_clears_a_pending_operator() {
+        let mut m = msg_normal("hello", 2);
+        press(&mut m, 'd');
+        assert_eq!(m.form.pending_op, Some('d'));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Down));
+        assert_eq!(m.form.pending_op, None, "moving fields drops the operator");
+    }
+
+    #[test]
+    fn leaving_the_tab_clears_a_pending_operator() {
+        let mut m = msg_normal("hello", 2);
+        press(&mut m, 'd');
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Tab));
+        assert_eq!(m.form.pending_op, None, "Tab away drops the operator");
+    }
+
+    #[test]
+    fn the_first_edit_after_a_field_change_is_not_off_by_one() {
+        // Regression: move_focus left the cursor one past the end, so the first
+        // x/D landed on nothing. Navigating onto a text field must leave the
+        // cursor on the last char in Normal mode.
+        let mut m = form_model();
+        m.form.message = MessageField::Editable("hello".into());
+        m.form.nav_mode = VimMode::Normal;
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Down)); // Pane -> When
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Down)); // When -> Message
+        assert_eq!(m.form.focus, FormField::Message);
+        assert_eq!(
+            m.form.cursor, 4,
+            "cursor rests on the last char, not past it"
+        );
+        press(&mut m, 'x');
+        assert_eq!(m.form.message, MessageField::Editable("hell".into()));
+    }
+
+    #[test]
+    fn editing_handles_multibyte_chars() {
+        // "café" — 'é' is 2 bytes, so char/byte indexing must not split it.
+        let mut m = msg_normal("café", 3); // cursor on 'é'
+        press(&mut m, 'x');
+        assert_eq!(m.form.message, MessageField::Editable("caf".into()));
+
+        // Insert a multibyte char at the cursor, then backspace it.
+        let mut m = form_model();
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable("ab".into());
+        m.form.cursor = 1; // between a and b
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('é')));
+        assert_eq!(m.form.message, MessageField::Editable("aéb".into()));
+        assert_eq!(m.form.cursor, 2);
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Backspace));
+        assert_eq!(m.form.message, MessageField::Editable("ab".into()));
     }
 
     #[test]
@@ -1220,10 +1671,11 @@ mod tests {
 
     #[test]
     fn space_types_into_a_message_but_toggles_a_flag() {
-        // Insert mode on the message: Space inserts a literal space.
+        // Insert mode on the message: Space inserts a literal space at the cursor.
         let mut m = form_model();
         m.form.focus = FormField::Message;
         m.form.message = MessageField::Editable("go".into());
+        m.form.cursor = 2; // at the end
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(' ')));
         assert_eq!(m.form.message, MessageField::Editable("go ".into()));
 

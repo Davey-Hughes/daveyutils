@@ -209,6 +209,13 @@ pub struct Form {
     /// and change fields); i/a/A/I return to `Insert`. The picker carries its
     /// own [`VimMode`] independently while open.
     pub nav_mode: VimMode,
+    /// Char index of the edit cursor within the focused text field (the message,
+    /// or the When field's manual time). Meaningful only while [`Form::focused_text`]
+    /// is `Some`; consumers clamp it into range, so a stale value is harmless.
+    pub cursor: usize,
+    /// A vim operator (`d` or `c`) awaiting its motion: after `d` the next key
+    /// completes `dd`, `dw`, `d$`, … `None` unless mid-operator.
+    pub pending_op: Option<char>,
     pub carried: Option<CarriedEdit>,
     /// The selected pane's captured screen for the live preview; `None` when the
     /// pane could not be captured (rendered as "(preview unavailable)").
@@ -239,6 +246,8 @@ impl Form {
             focus: FormField::Pane,
             mode: Mode::New,
             nav_mode: VimMode::Insert,
+            cursor: 0,
+            pending_op: None,
             carried: None,
             preview: None,
             last_capture: None,
@@ -248,6 +257,25 @@ impl Form {
 
     pub fn selected_pane(&self) -> Option<&Pane> {
         self.panes.get(self.pane_idx)
+    }
+
+    /// The buffer the user is editing, if the focused field is a text field: the
+    /// editable message, or the When field while it is `Manual`. `None` for
+    /// selector fields (pane, toggles, When-as-Auto/Keep) and preserved messages.
+    pub fn focused_text(&self) -> Option<&str> {
+        match self.focus {
+            FormField::Message => match &self.message {
+                MessageField::Editable(s) => Some(s.as_str()),
+                MessageField::Preserved(_) => None,
+            },
+            FormField::When if self.when == WhenMode::Manual => Some(self.manual_time.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Char length of the focused text buffer (0 when not editing text).
+    pub fn text_len(&self) -> usize {
+        self.focused_text().map_or(0, |s| s.chars().count())
     }
 
     /// The pane the preview/detection should track: the picker's highlighted

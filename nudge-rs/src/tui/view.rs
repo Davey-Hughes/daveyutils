@@ -39,7 +39,7 @@ pub fn view(model: &Model, f: &mut Frame) {
             }
             Some(_) => "INSERT · type to filter  ·  [↑↓] move  [enter] pick  [esc] normal",
             None if model.form.nav_mode == VimMode::Normal => {
-                "NORMAL · [j/k] field  [h/l] change  [space] toggle  [i] insert  [/] search  [enter] schedule  [q] quit  [esc] jobs"
+                "NORMAL · [j/k] field  [h/l] move/change  [i/a] insert  [x/dd] delete  [/] search  [enter] schedule  [q] quit  [esc] jobs"
             }
             None => {
                 "INSERT · [↑↓] field  [←→] change  [space] toggle  [/] search  [enter] schedule  [esc] normal  [^C] quit"
@@ -162,7 +162,7 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
         ),
         format!("{}[ Schedule ]", mark(FormField::Submit)),
     ];
-    let lines: Vec<Line> = rows_txt.iter().map(|s| Line::from(s.clone())).collect();
+    let mut lines: Vec<Line> = rows_txt.iter().map(|s| Line::from(s.clone())).collect();
     let base_title = match form.mode {
         super::model::Mode::New => "nudge",
         super::model::Mode::Editing(_) => "edit nudge",
@@ -197,26 +197,52 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
         preview_area,
     );
 
+    // The focused text row (message, or When-while-Manual) and its editable
+    // value length — `None` on selector fields, which show no cursor.
+    let editable = form.focused_text().map(|v| {
+        let idx = if form.focus == FormField::When { 1 } else { 2 };
+        (idx, v.chars().count())
+    });
+
+    // Normal mode draws a block cursor (reverse video on the char under it) by
+    // rebuilding that row's spans. No cursor-style escape is emitted, so the
+    // terminal's own cursor shape/blink is untouched (Insert uses it below).
+    if form.nav_mode == VimMode::Normal {
+        if let Some((idx, value_len)) = editable {
+            let rchars: Vec<char> = rows_txt[idx].chars().collect();
+            let vstart = rchars.len() - value_len;
+            let col = vstart
+                + if value_len == 0 {
+                    0
+                } else {
+                    form.cursor.min(value_len - 1)
+                };
+            let before: String = rchars[..col.min(rchars.len())].iter().collect();
+            let under = rchars.get(col).copied().unwrap_or(' ');
+            let after: String = rchars
+                .get(col + 1..)
+                .map_or(String::new(), |c| c.iter().collect());
+            lines[idx] = Line::from(vec![
+                Span::raw(before),
+                Span::styled(
+                    under.to_string(),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ),
+                Span::raw(after),
+            ]);
+        }
+    }
+
     let form_block = Block::default().borders(Borders::ALL).title(title);
     let inner = form_block.inner(form_area);
     f.render_widget(Paragraph::new(lines).block(form_block), form_area);
 
-    // In Insert mode, put the terminal cursor at the end of the focused text
-    // field so it reads as an editable field — same as the picker's search line.
-    // Editable rows: the message, and the When field once it's Manual (typing a
-    // time). Position+show only (no DECSCUSR style escape), so it keeps the
-    // terminal's own cursor shape and blink. Other fields and Normal mode show
-    // no cursor.
+    // Insert mode places the terminal's own cursor (a bar) at the edit position —
+    // position+show only, so it keeps the terminal's shape and blink setting.
     if form.nav_mode == VimMode::Insert {
-        // Index into `rows_txt` of the focused editable row, if any.
-        let editable_row = match form.focus {
-            FormField::When if form.when == WhenMode::Manual => Some(1),
-            FormField::Message if matches!(form.message, MessageField::Editable(_)) => Some(2),
-            _ => None,
-        };
-        if let Some(idx) = editable_row {
-            // The cursor sits just past the row's last rendered column.
-            let cursor_x = (inner.x + rows_txt[idx].chars().count() as u16)
+        if let Some((idx, value_len)) = editable {
+            let vstart = rows_txt[idx].chars().count() - value_len;
+            let cursor_x = (inner.x + vstart as u16 + form.cursor.min(value_len) as u16)
                 .min(inner.right().saturating_sub(1));
             let cursor_y = (inner.y + idx as u16).min(inner.bottom().saturating_sub(1));
             f.set_cursor_position((cursor_x, cursor_y));
@@ -546,11 +572,12 @@ mod tests {
         m.tab = Tab::NewNudge; // opens in Insert
         m.form.focus = FormField::Message;
         m.form.message = MessageField::Editable("hi".into());
+        m.form.cursor = 2; // at the end
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();
         // Message is row 2 of the form block; the block sits below the 8-row
         // preview (body y=1..18, preview 8 rows, form starts y=9 → inner y=10).
-        // x = block inset(1) + "▶ Message: "(11) + "hi"(2) = 14.
+        // x = block inset(1) + "▶ Message: "(11) + cursor 2 = 14.
         let pos = term.get_cursor_position().unwrap();
         assert_eq!(pos.x, 14, "just after '▶ Message: hi'");
         assert_eq!(pos.y, 12, "on the Message row (inner y 10 + row 2)");
@@ -563,11 +590,36 @@ mod tests {
         m.form.focus = FormField::When;
         m.form.when = WhenMode::Manual;
         m.form.manual_time = "3pm".into();
+        m.form.cursor = 3; // at the end
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();
-        // When is row 1; x = inset(1) + "▶ When:    manual → 3pm"(23) = 24.
+        // When is row 1; x = inset(1) + "▶ When:    manual → "(20) + cursor 3 = 24.
         let pos = term.get_cursor_position().unwrap();
         assert_eq!(pos.x, 24, "just after '▶ When:    manual → 3pm'");
         assert_eq!(pos.y, 11, "on the When row (inner y 10 + row 1)");
+    }
+
+    #[test]
+    fn normal_mode_draws_a_block_cursor_on_the_char() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable("hi".into());
+        m.form.cursor = 0; // on the 'h'
+        m.form.nav_mode = VimMode::Normal;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        // Message value starts at x = inset(1) + "▶ Message: "(11) = 12, row y=12.
+        let buf = term.backend().buffer();
+        let cell = &buf[(12, 12)];
+        assert_eq!(
+            cell.symbol(),
+            "h",
+            "block sits on the char under the cursor"
+        );
+        assert!(
+            cell.modifier.contains(Modifier::REVERSED),
+            "Normal-mode cursor is a reverse-video block"
+        );
     }
 }
