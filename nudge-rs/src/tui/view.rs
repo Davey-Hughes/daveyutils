@@ -2,7 +2,7 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs};
 use ratatui::Frame;
 
@@ -86,6 +86,24 @@ fn jobs_view(model: &Model, f: &mut Frame, area: Rect) {
     f.render_widget(table, area);
 }
 
+/// The preview panel's content: the captured pane's ANSI parsed into styled
+/// text, bottom-anchored to the last `inner_h` lines. Parsing (not raw
+/// passthrough) confines a pane's escapes to SGR styling. Degrades to stripped
+/// plain text on a parse error, and to a placeholder when there is no capture.
+fn preview_text(preview: &Option<String>, inner_h: usize) -> Text<'static> {
+    use ansi_to_tui::IntoText;
+    match preview {
+        Some(screen) => {
+            let text = screen
+                .into_text()
+                .unwrap_or_else(|_| Text::raw(strip_ansi_escapes::strip_str(screen)));
+            let start = text.lines.len().saturating_sub(inner_h);
+            Text::from(text.lines[start..].to_vec())
+        }
+        None => Text::from("(preview unavailable)"),
+    }
+}
+
 fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     let form = &model.form;
     if form.picker.is_some() {
@@ -164,16 +182,8 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .title(format!("preview: {pane_name}"));
     let inner_h = preview_area.height.saturating_sub(2) as usize; // minus borders
-    let preview_text = match &form.preview {
-        Some(screen) => {
-            let lines: Vec<&str> = screen.lines().collect();
-            let start = lines.len().saturating_sub(inner_h);
-            lines[start..].join("\n")
-        }
-        None => "(preview unavailable)".to_string(),
-    };
     f.render_widget(
-        Paragraph::new(preview_text).block(preview_block),
+        Paragraph::new(preview_text(&form.preview, inner_h)).block(preview_block),
         preview_area,
     );
 
@@ -238,14 +248,10 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .title(format!("preview: {name}"));
     let inner_h = rows[1].height.saturating_sub(2) as usize;
-    let body = match &form.preview {
-        Some(screen) => {
-            let ls: Vec<&str> = screen.lines().collect();
-            ls[ls.len().saturating_sub(inner_h)..].join("\n")
-        }
-        None => "(preview unavailable)".to_string(),
-    };
-    f.render_widget(Paragraph::new(body).block(block), rows[1]);
+    f.render_widget(
+        Paragraph::new(preview_text(&form.preview, inner_h)).block(block),
+        rows[1],
+    );
 }
 
 #[cfg(test)]
@@ -369,6 +375,24 @@ mod tests {
         assert!(out.contains("pick a pane"), "{out}");
         assert!(out.contains("> cl"), "{out}");
         assert!(out.contains("claude"), "{out}");
+    }
+
+    #[test]
+    fn the_preview_renders_ansi_colors_as_styled_text() {
+        // A red "RED" via SGR should parse into a span styled red.
+        let text = preview_text(&Some("\x1b[31mRED\x1b[0m".into()), 10);
+        let span = &text.lines[0].spans[0];
+        assert_eq!(span.content.as_ref(), "RED");
+        assert_eq!(span.style.fg, Some(ratatui::style::Color::Red));
+    }
+
+    #[test]
+    fn a_missing_capture_previews_unavailable() {
+        let text = preview_text(&None, 10);
+        assert_eq!(
+            text.lines[0].spans[0].content.as_ref(),
+            "(preview unavailable)"
+        );
     }
 
     #[test]
