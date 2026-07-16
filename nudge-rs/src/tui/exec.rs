@@ -21,11 +21,10 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
             Err(e) => Msg::ActionFailed(format!("{e}")),
         },
         Effect::CapturePane { pane } => {
-            use crate::target::Target;
             let clock = std::env::var("NUDGE_CLOCK_PATTERN").ok();
             let dur = std::env::var("NUDGE_DURATION_PATTERN").ok();
             let weekly = std::env::var("NUDGE_WEEKLY_PATTERN").ok();
-            match TmuxTarget::new(&pane).capture() {
+            match TmuxTarget::new(&pane).capture_escaped() {
                 Ok(raw) => {
                     let now = jiff::Zoned::now();
                     let detection = detect_reset(
@@ -35,11 +34,11 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
                         dur.as_deref(),
                         weekly.as_deref(),
                     );
-                    // capture-pane -p is already plain, but strip defensively for
-                    // the preview (mirrors detect.rs) so no stray escape shows.
-                    let screen = strip_ansi_escapes::strip_str(&raw);
+                    // Keep the escapes — the view parses them into styled text
+                    // (parsing confines them to SGR styling; no raw control
+                    // sequence reaches a widget). detect_reset strips internally.
                     Msg::PaneCaptured {
-                        screen: Some(screen),
+                        screen: Some(raw),
                         detection,
                     }
                 }

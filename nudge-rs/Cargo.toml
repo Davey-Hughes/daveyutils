@@ -44,6 +44,7 @@ inquire = "0.7"
 fs4 = "0.13"
 ratatui = "0.30.2"
 crossterm = "0.29.0"
+ansi-to-tui = "8.0.1"
 
 [dev-dependencies]
 tempfile = "3"
