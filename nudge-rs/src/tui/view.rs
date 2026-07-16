@@ -203,7 +203,7 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     // short filtered list leaves no empty gap and a long list can't crowd out the
     // preview. This keeps the two balanced as the match count changes.
     let content_h = picker.matches.len().max(1) as u16 + 3;
-    let picker_h = content_h.min(area.height.saturating_mul(2) / 3).max(5);
+    let picker_h = content_h.min(area.height.saturating_mul(2) / 3).max(4);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(picker_h)])
@@ -225,8 +225,26 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
         preview_area,
     );
 
-    // Search + fuzzy list (bottom).
-    let mut lines = vec![Line::from(format!("> {}", picker.query))];
+    // Search + list block (bottom). The search line is pinned to the BOTTOM of
+    // the block, below the list, so the line you type into stays put while the
+    // match list resizes above it (fzf-style) rather than jumping around.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(match picker.mode {
+            PickerMode::Insert => "pick a pane · INSERT",
+            PickerMode::Normal => "pick a pane · NORMAL",
+        });
+    let inner = block.inner(picker_area);
+    f.render_widget(block, picker_area);
+    let inner_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let list_area = inner_rows[0];
+    let search_area = inner_rows[1];
+
+    // The match list, above the search line.
+    let mut lines = Vec::new();
     for (row, &pane_i) in picker.matches.iter().enumerate() {
         let Some(p) = form.panes.get(pane_i) else {
             continue;
@@ -249,26 +267,21 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     if picker.matches.is_empty() {
         lines.push(Line::from("  (no matching panes)"));
     }
-    f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(
-            match picker.mode {
-                PickerMode::Insert => "pick a pane · INSERT",
-                PickerMode::Normal => "pick a pane · NORMAL",
-            },
-        )),
-        picker_area,
-    );
+    f.render_widget(Paragraph::new(lines), list_area);
+
+    // The search line, pinned at the bottom of the block.
+    f.render_widget(Paragraph::new(format!("> {}", picker.query)), search_area);
 
     // In Insert mode, put the terminal cursor at the end of the query so the
     // search line reads as the text field it is. This only positions+shows the
     // cursor (no DECSCUSR style escape), so it keeps the terminal's own cursor
     // shape and blink setting. In Normal mode the highlighted row is the focus,
-    // so no cursor is shown. x = left border + "> " prefix + query width,
-    // clamped inside the right border; y = the first inner (search) line.
+    // so no cursor is shown. x = "> " prefix + query width, clamped inside the
+    // right edge; y = the pinned search line.
     if picker.mode == PickerMode::Insert {
-        let cursor_x = (picker_area.x + 1 + 2 + picker.query.chars().count() as u16)
-            .min(picker_area.right().saturating_sub(2));
-        f.set_cursor_position((cursor_x, picker_area.y + 1));
+        let cursor_x = (search_area.x + 2 + picker.query.chars().count() as u16)
+            .min(search_area.right().saturating_sub(1));
+        f.set_cursor_position((cursor_x, search_area.y));
     }
 }
 
@@ -429,11 +442,14 @@ mod tests {
         });
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();
-        // The preview grows on top and the content-sized picker block sits at the
-        // bottom; the "> cl" search line lands on row 15 here. x = left border(1)
-        // + "> "(2) + "cl"(2) = 5. (Row tracks the layout; x is the contract.)
+        // The search line is pinned to the bottom of the picker block; here it
+        // lands on row 17 (just above the status line). x = "> "(2) + "cl"(2) + the
+        // block's left inset(1) = 5. (Row tracks the layout; x is the contract.)
         let pos = term.get_cursor_position().unwrap();
         assert_eq!(pos.x, 5, "cursor sits just after '> cl'");
-        assert_eq!(pos.y, 15, "on the picker's search line");
+        assert_eq!(
+            pos.y, 17,
+            "on the picker's search line, pinned at the bottom"
+        );
     }
 }
