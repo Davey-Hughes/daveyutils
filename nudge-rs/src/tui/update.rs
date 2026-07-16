@@ -210,6 +210,7 @@ fn enter_edit(model: &mut Model, job: &Job) {
         }),
         preview: None,
         last_capture: None,
+        picker: None,
     };
     model.tab = Tab::NewNudge;
 }

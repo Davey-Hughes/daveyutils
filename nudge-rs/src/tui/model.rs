@@ -56,6 +56,37 @@ mod tests {
         assert!(m.form.preview.is_none());
         assert!(m.form.last_capture.is_none());
     }
+
+    #[test]
+    fn active_pane_tracks_the_picker_highlight_then_falls_back_to_pane_idx() {
+        let mut form = Form::fresh();
+        form.panes = vec![
+            Pane {
+                target: "s:0.1".into(),
+                title: "claude".into(),
+            },
+            Pane {
+                target: "s:0.2".into(),
+                title: "vim".into(),
+            },
+        ];
+        form.pane_idx = 0;
+        assert_eq!(
+            form.active_pane().unwrap().target,
+            "s:0.1",
+            "no picker → pane_idx"
+        );
+        form.picker = Some(Picker {
+            query: String::new(),
+            matches: vec![1, 0],
+            highlight: 0,
+        });
+        assert_eq!(
+            form.active_pane().unwrap().target,
+            "s:0.2",
+            "picker → highlighted match"
+        );
+    }
 }
 
 use jiff::Timestamp;
@@ -118,6 +149,16 @@ pub enum Mode {
     Editing(u64),
 }
 
+/// The fzf-style pane picker's state, present only while the picker is open.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Picker {
+    pub query: String,
+    /// Indices into `Form.panes`, best fuzzy match first.
+    pub matches: Vec<usize>,
+    /// Index into `matches` of the highlighted row.
+    pub highlight: usize,
+}
+
 /// The transient bottom line: last error or confirmation.
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct Status(pub Option<String>);
@@ -158,6 +199,8 @@ pub struct Form {
     pub preview: Option<String>,
     /// When the preview was last (re)captured; gates the ~1.5s refresh cadence.
     pub last_capture: Option<jiff::Timestamp>,
+    /// Present while the fzf pane picker is open; `None` in the normal form.
+    pub picker: Option<Picker>,
 }
 
 impl Form {
@@ -177,11 +220,21 @@ impl Form {
             carried: None,
             preview: None,
             last_capture: None,
+            picker: None,
         }
     }
 
     pub fn selected_pane(&self) -> Option<&Pane> {
         self.panes.get(self.pane_idx)
+    }
+
+    /// The pane the preview/detection should track: the picker's highlighted
+    /// match while it is open, else the `pane_idx` selection.
+    pub fn active_pane(&self) -> Option<&Pane> {
+        match &self.picker {
+            Some(p) => p.matches.get(p.highlight).and_then(|&i| self.panes.get(i)),
+            None => self.panes.get(self.pane_idx),
+        }
     }
 }
 
