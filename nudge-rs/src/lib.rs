@@ -22,6 +22,7 @@ pub mod register;
 pub mod scheduler;
 pub mod target;
 pub mod timespec;
+pub mod tui;
 pub mod tmux_panes;
 pub mod verify;
 
