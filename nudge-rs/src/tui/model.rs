@@ -196,6 +196,11 @@ pub struct Form {
     pub carried: Option<CarriedEdit>,
     /// The selected pane's captured screen for the live preview; `None` when the
     /// pane could not be captured (rendered as "(preview unavailable)").
+    ///
+    /// Holds RAW SGR escape sequences (captured with `tmux capture-pane -e`).
+    /// Only `view::preview_text` may render it — it parses the escapes into
+    /// styled spans. Never feed this to a plain widget, or a pane's control
+    /// bytes would reach the terminal and corrupt the dashboard.
     pub preview: Option<String>,
     /// When the preview was last (re)captured; gates the ~1.5s refresh cadence.
     pub last_capture: Option<jiff::Timestamp>,
