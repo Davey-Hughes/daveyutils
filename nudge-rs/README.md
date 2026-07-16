@@ -38,6 +38,20 @@ nudge --list                     # pending jobs
 nudge --cancel 3 / --edit 3      # manage a job
 ```
 
+### Dashboard
+
+Run `nudge` with no arguments in a terminal to open the interactive dashboard:
+
+- **Jobs** — a live table of pending nudges with a countdown to each; `↑↓` to
+  select, `c` to cancel, `e` to edit, `r` to refresh, `q` to quit.
+- **New nudge** — `Tab` to it: pick a pane, let nudge auto-detect the reset (or
+  type a time), set a message and the verify/notify/auto-retry toggles, `Enter`
+  to schedule.
+
+Passing any scheduling flag (`-p`, `-m`, `-i`, …) schedules directly and skips
+the dashboard, as before. `nudge --list-plain`, or `nudge`/`--list` with output
+piped, prints a static table instead.
+
 ### Weekly limits
 
 nudge also detects Claude's weekly banner:

@@ -73,17 +73,11 @@ pub struct Cli {
     #[arg(long = "no-verify")]
     pub no_verify: bool,
 
-    /// Review pending jobs.
+    /// Review pending jobs (interactive on a terminal; a static table when piped).
     #[arg(short = 'l', long, visible_alias = "jobs")]
     pub list: bool,
-    /// Deprecated alias for --list; both print the same table.
-    ///
-    /// Hidden rather than removed: it has shipped, so anything scripted around
-    /// it keeps working. It never had a behaviour of its own -- `app::list`
-    /// ignored the flag -- and an interactive picker to be the "plain"
-    /// alternative *to* does not exist yet. If one lands, this is where the
-    /// distinction becomes real and the flag comes back out of hiding.
-    #[arg(long = "list-plain", hide = true)]
+    /// Print the static job table even on a terminal (for scripts and pipes).
+    #[arg(long = "list-plain")]
     pub list_plain: bool,
     /// Cancel a pending job by id.
     #[arg(long = "cancel", value_name = "ID")]
@@ -187,12 +181,11 @@ mod tests {
 
     /// The shipped `--help` and completions are generated from these doc
     /// comments, so a doc comment here is the product, not a note to the next
-    /// reader. `--list` advertised "(interactive)" and `--list-plain`
-    /// advertised a "plain table (non-interactive)" alternative to it, but
-    /// `app::list` ignores the flag and both spellings print the same static
-    /// table. Asserted through clap's own view of the arg rather than the
-    /// rendered help, which wraps at terminal width and would make this a test
-    /// of line breaking.
+    /// reader. `--list` now opens an interactive picker on a terminal and
+    /// falls back to a static table when piped; `--list-plain` forces that
+    /// static table even on a terminal. Asserted through clap's own view of
+    /// the arg rather than the rendered help, which wraps at terminal width
+    /// and would make this a test of line breaking.
     fn arg_help(name: &str) -> String {
         let cmd = <Cli as clap::CommandFactory>::command();
         let arg = cmd
@@ -203,33 +196,30 @@ mod tests {
     }
 
     #[test]
-    fn the_help_does_not_promise_a_list_picker_that_does_not_exist() {
+    fn the_help_advertises_the_interactive_list() {
         assert!(
-            !arg_help("list").to_lowercase().contains("interactive"),
-            "--list prints a static table; promising an interactive picker in the \
-             shipped --help sends users looking for a feature that is not there: {:?}",
+            arg_help("list").to_lowercase().contains("interactive"),
+            "the picker exists now; --help should say so: {:?}",
             arg_help("list")
         );
     }
 
     #[test]
-    fn list_plain_is_not_advertised_as_a_distinct_behaviour() {
+    fn list_plain_is_a_visible_distinct_behaviour() {
         let cmd = <Cli as clap::CommandFactory>::command();
         let plain = cmd
             .get_arguments()
             .find(|a| a.get_id() == "list_plain")
             .expect("--list-plain must still exist");
         assert!(
-            plain.is_hide_set(),
-            "--list-plain does exactly what --list does, so advertising it as a \
-             separate mode describes a distinction the code does not make"
+            !plain.is_hide_set(),
+            "--list-plain now forces the static table instead of the picker, so it \
+             is a real, documented behaviour rather than a hidden alias"
         );
     }
 
     #[test]
     fn list_plain_still_parses_for_anyone_who_scripted_it() {
-        // Hidden, not removed: it has shipped, and breaking a script to tidy
-        // the help text trades one problem for a worse one.
         assert!(parse(&["nudge", "--list-plain"]).list_plain);
     }
 
