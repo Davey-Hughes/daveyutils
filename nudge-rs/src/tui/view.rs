@@ -19,10 +19,10 @@ pub fn view(model: &Model, f: &mut Frame) {
         ])
         .split(f.area());
 
-    let titles = ["Jobs", "New nudge"];
+    let titles = ["nudge", "Jobs"];
     let sel = match model.tab {
-        Tab::Jobs => 0,
-        Tab::NewNudge => 1,
+        Tab::NewNudge => 0,
+        Tab::Jobs => 1,
     };
     f.render_widget(Tabs::new(titles.to_vec()).select(sel), chunks[0]);
 
@@ -34,7 +34,11 @@ pub fn view(model: &Model, f: &mut Frame) {
     let hint = match model.tab {
         Tab::Jobs => "[↑↓] select  [c] cancel  [e] edit  [r] refresh  [Tab] new  [q] quit",
         Tab::NewNudge => {
-            "[↑↓] field  [←→] change  [space] toggle  [enter] schedule  [Esc] back  [q] quit"
+            if model.form.picker.is_some() {
+                "[↑↓] move  [enter] pick  [esc] cancel  —  type to filter"
+            } else {
+                "[↑↓] field  [←→] change  [space] toggle  [/] search  [enter] schedule  [Esc] back  [q] quit"
+            }
         }
     };
     let status = model.status.0.clone().unwrap_or_else(|| hint.to_string());
@@ -84,6 +88,9 @@ fn jobs_view(model: &Model, f: &mut Frame, area: Rect) {
 
 fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     let form = &model.form;
+    if form.picker.is_some() {
+        return picker_view(model, f, area);
+    }
     let pane = form
         .selected_pane()
         .map(|p| p.target.as_str())
@@ -136,8 +143,8 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
         ))),
     ];
     let title = match form.mode {
-        super::model::Mode::New => "New nudge",
-        super::model::Mode::Editing(_) => "Edit nudge",
+        super::model::Mode::New => "nudge",
+        super::model::Mode::Editing(_) => "edit nudge",
     };
 
     let rows = Layout::default()
@@ -174,6 +181,60 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         form_area,
     );
+}
+
+fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
+    let form = &model.form;
+    let picker = form.picker.as_ref().unwrap();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(10)])
+        .split(area);
+
+    // Search + fuzzy list (top).
+    let mut lines = vec![Line::from(format!("> {}", picker.query))];
+    for (row, &pane_i) in picker.matches.iter().enumerate() {
+        let p = &form.panes[pane_i];
+        let mark = if row == picker.highlight {
+            "▶ "
+        } else {
+            "  "
+        };
+        let style = if row == picker.highlight {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{mark}{:<20} {}", p.target, p.title),
+            style,
+        )));
+    }
+    if picker.matches.is_empty() {
+        lines.push(Line::from("  (no matching panes)"));
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("pick a pane")),
+        rows[0],
+    );
+
+    // Live preview of the highlighted pane (bottom) — same source as the form.
+    let name = form
+        .active_pane()
+        .map(|p| p.target.as_str())
+        .unwrap_or("(no pane)");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("preview: {name}"));
+    let inner_h = rows[1].height.saturating_sub(2) as usize;
+    let body = match &form.preview {
+        Some(screen) => {
+            let ls: Vec<&str> = screen.lines().collect();
+            ls[ls.len().saturating_sub(inner_h)..].join("\n")
+        }
+        None => "(preview unavailable)".to_string(),
+    };
+    f.render_widget(Paragraph::new(body).block(block), rows[1]);
 }
 
 #[cfg(test)]
@@ -270,5 +331,32 @@ mod tests {
         m.form.preview = None;
         let out = render(&m);
         assert!(out.contains("preview unavailable"), "{out}");
+    }
+
+    #[test]
+    fn the_tab_bar_lists_nudge_first_then_jobs() {
+        let m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        let out = render(&m);
+        let nudge = out.find("nudge").expect("nudge tab present");
+        let jobs = out.find("Jobs").expect("Jobs tab present");
+        assert!(nudge < jobs, "nudge is left of Jobs: {out}");
+    }
+
+    #[test]
+    fn the_picker_renders_the_query_and_matches() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.form.panes = vec![crate::tmux_panes::Pane {
+            target: "bot:0.1".into(),
+            title: "claude".into(),
+        }];
+        m.form.picker = Some(super::super::model::Picker {
+            query: "cl".into(),
+            matches: vec![0],
+            highlight: 0,
+        });
+        let out = render(&m);
+        assert!(out.contains("pick a pane"), "{out}");
+        assert!(out.contains("> cl"), "{out}");
+        assert!(out.contains("claude"), "{out}");
     }
 }
