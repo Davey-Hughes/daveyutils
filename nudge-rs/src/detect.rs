@@ -156,6 +156,12 @@ pub fn detect_reset(
         // pane (e.g. "16 minutes ago" in a shell prompt) must not be mistaken
         // for the banner's own countdown.
         let rest = &clean[end..];
+        // The zone belongs to the banner's line. `rest` runs to the end of the
+        // capture, and a "(Region/City)" further down the scrollback is not this
+        // banner's zone -- the same reasoning that binds the token search here.
+        let line_rest = rest.split('\n').next().unwrap_or("");
+        let now = &now_in_zone(now, find_zone_token(line_rest).as_deref());
+
         let token = match shape {
             Shape::Duration => find_duration_token(rest),
             Shape::Clock => find_clock_token(rest),
@@ -173,6 +179,40 @@ pub fn detect_reset(
     }
 
     Detection::None
+}
+
+/// Extract an IANA zone name from a trailing `(America/Los_Angeles)`.
+///
+/// Requires the `Region/City` slash form, so it cannot mistake ordinary
+/// parenthesised prose for a zone. Accepts multi-segment names
+/// ("America/Argentina/Buenos_Aires").
+fn find_zone_token(text: &str) -> Option<String> {
+    let re = Regex::new(r"\(([A-Za-z]+(?:/[A-Za-z0-9_+-]+)+)\)").unwrap();
+    re.captures(text).map(|c| c[1].to_string())
+}
+
+/// `now`, expressed in the banner's zone so that a civil "8am" resolves on the
+/// clock the banner is quoting rather than the machine's.
+///
+/// The instant is unchanged — only the calendar it is read against moves — so
+/// `at_clock`'s "is this hour already past?" asks the right question. An
+/// unresolvable name warns and degrades to local; it must never panic, because
+/// this runs on the daemon's scheduler thread where a panic kills every pending
+/// job, and a banner is free to name a zone this build's tzdb has never heard of.
+fn now_in_zone(now: &Zoned, zone: Option<&str>) -> Zoned {
+    let Some(name) = zone else {
+        return now.clone();
+    };
+    match now.timestamp().in_tz(name) {
+        Ok(z) => z,
+        Err(err) => {
+            tracing::warn!(
+                "nudge: ignoring unknown time zone {name:?} from the banner ({err}); \
+                 resolving the reset in the local zone instead"
+            );
+            now.clone()
+        }
+    }
 }
 
 /// Extract the first "3pm" / "3:00 PM" / "14:30" token from the text.
@@ -380,6 +420,47 @@ mod tests {
         let z = reset_of(detect_reset(pane, &now(), None, None));
         // now 10:00 + 45m + 3m padding = 10:48, NOT the stale clock banner's 15:03.
         assert_eq!((z.hour(), z.minute()), (10, 48));
+    }
+
+    /// A banner naming a zone must resolve in THAT zone, not the machine's.
+    /// now() is 10:00 UTC; 3pm in New York is 19:00 UTC, so a local-zone reading
+    /// would say 15:03 and be four hours wrong.
+    #[test]
+    fn a_stated_zone_is_honored_over_the_local_one() {
+        let pane = "current session resets 3:00pm (America/New_York)";
+        let z = reset_of(detect_reset(pane, &now(), None, None));
+        // 15:00 New York + 3m padding == 19:03 UTC.
+        assert_eq!(z.timestamp().to_string(), "2026-07-13T19:03:00Z");
+    }
+
+    /// No zone in the banner: unchanged behavior, resolved in now()'s zone.
+    #[test]
+    fn a_banner_without_a_zone_still_uses_the_local_one() {
+        let z = reset_of(detect_reset(
+            "current session resets 3:00pm",
+            &now(),
+            None,
+            None,
+        ));
+        assert_eq!((z.hour(), z.minute()), (15, 3));
+    }
+
+    /// An unresolvable zone must degrade to local, never panic: this runs on the
+    /// daemon's scheduler thread, where a panic kills every pending job.
+    #[test]
+    fn an_unknown_zone_falls_back_to_local_without_panicking() {
+        let pane = "current session resets 3:00pm (Mars/Olympus_Mons)";
+        let z = reset_of(detect_reset(pane, &now(), None, None));
+        assert_eq!((z.hour(), z.minute()), (15, 3));
+    }
+
+    /// The zone must come from the banner's own line, not from anywhere in the
+    /// scrollback below it -- the same discipline the token search already has.
+    #[test]
+    fn a_zone_on_a_later_line_is_not_the_banners() {
+        let pane = "current session resets 3:00pm\nTZ set to (America/New_York)";
+        let z = reset_of(detect_reset(pane, &now(), None, None));
+        assert_eq!((z.hour(), z.minute()), (15, 3));
     }
 
     /// The enum's whole point: "no banner" and "a banner I can't read" are
