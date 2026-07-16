@@ -1,0 +1,184 @@
+//! Pure render of `Model` into a ratatui frame.
+
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs};
+use ratatui::Frame;
+
+use super::model::{human_countdown, FormField, MessageField, Model, Tab, WhenMode};
+use crate::job::TargetSpec;
+
+pub fn view(model: &Model, f: &mut Frame) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+        .split(f.area());
+
+    let titles = ["Jobs", "New nudge"];
+    let sel = match model.tab {
+        Tab::Jobs => 0,
+        Tab::NewNudge => 1,
+    };
+    f.render_widget(Tabs::new(titles.to_vec()).select(sel), chunks[0]);
+
+    match model.tab {
+        Tab::Jobs => jobs_view(model, f, chunks[1]),
+        Tab::NewNudge => form_view(model, f, chunks[1]),
+    }
+
+    let hint = match model.tab {
+        Tab::Jobs => "[↑↓] select  [c] cancel  [e] edit  [r] refresh  [Tab] new  [q] quit",
+        Tab::NewNudge => "[↑↓] field  [←→] change  [space] toggle  [enter] schedule  [Esc] back",
+    };
+    let status = model.status.0.clone().unwrap_or_else(|| hint.to_string());
+    f.render_widget(Paragraph::new(status), chunks[2]);
+}
+
+fn jobs_view(model: &Model, f: &mut Frame, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title("Pending jobs");
+    if model.jobs.is_empty() {
+        f.render_widget(Paragraph::new("no pending nudge jobs").block(block), area);
+        return;
+    }
+    let rows = model.jobs.iter().enumerate().map(|(i, j)| {
+        let TargetSpec::Tmux { pane } = &j.target;
+        let delta = j.fire_at.duration_since(model.now).as_secs();
+        let flags: String = [(j.verify, 'v'), (j.notify, 'n'), (j.auto_retry, 'a')]
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, c)| *c)
+            .collect();
+        let style = if i == model.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        Row::new(vec![
+            j.id.to_string(),
+            pane.clone(),
+            human_countdown(delta),
+            j.messages.len().to_string(),
+            flags,
+        ])
+        .style(style)
+    });
+    let widths = [
+        Constraint::Length(5),
+        Constraint::Length(22),
+        Constraint::Length(12),
+        Constraint::Length(5),
+        Constraint::Length(6),
+    ];
+    let table = Table::new(rows, widths)
+        .header(Row::new(vec!["ID", "PANE", "FIRES IN", "MSGS", "FLAGS"]))
+        .block(block);
+    f.render_widget(table, area);
+}
+
+fn form_view(model: &Model, f: &mut Frame, area: Rect) {
+    let form = &model.form;
+    let pane = form.selected_pane().map(|p| p.target.as_str()).unwrap_or("(no panes)");
+    let when = match form.when {
+        WhenMode::Keep => "keep current time".to_string(),
+        WhenMode::Auto => match &form.detected {
+            Some(crate::detect::Detection::Reset(z)) => format!("auto → {}", z),
+            Some(crate::detect::Detection::None) => "auto → no banner detected".to_string(),
+            Some(crate::detect::Detection::Unreadable { gap, .. }) => {
+                format!("auto → weekly, day unreadable ({gap:?})")
+            }
+            None => "auto → (select a pane)".to_string(),
+        },
+        WhenMode::Manual => format!("manual: {}", form.manual_time),
+    };
+    let message = match &form.message {
+        MessageField::Editable(s) => s.clone(),
+        MessageField::Preserved(n) => format!("{n} messages — edit via CLI"),
+    };
+    let mark = |field: FormField| if form.focus == field { "▶ " } else { "  " };
+    let onoff = |b: bool| if b { "[x]" } else { "[ ]" };
+    let lines = vec![
+        Line::from(format!("{}Pane:    {}", mark(FormField::Pane), pane)),
+        Line::from(format!("{}When:    {}", mark(FormField::When), when)),
+        Line::from(format!("{}Manual:  {}", mark(FormField::ManualTime), form.manual_time)),
+        Line::from(format!("{}Message: {}", mark(FormField::Message), message)),
+        Line::from(format!("{}{} verify", mark(FormField::Verify), onoff(form.verify))),
+        Line::from(format!("{}{} notify", mark(FormField::Notify), onoff(form.notify))),
+        Line::from(format!("{}{} auto-retry", mark(FormField::AutoRetry), onoff(form.auto_retry))),
+        Line::from(Span::from(format!("{}[ Schedule ]", mark(FormField::Submit)))),
+    ];
+    let title = match form.mode {
+        super::model::Mode::New => "New nudge",
+        super::model::Mode::Editing(_) => "Edit nudge",
+    };
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    use super::super::model::{Model, ScheduleDefaults};
+
+    fn render(model: &Model) -> String {
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(model, f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn defaults() -> ScheduleDefaults {
+        ScheduleDefaults { send_delay_secs: 0.75, settle_secs: 5.0, retries: 2 }
+    }
+
+    #[test]
+    fn empty_jobs_tab_says_so() {
+        let m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        assert!(render(&m).contains("no pending nudge jobs"));
+    }
+
+    #[test]
+    fn a_job_row_shows_pane_and_a_countdown() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        let mut j = crate::job::Job {
+            id: 12,
+            target: TargetSpec::Tmux { pane: "bot:0.1".into() },
+            messages: vec!["please continue".into()],
+            send_delay_secs: 0.75,
+            fire_at: "2026-07-16T14:14:00Z".parse().unwrap(),
+            notify: false,
+            verify: true,
+            auto_retry: true,
+            retries_left: 2,
+            settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
+        };
+        j.messages = vec!["please continue".into()];
+        m.jobs = vec![j];
+        let out = render(&m);
+        assert!(out.contains("bot:0.1"), "{out}");
+        assert!(out.contains("2h 14m"), "{out}");
+    }
+
+    #[test]
+    fn new_nudge_tab_shows_the_form_fields() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        let out = render(&m);
+        assert!(out.contains("Message"), "{out}");
+        assert!(out.contains("please continue"), "{out}");
+    }
+}
