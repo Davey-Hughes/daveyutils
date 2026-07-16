@@ -87,6 +87,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         }
         Msg::Key(code) => match model.tab {
             Tab::Jobs => jobs_key(model, code),
+            Tab::NewNudge if model.form.picker.is_some() => picker_key(model, code),
             Tab::NewNudge => form_key(model, code),
         },
         Msg::PanesLoaded(panes) => {
@@ -287,6 +288,10 @@ fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
             model.should_quit = true;
             vec![]
         }
+        KeyCode::Char('/') if !matches!(form.focus, FormField::ManualTime | FormField::Message) => {
+            open_picker(model)
+        }
+        KeyCode::Enter if form.focus == FormField::Pane => open_picker(model),
         KeyCode::Char(c) => {
             edit_text(form, |s| s.push(c));
             vec![]
@@ -311,11 +316,74 @@ fn capture_selected(form: &mut super::model::Form, now: Timestamp) -> Vec<Effect
     form.preview = None;
     form.detected = None;
     form.last_capture = Some(now);
-    match form.selected_pane() {
+    match form.active_pane() {
         Some(p) => vec![Effect::CapturePane {
             pane: p.target.clone(),
         }],
         None => vec![],
+    }
+}
+
+/// The strings the fuzzy matcher searches — "<target> <title>" per pane.
+fn pane_labels(panes: &[crate::tmux_panes::Pane]) -> Vec<String> {
+    panes
+        .iter()
+        .map(|p| format!("{} {}", p.target, p.title))
+        .collect()
+}
+
+/// Open the fzf picker over the current panes and capture the highlight.
+fn open_picker(model: &mut Model) -> Vec<Effect> {
+    let matches = crate::tui::fuzzy::filter("", &pane_labels(&model.form.panes));
+    model.form.picker = Some(super::model::Picker {
+        query: String::new(),
+        matches,
+        highlight: 0,
+    });
+    capture_selected(&mut model.form, model.now)
+}
+
+fn picker_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
+    match code {
+        KeyCode::Esc => {
+            model.form.picker = None;
+            capture_selected(&mut model.form, model.now)
+        }
+        KeyCode::Enter => {
+            if let Some(p) = &model.form.picker {
+                if let Some(&idx) = p.matches.get(p.highlight) {
+                    model.form.pane_idx = idx;
+                }
+            }
+            model.form.picker = None;
+            capture_selected(&mut model.form, model.now)
+        }
+        _ => {
+            let labels = pane_labels(&model.form.panes);
+            if let Some(picker) = model.form.picker.as_mut() {
+                match code {
+                    KeyCode::Up => picker.highlight = picker.highlight.saturating_sub(1),
+                    KeyCode::Down => {
+                        if !picker.matches.is_empty() {
+                            picker.highlight = (picker.highlight + 1).min(picker.matches.len() - 1);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        picker.query.pop();
+                        picker.matches = crate::tui::fuzzy::filter(&picker.query, &labels);
+                        picker.highlight = 0;
+                    }
+                    KeyCode::Char(c) => {
+                        picker.query.push(c);
+                        picker.matches = crate::tui::fuzzy::filter(&picker.query, &labels);
+                        picker.highlight = 0;
+                    }
+                    _ => return vec![],
+                }
+            }
+            // Highlight (may have) changed → refresh the preview to the new pane.
+            capture_selected(&mut model.form, model.now)
+        }
     }
 }
 
@@ -918,5 +986,80 @@ mod tests {
         );
         assert!(m.form.preview.as_deref().unwrap().contains("resets 3:00pm"));
         assert!(m.form.detected.is_some());
+    }
+
+    #[test]
+    fn slash_opens_the_picker_and_captures_the_highlight() {
+        let mut m = form_model(); // NewNudge tab, panes s:0.1, s:0.2, focus defaults to Pane
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
+        assert!(m.form.picker.is_some(), "/ opens the picker");
+        assert!(fx.iter().any(|e| matches!(e, Effect::CapturePane { .. })));
+    }
+
+    #[test]
+    fn enter_on_the_pane_field_opens_the_picker_not_submit() {
+        let mut m = form_model();
+        m.form.focus = FormField::Pane;
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
+        assert!(m.form.picker.is_some());
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::Schedule { .. })),
+            "not a submit"
+        );
+    }
+
+    #[test]
+    fn typing_in_the_picker_filters_and_navigating_moves_the_highlight() {
+        let mut m = form_model();
+        m.form.panes = vec![
+            Pane {
+                target: "s:0.1".into(),
+                title: "claude".into(),
+            },
+            Pane {
+                target: "s:0.2".into(),
+                title: "vim".into(),
+            },
+        ];
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('v')));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('i')));
+        let p = m.form.picker.as_ref().unwrap();
+        assert_eq!(p.query, "vi");
+        assert_eq!(p.matches, vec![1], "only the vim pane matches 'vi'");
+    }
+
+    #[test]
+    fn enter_in_the_picker_picks_the_highlight_and_closes() {
+        let mut m = form_model();
+        m.form.panes = vec![
+            Pane {
+                target: "s:0.1".into(),
+                title: "claude".into(),
+            },
+            Pane {
+                target: "s:0.2".into(),
+                title: "vim".into(),
+            },
+        ];
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('v'))); // filters to vim (idx 1)
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
+        assert!(m.form.picker.is_none(), "picker closes on Enter");
+        assert_eq!(m.form.pane_idx, 1, "the highlighted pane is now selected");
+    }
+
+    #[test]
+    fn esc_closes_the_picker_keeping_the_prior_pane() {
+        let mut m = form_model();
+        m.form.pane_idx = 0;
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('v')));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Esc));
+        assert!(m.form.picker.is_none());
+        assert_eq!(
+            m.form.pane_idx, 0,
+            "Esc keeps the pane that was selected before"
+        );
     }
 }
