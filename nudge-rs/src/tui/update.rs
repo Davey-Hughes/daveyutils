@@ -143,16 +143,14 @@ fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
                     let n = form.panes.len() as i32;
                     form.pane_idx = ((form.pane_idx as i32 + dir).rem_euclid(n)) as usize;
                     if form.when == WhenMode::Auto {
-                        return vec![Effect::AutoDetect { pane: form.panes[form.pane_idx].target.clone() }];
+                        return detect_selected(form);
                     }
                     vec![]
                 }
                 FormField::When => {
                     form.when = cycle_when(form.when, dir, form.mode);
                     if form.when == WhenMode::Auto {
-                        if let Some(p) = form.selected_pane() {
-                            return vec![Effect::AutoDetect { pane: p.target.clone() }];
-                        }
+                        return detect_selected(form);
                     }
                     vec![]
                 }
@@ -180,6 +178,16 @@ fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
         }
         KeyCode::Enter => submit(model),
         _ => vec![],
+    }
+}
+
+/// Clear the now-stale detection and ask exec to re-detect the selected pane.
+/// Returns no effect when there is no pane to detect.
+fn detect_selected(form: &mut super::model::Form) -> Vec<Effect> {
+    form.detected = None;
+    match form.selected_pane() {
+        Some(p) => vec![Effect::AutoDetect { pane: p.target.clone() }],
+        None => vec![],
     }
 }
 
@@ -354,6 +362,18 @@ mod tests {
         m.form.focus = FormField::Pane;
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Right));
         assert_eq!(m.form.pane_idx, 1);
+        assert_eq!(fx, vec![Effect::AutoDetect { pane: "s:0.2".into() }]);
+    }
+
+    #[test]
+    fn changing_pane_clears_stale_detection_and_redetects() {
+        let mut m = form_model(); // has panes s:0.1 and s:0.2, When defaults to Auto
+        m.form.focus = FormField::Pane;
+        m.form.detected = Some(Detection::Reset(
+            jiff::Timestamp::from_str("2026-07-16T15:00:00Z").unwrap().to_zoned(jiff::tz::TimeZone::UTC),
+        ));
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Right));
+        assert!(m.form.detected.is_none(), "stale detection must be cleared on pane change");
         assert_eq!(fx, vec![Effect::AutoDetect { pane: "s:0.2".into() }]);
     }
 
