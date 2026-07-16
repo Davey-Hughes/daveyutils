@@ -111,8 +111,15 @@ pub fn fire_time(cli: &Cli, pane: &str, now: &Zoned) -> anyhow::Result<jiff::Tim
     let clock_ext = std::env::var("NUDGE_CLOCK_PATTERN").ok();
     let dur_ext = std::env::var("NUDGE_DURATION_PATTERN").ok();
     match detect_reset(&screen, now, clock_ext.as_deref(), dur_ext.as_deref()) {
-        Some(z) => Ok(z.timestamp()),
-        None => bail!("no rate-limit banner detected in {pane}; pass -m to set a time"),
+        crate::detect::Detection::Reset(z) => Ok(z.timestamp()),
+        crate::detect::Detection::None => {
+            bail!("no rate-limit banner detected in {pane}; pass -m to set a time")
+        }
+        crate::detect::Detection::Unreadable { banner, gap } => bail!(
+            "weekly limit banner found in {pane}, but I can't read its reset day: {gap:?}\n\
+             (from {banner:?})\n\
+             Schedule it by hand with -m, and please file this text."
+        ),
     }
 }
 
