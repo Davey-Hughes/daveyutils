@@ -600,6 +600,26 @@ mod tests {
     }
 
     #[test]
+    fn insert_on_a_blank_when_shows_an_empty_manual_input() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge; // Insert
+        m.form.focus = FormField::When;
+        m.form.when = WhenMode::Manual;
+        m.form.manual_time = String::new(); // blank
+        m.form.cursor = 0;
+        let out = render(&m);
+        assert!(
+            out.contains("manual → "),
+            "shows the manual input, not auto: {out}"
+        );
+        assert!(!out.contains("auto →"), "does not fall back to auto: {out}");
+        // Cursor sits just after "manual → ": inset(1) + "▶ When:    manual → "(20) = 21.
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        assert_eq!(term.get_cursor_position().unwrap().x, 21);
+    }
+
+    #[test]
     fn normal_mode_draws_a_block_cursor_on_the_char() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
         m.tab = Tab::NewNudge;

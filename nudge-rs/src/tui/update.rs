@@ -236,7 +236,15 @@ fn move_focus(form: &mut super::model::Form, delta: i32) {
         .unwrap_or(0) as i32;
     let n = FORM_ORDER.len() as i32;
     let next = (i + delta).rem_euclid(n) as usize;
+    // Leaving a blank manual time abandons it back to Auto (don't strand an
+    // empty Manual behind you). Then reconcile the field we land on.
+    if form.focus == FormField::When && form.when == WhenMode::Manual && form.manual_time.is_empty()
+    {
+        form.when = WhenMode::Auto;
+    }
     form.focus = FORM_ORDER[next];
+    // Landing on the When field in Insert makes it a manual input.
+    sync_when_editing(form);
     // Land the edit cursor at the end of the new field's text (0 for non-text)
     // and drop any half-typed operator — it doesn't carry across fields.
     form.cursor = form.text_len();
@@ -330,6 +338,8 @@ fn insert_key(model: &mut Model, code: KeyCode, text: bool) -> Vec<Effect> {
         // The cursor steps left onto a character, as vim does leaving insert.
         KeyCode::Esc => {
             model.form.nav_mode = super::model::VimMode::Normal;
+            // Back in Normal, a blank manual time reverts to Auto.
+            sync_when_editing(&mut model.form);
             clamp_cursor_normal(&mut model.form);
             vec![]
         }
@@ -432,8 +442,9 @@ fn normal_text_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
             clamp_cursor_normal(&mut model.form);
         }
         KeyCode::Char('C') => {
-            delete_char_range(&mut model.form, cur, chars.len());
+            // Enter Insert first so emptying the manual time keeps it Manual.
             model.form.nav_mode = super::model::VimMode::Insert;
+            delete_char_range(&mut model.form, cur, chars.len());
         }
         KeyCode::Char(c @ ('d' | 'c')) => model.form.pending_op = Some(c),
         _ => {}
@@ -478,10 +489,13 @@ fn apply_operator(model: &mut Model, op: char, code: KeyCode) -> Vec<Effect> {
     let Some((a, b)) = range else {
         return vec![];
     };
-    delete_char_range(&mut model.form, a, b);
+    // `c` enters Insert before the delete, so emptying a manual time keeps it
+    // Manual (a blank manual input) rather than snapping to Auto.
     if op == 'c' {
         model.form.nav_mode = super::model::VimMode::Insert;
-    } else {
+    }
+    delete_char_range(&mut model.form, a, b);
+    if op == 'd' {
         clamp_cursor_normal(&mut model.form);
     }
     vec![]
@@ -652,6 +666,9 @@ enum InsertAt {
 }
 
 fn enter_insert(model: &mut Model, at: InsertAt) -> Vec<Effect> {
+    model.form.nav_mode = super::model::VimMode::Insert;
+    // Focusing the When field in Insert turns it into a manual input (even blank).
+    sync_when_editing(&mut model.form);
     let len = model.form.text_len();
     if model.form.focused_text().is_some() {
         model.form.cursor = match at {
@@ -661,7 +678,6 @@ fn enter_insert(model: &mut Model, at: InsertAt) -> Vec<Effect> {
             InsertAt::Start => 0,
         };
     }
-    model.form.nav_mode = super::model::VimMode::Insert;
     vec![]
 }
 
@@ -692,10 +708,26 @@ fn char_byte(s: &str, idx: usize) -> usize {
     s.char_indices().nth(idx).map_or(s.len(), |(b, _)| b)
 }
 
+/// Reconcile the When field's Auto/Manual state with how it's being edited:
+/// focusing it in Insert shows a (possibly empty) manual input for clarity, and
+/// a blank time reverts to Auto only once you're back in Normal or focused
+/// elsewhere. `Keep` is committed (only typing leaves it) and other fields are
+/// untouched, so this is safe to call after any focus / mode / buffer change.
+fn sync_when_editing(form: &mut super::model::Form) {
+    if form.focus != FormField::When || form.when == WhenMode::Keep {
+        return;
+    }
+    let editing = form.nav_mode == super::model::VimMode::Insert;
+    form.when = if editing || !form.manual_time.is_empty() {
+        WhenMode::Manual
+    } else {
+        WhenMode::Auto
+    };
+}
+
 /// Apply `f` to (the focused text buffer, the cursor). Editing the When field's
-/// time keeps the mode in sync: empty means Auto, any text means Manual — so
-/// erasing a time snaps back to auto-detect. Callers only run this in a text
-/// context, so `Keep` (a selector state) is never touched here.
+/// time then reconciles the mode via [`sync_when_editing`]. Callers only run this
+/// in a text context, so `Keep` (a selector state) is never touched here.
 fn edit_focused(form: &mut super::model::Form, f: impl FnOnce(&mut String, &mut usize)) {
     match form.focus {
         FormField::Message => {
@@ -705,11 +737,7 @@ fn edit_focused(form: &mut super::model::Form, f: impl FnOnce(&mut String, &mut 
         }
         FormField::When if form.when == WhenMode::Manual => {
             f(&mut form.manual_time, &mut form.cursor);
-            form.when = if form.manual_time.is_empty() {
-                WhenMode::Auto
-            } else {
-                WhenMode::Manual
-            };
+            sync_when_editing(form);
         }
         _ => {}
     }
@@ -1032,8 +1060,8 @@ mod tests {
     }
 
     #[test]
-    fn typing_on_when_enters_manual_and_erasing_returns_to_auto() {
-        let mut m = form_model();
+    fn typing_on_when_enters_manual_and_erasing_reverts_to_auto_in_normal() {
+        let mut m = form_model(); // opens in Insert
         m.form.focus = FormField::When;
         assert_eq!(m.form.when, WhenMode::Auto, "a new nudge starts on Auto");
 
@@ -1043,15 +1071,65 @@ mod tests {
         assert_eq!(m.form.when, WhenMode::Manual, "typing a time enters Manual");
         assert_eq!(m.form.manual_time, "3pm");
 
-        update(&mut m, Msg::Key(crossterm::event::KeyCode::Backspace));
-        update(&mut m, Msg::Key(crossterm::event::KeyCode::Backspace));
-        update(&mut m, Msg::Key(crossterm::event::KeyCode::Backspace));
+        // Erasing in Insert keeps a (blank) manual input for clarity — it does
+        // NOT snap back to Auto while you're still typing.
+        for _ in 0..3 {
+            update(&mut m, Msg::Key(crossterm::event::KeyCode::Backspace));
+        }
+        assert_eq!(m.form.manual_time, "");
+        assert_eq!(
+            m.form.when,
+            WhenMode::Manual,
+            "a blank manual stays Manual while in Insert"
+        );
+
+        // Only on returning to Normal does a blank time revert to Auto.
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Esc));
         assert_eq!(
             m.form.when,
             WhenMode::Auto,
-            "erasing the time snaps to Auto"
+            "blank + Normal reverts to Auto"
+        );
+    }
+
+    #[test]
+    fn entering_insert_on_the_when_field_shows_a_manual_input() {
+        // Pressing `i` on an Auto When shows an (empty) manual input, so it's
+        // clear you can type a time.
+        let mut m = form_model();
+        m.form.focus = FormField::When;
+        m.form.nav_mode = VimMode::Normal; // shows "auto → …"
+        assert_eq!(m.form.when, WhenMode::Auto);
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('i')));
+        assert_eq!(
+            m.form.when,
+            WhenMode::Manual,
+            "insert on When → manual input"
         );
         assert_eq!(m.form.manual_time, "");
+        // Leaving without typing reverts to Auto.
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Esc));
+        assert_eq!(m.form.when, WhenMode::Auto, "blank on Esc → Auto");
+    }
+
+    #[test]
+    fn leaving_a_blank_manual_input_reverts_to_auto() {
+        // Navigating onto When in Insert shows a blank manual input; navigating
+        // away without typing must not leave an empty Manual behind.
+        let mut m = form_model(); // Insert, focus Pane
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Down)); // Pane -> When
+        assert_eq!(m.form.focus, FormField::When);
+        assert_eq!(
+            m.form.when,
+            WhenMode::Manual,
+            "on When in Insert → manual input"
+        );
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Down)); // When -> Message
+        assert_eq!(
+            m.form.when,
+            WhenMode::Auto,
+            "blank Manual abandoned on leave"
+        );
     }
 
     #[test]
