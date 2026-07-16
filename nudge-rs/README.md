@@ -38,6 +38,30 @@ nudge --list                     # pending jobs
 nudge --cancel 3 / --edit 3      # manage a job
 ```
 
+### Weekly limits
+
+nudge also detects Claude's weekly banner:
+
+    You've hit your weekly limit · resets 8am (America/Los_Angeles)
+
+The stated time zone is honored, so the reset resolves on the clock the banner
+quotes rather than your machine's.
+
+A weekly reset may be days away, and the bare form above names no day. nudge
+reads a day when the banner gives one (`resets Wed 8am`, `resets Wednesday at
+8am`, `tomorrow`), and treats the bare form as the next such hour.
+
+If the banner names its day in a form nudge does not recognize, it **refuses to
+schedule** rather than guessing — guessing would fire the nudge up to six days
+early, silently. The error quotes the text it could not read:
+
+    weekly limit banner found in bot:0.1, but I can't read its reset day: " Jul 16, "
+    (from "You've hit your weekly limit · resets Jul 16, 8am")
+    Schedule it by hand with -m, and please file this text.
+
+That text is exactly what an issue needs. `NUDGE_WEEKLY_PATTERN` extends the
+weekly banner pattern the same way `NUDGE_CLOCK_PATTERN` extends the clock one.
+
 ### `--verify`
 
 `-v` means "don't type into this session if I've already come back to it myself".
