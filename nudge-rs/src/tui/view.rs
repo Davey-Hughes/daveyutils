@@ -126,8 +126,11 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
         .selected_pane()
         .map(|p| p.target.as_str())
         .unwrap_or("(no panes)");
+    // The When field is a single editable control: Auto shows the detected time,
+    // Manual shows the time you type (empty = Auto, so any text means Manual),
+    // Keep (edit-only) leaves the job's time alone.
     let when = match form.when {
-        WhenMode::Keep => "keep current time".to_string(),
+        WhenMode::Keep => "keep current fire time".to_string(),
         WhenMode::Auto => match &form.detected {
             Some(crate::detect::Detection::Reset(z)) => format!("auto → {}", z),
             Some(crate::detect::Detection::None) => "auto → no banner detected".to_string(),
@@ -136,7 +139,7 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
             }
             None => "auto → (select a pane)".to_string(),
         },
-        WhenMode::Manual => format!("manual: {}", form.manual_time),
+        WhenMode::Manual => format!("manual → {}", form.manual_time),
     };
     let message = match &form.message {
         MessageField::Editable(s) => s.clone(),
@@ -144,35 +147,22 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     };
     let mark = |field: FormField| if form.focus == field { "▶ " } else { "  " };
     let onoff = |b: bool| if b { "[x]" } else { "[ ]" };
-    let lines = vec![
-        Line::from(format!("{}Pane:    {}", mark(FormField::Pane), pane)),
-        Line::from(format!("{}When:    {}", mark(FormField::When), when)),
-        Line::from(format!(
-            "{}Manual:  {}",
-            mark(FormField::ManualTime),
-            form.manual_time
-        )),
-        Line::from(format!("{}Message: {}", mark(FormField::Message), message)),
-        Line::from(format!(
-            "{}{} verify",
-            mark(FormField::Verify),
-            onoff(form.verify)
-        )),
-        Line::from(format!(
-            "{}{} notify",
-            mark(FormField::Notify),
-            onoff(form.notify)
-        )),
-        Line::from(format!(
+    // Field rows, in `FORM_ORDER`. Kept as strings so the cursor can be placed at
+    // the exact end of the focused text row below.
+    let rows_txt = [
+        format!("{}Pane:    {}", mark(FormField::Pane), pane),
+        format!("{}When:    {}", mark(FormField::When), when),
+        format!("{}Message: {}", mark(FormField::Message), message),
+        format!("{}{} verify", mark(FormField::Verify), onoff(form.verify)),
+        format!("{}{} notify", mark(FormField::Notify), onoff(form.notify)),
+        format!(
             "{}{} auto-retry",
             mark(FormField::AutoRetry),
             onoff(form.auto_retry)
-        )),
-        Line::from(Span::from(format!(
-            "{}[ Schedule ]",
-            mark(FormField::Submit)
-        ))),
+        ),
+        format!("{}[ Schedule ]", mark(FormField::Submit)),
     ];
+    let lines: Vec<Line> = rows_txt.iter().map(|s| Line::from(s.clone())).collect();
     let base_title = match form.mode {
         super::model::Mode::New => "nudge",
         super::model::Mode::Editing(_) => "edit nudge",
@@ -212,26 +202,23 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(form_block), form_area);
 
     // In Insert mode, put the terminal cursor at the end of the focused text
-    // field (manual time / message) so it reads as an editable field — same as
-    // the picker's search line. Position+show only (no DECSCUSR style escape),
-    // so it keeps the terminal's own cursor shape and blink. Non-text fields
-    // (pane / when / toggles / submit) get no cursor, and Normal mode shows none.
+    // field so it reads as an editable field — same as the picker's search line.
+    // Editable rows: the message, and the When field once it's Manual (typing a
+    // time). Position+show only (no DECSCUSR style escape), so it keeps the
+    // terminal's own cursor shape and blink. Other fields and Normal mode show
+    // no cursor.
     if form.nav_mode == VimMode::Insert {
-        // (line index within the block, value char count) of the focused field.
-        let field = match form.focus {
-            FormField::ManualTime => Some((2u16, form.manual_time.chars().count())),
-            FormField::Message => match &form.message {
-                MessageField::Editable(s) => Some((3u16, s.chars().count())),
-                // Preserved messages aren't editable in the TUI — no cursor.
-                MessageField::Preserved(_) => None,
-            },
+        // Index into `rows_txt` of the focused editable row, if any.
+        let editable_row = match form.focus {
+            FormField::When if form.when == WhenMode::Manual => Some(1),
+            FormField::Message if matches!(form.message, MessageField::Editable(_)) => Some(2),
             _ => None,
         };
-        if let Some((line_idx, value_len)) = field {
-            // Each row is "▶ " (2 cols) + "Manual:  " / "Message: " (9 cols) then
-            // the value, so the value starts 11 cols into the inner area.
-            let cursor_x = (inner.x + 11 + value_len as u16).min(inner.right().saturating_sub(1));
-            let cursor_y = (inner.y + line_idx).min(inner.bottom().saturating_sub(1));
+        if let Some(idx) = editable_row {
+            // The cursor sits just past the row's last rendered column.
+            let cursor_x = (inner.x + rows_txt[idx].chars().count() as u16)
+                .min(inner.right().saturating_sub(1));
+            let cursor_y = (inner.y + idx as u16).min(inner.bottom().saturating_sub(1));
             f.set_cursor_position((cursor_x, cursor_y));
         }
     }
@@ -352,7 +339,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    use super::super::model::{Model, ScheduleDefaults, VimMode};
+    use super::super::model::{Model, ScheduleDefaults, VimMode, WhenMode};
 
     fn render(model: &Model) -> String {
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -561,25 +548,26 @@ mod tests {
         m.form.message = MessageField::Editable("hi".into());
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();
-        // Message is line 3 of the form block; the block sits below the 8-row
+        // Message is row 2 of the form block; the block sits below the 8-row
         // preview (body y=1..18, preview 8 rows, form starts y=9 → inner y=10).
         // x = block inset(1) + "▶ Message: "(11) + "hi"(2) = 14.
         let pos = term.get_cursor_position().unwrap();
         assert_eq!(pos.x, 14, "just after '▶ Message: hi'");
-        assert_eq!(pos.y, 13, "on the Message row (inner y 10 + line 3)");
+        assert_eq!(pos.y, 12, "on the Message row (inner y 10 + row 2)");
     }
 
     #[test]
-    fn manual_time_field_gets_the_cursor_too() {
+    fn the_manual_when_field_gets_the_cursor() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
         m.tab = Tab::NewNudge; // Insert
-        m.form.focus = FormField::ManualTime;
+        m.form.focus = FormField::When;
+        m.form.when = WhenMode::Manual;
         m.form.manual_time = "3pm".into();
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();
-        // Manual is line 2; x = inset(1) + "▶ Manual:  "(11) + "3pm"(3) = 15.
+        // When is row 1; x = inset(1) + "▶ When:    manual → 3pm"(23) = 24.
         let pos = term.get_cursor_position().unwrap();
-        assert_eq!(pos.x, 15, "just after '▶ Manual:  3pm'");
-        assert_eq!(pos.y, 12, "on the Manual row (inner y 10 + line 2)");
+        assert_eq!(pos.x, 24, "just after '▶ When:    manual → 3pm'");
+        assert_eq!(pos.y, 11, "on the When row (inner y 10 + row 1)");
     }
 }

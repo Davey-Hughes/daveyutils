@@ -119,7 +119,6 @@ pub struct ScheduleDefaults {
 pub enum FormField {
     Pane,
     When,
-    ManualTime,
     Message,
     Verify,
     Notify,

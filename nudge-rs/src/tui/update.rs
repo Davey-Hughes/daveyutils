@@ -217,10 +217,9 @@ fn enter_edit(model: &mut Model, job: &Job) {
     model.tab = Tab::NewNudge;
 }
 
-const FORM_ORDER: [FormField; 8] = [
+const FORM_ORDER: [FormField; 7] = [
     FormField::Pane,
     FormField::When,
-    FormField::ManualTime,
     FormField::Message,
     FormField::Verify,
     FormField::Notify,
@@ -253,7 +252,13 @@ fn change_value(model: &mut Model, dir: i32) -> Vec<Effect> {
             capture_selected(&mut model.form, model.now)
         }
         FormField::When => {
+            let prev = model.form.when;
             model.form.when = cycle_when(model.form.when, dir, model.form.mode);
+            // Leaving Manual drops any typed time, so "manual_time is non-empty"
+            // always means Manual — the invariant the type/erase edits rely on.
+            if prev == WhenMode::Manual && model.form.when != WhenMode::Manual {
+                model.form.manual_time.clear();
+            }
             if model.form.when == WhenMode::Auto {
                 capture_selected(&mut model.form, model.now)
             } else {
@@ -272,7 +277,10 @@ fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
     use super::model::VimMode;
     // Computed before any focus-changing arm runs; those arms all `return`, so
     // focus is still the field the user is on when the mode match reads this.
-    let is_text = matches!(model.form.focus, FormField::ManualTime | FormField::Message);
+    // A field the user types into: the message, or the When field once it's in
+    // Manual (where typing edits the time inline).
+    let is_text = model.form.focus == FormField::Message
+        || (model.form.focus == FormField::When && model.form.when == WhenMode::Manual);
 
     // --- keys shared by Insert and Normal ---
     match code {
@@ -504,9 +512,26 @@ fn cycle_when(cur: WhenMode, dir: i32, mode: super::model::Mode) -> WhenMode {
 }
 
 /// Apply `f` to whichever text buffer the focused field owns, if any.
+///
+/// Editing the When field's time keeps the mode in sync with the text: any text
+/// means Manual, empty means Auto — so typing a time overrides auto-detect and
+/// erasing it snaps back (`Keep` is reached only via the explicit `h/l` cycle).
 fn edit_text(form: &mut super::model::Form, f: impl FnOnce(&mut String)) {
     match form.focus {
-        FormField::ManualTime => f(&mut form.manual_time),
+        FormField::When => {
+            // Sync the mode only when the buffer actually changed (the callers
+            // are push/pop, so a length change is a real edit). A no-op Backspace
+            // on an empty field must not silently flip Keep → Auto.
+            let before = form.manual_time.len();
+            f(&mut form.manual_time);
+            if form.manual_time.len() != before {
+                form.when = if form.manual_time.is_empty() {
+                    WhenMode::Auto
+                } else {
+                    WhenMode::Manual
+                };
+            }
+        }
         FormField::Message => {
             if let MessageField::Editable(s) = &mut form.message {
                 f(s);
@@ -749,6 +774,76 @@ mod tests {
         assert_eq!(m.form.focus, FormField::Pane);
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Down));
         assert_eq!(m.form.focus, FormField::When);
+    }
+
+    #[test]
+    fn typing_on_when_enters_manual_and_erasing_returns_to_auto() {
+        let mut m = form_model();
+        m.form.focus = FormField::When;
+        assert_eq!(m.form.when, WhenMode::Auto, "a new nudge starts on Auto");
+
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('3')));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('p')));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('m')));
+        assert_eq!(m.form.when, WhenMode::Manual, "typing a time enters Manual");
+        assert_eq!(m.form.manual_time, "3pm");
+
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Backspace));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Backspace));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Backspace));
+        assert_eq!(
+            m.form.when,
+            WhenMode::Auto,
+            "erasing the time snaps to Auto"
+        );
+        assert_eq!(m.form.manual_time, "");
+    }
+
+    #[test]
+    fn a_no_op_backspace_on_when_preserves_keep() {
+        // Regression: editing an existing job opens on Keep with an empty time.
+        // A stray Backspace on the When field (nothing to erase) must NOT flip
+        // Keep → Auto and quietly re-time the job.
+        let mut m = form_model();
+        m.form.mode = Mode::Editing(7);
+        m.form.when = WhenMode::Keep;
+        m.form.focus = FormField::When;
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Backspace));
+        assert_eq!(
+            m.form.when,
+            WhenMode::Keep,
+            "Keep survives a no-op Backspace"
+        );
+        // But typing still overrides Keep → Manual.
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('3')));
+        assert_eq!(m.form.when, WhenMode::Manual);
+        assert_eq!(m.form.manual_time, "3");
+    }
+
+    #[test]
+    fn a_space_is_a_valid_manual_time_character() {
+        let mut m = form_model();
+        m.form.focus = FormField::When;
+        m.form.when = WhenMode::Manual;
+        m.form.manual_time = "in 90".into();
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(' ')));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('m')));
+        assert_eq!(m.form.manual_time, "in 90 m");
+    }
+
+    #[test]
+    fn cycling_off_manual_clears_the_typed_time() {
+        // New nudge: h/l toggles Auto ⇄ Manual; leaving Manual drops the text so
+        // "has text" always means Manual.
+        let mut m = form_model();
+        m.form.focus = FormField::When;
+        m.form.when = WhenMode::Manual;
+        m.form.manual_time = "3pm".into();
+        // Normal-mode `l` cycles the When mode (New: Auto ⇄ Manual).
+        m.form.nav_mode = VimMode::Normal;
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('l')));
+        assert_eq!(m.form.when, WhenMode::Auto);
+        assert_eq!(m.form.manual_time, "", "leaving Manual clears the time");
     }
 
     #[test]
