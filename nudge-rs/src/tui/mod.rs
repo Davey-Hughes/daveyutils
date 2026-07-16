@@ -2,3 +2,4 @@
 //! edges (view/exec) and the event loop in `run`.
 
 pub mod model;
+pub mod update;

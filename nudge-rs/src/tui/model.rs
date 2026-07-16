@@ -41,3 +41,157 @@ mod tests {
         assert_eq!(human_countdown(-500), "now");
     }
 }
+
+use jiff::Timestamp;
+
+use crate::detect::Detection;
+use crate::job::Job;
+use crate::tmux_panes::Pane;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tab {
+    Jobs,
+    NewNudge,
+}
+
+/// Defaults for fields the form does not show, read once from the environment
+/// in `tui::run` and then held in the (pure) model so `update` never reads env.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScheduleDefaults {
+    pub send_delay_secs: f64,
+    pub settle_secs: f64,
+    pub retries: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FormField {
+    Pane,
+    When,
+    ManualTime,
+    Message,
+    Verify,
+    Notify,
+    AutoRetry,
+    Submit,
+}
+
+/// `Keep` is only reachable while editing (leave the job's fire time alone);
+/// a new nudge starts on `Auto`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WhenMode {
+    Keep,
+    Auto,
+    Manual,
+}
+
+/// A single editable message, or — for a multi-message job being edited — the
+/// count carried through unchanged (the TUI never collapses them to one line).
+#[derive(Clone, PartialEq, Debug)]
+pub enum MessageField {
+    Editable(String),
+    Preserved(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    New,
+    Editing(u64),
+}
+
+/// The transient bottom line: last error or confirmation.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct Status(pub Option<String>);
+
+impl Status {
+    pub fn set(&mut self, msg: impl Into<String>) {
+        self.0 = Some(msg.into());
+    }
+}
+
+/// The fields an edit carries through unchanged because the form does not show
+/// them (mirrors `app::merge_edit` preserving what no flag overrode).
+#[derive(Clone, PartialEq, Debug)]
+pub struct CarriedEdit {
+    pub fire_at: Timestamp,
+    pub messages: Vec<String>,
+    pub send_delay_secs: f64,
+    pub settle_secs: f64,
+    pub retries_left: i64,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Form {
+    pub panes: Vec<Pane>,
+    pub pane_idx: usize,
+    pub when: WhenMode,
+    pub manual_time: String,
+    pub detected: Option<Detection>,
+    pub message: MessageField,
+    pub verify: bool,
+    pub notify: bool,
+    pub auto_retry: bool,
+    pub focus: FormField,
+    pub mode: Mode,
+    pub carried: Option<CarriedEdit>,
+}
+
+impl Form {
+    pub fn fresh() -> Form {
+        Form {
+            panes: Vec::new(),
+            pane_idx: 0,
+            when: WhenMode::Auto,
+            manual_time: String::new(),
+            detected: None,
+            message: MessageField::Editable("please continue".to_string()),
+            verify: false,
+            notify: false,
+            auto_retry: false,
+            focus: FormField::Pane,
+            mode: Mode::New,
+            carried: None,
+        }
+    }
+
+    pub fn selected_pane(&self) -> Option<&Pane> {
+        self.panes.get(self.pane_idx)
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Model {
+    pub tab: Tab,
+    pub jobs: Vec<Job>,
+    pub selected: usize,
+    pub form: Form,
+    pub status: Status,
+    pub now: Timestamp,
+    pub last_poll: Timestamp,
+    pub defaults: ScheduleDefaults,
+    pub should_quit: bool,
+}
+
+impl Model {
+    pub fn new(defaults: ScheduleDefaults, now: Timestamp) -> Model {
+        Model {
+            tab: Tab::Jobs,
+            jobs: Vec::new(),
+            selected: 0,
+            form: Form::fresh(),
+            status: Status::default(),
+            now,
+            last_poll: now,
+            defaults,
+            should_quit: false,
+        }
+    }
+
+    /// Keep `selected` inside `jobs` after the list changes.
+    pub fn clamp_selection(&mut self) {
+        if self.jobs.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.jobs.len() {
+            self.selected = self.jobs.len() - 1;
+        }
+    }
+}
