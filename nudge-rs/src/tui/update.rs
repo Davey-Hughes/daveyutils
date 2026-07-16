@@ -899,11 +899,7 @@ fn build_spec(model: &Model, pane: &str, fire_at: Timestamp) -> JobSpec {
             .map(|c| c.messages.clone())
             .unwrap_or_else(|| vec!["please continue".to_string()]),
     };
-    // Retry base mirrors app::merge_edit: a job with 0 left re-arms the default.
-    let retry_base = match &form.carried {
-        Some(c) if c.retries_left != 0 => c.retries_left,
-        _ => model.defaults.retries,
-    };
+    let retry_base = form.retry_base(model.defaults.retries);
     let (send_delay_secs, settle_secs) = match &form.carried {
         Some(c) => (c.send_delay_secs, c.settle_secs),
         None => (model.defaults.send_delay_secs, model.defaults.settle_secs),

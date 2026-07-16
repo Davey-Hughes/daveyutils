@@ -278,6 +278,16 @@ impl Form {
         self.focused_text().map_or(0, |s| s.chars().count())
     }
 
+    /// How many retries a scheduled job gets when auto-retry is on: the carried
+    /// job's remaining count if it still has any, else the config default.
+    /// Mirrors `app::merge_edit`'s "a job with 0 left re-arms the default".
+    pub fn retry_base(&self, default_retries: i64) -> i64 {
+        match &self.carried {
+            Some(c) if c.retries_left != 0 => c.retries_left,
+            _ => default_retries,
+        }
+    }
+
     /// The pane the preview/detection should track: the picker's highlighted
     /// match while it is open, else the `pane_idx` selection.
     pub fn active_pane(&self) -> Option<&Pane> {

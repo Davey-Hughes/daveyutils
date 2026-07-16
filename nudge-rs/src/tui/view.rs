@@ -147,6 +147,15 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     };
     let mark = |field: FormField| if form.focus == field { "▶ " } else { "  " };
     let onoff = |b: bool| if b { "[x]" } else { "[ ]" };
+    // Show how many retries auto-retry will actually schedule (from config, or a
+    // carried job's remaining count) so the count isn't a mystery.
+    let auto_retry_label = if form.auto_retry {
+        let n = form.retry_base(model.defaults.retries);
+        let unit = if n == 1 { "retry" } else { "retries" };
+        format!("auto-retry ({n} {unit})")
+    } else {
+        "auto-retry".to_string()
+    };
     // Field rows, in `FORM_ORDER`. Kept as strings so the cursor can be placed at
     // the exact end of the focused text row below.
     let rows_txt = [
@@ -156,9 +165,10 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
         format!("{}{} verify", mark(FormField::Verify), onoff(form.verify)),
         format!("{}{} notify", mark(FormField::Notify), onoff(form.notify)),
         format!(
-            "{}{} auto-retry",
+            "{}{} {}",
             mark(FormField::AutoRetry),
-            onoff(form.auto_retry)
+            onoff(form.auto_retry),
+            auto_retry_label
         ),
         format!("{}[ Schedule ]", mark(FormField::Submit)),
     ];
@@ -637,6 +647,23 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();
         assert_eq!(term.get_cursor_position().unwrap().x, 21);
+    }
+
+    #[test]
+    fn auto_retry_shows_the_configured_retry_count() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge; // defaults() configures retries = 2
+        m.form.auto_retry = true;
+        assert!(
+            render(&m).contains("auto-retry (2 retries)"),
+            "{}",
+            render(&m)
+        );
+        // No count when it's off (it won't retry).
+        m.form.auto_retry = false;
+        let out = render(&m);
+        assert!(out.contains("auto-retry"), "{out}");
+        assert!(!out.contains("retries)"), "no count when off: {out}");
     }
 
     #[test]
