@@ -6,7 +6,12 @@ name = "nudge"
 # silently from a Schedule it does not know — so a 0.1.0 daemon adopted by this
 # build would run the old banner-only `--verify` and report success doing it.
 # Bump this whenever the IPC wire format or the daemon's behavior changes.
-version = "0.2.0"
+# 0.2.0 predates the weekly banner. run_injection calls detect_reset at fire
+# time, so a 0.2.0 daemon adopted by this build would not recognize a weekly
+# banner, would report SkippedNoBanner, and the nudge would silently never
+# fire -- the failure this comment exists to prevent, via a path that is not
+# the wire format.
+version = "0.3.0"
 edition = "2021"
 description = "Rate-limit auto-resumer for AI CLIs in tmux"
 license = "GPL-3.0-or-later"
