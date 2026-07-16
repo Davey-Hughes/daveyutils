@@ -108,6 +108,7 @@ pub fn run() -> anyhow::Result<()> {
     let tick = update::update(&mut model, update::Msg::Tick(jiff::Timestamp::now()));
     dispatch_effects(&mut model, tick, &socket);
     dispatch_effects(&mut model, vec![update::Effect::PollJobs], &socket);
+    dispatch_effects(&mut model, vec![update::Effect::ListPanes], &socket);
 
     while !model.should_quit {
         terminal.draw(|f| view::view(&model, f))?;
