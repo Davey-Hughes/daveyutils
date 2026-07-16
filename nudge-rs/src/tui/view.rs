@@ -220,6 +220,15 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
         rows[0],
     );
 
+    // Put the terminal cursor at the end of the query, so the search line reads
+    // as the text field it is. This only positions+shows the cursor (no
+    // DECSCUSR style escape), so it keeps the terminal's own cursor shape and
+    // blink setting. x = left border + "> " prefix + query width, clamped inside
+    // the right border; y = the first inner (search) line.
+    let cursor_x = (rows[0].x + 1 + 2 + picker.query.chars().count() as u16)
+        .min(rows[0].right().saturating_sub(2));
+    f.set_cursor_position((cursor_x, rows[0].y + 1));
+
     // Live preview of the highlighted pane (bottom) — same source as the form.
     let name = form
         .active_pane()
@@ -360,5 +369,25 @@ mod tests {
         assert!(out.contains("pick a pane"), "{out}");
         assert!(out.contains("> cl"), "{out}");
         assert!(out.contains("claude"), "{out}");
+    }
+
+    #[test]
+    fn the_picker_puts_the_cursor_after_the_query() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.form.panes = vec![crate::tmux_panes::Pane {
+            target: "bot:0.1".into(),
+            title: "claude".into(),
+        }];
+        m.form.picker = Some(super::super::model::Picker {
+            query: "cl".into(),
+            matches: vec![0],
+            highlight: 0,
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        // tabs row 0, body from row 1; the picker's top block border is row 1 and
+        // the "> cl" search line is row 2; x = left border(1) + "> "(2) + "cl"(2).
+        let pos = term.get_cursor_position().unwrap();
+        assert_eq!((pos.x, pos.y), (5, 2), "cursor sits just after '> cl'");
     }
 }
