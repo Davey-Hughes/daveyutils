@@ -16,6 +16,7 @@ const POLL_SECS: i64 = 2;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
     Key(KeyCode),
+    Quit,
     Tick(Timestamp),
     JobsLoaded(Vec<Job>),
     PanesLoaded(Vec<Pane>),
@@ -48,6 +49,10 @@ pub enum Effect {
 
 pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
     match msg {
+        Msg::Quit => {
+            model.should_quit = true;
+            vec![]
+        }
         Msg::Tick(now) => {
             model.now = now;
             if now.duration_since(model.last_poll).as_secs() >= POLL_SECS {
@@ -302,7 +307,7 @@ fn edit_text(form: &mut super::model::Form, f: impl FnOnce(&mut String)) {
 }
 
 fn submit(model: &mut Model) -> Vec<Effect> {
-    let now_zoned = model.now.to_zoned(jiff::tz::TimeZone::UTC);
+    let now_zoned = model.now.to_zoned(model.defaults.tz.clone());
     let Some(pane) = model.form.selected_pane().map(|p| p.target.clone()) else {
         model
             .status
@@ -415,6 +420,7 @@ mod tests {
             send_delay_secs: 0.75,
             settle_secs: 5.0,
             retries: 2,
+            tz: jiff::tz::TimeZone::UTC,
         }
     }
 
@@ -597,6 +603,26 @@ mod tests {
     }
 
     #[test]
+    fn submit_manual_clock_time_resolves_in_the_local_zone_not_utc() {
+        // Regression: `submit` used to hardcode UTC when resolving absolute
+        // clock times ("3pm"), hours off from the CLI's system-local
+        // resolution. t0 is noon UTC, which is 04:00 in a fixed UTC-8 zone,
+        // so "3pm" there must land at 23:00 UTC — not 15:00 UTC (the bug).
+        let mut m = form_model();
+        m.defaults.tz = jiff::tz::TimeZone::fixed(jiff::tz::offset(-8));
+        m.form.when = WhenMode::Manual;
+        m.form.manual_time = "3pm".into();
+        m.form.focus = FormField::Submit;
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
+        match fx.as_slice() {
+            [Effect::Schedule { spec, .. }] => {
+                assert_eq!(spec.fire_at.to_string(), "2026-07-16T23:00:00Z");
+            }
+            other => panic!("expected Schedule, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn submit_without_a_time_sets_status_and_emits_nothing() {
         let mut m = form_model();
         m.form.focus = FormField::Submit; // when=Auto, detected=None
@@ -642,6 +668,14 @@ mod tests {
     fn q_quits_from_the_jobs_tab() {
         let mut m = with_jobs(1);
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('q')));
+        assert!(m.should_quit);
+    }
+
+    #[test]
+    fn quit_msg_quits_from_either_tab() {
+        let mut m = with_jobs(1);
+        m.tab = Tab::NewNudge;
+        update(&mut m, Msg::Quit);
         assert!(m.should_quit);
     }
 

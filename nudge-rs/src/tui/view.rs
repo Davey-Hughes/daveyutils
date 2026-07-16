@@ -170,6 +170,7 @@ mod tests {
             send_delay_secs: 0.75,
             settle_secs: 5.0,
             retries: 2,
+            tz: jiff::tz::TimeZone::UTC,
         }
     }
 

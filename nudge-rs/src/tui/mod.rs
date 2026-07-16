@@ -10,7 +10,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use anyhow::Context;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, Event, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -25,9 +25,27 @@ use model::{Model, ScheduleDefaults};
 
 /// Map a crossterm event to a `Msg`, ignoring what the dashboard does not act on.
 /// Pure so the key contract is testable without a terminal.
+///
+/// Ctrl/Alt combos are never read as bare command keys: crossterm strips
+/// nothing from `KeyEvent`, but a naive `Some(Msg::Key(k.code))` would
+/// discard `k.modifiers` and let Ctrl-C fall through to the plain `c`
+/// handler (cancel, on the Jobs tab) instead of quitting.
 pub fn map_event(ev: Event) -> Option<update::Msg> {
     match ev {
-        Event::Key(k) if k.kind == KeyEventKind::Press => Some(update::Msg::Key(k.code)),
+        Event::Key(k) if k.kind == KeyEventKind::Press => {
+            if k.modifiers.contains(KeyModifiers::CONTROL) {
+                match k.code {
+                    crossterm::event::KeyCode::Char('c') | crossterm::event::KeyCode::Char('d') => {
+                        Some(update::Msg::Quit)
+                    }
+                    _ => None,
+                }
+            } else if k.modifiers.contains(KeyModifiers::ALT) {
+                None
+            } else {
+                Some(update::Msg::Key(k.code))
+            }
+        }
         _ => None,
     }
 }
@@ -61,6 +79,7 @@ fn schedule_defaults() -> ScheduleDefaults {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5.0),
         retries: default_retries(),
+        tz: jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC),
     }
 }
 
@@ -149,5 +168,19 @@ mod tests {
     #[test]
     fn non_key_events_are_ignored() {
         assert_eq!(map_event(Event::Resize(80, 24)), None);
+    }
+
+    #[test]
+    fn ctrl_c_maps_to_quit_not_the_bare_c_command() {
+        // Regression: dropping k.modifiers let Ctrl-C fall through to the
+        // Jobs tab's plain `c` handler, which cancels the selected job.
+        let ev = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(map_event(ev), Some(update::Msg::Quit));
+    }
+
+    #[test]
+    fn other_ctrl_combos_are_ignored_rather_than_read_as_bare_commands() {
+        let ev = Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(map_event(ev), None);
     }
 }
