@@ -28,6 +28,14 @@ impl TmuxTarget {
         }
     }
 
+    /// Capture the pane WITH SGR escape sequences (`-e`), for a colored preview.
+    /// The plain `capture()` (the `Target` method used by `--verify`'s
+    /// fingerprint) stays escape-free, so the recency gate is unaffected.
+    pub fn capture_escaped(&self) -> Result<String> {
+        let out = self.run(&["capture-pane", "-e", "-p", "-t", &self.pane])?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     /// Run a tmux subcommand (with the configured socket, if any), erroring on
     /// non-zero exit.
     fn run(&self, args: &[&str]) -> Result<Output> {
