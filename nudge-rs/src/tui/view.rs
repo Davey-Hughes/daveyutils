@@ -196,12 +196,30 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
 fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     let form = &model.form;
     let picker = form.picker.as_ref().unwrap();
+    // Preview on top (a fixed glimpse), the search + fuzzy list below it (grows,
+    // so it gets the room on a tall terminal).
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(10)])
+        .constraints([Constraint::Length(10), Constraint::Min(3)])
         .split(area);
+    let preview_area = rows[0];
+    let picker_area = rows[1];
 
-    // Search + fuzzy list (top).
+    // Live preview of the highlighted pane (top) — same source as the form.
+    let name = form
+        .active_pane()
+        .map(|p| p.target.as_str())
+        .unwrap_or("(no pane)");
+    let preview_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("preview: {name}"));
+    let inner_h = preview_area.height.saturating_sub(2) as usize;
+    f.render_widget(
+        Paragraph::new(preview_text(&form.preview, inner_h)).block(preview_block),
+        preview_area,
+    );
+
+    // Search + fuzzy list (bottom).
     let mut lines = vec![Line::from(format!("> {}", picker.query))];
     for (row, &pane_i) in picker.matches.iter().enumerate() {
         let Some(p) = form.panes.get(pane_i) else {
@@ -227,31 +245,17 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     }
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("pick a pane")),
-        rows[0],
+        picker_area,
     );
 
     // Put the terminal cursor at the end of the query, so the search line reads
     // as the text field it is. This only positions+shows the cursor (no
     // DECSCUSR style escape), so it keeps the terminal's own cursor shape and
     // blink setting. x = left border + "> " prefix + query width, clamped inside
-    // the right border; y = the first inner (search) line.
-    let cursor_x = (rows[0].x + 1 + 2 + picker.query.chars().count() as u16)
-        .min(rows[0].right().saturating_sub(2));
-    f.set_cursor_position((cursor_x, rows[0].y + 1));
-
-    // Live preview of the highlighted pane (bottom) — same source as the form.
-    let name = form
-        .active_pane()
-        .map(|p| p.target.as_str())
-        .unwrap_or("(no pane)");
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!("preview: {name}"));
-    let inner_h = rows[1].height.saturating_sub(2) as usize;
-    f.render_widget(
-        Paragraph::new(preview_text(&form.preview, inner_h)).block(block),
-        rows[1],
-    );
+    // the right border; y = the first inner (search) line of the picker block.
+    let cursor_x = (picker_area.x + 1 + 2 + picker.query.chars().count() as u16)
+        .min(picker_area.right().saturating_sub(2));
+    f.set_cursor_position((cursor_x, picker_area.y + 1));
 }
 
 #[cfg(test)]
@@ -409,9 +413,10 @@ mod tests {
         });
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();
-        // tabs row 0, body from row 1; the picker's top block border is row 1 and
-        // the "> cl" search line is row 2; x = left border(1) + "> "(2) + "cl"(2).
+        // tabs row 0, body rows 1..18; the picker splits body into preview
+        // (rows 1..10) then the search+list block (border at row 11, "> cl"
+        // search line at row 12); x = left border(1) + "> "(2) + "cl"(2).
         let pos = term.get_cursor_position().unwrap();
-        assert_eq!((pos.x, pos.y), (5, 2), "cursor sits just after '> cl'");
+        assert_eq!((pos.x, pos.y), (5, 12), "cursor sits just after '> cl'");
     }
 }
