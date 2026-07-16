@@ -80,7 +80,7 @@ mod tests {
             query: String::new(),
             matches: vec![1, 0],
             highlight: 0,
-            mode: PickerMode::Insert,
+            mode: VimMode::Insert,
         });
         assert_eq!(
             form.active_pane().unwrap().target,
@@ -150,10 +150,11 @@ pub enum Mode {
     Editing(u64),
 }
 
-/// The picker's editing mode, vim-style: Insert (typing filters the list) or
-/// Normal (j/k navigate; i/a/A/I return to Insert).
+/// A vim-style editing mode, shared by the pane picker and the New-nudge form:
+/// Insert (typing edits the field / filters the list) or Normal (h/j/k/l
+/// navigate; i/a/A/I return to Insert). Both open in `Insert`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PickerMode {
+pub enum VimMode {
     Insert,
     Normal,
 }
@@ -167,7 +168,7 @@ pub struct Picker {
     /// Index into `matches` of the highlighted row.
     pub highlight: usize,
     /// vim-style editing mode; the picker opens in `Insert`.
-    pub mode: PickerMode,
+    pub mode: VimMode,
 }
 
 /// The transient bottom line: last error or confirmation.
@@ -204,6 +205,11 @@ pub struct Form {
     pub auto_retry: bool,
     pub focus: FormField,
     pub mode: Mode,
+    /// vim-style navigation mode for the form; opens in `Insert` so typing a
+    /// message / time works immediately. Esc drops to `Normal` (h/j/k/l move
+    /// and change fields); i/a/A/I return to `Insert`. The picker carries its
+    /// own [`VimMode`] independently while open.
+    pub nav_mode: VimMode,
     pub carried: Option<CarriedEdit>,
     /// The selected pane's captured screen for the live preview; `None` when the
     /// pane could not be captured (rendered as "(preview unavailable)").
@@ -233,6 +239,7 @@ impl Form {
             auto_retry: false,
             focus: FormField::Pane,
             mode: Mode::New,
+            nav_mode: VimMode::Insert,
             carried: None,
             preview: None,
             last_capture: None,

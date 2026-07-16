@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs};
 use ratatui::Frame;
 
-use super::model::{human_countdown, FormField, MessageField, Model, PickerMode, Tab, WhenMode};
+use super::model::{human_countdown, FormField, MessageField, Model, Tab, VimMode, WhenMode};
 use crate::job::TargetSpec;
 
 pub fn view(model: &Model, f: &mut Frame) {
@@ -34,12 +34,15 @@ pub fn view(model: &Model, f: &mut Frame) {
     let hint = match model.tab {
         Tab::Jobs => "[↑↓] select  [c] cancel  [e] edit  [r] refresh  [Tab] new  [q] quit",
         Tab::NewNudge => match &model.form.picker {
-            Some(p) if p.mode == PickerMode::Normal => {
+            Some(p) if p.mode == VimMode::Normal => {
                 "NORMAL · [j/k] move  [i] insert  [enter] pick  [esc/q] cancel"
             }
             Some(_) => "INSERT · type to filter  ·  [↑↓] move  [enter] pick  [esc] normal",
+            None if model.form.nav_mode == VimMode::Normal => {
+                "NORMAL · [j/k] field  [h/l] change  [space] toggle  [i] insert  [/] search  [enter] schedule  [q] quit  [esc] jobs"
+            }
             None => {
-                "[↑↓] field  [←→] change  [space] toggle  [/] search  [enter] schedule  [Esc] back  [q] quit"
+                "INSERT · [↑↓] field  [←→] change  [space] toggle  [/] search  [enter] schedule  [esc] normal  [^C] quit"
             }
         },
     };
@@ -170,10 +173,17 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
             mark(FormField::Submit)
         ))),
     ];
-    let title = match form.mode {
+    let base_title = match form.mode {
         super::model::Mode::New => "nudge",
         super::model::Mode::Editing(_) => "edit nudge",
     };
+    let title = format!(
+        "{base_title} · {}",
+        match form.nav_mode {
+            VimMode::Insert => "INSERT",
+            VimMode::Normal => "NORMAL",
+        }
+    );
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -241,8 +251,8 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(match picker.mode {
-            PickerMode::Insert => "pick a pane · INSERT",
-            PickerMode::Normal => "pick a pane · NORMAL",
+            VimMode::Insert => "pick a pane · INSERT",
+            VimMode::Normal => "pick a pane · NORMAL",
         });
     let inner = block.inner(picker_area);
     f.render_widget(block, picker_area);
@@ -305,7 +315,7 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     // shape and blink setting. In Normal mode the highlighted row is the focus,
     // so no cursor is shown. x = "> " prefix + query width, clamped inside the
     // right edge; y = the pinned search line.
-    if picker.mode == PickerMode::Insert {
+    if picker.mode == VimMode::Insert {
         let cursor_x = (search_area.x + 2 + picker.query.chars().count() as u16)
             .min(search_area.right().saturating_sub(1));
         f.set_cursor_position((cursor_x, search_area.y));
@@ -318,7 +328,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    use super::super::model::{Model, ScheduleDefaults};
+    use super::super::model::{Model, ScheduleDefaults, VimMode};
 
     fn render(model: &Model) -> String {
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -387,6 +397,15 @@ mod tests {
     }
 
     #[test]
+    fn the_form_title_shows_the_vim_mode() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge; // opens in Insert
+        assert!(render(&m).contains("nudge · INSERT"), "{}", render(&m));
+        m.form.nav_mode = VimMode::Normal;
+        assert!(render(&m).contains("nudge · NORMAL"), "{}", render(&m));
+    }
+
+    #[test]
     fn the_form_shows_a_pane_preview_on_top() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
         m.form.panes = vec![crate::tmux_panes::Pane {
@@ -421,7 +440,7 @@ mod tests {
             query: String::new(),
             matches: (0..30).collect(),
             highlight: 27,
-            mode: super::super::model::PickerMode::Insert,
+            mode: super::super::model::VimMode::Insert,
         });
         // 80x20: the fixed-height picker can't show 30 rows, so it scrolls.
         let out = render(&m);
@@ -455,7 +474,7 @@ mod tests {
             query: "cl".into(),
             matches: vec![0],
             highlight: 0,
-            mode: super::super::model::PickerMode::Insert,
+            mode: super::super::model::VimMode::Insert,
         });
         let out = render(&m);
         assert!(out.contains("pick a pane"), "{out}");
@@ -495,7 +514,7 @@ mod tests {
             query: "cl".into(),
             matches: vec![0],
             highlight: 0,
-            mode: super::super::model::PickerMode::Insert,
+            mode: super::super::model::VimMode::Insert,
         });
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();

@@ -202,6 +202,7 @@ fn enter_edit(model: &mut Model, job: &Job) {
         auto_retry: job.auto_retry,
         focus: FormField::Pane,
         mode: Mode::Editing(job.id),
+        nav_mode: super::model::VimMode::Insert,
         carried: Some(CarriedEdit {
             fire_at: job.fire_at,
             messages: job.messages.clone(),
@@ -237,73 +238,130 @@ fn move_focus(form: &mut super::model::Form, delta: i32) {
     form.focus = FORM_ORDER[next];
 }
 
+/// Change the focused field's value (←→ or h/l): cycle the selected pane or the
+/// When mode. Toggle fields are handled by Space; text fields aren't changed
+/// here (Insert mode edits them via typing).
+fn change_value(model: &mut Model, dir: i32) -> Vec<Effect> {
+    match model.form.focus {
+        FormField::Pane if !model.form.panes.is_empty() => {
+            let n = model.form.panes.len() as i32;
+            model.form.pane_idx = ((model.form.pane_idx as i32 + dir).rem_euclid(n)) as usize;
+            // Always refresh: the preview title tracks the selected pane live, so
+            // a stale screen from the old pane would otherwise show under the new
+            // pane's name until the next tick. Re-detecting in non-Auto is
+            // harmless — `submit` only reads `detected` in Auto mode.
+            capture_selected(&mut model.form, model.now)
+        }
+        FormField::When => {
+            model.form.when = cycle_when(model.form.when, dir, model.form.mode);
+            if model.form.when == WhenMode::Auto {
+                capture_selected(&mut model.form, model.now)
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// Handle a key on the New-nudge form. Modal, vim-style: the form opens in
+/// `Insert` so typing edits the focused text field. Keys that mean the same in
+/// both modes — leaving the tab, arrow navigation, Space toggles, Enter — are
+/// handled first; the rest branch on `nav_mode`.
 fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
-    let form = &mut model.form;
+    use super::model::VimMode;
+    // Computed before any focus-changing arm runs; those arms all `return`, so
+    // focus is still the field the user is on when the mode match reads this.
+    let is_text = matches!(model.form.focus, FormField::ManualTime | FormField::Message);
+
+    // --- keys shared by Insert and Normal ---
     match code {
-        KeyCode::Tab | KeyCode::Esc => {
+        KeyCode::Tab => {
             model.tab = Tab::Jobs;
-            vec![]
+            return vec![];
         }
         KeyCode::Down => {
-            move_focus(form, 1);
-            vec![]
+            move_focus(&mut model.form, 1);
+            return vec![];
         }
         KeyCode::Up => {
-            move_focus(form, -1);
-            vec![]
+            move_focus(&mut model.form, -1);
+            return vec![];
         }
-        KeyCode::Left | KeyCode::Right => {
-            let dir: i32 = if code == KeyCode::Right { 1 } else { -1 };
-            match form.focus {
-                FormField::Pane if !form.panes.is_empty() => {
-                    let n = form.panes.len() as i32;
-                    form.pane_idx = ((form.pane_idx as i32 + dir).rem_euclid(n)) as usize;
-                    // Always refresh: the preview title tracks the selected
-                    // pane live, so a stale screen from the old pane would
-                    // otherwise show under the new pane's name until the next
-                    // tick. Re-detecting in non-Auto is harmless — `submit`
-                    // only reads `detected` in Auto mode.
-                    capture_selected(form, model.now)
-                }
-                FormField::When => {
-                    form.when = cycle_when(form.when, dir, form.mode);
-                    if form.when == WhenMode::Auto {
-                        return capture_selected(form, model.now);
-                    }
-                    vec![]
-                }
-                _ => vec![],
-            }
-        }
-        KeyCode::Char(' ') => {
-            match form.focus {
-                FormField::Verify => form.verify = !form.verify,
-                FormField::Notify => form.notify = !form.notify,
-                FormField::AutoRetry => form.auto_retry = !form.auto_retry,
+        KeyCode::Left => return change_value(model, -1),
+        KeyCode::Right => return change_value(model, 1),
+        // Space toggles a flag field; on a text field it falls through so Insert
+        // can type a literal space into the message.
+        KeyCode::Char(' ')
+            if matches!(
+                model.form.focus,
+                FormField::Verify | FormField::Notify | FormField::AutoRetry
+            ) =>
+        {
+            match model.form.focus {
+                FormField::Verify => model.form.verify = !model.form.verify,
+                FormField::Notify => model.form.notify = !model.form.notify,
+                FormField::AutoRetry => model.form.auto_retry = !model.form.auto_retry,
                 _ => {}
             }
-            vec![]
+            return vec![];
         }
-        KeyCode::Char('q') if !matches!(form.focus, FormField::ManualTime | FormField::Message) => {
-            model.should_quit = true;
-            vec![]
-        }
-        KeyCode::Char('/') if !matches!(form.focus, FormField::ManualTime | FormField::Message) => {
-            open_picker(model)
-        }
-        KeyCode::Enter if form.focus == FormField::Pane => open_picker(model),
-        KeyCode::Char(c) => {
-            edit_text(form, |s| s.push(c));
-            vec![]
-        }
-        KeyCode::Backspace => {
-            edit_text(form, |s| {
-                s.pop();
-            });
-            vec![]
-        }
-        KeyCode::Enter => submit(model),
-        _ => vec![],
+        // Enter opens the picker on the Pane field, otherwise schedules.
+        KeyCode::Enter if model.form.focus == FormField::Pane => return open_picker(model),
+        KeyCode::Enter => return submit(model),
+        _ => {}
+    }
+
+    // --- mode-specific keys ---
+    match model.form.nav_mode {
+        VimMode::Insert => match code {
+            // Esc drops to Normal — it does NOT leave the tab (that's Normal's Esc).
+            KeyCode::Esc => {
+                model.form.nav_mode = VimMode::Normal;
+                vec![]
+            }
+            KeyCode::Backspace => {
+                edit_text(&mut model.form, |s| {
+                    s.pop();
+                });
+                vec![]
+            }
+            // `/` opens the pane picker unless you're typing into a text field.
+            KeyCode::Char('/') if !is_text => open_picker(model),
+            KeyCode::Char(c) => {
+                edit_text(&mut model.form, |s| s.push(c));
+                vec![]
+            }
+            _ => vec![],
+        },
+        VimMode::Normal => match code {
+            KeyCode::Char('j') => {
+                move_focus(&mut model.form, 1);
+                vec![]
+            }
+            KeyCode::Char('k') => {
+                move_focus(&mut model.form, -1);
+                vec![]
+            }
+            KeyCode::Char('h') => change_value(model, -1),
+            KeyCode::Char('l') => change_value(model, 1),
+            // The usual vim ways back into Insert.
+            KeyCode::Char('i' | 'a' | 'A' | 'I') => {
+                model.form.nav_mode = VimMode::Insert;
+                vec![]
+            }
+            KeyCode::Char('/') => open_picker(model),
+            KeyCode::Char('q') => {
+                model.should_quit = true;
+                vec![]
+            }
+            // Esc from Normal leaves the form for the Jobs tab.
+            KeyCode::Esc => {
+                model.tab = Tab::Jobs;
+                vec![]
+            }
+            _ => vec![],
+        },
     }
 }
 
@@ -339,13 +397,13 @@ fn open_picker(model: &mut Model) -> Vec<Effect> {
         query: String::new(),
         matches,
         highlight: 0,
-        mode: super::model::PickerMode::Insert,
+        mode: super::model::VimMode::Insert,
     });
     capture_selected(&mut model.form, model.now)
 }
 
 fn picker_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
-    use super::model::PickerMode;
+    use super::model::VimMode;
     let mode = match model.form.picker.as_ref() {
         Some(p) => p.mode,
         None => return vec![],
@@ -366,11 +424,11 @@ fn picker_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
         _ => {}
     }
     match mode {
-        PickerMode::Insert => match code {
+        VimMode::Insert => match code {
             // Esc leaves Insert for Normal — it does NOT close the picker.
             KeyCode::Esc => {
                 if let Some(p) = model.form.picker.as_mut() {
-                    p.mode = PickerMode::Normal;
+                    p.mode = VimMode::Normal;
                 }
                 vec![]
             }
@@ -380,14 +438,14 @@ fn picker_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
             KeyCode::Char(c) => picker_filter(model, |q| q.push(c)),
             _ => vec![],
         },
-        PickerMode::Normal => match code {
+        VimMode::Normal => match code {
             KeyCode::Char('j') => picker_move(model, 1),
             KeyCode::Char('k') => picker_move(model, -1),
             // The usual vim ways back into Insert; a single-line search box has
             // no distinct cursor position, so i/a/A/I are all equivalent.
             KeyCode::Char('i' | 'a' | 'A' | 'I') => {
                 if let Some(p) = model.form.picker.as_mut() {
-                    p.mode = PickerMode::Insert;
+                    p.mode = VimMode::Insert;
                 }
                 vec![]
             }
@@ -984,23 +1042,105 @@ mod tests {
     }
 
     #[test]
-    fn q_quits_from_the_new_nudge_tab_unless_editing_text() {
-        let mut m = form_model(); // NewNudge tab, focus defaults to Pane
-        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('q')));
-        assert!(
-            m.should_quit,
-            "q quits from the form when not on a text field"
-        );
+    fn the_form_opens_in_insert_mode() {
+        let m = form_model();
+        assert_eq!(m.form.nav_mode, VimMode::Insert);
+    }
 
+    #[test]
+    fn q_quits_only_in_normal_mode() {
+        // Insert (the default): q on a non-text field is a no-op, not a quit.
+        let mut m = form_model(); // focus defaults to Pane
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('q')));
+        assert!(!m.should_quit, "q does not quit while in Insert mode");
+
+        // Normal mode: q quits.
+        m.form.nav_mode = VimMode::Normal;
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('q')));
+        assert!(m.should_quit, "q quits from Normal mode");
+
+        // Insert mode on a text field: q types, never quits.
         let mut m2 = form_model();
         m2.form.focus = FormField::Message;
         m2.form.message = MessageField::Editable(String::new());
         update(&mut m2, Msg::Key(crossterm::event::KeyCode::Char('q')));
-        assert!(
-            !m2.should_quit,
-            "q types, not quits, while editing a text field"
-        );
+        assert!(!m2.should_quit, "q types, not quits, in a text field");
         assert_eq!(m2.form.message, MessageField::Editable("q".into()));
+    }
+
+    #[test]
+    fn esc_drops_to_normal_then_leaves_the_form() {
+        let mut m = form_model(); // Insert
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Esc));
+        assert_eq!(m.form.nav_mode, VimMode::Normal, "first Esc → Normal");
+        assert_eq!(m.tab, Tab::NewNudge, "first Esc stays on the form");
+
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Esc));
+        assert_eq!(m.tab, Tab::Jobs, "Esc from Normal leaves for Jobs");
+    }
+
+    #[test]
+    fn insert_keys_all_return_to_insert_from_normal() {
+        for key in ['i', 'a', 'A', 'I'] {
+            let mut m = form_model();
+            m.form.nav_mode = VimMode::Normal;
+            update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(key)));
+            assert_eq!(m.form.nav_mode, VimMode::Insert, "{key} → Insert");
+        }
+    }
+
+    #[test]
+    fn normal_jk_move_the_focused_field() {
+        let mut m = form_model();
+        m.form.nav_mode = VimMode::Normal;
+        assert_eq!(m.form.focus, FormField::Pane);
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('j')));
+        assert_eq!(m.form.focus, FormField::When, "j moves down a field");
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('k')));
+        assert_eq!(m.form.focus, FormField::Pane, "k moves back up");
+    }
+
+    #[test]
+    fn normal_hl_change_the_focused_value() {
+        let mut m = form_model();
+        m.form.nav_mode = VimMode::Normal;
+        m.form.focus = FormField::Pane; // panes: s:0.1, s:0.2
+        assert_eq!(m.form.pane_idx, 0);
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('l')));
+        assert_eq!(m.form.pane_idx, 1, "l cycles the pane forward");
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('h')));
+        assert_eq!(m.form.pane_idx, 0, "h cycles the pane back");
+    }
+
+    #[test]
+    fn normal_jkhl_are_literal_text_in_insert() {
+        let mut m = form_model();
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable(String::new());
+        for key in ['h', 'j', 'k', 'l'] {
+            update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(key)));
+        }
+        assert_eq!(m.form.message, MessageField::Editable("hjkl".into()));
+    }
+
+    #[test]
+    fn space_types_into_a_message_but_toggles_a_flag() {
+        // Insert mode on the message: Space inserts a literal space.
+        let mut m = form_model();
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable("go".into());
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(' ')));
+        assert_eq!(m.form.message, MessageField::Editable("go ".into()));
+
+        // Space on a flag field toggles it, in either mode.
+        let mut m2 = form_model();
+        m2.form.focus = FormField::Verify;
+        assert!(!m2.form.verify);
+        update(&mut m2, Msg::Key(crossterm::event::KeyCode::Char(' ')));
+        assert!(m2.form.verify, "space toggles verify in Insert");
+        m2.form.nav_mode = VimMode::Normal;
+        update(&mut m2, Msg::Key(crossterm::event::KeyCode::Char(' ')));
+        assert!(!m2.form.verify, "space toggles verify in Normal too");
     }
 
     #[test]
@@ -1108,7 +1248,7 @@ mod tests {
             m.form.picker.is_some(),
             "the first Esc leaves Insert for Normal, it does not close"
         );
-        assert_eq!(m.form.picker.as_ref().unwrap().mode, PickerMode::Normal);
+        assert_eq!(m.form.picker.as_ref().unwrap().mode, VimMode::Normal);
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Esc)); // Normal -> cancel
         assert!(m.form.picker.is_none(), "Esc in Normal cancels the picker");
         assert_eq!(
@@ -1121,7 +1261,7 @@ mod tests {
     fn the_picker_opens_in_insert_mode() {
         let mut m = form_model();
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
-        assert_eq!(m.form.picker.as_ref().unwrap().mode, PickerMode::Insert);
+        assert_eq!(m.form.picker.as_ref().unwrap().mode, VimMode::Insert);
     }
 
     #[test]
@@ -1168,7 +1308,7 @@ mod tests {
             update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(key)));
             assert_eq!(
                 m.form.picker.as_ref().unwrap().mode,
-                PickerMode::Insert,
+                VimMode::Insert,
                 "{key} re-enters Insert"
             );
         }
