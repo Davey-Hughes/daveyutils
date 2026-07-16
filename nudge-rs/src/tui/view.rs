@@ -33,7 +33,9 @@ pub fn view(model: &Model, f: &mut Frame) {
 
     let hint = match model.tab {
         Tab::Jobs => "[↑↓] select  [c] cancel  [e] edit  [r] refresh  [Tab] new  [q] quit",
-        Tab::NewNudge => "[↑↓] field  [←→] change  [space] toggle  [enter] schedule  [Esc] back",
+        Tab::NewNudge => {
+            "[↑↓] field  [←→] change  [space] toggle  [enter] schedule  [Esc] back  [q] quit"
+        }
     };
     let status = model.status.0.clone().unwrap_or_else(|| hint.to_string());
     f.render_widget(Paragraph::new(status), chunks[2]);

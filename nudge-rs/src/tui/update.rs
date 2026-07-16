@@ -256,10 +256,12 @@ fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
                 FormField::Pane if !form.panes.is_empty() => {
                     let n = form.panes.len() as i32;
                     form.pane_idx = ((form.pane_idx as i32 + dir).rem_euclid(n)) as usize;
-                    if form.when == WhenMode::Auto {
-                        return capture_selected(form, model.now);
-                    }
-                    vec![]
+                    // Always refresh: the preview title tracks the selected
+                    // pane live, so a stale screen from the old pane would
+                    // otherwise show under the new pane's name until the next
+                    // tick. Re-detecting in non-Auto is harmless — `submit`
+                    // only reads `detected` in Auto mode.
+                    capture_selected(form, model.now)
                 }
                 FormField::When => {
                     form.when = cycle_when(form.when, dir, form.mode);
@@ -278,6 +280,10 @@ fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
                 FormField::AutoRetry => form.auto_retry = !form.auto_retry,
                 _ => {}
             }
+            vec![]
+        }
+        KeyCode::Char('q') if !matches!(form.focus, FormField::ManualTime | FormField::Message) => {
+            model.should_quit = true;
             vec![]
         }
         KeyCode::Char(c) => {
@@ -856,6 +862,45 @@ mod tests {
             fx,
             vec![Effect::CapturePane {
                 pane: "s:0.1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn q_quits_from_the_new_nudge_tab_unless_editing_text() {
+        let mut m = form_model(); // NewNudge tab, focus defaults to Pane
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('q')));
+        assert!(
+            m.should_quit,
+            "q quits from the form when not on a text field"
+        );
+
+        let mut m2 = form_model();
+        m2.form.focus = FormField::Message;
+        m2.form.message = MessageField::Editable(String::new());
+        update(&mut m2, Msg::Key(crossterm::event::KeyCode::Char('q')));
+        assert!(
+            !m2.should_quit,
+            "q types, not quits, while editing a text field"
+        );
+        assert_eq!(m2.form.message, MessageField::Editable("q".into()));
+    }
+
+    #[test]
+    fn changing_pane_refreshes_the_preview_even_in_manual_mode() {
+        let mut m = form_model(); // has panes s:0.1, s:0.2
+        m.form.when = WhenMode::Manual;
+        m.form.focus = FormField::Pane;
+        m.form.preview = Some("old pane screen".into());
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Right));
+        assert!(
+            m.form.preview.is_none(),
+            "stale preview cleared on pane change even in Manual"
+        );
+        assert_eq!(
+            fx,
+            vec![Effect::CapturePane {
+                pane: "s:0.2".into()
             }]
         );
     }
