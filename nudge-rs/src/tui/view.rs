@@ -1,7 +1,7 @@
 //! Pure render of `Model` into a ratatui frame.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs};
 use ratatui::Frame;
@@ -236,6 +236,26 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     let form_block = Block::default().borders(Borders::ALL).title(title);
     let inner = form_block.inner(form_area);
     f.render_widget(Paragraph::new(lines).block(form_block), form_area);
+
+    // Live-validate the manual time: colour it red when it's non-empty but won't
+    // parse, so a bad time reads as wrong before you schedule it. Parsing is a
+    // pure function of the text (relative specs resolve against `now`, but
+    // whether it parses does not depend on `now`), so it's fine to do here.
+    if form.when == WhenMode::Manual && !form.manual_time.is_empty() {
+        let now_zoned = model.now.to_zoned(model.defaults.tz.clone());
+        if crate::timespec::parse_timespec(&form.manual_time, &now_zoned).is_err() {
+            let value_len = form.manual_time.chars().count() as u16;
+            let vstart = (rows_txt[1].chars().count() as u16).saturating_sub(value_len);
+            let y = inner.y + 1; // the When row
+            let buf = f.buffer_mut();
+            for col in 0..value_len {
+                let x = inner.x + vstart + col;
+                if x < inner.right() && y < inner.bottom() {
+                    buf[(x, y)].set_fg(Color::Red);
+                }
+            }
+        }
+    }
 
     // Insert mode places the terminal's own cursor (a bar) at the edit position —
     // position+show only, so it keeps the terminal's shape and blink setting.
@@ -617,6 +637,34 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();
         assert_eq!(term.get_cursor_position().unwrap().x, 21);
+    }
+
+    #[test]
+    fn an_invalid_manual_time_is_shown_in_red() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        m.form.focus = FormField::When;
+        m.form.when = WhenMode::Manual;
+        m.form.manual_time = "zzz".into(); // not a parseable time
+        m.form.cursor = 3;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        // The value starts at inset(1) + "▶ When:    manual → "(20) = 21, row y=11.
+        assert_eq!(
+            term.backend().buffer()[(21, 11)].fg,
+            Color::Red,
+            "an unparseable time is red"
+        );
+
+        // A valid time is not red.
+        m.form.manual_time = "3pm".into();
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        assert_ne!(
+            term.backend().buffer()[(21, 11)].fg,
+            Color::Red,
+            "a valid time is not red"
+        );
     }
 
     #[test]
