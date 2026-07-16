@@ -2,6 +2,7 @@
 //! edges (view/exec) and the event loop in `run`.
 
 pub mod exec;
+pub mod fuzzy;
 pub mod model;
 pub mod update;
 pub mod view;
