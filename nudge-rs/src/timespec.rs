@@ -71,6 +71,17 @@ fn parse_named(s: &str, now: &Zoned) -> Option<Zoned> {
 /// Callers pass an already-isolated token (`detect::find_clock_token` extracts
 /// one; `--time` is a whole argument), so nothing legitimate needs the slack.
 fn parse_clock(s: &str, now: &Zoned) -> Option<Zoned> {
+    let (hour, minute) = clock_hm(s)?;
+    at_clock(now, hour, minute)
+}
+
+/// The clock-token parse, without resolving it against a date. Returns
+/// `(hour, minute)` on a 24-hour clock.
+///
+/// Split out of `parse_clock` because the weekly shape needs the fields to hang
+/// on a day that is not necessarily today or tomorrow. Every guard below is
+/// load-bearing and documented at its original site; do not relax them.
+fn clock_hm(s: &str) -> Option<(i8, i8)> {
     let up = s.to_uppercase();
     let re = Regex::new(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?\s*$").unwrap();
     let caps = re.captures(&up)?;
@@ -100,7 +111,7 @@ fn parse_clock(s: &str, now: &Zoned) -> Option<Zoned> {
     if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
         return None;
     }
-    at_clock(now, hour, minute)
+    Some((hour, minute))
 }
 
 /// Build today's `hour:minute` in now's zone; if it's already past, roll to tomorrow.
@@ -120,6 +131,72 @@ fn at_clock(now: &Zoned, hour: i8, minute: i8) -> Option<Zoned> {
             .ok()
     } else {
         Some(today)
+    }
+}
+
+/// A day named by a banner, relative to "now".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaySpec {
+    Today,
+    Tomorrow,
+    Weekday(jiff::civil::Weekday),
+}
+
+/// Parse a single day word. Weekday names (abbreviated or full), plus `today`
+/// and `tomorrow`.
+///
+/// Deliberately does NOT accept month-day forms ("Jul 16"). No capture of such a
+/// banner exists, and guessing at one is how you get a parser that is confidently
+/// wrong. The caller's gap-guard turns anything unrecognized into a loud refusal
+/// that quotes the text, which is how the next shape gets discovered.
+pub fn parse_day(s: &str) -> Option<DaySpec> {
+    use jiff::civil::Weekday;
+    Some(match s.trim().to_lowercase().as_str() {
+        "today" => DaySpec::Today,
+        "tomorrow" => DaySpec::Tomorrow,
+        "mon" | "monday" => DaySpec::Weekday(Weekday::Monday),
+        "tue" | "tues" | "tuesday" => DaySpec::Weekday(Weekday::Tuesday),
+        "wed" | "weds" | "wednesday" => DaySpec::Weekday(Weekday::Wednesday),
+        "thu" | "thur" | "thurs" | "thursday" => DaySpec::Weekday(Weekday::Thursday),
+        "fri" | "friday" => DaySpec::Weekday(Weekday::Friday),
+        "sat" | "saturday" => DaySpec::Weekday(Weekday::Saturday),
+        "sun" | "sunday" => DaySpec::Weekday(Weekday::Sunday),
+        _ => return None,
+    })
+}
+
+/// Resolve `day` + `clock_token` into an absolute time in `now`'s zone.
+///
+/// `None` means "these words do not describe a future time" — an unparseable
+/// clock, or a self-contradictory `today` whose hour has already passed. It is
+/// never "roll forward to something plausible": the caller refuses instead,
+/// because a plausible-but-invented reset day is exactly the silent misfire this
+/// design exists to prevent.
+pub fn resolve_day_clock(now: &Zoned, day: DaySpec, clock_token: &str) -> Option<Zoned> {
+    let (hour, minute) = clock_hm(clock_token)?;
+    let tz = now.time_zone().clone();
+    match day {
+        DaySpec::Today => {
+            let z = now.date().at(hour, minute, 0, 0).to_zoned(tz).ok()?;
+            (&z > now).then_some(z)
+        }
+        DaySpec::Tomorrow => now
+            .date()
+            .tomorrow()
+            .ok()?
+            .at(hour, minute, 0, 0)
+            .to_zoned(tz)
+            .ok(),
+        DaySpec::Weekday(target) => {
+            let today_at = now.date().at(hour, minute, 0, 0).to_zoned(tz).ok()?;
+            // Today counts only if its hour is still ahead; otherwise the reset
+            // is a full week out, NOT tomorrow.
+            if now.weekday() == target && &today_at > now {
+                return Some(today_at);
+            }
+            // `nth_weekday(1, ..)` is strictly future and preserves time-of-day.
+            today_at.nth_weekday(1, target).ok()
+        }
     }
 }
 
@@ -245,5 +322,78 @@ mod tests {
         assert_eq!(hm(&parse_timespec(" 3:05 pm ", &now()).unwrap()), (15, 5));
         assert_eq!(hm(&parse_timespec("00:30", &now()).unwrap()), (0, 30));
         assert_eq!(hm(&parse_timespec("23:59", &now()).unwrap()), (23, 59));
+    }
+
+    #[test]
+    fn parses_every_weekday_spelling() {
+        use jiff::civil::Weekday;
+        assert_eq!(parse_day("Mon"), Some(DaySpec::Weekday(Weekday::Monday)));
+        assert_eq!(parse_day("monday"), Some(DaySpec::Weekday(Weekday::Monday)));
+        assert_eq!(
+            parse_day("WEDS"),
+            Some(DaySpec::Weekday(Weekday::Wednesday))
+        );
+        assert_eq!(
+            parse_day("Wednesday"),
+            Some(DaySpec::Weekday(Weekday::Wednesday))
+        );
+        assert_eq!(
+            parse_day("thurs"),
+            Some(DaySpec::Weekday(Weekday::Thursday))
+        );
+        assert_eq!(parse_day("sun"), Some(DaySpec::Weekday(Weekday::Sunday)));
+        assert_eq!(parse_day("today"), Some(DaySpec::Today));
+        assert_eq!(parse_day("tomorrow"), Some(DaySpec::Tomorrow));
+        assert_eq!(parse_day("jul"), None);
+        assert_eq!(parse_day("banana"), None);
+    }
+
+    #[test]
+    fn resolves_a_weekday_later_this_week() {
+        // now() is Monday 2026-07-13 10:00. Wednesday 8am is 2 days out.
+        let z = resolve_day_clock(&now(), parse_day("Wed").unwrap(), "8am").unwrap();
+        assert_eq!(z.date(), date(2026, 7, 15));
+        assert_eq!(hm(&z), (8, 0));
+    }
+
+    #[test]
+    fn resolves_today_s_weekday_when_the_time_is_still_ahead() {
+        // Monday 10:00, banner says Monday 3pm -> today, not next week.
+        let z = resolve_day_clock(&now(), parse_day("Monday").unwrap(), "3pm").unwrap();
+        assert_eq!(z.date(), date(2026, 7, 13));
+        assert_eq!(hm(&z), (15, 0));
+    }
+
+    #[test]
+    fn resolves_today_s_weekday_to_next_week_when_the_time_has_passed() {
+        // Monday 10:00, banner says Monday 8am -> this Monday's 8am is gone,
+        // so the reset is a full week out. Rolling to "tomorrow" would be wrong
+        // by six days, which is the entire bug this feature exists to avoid.
+        let z = resolve_day_clock(&now(), parse_day("Monday").unwrap(), "8am").unwrap();
+        assert_eq!(z.date(), date(2026, 7, 20));
+        assert_eq!(hm(&z), (8, 0));
+    }
+
+    #[test]
+    fn resolves_tomorrow_and_today() {
+        let z = resolve_day_clock(&now(), DaySpec::Tomorrow, "8am").unwrap();
+        assert_eq!(z.date(), date(2026, 7, 14));
+        assert_eq!(hm(&z), (8, 0));
+
+        let z = resolve_day_clock(&now(), DaySpec::Today, "3pm").unwrap();
+        assert_eq!(z.date(), date(2026, 7, 13));
+    }
+
+    #[test]
+    fn today_in_the_past_is_unresolvable_not_immediate() {
+        // "resets today 8am" at 10:00 is self-contradictory. Returning a past
+        // time would make the scheduler fire it at once; None lets the caller
+        // refuse out loud instead.
+        assert_eq!(resolve_day_clock(&now(), DaySpec::Today, "8am"), None);
+    }
+
+    #[test]
+    fn a_day_with_an_unparseable_clock_is_unresolvable() {
+        assert_eq!(resolve_day_clock(&now(), DaySpec::Tomorrow, "banana"), None);
     }
 }
