@@ -3,7 +3,7 @@
 use crossterm::event::KeyCode;
 use jiff::Timestamp;
 
-use super::model::{FormField, MessageField, Model, Tab, WhenMode};
+use super::model::{CarriedEdit, Form, FormField, MessageField, Mode, Model, Tab, WhenMode};
 use crate::detect::Detection;
 use crate::job::{Job, JobSpec, TargetSpec};
 use crate::timespec::parse_timespec;
@@ -68,8 +68,33 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             model.form.detected = Some(d);
             vec![]
         }
-        Msg::Scheduled(_) | Msg::Cancelled(_) | Msg::Replaced(_) | Msg::ActionFailed(_) => {
-            vec![] // Task 4
+        Msg::Scheduled(id) => {
+            model.status.set(format!("scheduled job {id}"));
+            model.tab = Tab::Jobs;
+            model.form = super::model::Form::fresh();
+            vec![Effect::PollJobs]
+        }
+        Msg::Replaced(Some(id)) => {
+            model.status.set(format!("edited — now job {id}"));
+            model.tab = Tab::Jobs;
+            model.form = super::model::Form::fresh();
+            vec![Effect::PollJobs]
+        }
+        Msg::Replaced(None) => {
+            model.status.set("that job is already gone");
+            vec![Effect::PollJobs]
+        }
+        Msg::Cancelled(true) => {
+            model.status.set("cancelled");
+            vec![Effect::PollJobs]
+        }
+        Msg::Cancelled(false) => {
+            model.status.set("no such job");
+            vec![Effect::PollJobs]
+        }
+        Msg::ActionFailed(e) => {
+            model.status.set(e);
+            vec![]
         }
     }
 }
@@ -99,8 +124,53 @@ fn jobs_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
                 vec![]
             }
         }
+        KeyCode::Char('c') => match model.jobs.get(model.selected) {
+            Some(j) => vec![Effect::Cancel(j.id)],
+            None => vec![],
+        },
+        KeyCode::Char('e') => {
+            if let Some(j) = model.jobs.get(model.selected).cloned() {
+                enter_edit(model, &j);
+            }
+            vec![]
+        }
         _ => vec![],
     }
+}
+
+/// Switch to the New-nudge form pre-filled from `job`, carrying through the
+/// fields the form does not show (mirrors `app::merge_edit`'s "unset stays put").
+fn enter_edit(model: &mut Model, job: &Job) {
+    let TargetSpec::Tmux { pane } = &job.target;
+    let panes = std::mem::take(&mut model.form.panes);
+    let pane_idx = panes.iter().position(|p| &p.target == pane).unwrap_or(0);
+    let message = match job.messages.len() {
+        0 | 1 => MessageField::Editable(
+            job.messages.first().cloned().unwrap_or_else(|| "please continue".into()),
+        ),
+        n => MessageField::Preserved(n),
+    };
+    model.form = Form {
+        panes,
+        pane_idx,
+        when: WhenMode::Keep,
+        manual_time: String::new(),
+        detected: None,
+        message,
+        verify: job.verify,
+        notify: job.notify,
+        auto_retry: job.auto_retry,
+        focus: FormField::Pane,
+        mode: Mode::Editing(job.id),
+        carried: Some(CarriedEdit {
+            fire_at: job.fire_at,
+            messages: job.messages.clone(),
+            send_delay_secs: job.send_delay_secs,
+            settle_secs: job.settle_secs,
+            retries_left: job.retries_left,
+        }),
+    };
+    model.tab = Tab::NewNudge;
 }
 
 const FORM_ORDER: [FormField; 8] = [
@@ -347,6 +417,16 @@ mod tests {
         m
     }
 
+    fn multi_msg_job() -> Job {
+        let mut j = job(7, 4000);
+        j.messages = vec!["one".into(), "two".into()];
+        j.send_delay_secs = 1.5;
+        j.settle_secs = 9.0;
+        j.retries_left = 3;
+        j.auto_retry = true;
+        j
+    }
+
     #[test]
     fn panes_loaded_populates_the_dropdown_and_clamps_index() {
         let mut m = form_model();
@@ -501,5 +581,59 @@ mod tests {
         update(&mut m, Msg::JobsLoaded(vec![job(1, 3600)]));
         assert_eq!(m.jobs.len(), 1);
         assert_eq!(m.selected, 0, "selection clamps into the shorter list");
+    }
+
+    #[test]
+    fn e_enters_edit_prefilled_and_preserves_hidden_fields_on_save() {
+        let mut m = with_jobs(0);
+        m.jobs = vec![multi_msg_job()];
+        m.form.panes = vec![Pane { target: "s:0.7".into(), title: String::new() }];
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('e')));
+        assert_eq!(m.tab, Tab::NewNudge);
+        assert!(matches!(m.form.mode, Mode::Editing(7)));
+        assert_eq!(m.form.when, WhenMode::Keep, "an edit keeps the time by default");
+        assert_eq!(m.form.message, MessageField::Preserved(2), "multi-message is not editable in the TUI");
+        assert!(m.form.auto_retry);
+
+        // Save with nothing changed -> Replace preserving delay/settle/retries/messages.
+        m.form.focus = FormField::Submit;
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
+        match fx.as_slice() {
+            [Effect::Replace { id, spec, .. }] => {
+                assert_eq!(*id, 7);
+                assert_eq!(spec.messages, vec!["one".to_string(), "two".to_string()]);
+                assert_eq!(spec.send_delay_secs, 1.5);
+                assert_eq!(spec.settle_secs, 9.0);
+                assert_eq!(spec.retries_left, 3, "auto-retry on -> keep the job's budget");
+                assert_eq!(spec.fire_at, multi_msg_job().fire_at, "Keep -> unchanged time");
+            }
+            other => panic!("expected Replace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn c_cancels_the_selected_job() {
+        let mut m = with_jobs(2);
+        m.selected = 1;
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('c')));
+        assert_eq!(fx, vec![Effect::Cancel(2)]);
+    }
+
+    #[test]
+    fn scheduled_confirms_switches_to_jobs_and_refreshes() {
+        let mut m = form_model();
+        let fx = update(&mut m, Msg::Scheduled(12));
+        assert_eq!(m.tab, Tab::Jobs);
+        assert!(m.status.0.as_ref().unwrap().contains("12"));
+        assert!(fx.contains(&Effect::PollJobs));
+        assert!(matches!(m.form.mode, Mode::New), "the form resets after a successful schedule");
+    }
+
+    #[test]
+    fn action_failed_lands_in_the_status_line_and_does_not_quit() {
+        let mut m = with_jobs(1);
+        update(&mut m, Msg::ActionFailed("daemon is not this build".into()));
+        assert!(m.status.0.as_ref().unwrap().contains("daemon is not this build"));
+        assert!(!m.should_quit);
     }
 }
