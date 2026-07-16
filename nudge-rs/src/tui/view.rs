@@ -176,13 +176,15 @@ mod tests {
 
     #[test]
     fn empty_jobs_tab_says_so() {
-        let m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::Jobs;
         assert!(render(&m).contains("no pending nudge jobs"));
     }
 
     #[test]
     fn a_job_row_shows_pane_and_a_countdown() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::Jobs;
         let mut j = crate::job::Job {
             id: 12,
             target: TargetSpec::Tmux {

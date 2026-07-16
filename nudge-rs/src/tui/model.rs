@@ -40,6 +40,22 @@ mod tests {
         assert_eq!(human_countdown(0), "now");
         assert_eq!(human_countdown(-500), "now");
     }
+
+    #[test]
+    fn the_dashboard_opens_on_the_new_nudge_tab() {
+        let m = Model::new(
+            ScheduleDefaults {
+                send_delay_secs: 0.75,
+                settle_secs: 5.0,
+                retries: 2,
+                tz: jiff::tz::TimeZone::UTC,
+            },
+            "2026-07-16T12:00:00Z".parse().unwrap(),
+        );
+        assert_eq!(m.tab, Tab::NewNudge);
+        assert!(m.form.preview.is_none());
+        assert!(m.form.last_capture.is_none());
+    }
 }
 
 use jiff::Timestamp;
@@ -137,6 +153,11 @@ pub struct Form {
     pub focus: FormField,
     pub mode: Mode,
     pub carried: Option<CarriedEdit>,
+    /// The selected pane's captured screen for the live preview; `None` when the
+    /// pane could not be captured (rendered as "(preview unavailable)").
+    pub preview: Option<String>,
+    /// When the preview was last (re)captured; gates the ~1.5s refresh cadence.
+    pub last_capture: Option<jiff::Timestamp>,
 }
 
 impl Form {
@@ -154,6 +175,8 @@ impl Form {
             focus: FormField::Pane,
             mode: Mode::New,
             carried: None,
+            preview: None,
+            last_capture: None,
         }
     }
 
@@ -178,7 +201,7 @@ pub struct Model {
 impl Model {
     pub fn new(defaults: ScheduleDefaults, now: Timestamp) -> Model {
         Model {
-            tab: Tab::Jobs,
+            tab: Tab::NewNudge,
             jobs: Vec::new(),
             selected: 0,
             form: Form::fresh(),

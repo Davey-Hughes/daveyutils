@@ -186,6 +186,8 @@ fn enter_edit(model: &mut Model, job: &Job) {
             settle_secs: job.settle_secs,
             retries_left: job.retries_left,
         }),
+        preview: None,
+        last_capture: None,
     };
     model.tab = Tab::NewNudge;
 }
@@ -449,6 +451,7 @@ mod tests {
 
     fn with_jobs(n: u64) -> Model {
         let mut m = Model::new(defaults(), t0());
+        m.tab = Tab::Jobs;
         m.jobs = (1..=n).map(|i| job(i, 3600)).collect();
         m
     }
