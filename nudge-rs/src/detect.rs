@@ -126,7 +126,7 @@ enum Shape {
 /// day we cannot read is not "no banner" — reporting it as such prints `no
 /// rate-limit banner detected in <pane>`, blaming the pane for a gap in this
 /// parser. It is a distinct answer with a distinct remedy, so it gets a variant.
-#[derive(Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum Detection {
     /// No rate-limit banner in the pane.
     None,

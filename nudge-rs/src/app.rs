@@ -18,6 +18,60 @@ use crate::paths;
 use crate::target::{tmux::TmuxTarget, PaneDims, Target};
 use crate::timespec::parse_timespec;
 
+/// The mode `dispatch` resolves a parsed CLI + TTY state into.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Route {
+    Cancel(u64),
+    Edit(u64),
+    StaticList,
+    Dashboard,
+    Schedule,
+}
+
+/// True if the user expressed scheduling intent — any flag `schedule` consumes.
+/// Bare `nudge` (none of these) is the dashboard's front door instead.
+pub fn has_scheduling_flags(cli: &Cli) -> bool {
+    cli.pane.is_some()
+        || cli.time.is_some()
+        || !cli.input.is_empty()
+        || cli.delay.is_some()
+        || cli.notify
+        || cli.no_notify
+        || cli.auto_retry
+        || cli.no_auto_retry
+        || cli.retries.is_some()
+        || cli.verify
+        || cli.no_verify
+}
+
+/// Pure routing: mode flags first, then the dashboard/table/schedule split.
+pub fn route(cli: &Cli, is_tty: bool) -> Route {
+    if let Some(id) = cli.cancel {
+        return Route::Cancel(id);
+    }
+    if let Some(id) = cli.edit {
+        return Route::Edit(id);
+    }
+    if cli.list_plain {
+        return Route::StaticList;
+    }
+    if cli.list {
+        return if is_tty {
+            Route::Dashboard
+        } else {
+            Route::StaticList
+        };
+    }
+    if has_scheduling_flags(cli) {
+        return Route::Schedule;
+    }
+    if is_tty {
+        Route::Dashboard
+    } else {
+        Route::StaticList
+    }
+}
+
 /// Split a `--verify` snapshot into the two fields a JobSpec stores.
 ///
 /// `None` in, `None`s out — a pane that could not be snapshotted arms no
@@ -510,16 +564,14 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
 
 /// Dispatch non-daemon modes.
 pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    if let Some(id) = cli.cancel {
-        return cancel(id);
+    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    match route(&cli, is_tty) {
+        Route::Cancel(id) => cancel(id),
+        Route::Edit(id) => edit(id, &cli),
+        Route::StaticList => list(),
+        Route::Dashboard => crate::tui::run(),
+        Route::Schedule => schedule(&cli),
     }
-    if let Some(id) = cli.edit {
-        return edit(id, &cli);
-    }
-    if cli.list || cli.list_plain {
-        return list();
-    }
-    schedule(&cli)
 }
 
 /// Interactively choose a tmux pane.
@@ -559,6 +611,56 @@ pub fn print_completions(shell: clap_complete::Shell) {
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+
+    use crate::cli::Cli;
+
+    fn cli(args: &[&str]) -> Cli {
+        <Cli as clap::Parser>::try_parse_from(args).unwrap()
+    }
+
+    #[test]
+    fn bare_nudge_on_a_tty_opens_the_dashboard() {
+        assert_eq!(route(&cli(&["nudge"]), true), Route::Dashboard);
+    }
+
+    #[test]
+    fn bare_nudge_without_a_tty_prints_the_static_table() {
+        assert_eq!(route(&cli(&["nudge"]), false), Route::StaticList);
+    }
+
+    #[test]
+    fn list_opens_the_dashboard_on_a_tty_and_the_table_otherwise() {
+        assert_eq!(route(&cli(&["nudge", "--list"]), true), Route::Dashboard);
+        assert_eq!(route(&cli(&["nudge", "--list"]), false), Route::StaticList);
+    }
+
+    #[test]
+    fn list_plain_is_always_the_static_table() {
+        assert_eq!(
+            route(&cli(&["nudge", "--list-plain"]), true),
+            Route::StaticList
+        );
+    }
+
+    #[test]
+    fn any_scheduling_flag_schedules_directly_even_on_a_tty() {
+        assert_eq!(
+            route(&cli(&["nudge", "-p", "bot:0.1"]), true),
+            Route::Schedule
+        );
+        assert_eq!(route(&cli(&["nudge", "-m", "3pm"]), true), Route::Schedule);
+        assert_eq!(route(&cli(&["nudge", "-i", "go"]), true), Route::Schedule);
+        assert_eq!(route(&cli(&["nudge", "-v"]), true), Route::Schedule);
+    }
+
+    #[test]
+    fn cancel_and_edit_still_win() {
+        assert_eq!(
+            route(&cli(&["nudge", "--cancel", "1"]), true),
+            Route::Cancel(1)
+        );
+        assert_eq!(route(&cli(&["nudge", "--edit", "2"]), true), Route::Edit(2));
+    }
 
     /// The distinction the whole handshake rests on. Get it wrong one way and a
     /// first-ever `nudge` stops auto-starting its daemon; wrong the other way

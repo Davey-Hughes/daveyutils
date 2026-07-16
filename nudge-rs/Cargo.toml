@@ -11,7 +11,9 @@ name = "nudge"
 # banner, would report SkippedNoBanner, and the nudge would silently never
 # fire -- the failure this comment exists to prevent, via a path that is not
 # the wire format.
-version = "0.3.0"
+# 0.4.0 adds the client-side TUI dashboard: no wire/daemon change, so this bump
+# is a feature marker, not compat-load-bearing like the ones above.
+version = "0.4.0"
 edition = "2021"
 description = "Rate-limit auto-resumer for AI CLIs in tmux"
 license = "GPL-3.0-or-later"
@@ -40,6 +42,9 @@ plist = "1"
 notify-rust = "4"
 inquire = "0.7"
 fs4 = "0.13"
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+ansi-to-tui = "8.0.1"
 
 [dev-dependencies]
 tempfile = "3"

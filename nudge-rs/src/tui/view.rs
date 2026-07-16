@@ -1,0 +1,720 @@
+//! Pure render of `Model` into a ratatui frame.
+
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs};
+use ratatui::Frame;
+
+use super::model::{human_countdown, FormField, MessageField, Model, Tab, VimMode, WhenMode};
+use crate::job::TargetSpec;
+
+pub fn view(model: &Model, f: &mut Frame) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    let titles = ["nudge", "Jobs"];
+    let sel = match model.tab {
+        Tab::NewNudge => 0,
+        Tab::Jobs => 1,
+    };
+    f.render_widget(Tabs::new(titles.to_vec()).select(sel), chunks[0]);
+
+    match model.tab {
+        Tab::Jobs => jobs_view(model, f, chunks[1]),
+        Tab::NewNudge => form_view(model, f, chunks[1]),
+    }
+
+    let hint = match model.tab {
+        Tab::Jobs => "[↑↓] select  [c] cancel  [e] edit  [r] refresh  [Tab] new  [q] quit",
+        Tab::NewNudge => match &model.form.picker {
+            Some(p) if p.mode == VimMode::Normal => {
+                "NORMAL · [j/k] move  [i] insert  [enter] pick  [esc/q] cancel"
+            }
+            Some(_) => "INSERT · type to filter  ·  [↑↓] move  [enter] pick  [esc] normal",
+            None if model.form.nav_mode == VimMode::Normal => {
+                "NORMAL · [j/k] field  [h/l] move/change  [i/a] insert  [x/dd] delete  [/] search  [enter] schedule  [q] quit  [esc] jobs"
+            }
+            None => {
+                "INSERT · [↑↓] field  [←→] change  [space] toggle  [/] search  [enter] schedule  [esc] normal  [^C] quit"
+            }
+        },
+    };
+    let status = model.status.0.clone().unwrap_or_else(|| hint.to_string());
+    f.render_widget(Paragraph::new(status), chunks[2]);
+}
+
+fn jobs_view(model: &Model, f: &mut Frame, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title("Pending jobs");
+    if model.jobs.is_empty() {
+        f.render_widget(Paragraph::new("no pending nudge jobs").block(block), area);
+        return;
+    }
+    let rows = model.jobs.iter().enumerate().map(|(i, j)| {
+        let TargetSpec::Tmux { pane } = &j.target;
+        let delta = j.fire_at.duration_since(model.now).as_secs();
+        let flags: String = [(j.verify, 'v'), (j.notify, 'n'), (j.auto_retry, 'a')]
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, c)| *c)
+            .collect();
+        let style = if i == model.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        Row::new(vec![
+            j.id.to_string(),
+            pane.clone(),
+            human_countdown(delta),
+            j.messages.len().to_string(),
+            flags,
+        ])
+        .style(style)
+    });
+    let widths = [
+        Constraint::Length(5),
+        Constraint::Length(22),
+        Constraint::Length(12),
+        Constraint::Length(5),
+        Constraint::Length(6),
+    ];
+    let table = Table::new(rows, widths)
+        .header(Row::new(vec!["ID", "PANE", "FIRES IN", "MSGS", "FLAGS"]))
+        .block(block);
+    f.render_widget(table, area);
+}
+
+/// The preview panel's content: the captured pane's ANSI parsed into styled
+/// text, bottom-anchored to the last `inner_h` lines. Parsing (not raw
+/// passthrough) confines a pane's escapes to SGR styling. Degrades to stripped
+/// plain text on a parse error, and to a placeholder when there is no capture.
+fn preview_text(preview: &Option<String>, inner_h: usize) -> Text<'static> {
+    use ansi_to_tui::IntoText;
+    match preview {
+        Some(screen) => {
+            let text = screen
+                .into_text()
+                .unwrap_or_else(|_| Text::raw(strip_ansi_escapes::strip_str(screen)));
+            let start = text.lines.len().saturating_sub(inner_h);
+            let tail = &text.lines[start..];
+            // Bottom-align: pad the top so the pane's tail (where the banner sits)
+            // rests at the bottom of the panel.
+            let pad = inner_h.saturating_sub(tail.len());
+            let mut lines: Vec<Line> = std::iter::repeat_with(|| Line::from(""))
+                .take(pad)
+                .collect();
+            lines.extend_from_slice(tail);
+            Text::from(lines)
+        }
+        None => Text::from("(preview unavailable)"),
+    }
+}
+
+fn form_view(model: &Model, f: &mut Frame, area: Rect) {
+    let form = &model.form;
+    if form.picker.is_some() {
+        return picker_view(model, f, area);
+    }
+    let pane = form
+        .selected_pane()
+        .map(|p| p.target.as_str())
+        .unwrap_or("(no panes)");
+    // The When field is a single editable control: Auto shows the detected time,
+    // Manual shows the time you type (empty = Auto, so any text means Manual),
+    // Keep (edit-only) leaves the job's time alone.
+    let when = match form.when {
+        WhenMode::Keep => "keep current fire time".to_string(),
+        WhenMode::Auto => match &form.detected {
+            Some(crate::detect::Detection::Reset(z)) => format!("auto → {}", z),
+            Some(crate::detect::Detection::None) => "auto → no banner detected".to_string(),
+            Some(crate::detect::Detection::Unreadable { gap, .. }) => {
+                format!("auto → weekly, day unreadable ({gap:?})")
+            }
+            None => "auto → (select a pane)".to_string(),
+        },
+        WhenMode::Manual => format!("manual → {}", form.manual_time),
+    };
+    let message = match &form.message {
+        MessageField::Editable(s) => s.clone(),
+        MessageField::Preserved(n) => format!("{n} messages — edit via CLI"),
+    };
+    let mark = |field: FormField| if form.focus == field { "▶ " } else { "  " };
+    let onoff = |b: bool| if b { "[x]" } else { "[ ]" };
+    // Show how many retries auto-retry will actually schedule (from config, or a
+    // carried job's remaining count) so the count isn't a mystery.
+    let auto_retry_label = if form.auto_retry {
+        let n = form.retry_base(model.defaults.retries);
+        let unit = if n == 1 { "retry" } else { "retries" };
+        format!("auto-retry ({n} {unit})")
+    } else {
+        "auto-retry".to_string()
+    };
+    // Field rows, in `FORM_ORDER`. Kept as strings so the cursor can be placed at
+    // the exact end of the focused text row below.
+    let rows_txt = [
+        format!("{}Pane:    {}", mark(FormField::Pane), pane),
+        format!("{}When:    {}", mark(FormField::When), when),
+        format!("{}Message: {}", mark(FormField::Message), message),
+        format!("{}{} verify", mark(FormField::Verify), onoff(form.verify)),
+        format!("{}{} notify", mark(FormField::Notify), onoff(form.notify)),
+        format!(
+            "{}{} {}",
+            mark(FormField::AutoRetry),
+            onoff(form.auto_retry),
+            auto_retry_label
+        ),
+        format!("{}[ Schedule ]", mark(FormField::Submit)),
+    ];
+    let mut lines: Vec<Line> = rows_txt.iter().map(|s| Line::from(s.clone())).collect();
+    let base_title = match form.mode {
+        super::model::Mode::New => "nudge",
+        super::model::Mode::Editing(_) => "edit nudge",
+    };
+    let title = format!(
+        "{base_title} · {}",
+        match form.nav_mode {
+            VimMode::Insert => "INSERT",
+            VimMode::Normal => "NORMAL",
+        }
+    );
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(10)]) // preview grows, form fixed
+        .split(area);
+    let preview_area = rows[0];
+    let form_area = rows[1];
+
+    // Preview panel (top): the selected pane's screen, bottom-anchored so the
+    // banner (at the pane's bottom) stays visible when the panel is shorter.
+    let pane_name = form
+        .selected_pane()
+        .map(|p| p.target.as_str())
+        .unwrap_or("(no pane)");
+    let preview_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("preview: {pane_name}"));
+    let inner_h = preview_area.height.saturating_sub(2) as usize; // minus borders
+    f.render_widget(
+        Paragraph::new(preview_text(&form.preview, inner_h)).block(preview_block),
+        preview_area,
+    );
+
+    // The focused text row (message, or When-while-Manual) and its editable
+    // value length — `None` on selector fields, which show no cursor.
+    let editable = form.focused_text().map(|v| {
+        let idx = if form.focus == FormField::When { 1 } else { 2 };
+        (idx, v.chars().count())
+    });
+
+    // Normal mode draws a block cursor (reverse video on the char under it) by
+    // rebuilding that row's spans. No cursor-style escape is emitted, so the
+    // terminal's own cursor shape/blink is untouched (Insert uses it below).
+    if form.nav_mode == VimMode::Normal {
+        if let Some((idx, value_len)) = editable {
+            let rchars: Vec<char> = rows_txt[idx].chars().collect();
+            let vstart = rchars.len() - value_len;
+            let col = vstart
+                + if value_len == 0 {
+                    0
+                } else {
+                    form.cursor.min(value_len - 1)
+                };
+            let before: String = rchars[..col.min(rchars.len())].iter().collect();
+            let under = rchars.get(col).copied().unwrap_or(' ');
+            let after: String = rchars
+                .get(col + 1..)
+                .map_or(String::new(), |c| c.iter().collect());
+            lines[idx] = Line::from(vec![
+                Span::raw(before),
+                Span::styled(
+                    under.to_string(),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ),
+                Span::raw(after),
+            ]);
+        }
+    }
+
+    let form_block = Block::default().borders(Borders::ALL).title(title);
+    let inner = form_block.inner(form_area);
+    f.render_widget(Paragraph::new(lines).block(form_block), form_area);
+
+    // Live-validate the manual time: colour it red when it's non-empty but won't
+    // parse, so a bad time reads as wrong before you schedule it. Parsing is a
+    // pure function of the text (relative specs resolve against `now`, but
+    // whether it parses does not depend on `now`), so it's fine to do here.
+    if form.when == WhenMode::Manual && !form.manual_time.is_empty() {
+        let now_zoned = model.now.to_zoned(model.defaults.tz.clone());
+        if crate::timespec::parse_timespec(&form.manual_time, &now_zoned).is_err() {
+            let value_len = form.manual_time.chars().count() as u16;
+            let vstart = (rows_txt[1].chars().count() as u16).saturating_sub(value_len);
+            let y = inner.y + 1; // the When row
+            let buf = f.buffer_mut();
+            for col in 0..value_len {
+                let x = inner.x + vstart + col;
+                if x < inner.right() && y < inner.bottom() {
+                    buf[(x, y)].set_fg(Color::Red);
+                }
+            }
+        }
+    }
+
+    // Insert mode places the terminal's own cursor (a bar) at the edit position —
+    // position+show only, so it keeps the terminal's shape and blink setting.
+    if form.nav_mode == VimMode::Insert {
+        if let Some((idx, value_len)) = editable {
+            let vstart = rows_txt[idx].chars().count() - value_len;
+            let cursor_x = (inner.x + vstart as u16 + form.cursor.min(value_len) as u16)
+                .min(inner.right().saturating_sub(1));
+            let cursor_y = (inner.y + idx as u16).min(inner.bottom().saturating_sub(1));
+            f.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
+}
+
+/// The picker occupies this fraction of the tab body; the preview gets the rest.
+/// Fixed (not content-sized) so it doesn't resize as the match count changes —
+/// the list scrolls inside it instead.
+const PICKER_HEIGHT_PCT: u32 = 50;
+
+fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
+    let form = &model.form;
+    let picker = form.picker.as_ref().unwrap();
+    // Preview on top, the search + list block below at a fixed fraction of the
+    // body. The block does NOT resize with the match count; its list scrolls.
+    let picker_h = ((area.height as u32 * PICKER_HEIGHT_PCT / 100) as u16).max(4);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(picker_h)])
+        .split(area);
+    let preview_area = rows[0];
+    let picker_area = rows[1];
+
+    // Live preview of the highlighted pane (top) — same source as the form.
+    let name = form
+        .active_pane()
+        .map(|p| p.target.as_str())
+        .unwrap_or("(no pane)");
+    let preview_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("preview: {name}"));
+    let inner_h = preview_area.height.saturating_sub(2) as usize;
+    f.render_widget(
+        Paragraph::new(preview_text(&form.preview, inner_h)).block(preview_block),
+        preview_area,
+    );
+
+    // Search + list block (bottom). The search line is pinned to the BOTTOM of
+    // the block, below the list, so the line you type into stays put while the
+    // match list resizes above it (fzf-style) rather than jumping around.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(match picker.mode {
+            VimMode::Insert => "pick a pane · INSERT",
+            VimMode::Normal => "pick a pane · NORMAL",
+        });
+    let inner = block.inner(picker_area);
+    f.render_widget(block, picker_area);
+    let inner_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let list_area = inner_rows[0];
+    let search_area = inner_rows[1];
+
+    // The match list, above the search line: a scrolling window that keeps the
+    // highlight visible (when there are more matches than rows, the highlighted
+    // row rides the bottom of the window), bottom-aligned so the results rest
+    // just above the prompt.
+    let h = list_area.height as usize;
+    let m = picker.matches.len();
+    let (start, end) = if m <= h {
+        (0, m)
+    } else {
+        let end = (picker.highlight + 1).clamp(h, m);
+        (end - h, end)
+    };
+    let mut lines = Vec::new();
+    for row in start..end {
+        let Some(p) = form.panes.get(picker.matches[row]) else {
+            continue;
+        };
+        let mark = if row == picker.highlight {
+            "▶ "
+        } else {
+            "  "
+        };
+        let style = if row == picker.highlight {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{mark}{:<20} {}", p.target, p.title),
+            style,
+        )));
+    }
+    if picker.matches.is_empty() {
+        lines.push(Line::from("  (no matching panes)"));
+    }
+    // Bottom-align: pad the top so the results rest just above the search line.
+    let pad = h.saturating_sub(lines.len());
+    let mut padded: Vec<Line> = std::iter::repeat_with(|| Line::from(""))
+        .take(pad)
+        .collect();
+    padded.extend(lines);
+    f.render_widget(Paragraph::new(padded), list_area);
+
+    // The search line, pinned at the bottom of the block.
+    f.render_widget(Paragraph::new(format!("> {}", picker.query)), search_area);
+
+    // In Insert mode, put the terminal cursor at the end of the query so the
+    // search line reads as the text field it is. This only positions+shows the
+    // cursor (no DECSCUSR style escape), so it keeps the terminal's own cursor
+    // shape and blink setting. In Normal mode the highlighted row is the focus,
+    // so no cursor is shown. x = "> " prefix + query width, clamped inside the
+    // right edge; y = the pinned search line.
+    if picker.mode == VimMode::Insert {
+        let cursor_x = (search_area.x + 2 + picker.query.chars().count() as u16)
+            .min(search_area.right().saturating_sub(1));
+        f.set_cursor_position((cursor_x, search_area.y));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    use super::super::model::{Model, ScheduleDefaults, VimMode, WhenMode};
+
+    fn render(model: &Model) -> String {
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(model, f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn defaults() -> ScheduleDefaults {
+        ScheduleDefaults {
+            send_delay_secs: 0.75,
+            settle_secs: 5.0,
+            retries: 2,
+            tz: jiff::tz::TimeZone::UTC,
+        }
+    }
+
+    #[test]
+    fn empty_jobs_tab_says_so() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::Jobs;
+        assert!(render(&m).contains("no pending nudge jobs"));
+    }
+
+    #[test]
+    fn a_job_row_shows_pane_and_a_countdown() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::Jobs;
+        let mut j = crate::job::Job {
+            id: 12,
+            target: TargetSpec::Tmux {
+                pane: "bot:0.1".into(),
+            },
+            messages: vec!["please continue".into()],
+            send_delay_secs: 0.75,
+            fire_at: "2026-07-16T14:14:00Z".parse().unwrap(),
+            notify: false,
+            verify: true,
+            auto_retry: true,
+            retries_left: 2,
+            settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
+        };
+        j.messages = vec!["please continue".into()];
+        m.jobs = vec![j];
+        let out = render(&m);
+        assert!(out.contains("bot:0.1"), "{out}");
+        assert!(out.contains("2h 14m"), "{out}");
+    }
+
+    #[test]
+    fn new_nudge_tab_shows_the_form_fields() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        let out = render(&m);
+        assert!(out.contains("Message"), "{out}");
+        assert!(out.contains("please continue"), "{out}");
+    }
+
+    #[test]
+    fn the_form_title_shows_the_vim_mode() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge; // opens in Insert
+        assert!(render(&m).contains("nudge · INSERT"), "{}", render(&m));
+        m.form.nav_mode = VimMode::Normal;
+        assert!(render(&m).contains("nudge · NORMAL"), "{}", render(&m));
+    }
+
+    #[test]
+    fn the_form_shows_a_pane_preview_on_top() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.form.panes = vec![crate::tmux_panes::Pane {
+            target: "bot:0.1".into(),
+            title: String::new(),
+        }];
+        m.form.preview = Some("current session limit · resets 3:00pm".into());
+        let out = render(&m); // NewNudge is the default tab
+        assert!(out.contains("preview: bot:0.1"), "{out}");
+        assert!(out.contains("resets 3:00pm"), "{out}");
+        assert!(out.contains("Message"), "form fields still render: {out}");
+    }
+
+    #[test]
+    fn a_missing_preview_says_unavailable() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.form.preview = None;
+        let out = render(&m);
+        assert!(out.contains("preview unavailable"), "{out}");
+    }
+
+    #[test]
+    fn the_picker_list_scrolls_to_keep_the_highlight_visible() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.form.panes = (0..30)
+            .map(|i| crate::tmux_panes::Pane {
+                target: format!("s:0.{i}"),
+                title: format!("pane{i}"),
+            })
+            .collect();
+        m.form.picker = Some(super::super::model::Picker {
+            query: String::new(),
+            matches: (0..30).collect(),
+            highlight: 27,
+            mode: super::super::model::VimMode::Insert,
+        });
+        // 80x20: the fixed-height picker can't show 30 rows, so it scrolls.
+        let out = render(&m);
+        assert!(
+            out.contains("pane27"),
+            "the highlighted pane is scrolled into view: {out}"
+        );
+        assert!(
+            !out.contains("pane0 "),
+            "an early pane scrolled out of the window: {out}"
+        );
+    }
+
+    #[test]
+    fn the_tab_bar_lists_nudge_first_then_jobs() {
+        let m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        let out = render(&m);
+        let nudge = out.find("nudge").expect("nudge tab present");
+        let jobs = out.find("Jobs").expect("Jobs tab present");
+        assert!(nudge < jobs, "nudge is left of Jobs: {out}");
+    }
+
+    #[test]
+    fn the_picker_renders_the_query_and_matches() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.form.panes = vec![crate::tmux_panes::Pane {
+            target: "bot:0.1".into(),
+            title: "claude".into(),
+        }];
+        m.form.picker = Some(super::super::model::Picker {
+            query: "cl".into(),
+            matches: vec![0],
+            highlight: 0,
+            mode: super::super::model::VimMode::Insert,
+        });
+        let out = render(&m);
+        assert!(out.contains("pick a pane"), "{out}");
+        assert!(out.contains("> cl"), "{out}");
+        assert!(out.contains("claude"), "{out}");
+    }
+
+    #[test]
+    fn the_preview_renders_ansi_colors_as_styled_text() {
+        // A red "RED" via SGR should parse into a span styled red. The preview is
+        // bottom-aligned and padded to the panel height, so the content is on the
+        // last line.
+        let text = preview_text(&Some("\x1b[31mRED\x1b[0m".into()), 10);
+        assert_eq!(text.lines.len(), 10, "padded to the panel height");
+        let last = text.lines.last().unwrap();
+        assert_eq!(last.spans[0].content.as_ref(), "RED");
+        assert_eq!(last.spans[0].style.fg, Some(ratatui::style::Color::Red));
+    }
+
+    #[test]
+    fn a_missing_capture_previews_unavailable() {
+        let text = preview_text(&None, 10);
+        assert_eq!(
+            text.lines[0].spans[0].content.as_ref(),
+            "(preview unavailable)"
+        );
+    }
+
+    #[test]
+    fn the_picker_puts_the_cursor_after_the_query() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.form.panes = vec![crate::tmux_panes::Pane {
+            target: "bot:0.1".into(),
+            title: "claude".into(),
+        }];
+        m.form.picker = Some(super::super::model::Picker {
+            query: "cl".into(),
+            matches: vec![0],
+            highlight: 0,
+            mode: super::super::model::VimMode::Insert,
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        // The search line is pinned to the bottom of the picker block; here it
+        // lands on row 17 (just above the status line). x = "> "(2) + "cl"(2) + the
+        // block's left inset(1) = 5. (Row tracks the layout; x is the contract.)
+        let pos = term.get_cursor_position().unwrap();
+        assert_eq!(pos.x, 5, "cursor sits just after '> cl'");
+        assert_eq!(
+            pos.y, 17,
+            "on the picker's search line, pinned at the bottom"
+        );
+    }
+
+    #[test]
+    fn insert_mode_puts_the_cursor_after_the_focused_text_field() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge; // opens in Insert
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable("hi".into());
+        m.form.cursor = 2; // at the end
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        // Message is row 2 of the form block; the block sits below the 8-row
+        // preview (body y=1..18, preview 8 rows, form starts y=9 → inner y=10).
+        // x = block inset(1) + "▶ Message: "(11) + cursor 2 = 14.
+        let pos = term.get_cursor_position().unwrap();
+        assert_eq!(pos.x, 14, "just after '▶ Message: hi'");
+        assert_eq!(pos.y, 12, "on the Message row (inner y 10 + row 2)");
+    }
+
+    #[test]
+    fn the_manual_when_field_gets_the_cursor() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge; // Insert
+        m.form.focus = FormField::When;
+        m.form.when = WhenMode::Manual;
+        m.form.manual_time = "3pm".into();
+        m.form.cursor = 3; // at the end
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        // When is row 1; x = inset(1) + "▶ When:    manual → "(20) + cursor 3 = 24.
+        let pos = term.get_cursor_position().unwrap();
+        assert_eq!(pos.x, 24, "just after '▶ When:    manual → 3pm'");
+        assert_eq!(pos.y, 11, "on the When row (inner y 10 + row 1)");
+    }
+
+    #[test]
+    fn insert_on_a_blank_when_shows_an_empty_manual_input() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge; // Insert
+        m.form.focus = FormField::When;
+        m.form.when = WhenMode::Manual;
+        m.form.manual_time = String::new(); // blank
+        m.form.cursor = 0;
+        let out = render(&m);
+        assert!(
+            out.contains("manual → "),
+            "shows the manual input, not auto: {out}"
+        );
+        assert!(!out.contains("auto →"), "does not fall back to auto: {out}");
+        // Cursor sits just after "manual → ": inset(1) + "▶ When:    manual → "(20) = 21.
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        assert_eq!(term.get_cursor_position().unwrap().x, 21);
+    }
+
+    #[test]
+    fn auto_retry_shows_the_configured_retry_count() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge; // defaults() configures retries = 2
+        m.form.auto_retry = true;
+        assert!(
+            render(&m).contains("auto-retry (2 retries)"),
+            "{}",
+            render(&m)
+        );
+        // No count when it's off (it won't retry).
+        m.form.auto_retry = false;
+        let out = render(&m);
+        assert!(out.contains("auto-retry"), "{out}");
+        assert!(!out.contains("retries)"), "no count when off: {out}");
+    }
+
+    #[test]
+    fn an_invalid_manual_time_is_shown_in_red() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        m.form.focus = FormField::When;
+        m.form.when = WhenMode::Manual;
+        m.form.manual_time = "zzz".into(); // not a parseable time
+        m.form.cursor = 3;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        // The value starts at inset(1) + "▶ When:    manual → "(20) = 21, row y=11.
+        assert_eq!(
+            term.backend().buffer()[(21, 11)].fg,
+            Color::Red,
+            "an unparseable time is red"
+        );
+
+        // A valid time is not red.
+        m.form.manual_time = "3pm".into();
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        assert_ne!(
+            term.backend().buffer()[(21, 11)].fg,
+            Color::Red,
+            "a valid time is not red"
+        );
+    }
+
+    #[test]
+    fn normal_mode_draws_a_block_cursor_on_the_char() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable("hi".into());
+        m.form.cursor = 0; // on the 'h'
+        m.form.nav_mode = VimMode::Normal;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        // Message value starts at x = inset(1) + "▶ Message: "(11) = 12, row y=12.
+        let buf = term.backend().buffer();
+        let cell = &buf[(12, 12)];
+        assert_eq!(
+            cell.symbol(),
+            "h",
+            "block sits on the char under the cursor"
+        );
+        assert!(
+            cell.modifier.contains(Modifier::REVERSED),
+            "Normal-mode cursor is a reverse-video block"
+        );
+    }
+}
