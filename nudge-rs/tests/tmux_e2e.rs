@@ -158,7 +158,7 @@ fn end_to_end_injection_verifies_then_sends() {
         verify_dims: None,
     };
 
-    let out = run_injection(&target, &job, &fixed_now(), None, None).unwrap();
+    let out = run_injection(&target, &job, &fixed_now(), None, None, None).unwrap();
     assert_eq!(out, InjectOutcome::Sent(1));
 
     thread::sleep(Duration::from_millis(500));
@@ -286,7 +286,7 @@ fn end_to_end_verify_skips_a_pane_that_moved_after_the_snapshot() {
         verify_fingerprint: Some(base.fingerprint),
         verify_dims: Some(base.dims),
     };
-    let out = run_injection(&target, &job, &fixed_now(), None, None).unwrap();
+    let out = run_injection(&target, &job, &fixed_now(), None, None, None).unwrap();
     assert_eq!(out, InjectOutcome::SkippedResumed);
 
     thread::sleep(Duration::from_millis(300));
@@ -329,7 +329,7 @@ fn end_to_end_verify_still_fires_into_a_pane_nobody_touched() {
         verify_fingerprint: Some(base.fingerprint),
         verify_dims: Some(base.dims),
     };
-    let out = run_injection(&target, &job, &fixed_now(), None, None).unwrap();
+    let out = run_injection(&target, &job, &fixed_now(), None, None, None).unwrap();
     assert_eq!(
         out,
         InjectOutcome::Sent(1),

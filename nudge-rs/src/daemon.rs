@@ -74,9 +74,10 @@ pub fn run(
     paths: &Paths,
     clock_ext: Option<String>,
     dur_ext: Option<String>,
+    weekly_ext: Option<String>,
     grace: Span,
 ) -> std::io::Result<()> {
-    run_with(paths, clock_ext, dur_ext, grace, on_serve_exit)
+    run_with(paths, clock_ext, dur_ext, weekly_ext, grace, on_serve_exit)
 }
 
 /// [`run`], with the serve-exit policy injected.
@@ -94,6 +95,7 @@ pub fn run_with(
     paths: &Paths,
     clock_ext: Option<String>,
     dur_ext: Option<String>,
+    weekly_ext: Option<String>,
     grace: Span,
     on_serve_exit: fn(std::io::Result<()>) -> !,
 ) -> std::io::Result<()> {
@@ -134,6 +136,7 @@ pub fn run_with(
                 &now,
                 clock_ext.as_deref(),
                 dur_ext.as_deref(),
+                weekly_ext.as_deref(),
             );
             match &outcome {
                 // Not "fired": two of the three outcomes deliberately send

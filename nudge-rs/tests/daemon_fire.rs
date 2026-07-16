@@ -153,7 +153,7 @@ fn daemon_fires_a_due_job_into_the_pane() {
     // Spawn the daemon: loops forever, reaped at process exit.
     let daemon_paths = paths.clone();
     std::thread::spawn(move || {
-        let _ = nudge::daemon::run(&daemon_paths, None, None, 6.hours());
+        let _ = nudge::daemon::run(&daemon_paths, None, None, None, 6.hours());
     });
 
     // Poll the pane until the injected echo has actually run.

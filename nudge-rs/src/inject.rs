@@ -39,6 +39,7 @@ pub fn run_injection(
     now: &jiff::Zoned,
     clock_ext: Option<&str>,
     dur_ext: Option<&str>,
+    weekly_ext: Option<&str>,
 ) -> Result<InjectOutcome> {
     if job.verify {
         // Dims either side of the capture, believed only when they agree.
@@ -87,7 +88,7 @@ pub fn run_injection(
         // per this module's polarity, every ambiguity resolves toward inject,
         // because a false skip is the nudge silently never firing.
         if matches!(
-            detect_reset(&screen, now, clock_ext, dur_ext),
+            detect_reset(&screen, now, clock_ext, dur_ext, weekly_ext),
             crate::detect::Detection::None
         ) {
             return Ok(InjectOutcome::SkippedNoBanner);
@@ -208,7 +209,8 @@ mod tests {
     #[test]
     fn sends_all_messages_in_order_when_verify_off() {
         let t = FakeTarget::new("");
-        let out = run_injection(&t, &job(false, &["one", "two"]), &now(), None, None).unwrap();
+        let out =
+            run_injection(&t, &job(false, &["one", "two"]), &now(), None, None, None).unwrap();
         assert_eq!(out, InjectOutcome::Sent(2));
         assert_eq!(*t.sent.borrow(), vec!["one".to_string(), "two".to_string()]);
     }
@@ -216,7 +218,7 @@ mod tests {
     #[test]
     fn verify_sends_when_banner_present() {
         let t = FakeTarget::new("quota reached. Resets in 45m");
-        let out = run_injection(&t, &job(true, &["go"]), &now(), None, None).unwrap();
+        let out = run_injection(&t, &job(true, &["go"]), &now(), None, None, None).unwrap();
         assert_eq!(out, InjectOutcome::Sent(1));
         assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
     }
@@ -224,7 +226,7 @@ mod tests {
     #[test]
     fn verify_skips_when_banner_gone() {
         let t = FakeTarget::new("all done, no limits here");
-        let out = run_injection(&t, &job(true, &["go"]), &now(), None, None).unwrap();
+        let out = run_injection(&t, &job(true, &["go"]), &now(), None, None, None).unwrap();
         assert_eq!(out, InjectOutcome::SkippedNoBanner);
         assert!(t.sent.borrow().is_empty());
     }
@@ -263,8 +265,15 @@ mod tests {
 
 ❯ ";
         let t = FakeTarget::new(resumed);
-        let out =
-            run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None).unwrap();
+        let out = run_injection(
+            &t,
+            &job_snapshotted_at(PARKED, &["go"]),
+            &now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             out,
             InjectOutcome::SkippedResumed,
@@ -284,8 +293,15 @@ mod tests {
     #[test]
     fn verify_sends_when_the_pane_is_untouched_since_scheduling() {
         let t = FakeTarget::new(PARKED);
-        let out =
-            run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None).unwrap();
+        let out = run_injection(
+            &t,
+            &job_snapshotted_at(PARKED, &["go"]),
+            &now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             out,
             InjectOutcome::Sent(1),
@@ -319,8 +335,15 @@ mod tests {
             "precondition: nothing scrolled, so the banner is at the same offset in both"
         );
         let t = FakeTarget::new(appended);
-        let out =
-            run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None).unwrap();
+        let out = run_injection(
+            &t,
+            &job_snapshotted_at(PARKED, &["go"]),
+            &now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             out,
             InjectOutcome::SkippedResumed,
@@ -343,8 +366,15 @@ mod tests {
                 height: 24,
             },
         );
-        let out =
-            run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None).unwrap();
+        let out = run_injection(
+            &t,
+            &job_snapshotted_at(PARKED, &["go"]),
+            &now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             out,
             InjectOutcome::Sent(1),
@@ -377,8 +407,15 @@ mod tests {
                 height: 24,
             },
         );
-        let out =
-            run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None).unwrap();
+        let out = run_injection(
+            &t,
+            &job_snapshotted_at(PARKED, &["go"]),
+            &now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             out,
             InjectOutcome::Sent(1),
@@ -397,7 +434,7 @@ mod tests {
         let mut j = job(true, &["go"]);
         j.verify_fingerprint = None;
         j.verify_dims = None;
-        let out = run_injection(&t, &j, &now(), None, None).unwrap();
+        let out = run_injection(&t, &j, &now(), None, None, None).unwrap();
         assert_eq!(
             out,
             InjectOutcome::Sent(1),
@@ -410,8 +447,15 @@ mod tests {
     #[test]
     fn verify_fails_open_and_sends_when_the_pane_dims_are_unreadable() {
         let t = FakeTarget::with_unknown_dims("● busy\n⏸ session limit reached · resets 3:00am");
-        let out =
-            run_injection(&t, &job_snapshotted_at(PARKED, &["go"]), &now(), None, None).unwrap();
+        let out = run_injection(
+            &t,
+            &job_snapshotted_at(PARKED, &["go"]),
+            &now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             out,
             InjectOutcome::Sent(1),
@@ -427,7 +471,7 @@ mod tests {
         let t = FakeTarget::new("all done, no limits here");
         let mut j = job(true, &["go"]);
         j.verify_fingerprint = None;
-        let out = run_injection(&t, &j, &now(), None, None).unwrap();
+        let out = run_injection(&t, &j, &now(), None, None, None).unwrap();
         assert_eq!(out, InjectOutcome::SkippedNoBanner);
     }
 
@@ -442,7 +486,7 @@ mod tests {
             ..job(false, &["go"])
         };
         assert_eq!(
-            run_injection(&t, &j, &now(), None, None).unwrap(),
+            run_injection(&t, &j, &now(), None, None, None).unwrap(),
             InjectOutcome::Sent(1)
         );
     }
