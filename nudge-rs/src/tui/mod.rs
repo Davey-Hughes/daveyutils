@@ -36,7 +36,10 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> io::Result<TerminalGuard> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        if let Err(e) = execute!(io::stdout(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(e);
+        }
         Ok(TerminalGuard)
     }
 }
@@ -103,11 +106,13 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 /// Run each effect (blocking) and feed its `Msg` straight back into `update`.
-fn dispatch_effects(model: &mut Model, mut effects: Vec<update::Effect>, socket: &std::path::Path) {
-    while let Some(effect) = effects.pop() {
+fn dispatch_effects(model: &mut Model, effects: Vec<update::Effect>, socket: &std::path::Path) {
+    let mut queue: std::collections::VecDeque<update::Effect> = effects.into();
+    while let Some(effect) = queue.pop_front() {
         let msg = exec::run_effect(effect, socket);
-        let more = update::update(model, msg);
-        effects.extend(more);
+        for more in update::update(model, msg) {
+            queue.push_back(more);
+        }
     }
 }
 
