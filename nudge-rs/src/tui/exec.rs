@@ -39,11 +39,16 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
                 Err(e) => Msg::ActionFailed(format!("capturing {pane}: {e}")),
             }
         }
-        Effect::Schedule { mut spec, snapshot_pane } => {
+        Effect::Schedule {
+            mut spec,
+            snapshot_pane,
+        } => {
             attach_baseline(&mut spec, snapshot_pane);
             match client::request(socket, &Request::Schedule(spec)) {
                 Ok(Response::Scheduled(id)) => Msg::Scheduled(id),
-                Ok(Response::Error(e)) => Msg::ActionFailed(format!("daemon rejected the job: {e}")),
+                Ok(Response::Error(e)) => {
+                    Msg::ActionFailed(format!("daemon rejected the job: {e}"))
+                }
                 Ok(other) => Msg::ActionFailed(format!("unexpected response: {other:?}")),
                 Err(e) => Msg::ActionFailed(format!("daemon request failed: {e}")),
             }
@@ -54,7 +59,11 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
             Ok(other) => Msg::ActionFailed(format!("unexpected response: {other:?}")),
             Err(e) => Msg::ActionFailed(format!("daemon request failed: {e}")),
         },
-        Effect::Replace { id, mut spec, snapshot_pane } => {
+        Effect::Replace {
+            id,
+            mut spec,
+            snapshot_pane,
+        } => {
             attach_baseline(&mut spec, snapshot_pane);
             match client::request(socket, &Request::Replace { id, spec }) {
                 Ok(Response::Replaced(new_id)) => Msg::Replaced(new_id),
@@ -89,7 +98,9 @@ mod tests {
 
     fn spec() -> JobSpec {
         JobSpec {
-            target: TargetSpec::Tmux { pane: "bot:0.1".into() },
+            target: TargetSpec::Tmux {
+                pane: "bot:0.1".into(),
+            },
             messages: vec!["go".into()],
             send_delay_secs: 0.75,
             fire_at: "2026-07-16T15:00:00Z".parse().unwrap(),
@@ -105,7 +116,10 @@ mod tests {
 
     /// Serve a queue on a temp socket and return its path + tempdir guard.
     fn serving_queue(seed: bool) -> (std::path::PathBuf, tempfile::TempDir) {
-        let tmp = tempfile::Builder::new().prefix("nudge-").tempdir_in("/tmp").unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("nudge-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let socket = tmp.path().join("s.sock");
         let queue = Arc::new(Mutex::new(Queue::load(tmp.path().join("q.json")).unwrap()));
         if seed {
@@ -133,12 +147,18 @@ mod tests {
     #[test]
     fn cancel_of_a_missing_job_reports_false_not_an_error() {
         let (socket, _tmp) = serving_queue(false);
-        assert_eq!(run_effect(Effect::Cancel(999), &socket), Msg::Cancelled(false));
+        assert_eq!(
+            run_effect(Effect::Cancel(999), &socket),
+            Msg::Cancelled(false)
+        );
     }
 
     #[test]
     fn a_dead_socket_becomes_action_failed_not_a_panic() {
         let socket = std::path::Path::new("/tmp/nudge-does-not-exist.sock");
-        assert!(matches!(run_effect(Effect::PollJobs, socket), Msg::ActionFailed(_)));
+        assert!(matches!(
+            run_effect(Effect::PollJobs, socket),
+            Msg::ActionFailed(_)
+        ));
     }
 }

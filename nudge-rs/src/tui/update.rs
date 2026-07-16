@@ -31,10 +31,19 @@ pub enum Msg {
 pub enum Effect {
     PollJobs,
     ListPanes,
-    AutoDetect { pane: String },
-    Schedule { spec: JobSpec, snapshot_pane: Option<String> },
+    AutoDetect {
+        pane: String,
+    },
+    Schedule {
+        spec: JobSpec,
+        snapshot_pane: Option<String>,
+    },
     Cancel(u64),
-    Replace { id: u64, spec: JobSpec, snapshot_pane: Option<String> },
+    Replace {
+        id: u64,
+        spec: JobSpec,
+        snapshot_pane: Option<String>,
+    },
 }
 
 pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
@@ -146,7 +155,10 @@ fn enter_edit(model: &mut Model, job: &Job) {
     let pane_idx = panes.iter().position(|p| &p.target == pane).unwrap_or(0);
     let message = match job.messages.len() {
         0 | 1 => MessageField::Editable(
-            job.messages.first().cloned().unwrap_or_else(|| "please continue".into()),
+            job.messages
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "please continue".into()),
         ),
         n => MessageField::Preserved(n),
     };
@@ -185,7 +197,10 @@ const FORM_ORDER: [FormField; 8] = [
 ];
 
 fn move_focus(form: &mut super::model::Form, delta: i32) {
-    let i = FORM_ORDER.iter().position(|f| *f == form.focus).unwrap_or(0) as i32;
+    let i = FORM_ORDER
+        .iter()
+        .position(|f| *f == form.focus)
+        .unwrap_or(0) as i32;
     let n = FORM_ORDER.len() as i32;
     let next = (i + delta).rem_euclid(n) as usize;
     form.focus = FORM_ORDER[next];
@@ -256,7 +271,9 @@ fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
 fn detect_selected(form: &mut super::model::Form) -> Vec<Effect> {
     form.detected = None;
     match form.selected_pane() {
-        Some(p) => vec![Effect::AutoDetect { pane: p.target.clone() }],
+        Some(p) => vec![Effect::AutoDetect {
+            pane: p.target.clone(),
+        }],
         None => vec![],
     }
 }
@@ -287,7 +304,9 @@ fn edit_text(form: &mut super::model::Form, f: impl FnOnce(&mut String)) {
 fn submit(model: &mut Model) -> Vec<Effect> {
     let now_zoned = model.now.to_zoned(jiff::tz::TimeZone::UTC);
     let Some(pane) = model.form.selected_pane().map(|p| p.target.clone()) else {
-        model.status.set("no tmux pane selected (none found — schedule from the CLI with -p)");
+        model
+            .status
+            .set("no tmux pane selected (none found — schedule from the CLI with -p)");
         return vec![];
     };
     // fire time
@@ -302,15 +321,21 @@ fn submit(model: &mut Model) -> Vec<Effect> {
         WhenMode::Auto => match &model.form.detected {
             Some(Detection::Reset(z)) => z.timestamp(),
             Some(Detection::None) => {
-                model.status.set("no rate-limit banner on that pane — enter a time manually");
+                model
+                    .status
+                    .set("no rate-limit banner on that pane — enter a time manually");
                 return vec![];
             }
             Some(Detection::Unreadable { gap, .. }) => {
-                model.status.set(format!("weekly banner day unreadable ({gap:?}) — enter a time manually"));
+                model.status.set(format!(
+                    "weekly banner day unreadable ({gap:?}) — enter a time manually"
+                ));
                 return vec![];
             }
             None => {
-                model.status.set("no time detected yet — select a pane or switch to Manual");
+                model
+                    .status
+                    .set("no time detected yet — select a pane or switch to Manual");
                 return vec![];
             }
         },
@@ -326,8 +351,15 @@ fn submit(model: &mut Model) -> Vec<Effect> {
     let spec = build_spec(model, &pane, fire_at);
     let snapshot_pane = model.form.verify.then(|| pane.clone());
     match model.form.mode {
-        super::model::Mode::New => vec![Effect::Schedule { spec, snapshot_pane }],
-        super::model::Mode::Editing(id) => vec![Effect::Replace { id, spec, snapshot_pane }],
+        super::model::Mode::New => vec![Effect::Schedule {
+            spec,
+            snapshot_pane,
+        }],
+        super::model::Mode::Editing(id) => vec![Effect::Replace {
+            id,
+            spec,
+            snapshot_pane,
+        }],
     }
 }
 
@@ -354,7 +386,9 @@ fn build_spec(model: &Model, pane: &str, fire_at: Timestamp) -> JobSpec {
         None => (model.defaults.send_delay_secs, model.defaults.settle_secs),
     };
     JobSpec {
-        target: TargetSpec::Tmux { pane: pane.to_string() },
+        target: TargetSpec::Tmux {
+            pane: pane.to_string(),
+        },
         messages,
         send_delay_secs,
         fire_at,
@@ -377,7 +411,11 @@ mod tests {
     use crate::job::{Job, TargetSpec};
 
     fn defaults() -> ScheduleDefaults {
-        ScheduleDefaults { send_delay_secs: 0.75, settle_secs: 5.0, retries: 2 }
+        ScheduleDefaults {
+            send_delay_secs: 0.75,
+            settle_secs: 5.0,
+            retries: 2,
+        }
     }
 
     fn t0() -> jiff::Timestamp {
@@ -387,7 +425,9 @@ mod tests {
     fn job(id: u64, secs_out: i64) -> Job {
         Job {
             id,
-            target: TargetSpec::Tmux { pane: format!("s:0.{id}") },
+            target: TargetSpec::Tmux {
+                pane: format!("s:0.{id}"),
+            },
             messages: vec!["please continue".into()],
             send_delay_secs: 0.75,
             fire_at: t0().checked_add(jiff::ToSpan::seconds(secs_out)).unwrap(),
@@ -411,8 +451,14 @@ mod tests {
         let mut m = Model::new(defaults(), t0());
         m.tab = Tab::NewNudge;
         m.form.panes = vec![
-            Pane { target: "s:0.1".into(), title: "claude".into() },
-            Pane { target: "s:0.2".into(), title: "agy".into() },
+            Pane {
+                target: "s:0.1".into(),
+                title: "claude".into(),
+            },
+            Pane {
+                target: "s:0.2".into(),
+                title: "agy".into(),
+            },
         ];
         m
     }
@@ -431,7 +477,13 @@ mod tests {
     fn panes_loaded_populates_the_dropdown_and_clamps_index() {
         let mut m = form_model();
         m.form.pane_idx = 5;
-        update(&mut m, Msg::PanesLoaded(vec![Pane { target: "s:0.9".into(), title: String::new() }]));
+        update(
+            &mut m,
+            Msg::PanesLoaded(vec![Pane {
+                target: "s:0.9".into(),
+                title: String::new(),
+            }]),
+        );
         assert_eq!(m.form.panes.len(), 1);
         assert_eq!(m.form.pane_idx, 0);
     }
@@ -442,7 +494,12 @@ mod tests {
         m.form.focus = FormField::Pane;
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Right));
         assert_eq!(m.form.pane_idx, 1);
-        assert_eq!(fx, vec![Effect::AutoDetect { pane: "s:0.2".into() }]);
+        assert_eq!(
+            fx,
+            vec![Effect::AutoDetect {
+                pane: "s:0.2".into()
+            }]
+        );
     }
 
     #[test]
@@ -450,11 +507,21 @@ mod tests {
         let mut m = form_model(); // has panes s:0.1 and s:0.2, When defaults to Auto
         m.form.focus = FormField::Pane;
         m.form.detected = Some(Detection::Reset(
-            jiff::Timestamp::from_str("2026-07-16T15:00:00Z").unwrap().to_zoned(jiff::tz::TimeZone::UTC),
+            jiff::Timestamp::from_str("2026-07-16T15:00:00Z")
+                .unwrap()
+                .to_zoned(jiff::tz::TimeZone::UTC),
         ));
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Right));
-        assert!(m.form.detected.is_none(), "stale detection must be cleared on pane change");
-        assert_eq!(fx, vec![Effect::AutoDetect { pane: "s:0.2".into() }]);
+        assert!(
+            m.form.detected.is_none(),
+            "stale detection must be cleared on pane change"
+        );
+        assert_eq!(
+            fx,
+            vec![Effect::AutoDetect {
+                pane: "s:0.2".into()
+            }]
+        );
     }
 
     #[test]
@@ -490,16 +557,25 @@ mod tests {
         let mut m = form_model();
         m.form.verify = true;
         m.form.detected = Some(Detection::Reset(
-            jiff::Timestamp::from_str("2026-07-16T15:00:00Z").unwrap().to_zoned(jiff::tz::TimeZone::UTC),
+            jiff::Timestamp::from_str("2026-07-16T15:00:00Z")
+                .unwrap()
+                .to_zoned(jiff::tz::TimeZone::UTC),
         ));
         m.form.focus = FormField::Submit;
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
         match fx.as_slice() {
-            [Effect::Schedule { spec, snapshot_pane }] => {
+            [Effect::Schedule {
+                spec,
+                snapshot_pane,
+            }] => {
                 assert_eq!(spec.messages, vec!["please continue".to_string()]);
                 assert!(spec.verify);
                 assert_eq!(spec.fire_at.to_string(), "2026-07-16T15:00:00Z");
-                assert_eq!(snapshot_pane.as_deref(), Some("s:0.1"), "verify wants a baseline");
+                assert_eq!(
+                    snapshot_pane.as_deref(),
+                    Some("s:0.1"),
+                    "verify wants a baseline"
+                );
             }
             other => panic!("expected one Schedule effect, got {other:?}"),
         }
@@ -526,7 +602,10 @@ mod tests {
         m.form.focus = FormField::Submit; // when=Auto, detected=None
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
         assert!(fx.is_empty());
-        assert!(m.status.0.is_some(), "must explain why nothing was scheduled");
+        assert!(
+            m.status.0.is_some(),
+            "must explain why nothing was scheduled"
+        );
     }
 
     #[test]
@@ -550,7 +629,10 @@ mod tests {
         assert_eq!(m.tab, Tab::NewNudge);
         assert!(matches!(fx.as_slice(), [Effect::ListPanes]));
         // Already have panes -> no second fetch.
-        m.form.panes = vec![crate::tmux_panes::Pane { target: "s:0.1".into(), title: String::new() }];
+        m.form.panes = vec![crate::tmux_panes::Pane {
+            target: "s:0.1".into(),
+            title: String::new(),
+        }];
         m.tab = Tab::Jobs;
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Tab));
         assert!(fx.is_empty(), "panes already loaded, do not refetch");
@@ -587,12 +669,23 @@ mod tests {
     fn e_enters_edit_prefilled_and_preserves_hidden_fields_on_save() {
         let mut m = with_jobs(0);
         m.jobs = vec![multi_msg_job()];
-        m.form.panes = vec![Pane { target: "s:0.7".into(), title: String::new() }];
+        m.form.panes = vec![Pane {
+            target: "s:0.7".into(),
+            title: String::new(),
+        }];
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('e')));
         assert_eq!(m.tab, Tab::NewNudge);
         assert!(matches!(m.form.mode, Mode::Editing(7)));
-        assert_eq!(m.form.when, WhenMode::Keep, "an edit keeps the time by default");
-        assert_eq!(m.form.message, MessageField::Preserved(2), "multi-message is not editable in the TUI");
+        assert_eq!(
+            m.form.when,
+            WhenMode::Keep,
+            "an edit keeps the time by default"
+        );
+        assert_eq!(
+            m.form.message,
+            MessageField::Preserved(2),
+            "multi-message is not editable in the TUI"
+        );
         assert!(m.form.auto_retry);
 
         // Save with nothing changed -> Replace preserving delay/settle/retries/messages.
@@ -604,8 +697,15 @@ mod tests {
                 assert_eq!(spec.messages, vec!["one".to_string(), "two".to_string()]);
                 assert_eq!(spec.send_delay_secs, 1.5);
                 assert_eq!(spec.settle_secs, 9.0);
-                assert_eq!(spec.retries_left, 3, "auto-retry on -> keep the job's budget");
-                assert_eq!(spec.fire_at, multi_msg_job().fire_at, "Keep -> unchanged time");
+                assert_eq!(
+                    spec.retries_left, 3,
+                    "auto-retry on -> keep the job's budget"
+                );
+                assert_eq!(
+                    spec.fire_at,
+                    multi_msg_job().fire_at,
+                    "Keep -> unchanged time"
+                );
             }
             other => panic!("expected Replace, got {other:?}"),
         }
@@ -626,14 +726,22 @@ mod tests {
         assert_eq!(m.tab, Tab::Jobs);
         assert!(m.status.0.as_ref().unwrap().contains("12"));
         assert!(fx.contains(&Effect::PollJobs));
-        assert!(matches!(m.form.mode, Mode::New), "the form resets after a successful schedule");
+        assert!(
+            matches!(m.form.mode, Mode::New),
+            "the form resets after a successful schedule"
+        );
     }
 
     #[test]
     fn action_failed_lands_in_the_status_line_and_does_not_quit() {
         let mut m = with_jobs(1);
         update(&mut m, Msg::ActionFailed("daemon is not this build".into()));
-        assert!(m.status.0.as_ref().unwrap().contains("daemon is not this build"));
+        assert!(m
+            .status
+            .0
+            .as_ref()
+            .unwrap()
+            .contains("daemon is not this build"));
         assert!(!m.should_quit);
     }
 }

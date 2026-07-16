@@ -11,8 +11,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use crossterm::event::{self, Event, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -127,7 +129,10 @@ mod tests {
 
     #[test]
     fn a_key_press_maps_to_a_key_msg() {
-        assert_eq!(map_event(press(KeyCode::Char('q'))), Some(update::Msg::Key(KeyCode::Char('q'))));
+        assert_eq!(
+            map_event(press(KeyCode::Char('q'))),
+            Some(update::Msg::Key(KeyCode::Char('q')))
+        );
     }
 
     #[test]

@@ -12,7 +12,11 @@ use crate::job::TargetSpec;
 pub fn view(model: &Model, f: &mut Frame) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
     let titles = ["Jobs", "New nudge"];
@@ -78,7 +82,10 @@ fn jobs_view(model: &Model, f: &mut Frame, area: Rect) {
 
 fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     let form = &model.form;
-    let pane = form.selected_pane().map(|p| p.target.as_str()).unwrap_or("(no panes)");
+    let pane = form
+        .selected_pane()
+        .map(|p| p.target.as_str())
+        .unwrap_or("(no panes)");
     let when = match form.when {
         WhenMode::Keep => "keep current time".to_string(),
         WhenMode::Auto => match &form.detected {
@@ -100,12 +107,31 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(format!("{}Pane:    {}", mark(FormField::Pane), pane)),
         Line::from(format!("{}When:    {}", mark(FormField::When), when)),
-        Line::from(format!("{}Manual:  {}", mark(FormField::ManualTime), form.manual_time)),
+        Line::from(format!(
+            "{}Manual:  {}",
+            mark(FormField::ManualTime),
+            form.manual_time
+        )),
         Line::from(format!("{}Message: {}", mark(FormField::Message), message)),
-        Line::from(format!("{}{} verify", mark(FormField::Verify), onoff(form.verify))),
-        Line::from(format!("{}{} notify", mark(FormField::Notify), onoff(form.notify))),
-        Line::from(format!("{}{} auto-retry", mark(FormField::AutoRetry), onoff(form.auto_retry))),
-        Line::from(Span::from(format!("{}[ Schedule ]", mark(FormField::Submit)))),
+        Line::from(format!(
+            "{}{} verify",
+            mark(FormField::Verify),
+            onoff(form.verify)
+        )),
+        Line::from(format!(
+            "{}{} notify",
+            mark(FormField::Notify),
+            onoff(form.notify)
+        )),
+        Line::from(format!(
+            "{}{} auto-retry",
+            mark(FormField::AutoRetry),
+            onoff(form.auto_retry)
+        )),
+        Line::from(Span::from(format!(
+            "{}[ Schedule ]",
+            mark(FormField::Submit)
+        ))),
     ];
     let title = match form.mode {
         super::model::Mode::New => "New nudge",
@@ -140,7 +166,11 @@ mod tests {
     }
 
     fn defaults() -> ScheduleDefaults {
-        ScheduleDefaults { send_delay_secs: 0.75, settle_secs: 5.0, retries: 2 }
+        ScheduleDefaults {
+            send_delay_secs: 0.75,
+            settle_secs: 5.0,
+            retries: 2,
+        }
     }
 
     #[test]
@@ -154,7 +184,9 @@ mod tests {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
         let mut j = crate::job::Job {
             id: 12,
-            target: TargetSpec::Tmux { pane: "bot:0.1".into() },
+            target: TargetSpec::Tmux {
+                pane: "bot:0.1".into(),
+            },
             messages: vec!["please continue".into()],
             send_delay_secs: 0.75,
             fire_at: "2026-07-16T14:14:00Z".parse().unwrap(),
