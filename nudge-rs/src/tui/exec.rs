@@ -20,23 +20,35 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
             Ok(panes) => Msg::PanesLoaded(panes),
             Err(e) => Msg::ActionFailed(format!("{e}")),
         },
-        Effect::AutoDetect { pane } => {
+        Effect::CapturePane { pane } => {
             use crate::target::Target;
             let clock = std::env::var("NUDGE_CLOCK_PATTERN").ok();
             let dur = std::env::var("NUDGE_DURATION_PATTERN").ok();
             let weekly = std::env::var("NUDGE_WEEKLY_PATTERN").ok();
             match TmuxTarget::new(&pane).capture() {
-                Ok(screen) => {
+                Ok(raw) => {
                     let now = jiff::Zoned::now();
-                    Msg::Detected(detect_reset(
-                        &screen,
+                    let detection = detect_reset(
+                        &raw,
                         &now,
                         clock.as_deref(),
                         dur.as_deref(),
                         weekly.as_deref(),
-                    ))
+                    );
+                    // capture-pane -p is already plain, but strip defensively for
+                    // the preview (mirrors detect.rs) so no stray escape shows.
+                    let screen = strip_ansi_escapes::strip_str(&raw);
+                    Msg::PaneCaptured {
+                        screen: Some(screen),
+                        detection,
+                    }
                 }
-                Err(e) => Msg::ActionFailed(format!("capturing {pane}: {e}")),
+                // Silent on failure — the live preview must not spam the status
+                // line every 1.5s. The panel shows "(preview unavailable)".
+                Err(_) => Msg::PaneCaptured {
+                    screen: None,
+                    detection: crate::detect::Detection::None,
+                },
             }
         }
         Effect::Schedule {

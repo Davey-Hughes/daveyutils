@@ -12,6 +12,9 @@ use crate::tmux_panes::Pane;
 /// How stale the job set may get before a Tick triggers a refresh.
 const POLL_SECS: i64 = 2;
 
+/// How often the New-nudge tab re-captures the selected pane for the live preview.
+const CAPTURE_MILLIS: i64 = 1500;
+
 /// Everything that can change the model.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
@@ -20,7 +23,10 @@ pub enum Msg {
     Tick(Timestamp),
     JobsLoaded(Vec<Job>),
     PanesLoaded(Vec<Pane>),
-    Detected(Detection),
+    PaneCaptured {
+        screen: Option<String>,
+        detection: Detection,
+    },
     Scheduled(u64),
     Cancelled(bool),
     Replaced(Option<u64>),
@@ -32,7 +38,7 @@ pub enum Msg {
 pub enum Effect {
     PollJobs,
     ListPanes,
-    AutoDetect {
+    CapturePane {
         pane: String,
     },
     Schedule {
@@ -55,12 +61,24 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         }
         Msg::Tick(now) => {
             model.now = now;
+            let mut effects = vec![];
             if now.duration_since(model.last_poll).as_secs() >= POLL_SECS {
                 model.last_poll = now;
-                vec![Effect::PollJobs]
-            } else {
-                vec![]
+                effects.push(Effect::PollJobs);
             }
+            // Live pane preview: while the form is open, re-capture the selected
+            // pane about every 1.5s. Gated by last_capture so it fires at the
+            // cadence, not on every 250ms idle tick.
+            if model.tab == Tab::NewNudge && model.form.selected_pane().is_some() {
+                let due = model
+                    .form
+                    .last_capture
+                    .is_none_or(|t| now.duration_since(t).as_millis() >= CAPTURE_MILLIS as i128);
+                if due {
+                    effects.extend(capture_selected(&mut model.form, now));
+                }
+            }
+            effects
         }
         Msg::JobsLoaded(jobs) => {
             model.jobs = jobs;
@@ -76,10 +94,14 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             if model.form.pane_idx >= model.form.panes.len() {
                 model.form.pane_idx = 0;
             }
+            if model.tab == Tab::NewNudge {
+                return capture_selected(&mut model.form, model.now);
+            }
             vec![]
         }
-        Msg::Detected(d) => {
-            model.form.detected = Some(d);
+        Msg::PaneCaptured { screen, detection } => {
+            model.form.preview = screen;
+            model.form.detected = Some(detection);
             vec![]
         }
         Msg::Scheduled(id) => {
@@ -235,14 +257,14 @@ fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
                     let n = form.panes.len() as i32;
                     form.pane_idx = ((form.pane_idx as i32 + dir).rem_euclid(n)) as usize;
                     if form.when == WhenMode::Auto {
-                        return detect_selected(form);
+                        return capture_selected(form, model.now);
                     }
                     vec![]
                 }
                 FormField::When => {
                     form.when = cycle_when(form.when, dir, form.mode);
                     if form.when == WhenMode::Auto {
-                        return detect_selected(form);
+                        return capture_selected(form, model.now);
                     }
                     vec![]
                 }
@@ -273,12 +295,17 @@ fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
     }
 }
 
-/// Clear the now-stale detection and ask exec to re-detect the selected pane.
-/// Returns no effect when there is no pane to detect.
-fn detect_selected(form: &mut super::model::Form) -> Vec<Effect> {
+/// Emit a capture of the selected pane and mark the time, clearing the stale
+/// preview + detection so a submit can't read them mid-refresh. Takes
+/// `&mut Form` + `now` (not `&mut Model`) so the pane-change arms that already
+/// hold `&mut model.form` can call it without a second whole-model borrow;
+/// `now` is a `Copy` `Timestamp` from a disjoint field.
+fn capture_selected(form: &mut super::model::Form, now: Timestamp) -> Vec<Effect> {
+    form.preview = None;
     form.detected = None;
+    form.last_capture = Some(now);
     match form.selected_pane() {
-        Some(p) => vec![Effect::AutoDetect {
+        Some(p) => vec![Effect::CapturePane {
             pane: p.target.clone(),
         }],
         None => vec![],
@@ -505,7 +532,7 @@ mod tests {
         assert_eq!(m.form.pane_idx, 1);
         assert_eq!(
             fx,
-            vec![Effect::AutoDetect {
+            vec![Effect::CapturePane {
                 pane: "s:0.2".into()
             }]
         );
@@ -520,14 +547,16 @@ mod tests {
                 .unwrap()
                 .to_zoned(jiff::tz::TimeZone::UTC),
         ));
+        m.form.preview = Some("stale screen".into());
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Right));
         assert!(
             m.form.detected.is_none(),
             "stale detection must be cleared on pane change"
         );
+        assert!(m.form.preview.is_none());
         assert_eq!(
             fx,
-            vec![Effect::AutoDetect {
+            vec![Effect::CapturePane {
                 pane: "s:0.2".into()
             }]
         );
@@ -780,5 +809,68 @@ mod tests {
             .unwrap()
             .contains("daemon is not this build"));
         assert!(!m.should_quit);
+    }
+
+    #[test]
+    fn a_tick_on_the_new_nudge_tab_captures_the_pane_at_the_interval() {
+        let mut m = form_model(); // NewNudge tab, panes present
+        m.form.last_capture = Some(m.now);
+        let soon = m.now.checked_add(jiff::ToSpan::milliseconds(500)).unwrap();
+        assert!(
+            update(&mut m, Msg::Tick(soon))
+                .iter()
+                .all(|e| !matches!(e, Effect::CapturePane { .. })),
+            "before the interval, no capture"
+        );
+        let later = m.now.checked_add(jiff::ToSpan::milliseconds(1600)).unwrap();
+        let fx = update(&mut m, Msg::Tick(later));
+        assert!(
+            fx.iter().any(|e| matches!(e, Effect::CapturePane { .. })),
+            "after the interval, capture"
+        );
+    }
+
+    #[test]
+    fn a_tick_on_the_jobs_tab_does_not_capture() {
+        let mut m = form_model();
+        m.tab = Tab::Jobs;
+        let later = m.now.checked_add(jiff::ToSpan::seconds(3)).unwrap();
+        let fx = update(&mut m, Msg::Tick(later));
+        assert!(
+            fx.iter().all(|e| !matches!(e, Effect::CapturePane { .. })),
+            "Jobs tab has no preview"
+        );
+    }
+
+    #[test]
+    fn panes_loaded_on_the_form_captures_the_selected_pane() {
+        let mut m = Model::new(defaults(), t0()); // NewNudge default
+        let fx = update(
+            &mut m,
+            Msg::PanesLoaded(vec![Pane {
+                target: "s:0.1".into(),
+                title: String::new(),
+            }]),
+        );
+        assert_eq!(
+            fx,
+            vec![Effect::CapturePane {
+                pane: "s:0.1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn pane_captured_stores_preview_and_detection() {
+        let mut m = form_model();
+        update(
+            &mut m,
+            Msg::PaneCaptured {
+                screen: Some("current session limit · resets 3:00pm".into()),
+                detection: Detection::None,
+            },
+        );
+        assert!(m.form.preview.as_deref().unwrap().contains("resets 3:00pm"));
+        assert!(m.form.detected.is_some());
     }
 }
