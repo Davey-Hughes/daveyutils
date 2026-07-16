@@ -1,11 +1,12 @@
 //! The pure state transition: `update(&mut Model, Msg) -> Vec<Effect>`.
 
 use crossterm::event::KeyCode;
-use jiff::{Timestamp, ToSpan};
+use jiff::Timestamp;
 
-use super::model::{Model, Tab};
+use super::model::{FormField, MessageField, Model, Tab, WhenMode};
 use crate::detect::Detection;
-use crate::job::{Job, JobSpec};
+use crate::job::{Job, JobSpec, TargetSpec};
+use crate::timespec::parse_timespec;
 use crate::tmux_panes::Pane;
 
 /// How stale the job set may get before a Tick triggers a refresh.
@@ -54,15 +55,22 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         }
         Msg::Key(code) => match model.tab {
             Tab::Jobs => jobs_key(model, code),
-            Tab::NewNudge => vec![], // filled in Task 3
+            Tab::NewNudge => form_key(model, code),
         },
-        // Filled in Tasks 3-4.
-        Msg::PanesLoaded(_)
-        | Msg::Detected(_)
-        | Msg::Scheduled(_)
-        | Msg::Cancelled(_)
-        | Msg::Replaced(_)
-        | Msg::ActionFailed(_) => vec![],
+        Msg::PanesLoaded(panes) => {
+            model.form.panes = panes;
+            if model.form.pane_idx >= model.form.panes.len() {
+                model.form.pane_idx = 0;
+            }
+            vec![]
+        }
+        Msg::Detected(d) => {
+            model.form.detected = Some(d);
+            vec![]
+        }
+        Msg::Scheduled(_) | Msg::Cancelled(_) | Msg::Replaced(_) | Msg::ActionFailed(_) => {
+            vec![] // Task 4
+        }
     }
 }
 
@@ -95,8 +103,197 @@ fn jobs_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
     }
 }
 
+const FORM_ORDER: [FormField; 8] = [
+    FormField::Pane,
+    FormField::When,
+    FormField::ManualTime,
+    FormField::Message,
+    FormField::Verify,
+    FormField::Notify,
+    FormField::AutoRetry,
+    FormField::Submit,
+];
+
+fn move_focus(form: &mut super::model::Form, delta: i32) {
+    let i = FORM_ORDER.iter().position(|f| *f == form.focus).unwrap_or(0) as i32;
+    let n = FORM_ORDER.len() as i32;
+    let next = (i + delta).rem_euclid(n) as usize;
+    form.focus = FORM_ORDER[next];
+}
+
+fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
+    let form = &mut model.form;
+    match code {
+        KeyCode::Tab | KeyCode::Esc => {
+            model.tab = Tab::Jobs;
+            vec![]
+        }
+        KeyCode::Down => {
+            move_focus(form, 1);
+            vec![]
+        }
+        KeyCode::Up => {
+            move_focus(form, -1);
+            vec![]
+        }
+        KeyCode::Left | KeyCode::Right => {
+            let dir: i32 = if code == KeyCode::Right { 1 } else { -1 };
+            match form.focus {
+                FormField::Pane if !form.panes.is_empty() => {
+                    let n = form.panes.len() as i32;
+                    form.pane_idx = ((form.pane_idx as i32 + dir).rem_euclid(n)) as usize;
+                    if form.when == WhenMode::Auto {
+                        return vec![Effect::AutoDetect { pane: form.panes[form.pane_idx].target.clone() }];
+                    }
+                    vec![]
+                }
+                FormField::When => {
+                    form.when = cycle_when(form.when, dir, form.mode);
+                    if form.when == WhenMode::Auto {
+                        if let Some(p) = form.selected_pane() {
+                            return vec![Effect::AutoDetect { pane: p.target.clone() }];
+                        }
+                    }
+                    vec![]
+                }
+                _ => vec![],
+            }
+        }
+        KeyCode::Char(' ') => {
+            match form.focus {
+                FormField::Verify => form.verify = !form.verify,
+                FormField::Notify => form.notify = !form.notify,
+                FormField::AutoRetry => form.auto_retry = !form.auto_retry,
+                _ => {}
+            }
+            vec![]
+        }
+        KeyCode::Char(c) => {
+            edit_text(form, |s| s.push(c));
+            vec![]
+        }
+        KeyCode::Backspace => {
+            edit_text(form, |s| {
+                s.pop();
+            });
+            vec![]
+        }
+        KeyCode::Enter => submit(model),
+        _ => vec![],
+    }
+}
+
+/// Keep is only offered while editing; new nudges cycle Auto<->Manual only.
+fn cycle_when(cur: WhenMode, dir: i32, mode: super::model::Mode) -> WhenMode {
+    let opts: &[WhenMode] = match mode {
+        super::model::Mode::Editing(_) => &[WhenMode::Keep, WhenMode::Auto, WhenMode::Manual],
+        super::model::Mode::New => &[WhenMode::Auto, WhenMode::Manual],
+    };
+    let i = opts.iter().position(|w| *w == cur).unwrap_or(0) as i32;
+    opts[((i + dir).rem_euclid(opts.len() as i32)) as usize]
+}
+
+/// Apply `f` to whichever text buffer the focused field owns, if any.
+fn edit_text(form: &mut super::model::Form, f: impl FnOnce(&mut String)) {
+    match form.focus {
+        FormField::ManualTime => f(&mut form.manual_time),
+        FormField::Message => {
+            if let MessageField::Editable(s) = &mut form.message {
+                f(s);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn submit(model: &mut Model) -> Vec<Effect> {
+    let now_zoned = model.now.to_zoned(jiff::tz::TimeZone::UTC);
+    let Some(pane) = model.form.selected_pane().map(|p| p.target.clone()) else {
+        model.status.set("no tmux pane selected (none found — schedule from the CLI with -p)");
+        return vec![];
+    };
+    // fire time
+    let fire_at = match model.form.when {
+        WhenMode::Keep => match &model.form.carried {
+            Some(c) => c.fire_at,
+            None => {
+                model.status.set("nothing to keep — pick Auto or Manual");
+                return vec![];
+            }
+        },
+        WhenMode::Auto => match &model.form.detected {
+            Some(Detection::Reset(z)) => z.timestamp(),
+            Some(Detection::None) => {
+                model.status.set("no rate-limit banner on that pane — enter a time manually");
+                return vec![];
+            }
+            Some(Detection::Unreadable { gap, .. }) => {
+                model.status.set(format!("weekly banner day unreadable ({gap:?}) — enter a time manually"));
+                return vec![];
+            }
+            None => {
+                model.status.set("no time detected yet — select a pane or switch to Manual");
+                return vec![];
+            }
+        },
+        WhenMode::Manual => match parse_timespec(&model.form.manual_time, &now_zoned) {
+            Ok(z) => z.timestamp(),
+            Err(e) => {
+                model.status.set(format!("could not parse time: {e}"));
+                return vec![];
+            }
+        },
+    };
+
+    let spec = build_spec(model, &pane, fire_at);
+    let snapshot_pane = model.form.verify.then(|| pane.clone());
+    match model.form.mode {
+        super::model::Mode::New => vec![Effect::Schedule { spec, snapshot_pane }],
+        super::model::Mode::Editing(id) => vec![Effect::Replace { id, spec, snapshot_pane }],
+    }
+}
+
+/// Build the JobSpec from the form + carried edit fields. Baseline is left
+/// `None` here; `exec` fills it when `snapshot_pane` is set.
+fn build_spec(model: &Model, pane: &str, fire_at: Timestamp) -> JobSpec {
+    let form = &model.form;
+    let messages = match &form.message {
+        MessageField::Editable(s) if s.trim().is_empty() => vec!["please continue".to_string()],
+        MessageField::Editable(s) => vec![s.clone()],
+        MessageField::Preserved(_) => form
+            .carried
+            .as_ref()
+            .map(|c| c.messages.clone())
+            .unwrap_or_else(|| vec!["please continue".to_string()]),
+    };
+    // Retry base mirrors app::merge_edit: a job with 0 left re-arms the default.
+    let retry_base = match &form.carried {
+        Some(c) if c.retries_left != 0 => c.retries_left,
+        _ => model.defaults.retries,
+    };
+    let (send_delay_secs, settle_secs) = match &form.carried {
+        Some(c) => (c.send_delay_secs, c.settle_secs),
+        None => (model.defaults.send_delay_secs, model.defaults.settle_secs),
+    };
+    JobSpec {
+        target: TargetSpec::Tmux { pane: pane.to_string() },
+        messages,
+        send_delay_secs,
+        fire_at,
+        notify: form.notify,
+        verify: form.verify,
+        auto_retry: form.auto_retry,
+        retries_left: if form.auto_retry { retry_base } else { 0 },
+        settle_secs,
+        verify_fingerprint: None,
+        verify_dims: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::super::model::*;
     use super::*;
     use crate::job::{Job, TargetSpec};
@@ -130,6 +327,106 @@ mod tests {
         let mut m = Model::new(defaults(), t0());
         m.jobs = (1..=n).map(|i| job(i, 3600)).collect();
         m
+    }
+
+    fn form_model() -> Model {
+        let mut m = Model::new(defaults(), t0());
+        m.tab = Tab::NewNudge;
+        m.form.panes = vec![
+            Pane { target: "s:0.1".into(), title: "claude".into() },
+            Pane { target: "s:0.2".into(), title: "agy".into() },
+        ];
+        m
+    }
+
+    #[test]
+    fn panes_loaded_populates_the_dropdown_and_clamps_index() {
+        let mut m = form_model();
+        m.form.pane_idx = 5;
+        update(&mut m, Msg::PanesLoaded(vec![Pane { target: "s:0.9".into(), title: String::new() }]));
+        assert_eq!(m.form.panes.len(), 1);
+        assert_eq!(m.form.pane_idx, 0);
+    }
+
+    #[test]
+    fn changing_pane_requests_autodetect_when_when_is_auto() {
+        let mut m = form_model();
+        m.form.focus = FormField::Pane;
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Right));
+        assert_eq!(m.form.pane_idx, 1);
+        assert_eq!(fx, vec![Effect::AutoDetect { pane: "s:0.2".into() }]);
+    }
+
+    #[test]
+    fn focus_cycles_with_arrows() {
+        let mut m = form_model();
+        assert_eq!(m.form.focus, FormField::Pane);
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Down));
+        assert_eq!(m.form.focus, FormField::When);
+    }
+
+    #[test]
+    fn space_toggles_the_focused_flag() {
+        let mut m = form_model();
+        m.form.focus = FormField::Verify;
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(' ')));
+        assert!(m.form.verify);
+    }
+
+    #[test]
+    fn typing_edits_the_focused_message_field() {
+        let mut m = form_model();
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable(String::new());
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('h')));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('i')));
+        assert_eq!(m.form.message, MessageField::Editable("hi".into()));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Backspace));
+        assert_eq!(m.form.message, MessageField::Editable("h".into()));
+    }
+
+    #[test]
+    fn submit_with_a_detected_reset_emits_schedule() {
+        let mut m = form_model();
+        m.form.verify = true;
+        m.form.detected = Some(Detection::Reset(
+            jiff::Timestamp::from_str("2026-07-16T15:00:00Z").unwrap().to_zoned(jiff::tz::TimeZone::UTC),
+        ));
+        m.form.focus = FormField::Submit;
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
+        match fx.as_slice() {
+            [Effect::Schedule { spec, snapshot_pane }] => {
+                assert_eq!(spec.messages, vec!["please continue".to_string()]);
+                assert!(spec.verify);
+                assert_eq!(spec.fire_at.to_string(), "2026-07-16T15:00:00Z");
+                assert_eq!(snapshot_pane.as_deref(), Some("s:0.1"), "verify wants a baseline");
+            }
+            other => panic!("expected one Schedule effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_manual_time_parses_relative_to_now() {
+        let mut m = form_model();
+        m.form.when = WhenMode::Manual;
+        m.form.manual_time = "now + 2 hours".into();
+        m.form.focus = FormField::Submit;
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
+        match fx.as_slice() {
+            [Effect::Schedule { spec, .. }] => {
+                assert_eq!(spec.fire_at.to_string(), "2026-07-16T14:00:00Z");
+            }
+            other => panic!("expected Schedule, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_without_a_time_sets_status_and_emits_nothing() {
+        let mut m = form_model();
+        m.form.focus = FormField::Submit; // when=Auto, detected=None
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
+        assert!(fx.is_empty());
+        assert!(m.status.0.is_some(), "must explain why nothing was scheduled");
     }
 
     #[test]
