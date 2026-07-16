@@ -360,6 +360,7 @@ fn picker_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
         }
         _ => {
             let labels = pane_labels(&model.form.panes);
+            let before = model.form.active_pane().map(|p| p.target.clone());
             if let Some(picker) = model.form.picker.as_mut() {
                 match code {
                     KeyCode::Up => picker.highlight = picker.highlight.saturating_sub(1),
@@ -381,8 +382,13 @@ fn picker_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
                     _ => return vec![],
                 }
             }
-            // Highlight (may have) changed → refresh the preview to the new pane.
-            capture_selected(&mut model.form, model.now)
+            // Only re-capture when the highlighted pane actually changed. (The ~1.5s
+            // Tick still keeps the preview live for the current highlight.)
+            if model.form.active_pane().map(|p| p.target.clone()) != before {
+                capture_selected(&mut model.form, model.now)
+            } else {
+                vec![]
+            }
         }
     }
 }
@@ -1060,6 +1066,33 @@ mod tests {
         assert_eq!(
             m.form.pane_idx, 0,
             "Esc keeps the pane that was selected before"
+        );
+    }
+
+    #[test]
+    fn the_picker_captures_only_when_the_highlighted_pane_changes() {
+        let mut m = form_model();
+        m.form.panes = vec![
+            Pane {
+                target: "s:0.1".into(),
+                title: "claude".into(),
+            },
+            Pane {
+                target: "s:0.2".into(),
+                title: "vim".into(),
+            },
+        ];
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/'))); // open; highlight = s:0.1
+                                                                        // Typing 'v' filters to [vim] -> highlighted pane changes to s:0.2 -> capture.
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('v')));
+        assert!(fx
+            .iter()
+            .any(|e| matches!(e, Effect::CapturePane { pane } if pane == "s:0.2")));
+        // Typing 'i' keeps the match [vim] -> highlighted pane unchanged -> no capture.
+        let fx2 = update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('i')));
+        assert!(
+            !fx2.iter().any(|e| matches!(e, Effect::CapturePane { .. })),
+            "no re-capture when the pane is unchanged"
         );
     }
 }

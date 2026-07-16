@@ -194,7 +194,9 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     // Search + fuzzy list (top).
     let mut lines = vec![Line::from(format!("> {}", picker.query))];
     for (row, &pane_i) in picker.matches.iter().enumerate() {
-        let p = &form.panes[pane_i];
+        let Some(p) = form.panes.get(pane_i) else {
+            continue;
+        };
         let mark = if row == picker.highlight {
             "▶ "
         } else {
