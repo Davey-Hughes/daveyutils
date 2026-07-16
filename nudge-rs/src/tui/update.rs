@@ -595,14 +595,14 @@ fn picker_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
     }
 }
 
-/// Move the picker highlight by `delta` (clamped to the match list), re-capturing
-/// the preview only when the highlighted pane actually changes.
+/// Move the picker highlight by `delta`, wrapping around the ends of the match
+/// list, re-capturing the preview only when the highlighted pane actually changes.
 fn picker_move(model: &mut Model, delta: i32) -> Vec<Effect> {
     let before = model.form.active_pane().map(|p| p.target.clone());
     if let Some(picker) = model.form.picker.as_mut() {
         if !picker.matches.is_empty() {
             let n = picker.matches.len() as i32;
-            picker.highlight = (picker.highlight as i32 + delta).clamp(0, n - 1) as usize;
+            picker.highlight = (picker.highlight as i32 + delta).rem_euclid(n) as usize;
         }
     }
     if model.form.active_pane().map(|p| p.target.clone()) != before {
@@ -1836,6 +1836,39 @@ mod tests {
         let p = m.form.picker.as_ref().unwrap();
         assert_eq!(p.query, "vi");
         assert_eq!(p.matches, vec![1], "only the vim pane matches 'vi'");
+    }
+
+    #[test]
+    fn picker_up_down_wrap_around_the_ends() {
+        let mut m = form_model();
+        m.form.panes = vec![
+            Pane {
+                target: "s:0.1".into(),
+                title: "a".into(),
+            },
+            Pane {
+                target: "s:0.2".into(),
+                title: "b".into(),
+            },
+            Pane {
+                target: "s:0.3".into(),
+                title: "c".into(),
+            },
+        ];
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/'))); // opens, highlight 0
+        assert_eq!(m.form.picker.as_ref().unwrap().highlight, 0);
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Up));
+        assert_eq!(
+            m.form.picker.as_ref().unwrap().highlight,
+            2,
+            "Up from the top wraps to the bottom"
+        );
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Down));
+        assert_eq!(
+            m.form.picker.as_ref().unwrap().highlight,
+            0,
+            "Down from the bottom wraps to the top"
+        );
     }
 
     #[test]
