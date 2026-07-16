@@ -80,6 +80,7 @@ mod tests {
             query: String::new(),
             matches: vec![1, 0],
             highlight: 0,
+            mode: PickerMode::Insert,
         });
         assert_eq!(
             form.active_pane().unwrap().target,
@@ -149,6 +150,14 @@ pub enum Mode {
     Editing(u64),
 }
 
+/// The picker's editing mode, vim-style: Insert (typing filters the list) or
+/// Normal (j/k navigate; i/a/A/I return to Insert).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PickerMode {
+    Insert,
+    Normal,
+}
+
 /// The fzf-style pane picker's state, present only while the picker is open.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Picker {
@@ -157,6 +166,8 @@ pub struct Picker {
     pub matches: Vec<usize>,
     /// Index into `matches` of the highlighted row.
     pub highlight: usize,
+    /// vim-style editing mode; the picker opens in `Insert`.
+    pub mode: PickerMode,
 }
 
 /// The transient bottom line: last error or confirmation.

@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs};
 use ratatui::Frame;
 
-use super::model::{human_countdown, FormField, MessageField, Model, Tab, WhenMode};
+use super::model::{human_countdown, FormField, MessageField, Model, PickerMode, Tab, WhenMode};
 use crate::job::TargetSpec;
 
 pub fn view(model: &Model, f: &mut Frame) {
@@ -33,13 +33,15 @@ pub fn view(model: &Model, f: &mut Frame) {
 
     let hint = match model.tab {
         Tab::Jobs => "[↑↓] select  [c] cancel  [e] edit  [r] refresh  [Tab] new  [q] quit",
-        Tab::NewNudge => {
-            if model.form.picker.is_some() {
-                "[↑↓] move  [enter] pick  [esc] cancel  —  type to filter"
-            } else {
+        Tab::NewNudge => match &model.form.picker {
+            Some(p) if p.mode == PickerMode::Normal => {
+                "NORMAL · [j/k] move  [i] insert  [enter] pick  [esc/q] cancel"
+            }
+            Some(_) => "INSERT · type to filter  ·  [↑↓] move  [enter] pick  [esc] normal",
+            None => {
                 "[↑↓] field  [←→] change  [space] toggle  [/] search  [enter] schedule  [Esc] back  [q] quit"
             }
-        }
+        },
     };
     let status = model.status.0.clone().unwrap_or_else(|| hint.to_string());
     f.render_widget(Paragraph::new(status), chunks[2]);
@@ -248,18 +250,26 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
         lines.push(Line::from("  (no matching panes)"));
     }
     f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("pick a pane")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(
+            match picker.mode {
+                PickerMode::Insert => "pick a pane · INSERT",
+                PickerMode::Normal => "pick a pane · NORMAL",
+            },
+        )),
         picker_area,
     );
 
-    // Put the terminal cursor at the end of the query, so the search line reads
-    // as the text field it is. This only positions+shows the cursor (no
-    // DECSCUSR style escape), so it keeps the terminal's own cursor shape and
-    // blink setting. x = left border + "> " prefix + query width, clamped inside
-    // the right border; y = the first inner (search) line of the picker block.
-    let cursor_x = (picker_area.x + 1 + 2 + picker.query.chars().count() as u16)
-        .min(picker_area.right().saturating_sub(2));
-    f.set_cursor_position((cursor_x, picker_area.y + 1));
+    // In Insert mode, put the terminal cursor at the end of the query so the
+    // search line reads as the text field it is. This only positions+shows the
+    // cursor (no DECSCUSR style escape), so it keeps the terminal's own cursor
+    // shape and blink setting. In Normal mode the highlighted row is the focus,
+    // so no cursor is shown. x = left border + "> " prefix + query width,
+    // clamped inside the right border; y = the first inner (search) line.
+    if picker.mode == PickerMode::Insert {
+        let cursor_x = (picker_area.x + 1 + 2 + picker.query.chars().count() as u16)
+            .min(picker_area.right().saturating_sub(2));
+        f.set_cursor_position((cursor_x, picker_area.y + 1));
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +388,7 @@ mod tests {
             query: "cl".into(),
             matches: vec![0],
             highlight: 0,
+            mode: super::super::model::PickerMode::Insert,
         });
         let out = render(&m);
         assert!(out.contains("pick a pane"), "{out}");
@@ -414,6 +425,7 @@ mod tests {
             query: "cl".into(),
             matches: vec![0],
             highlight: 0,
+            mode: super::super::model::PickerMode::Insert,
         });
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();

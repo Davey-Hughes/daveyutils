@@ -339,16 +339,19 @@ fn open_picker(model: &mut Model) -> Vec<Effect> {
         query: String::new(),
         matches,
         highlight: 0,
+        mode: super::model::PickerMode::Insert,
     });
     capture_selected(&mut model.form, model.now)
 }
 
 fn picker_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
+    use super::model::PickerMode;
+    let mode = match model.form.picker.as_ref() {
+        Some(p) => p.mode,
+        None => return vec![],
+    };
+    // Keys shared by both modes: pick, and arrow navigation.
     match code {
-        KeyCode::Esc => {
-            model.form.picker = None;
-            capture_selected(&mut model.form, model.now)
-        }
         KeyCode::Enter => {
             if let Some(p) = &model.form.picker {
                 if let Some(&idx) = p.matches.get(p.highlight) {
@@ -356,40 +359,79 @@ fn picker_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
                 }
             }
             model.form.picker = None;
-            capture_selected(&mut model.form, model.now)
+            return capture_selected(&mut model.form, model.now);
         }
-        _ => {
-            let labels = pane_labels(&model.form.panes);
-            let before = model.form.active_pane().map(|p| p.target.clone());
-            if let Some(picker) = model.form.picker.as_mut() {
-                match code {
-                    KeyCode::Up => picker.highlight = picker.highlight.saturating_sub(1),
-                    KeyCode::Down => {
-                        if !picker.matches.is_empty() {
-                            picker.highlight = (picker.highlight + 1).min(picker.matches.len() - 1);
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        picker.query.pop();
-                        picker.matches = crate::tui::fuzzy::filter(&picker.query, &labels);
-                        picker.highlight = 0;
-                    }
-                    KeyCode::Char(c) => {
-                        picker.query.push(c);
-                        picker.matches = crate::tui::fuzzy::filter(&picker.query, &labels);
-                        picker.highlight = 0;
-                    }
-                    _ => return vec![],
+        KeyCode::Up => return picker_move(model, -1),
+        KeyCode::Down => return picker_move(model, 1),
+        _ => {}
+    }
+    match mode {
+        PickerMode::Insert => match code {
+            // Esc leaves Insert for Normal — it does NOT close the picker.
+            KeyCode::Esc => {
+                if let Some(p) = model.form.picker.as_mut() {
+                    p.mode = PickerMode::Normal;
                 }
-            }
-            // Only re-capture when the highlighted pane actually changed. (The ~1.5s
-            // Tick still keeps the preview live for the current highlight.)
-            if model.form.active_pane().map(|p| p.target.clone()) != before {
-                capture_selected(&mut model.form, model.now)
-            } else {
                 vec![]
             }
+            KeyCode::Backspace => picker_filter(model, |q| {
+                q.pop();
+            }),
+            KeyCode::Char(c) => picker_filter(model, |q| q.push(c)),
+            _ => vec![],
+        },
+        PickerMode::Normal => match code {
+            KeyCode::Char('j') => picker_move(model, 1),
+            KeyCode::Char('k') => picker_move(model, -1),
+            // The usual vim ways back into Insert; a single-line search box has
+            // no distinct cursor position, so i/a/A/I are all equivalent.
+            KeyCode::Char('i' | 'a' | 'A' | 'I') => {
+                if let Some(p) = model.form.picker.as_mut() {
+                    p.mode = PickerMode::Insert;
+                }
+                vec![]
+            }
+            // In Normal mode, Esc or q cancels the picker (back to the form).
+            KeyCode::Esc | KeyCode::Char('q') => {
+                model.form.picker = None;
+                capture_selected(&mut model.form, model.now)
+            }
+            _ => vec![],
+        },
+    }
+}
+
+/// Move the picker highlight by `delta` (clamped to the match list), re-capturing
+/// the preview only when the highlighted pane actually changes.
+fn picker_move(model: &mut Model, delta: i32) -> Vec<Effect> {
+    let before = model.form.active_pane().map(|p| p.target.clone());
+    if let Some(picker) = model.form.picker.as_mut() {
+        if !picker.matches.is_empty() {
+            let n = picker.matches.len() as i32;
+            picker.highlight = (picker.highlight as i32 + delta).clamp(0, n - 1) as usize;
         }
+    }
+    if model.form.active_pane().map(|p| p.target.clone()) != before {
+        capture_selected(&mut model.form, model.now)
+    } else {
+        vec![]
+    }
+}
+
+/// Edit the picker query, re-filter, reset the highlight, and re-capture the
+/// preview only when the new top match differs from the previous highlight.
+fn picker_filter(model: &mut Model, edit: impl FnOnce(&mut String)) -> Vec<Effect> {
+    let labels = pane_labels(&model.form.panes);
+    let before = model.form.active_pane().map(|p| p.target.clone());
+    if let Some(picker) = model.form.picker.as_mut() {
+        edit(&mut picker.query);
+        picker.matches = crate::tui::fuzzy::filter(&picker.query, &labels);
+        picker.highlight = 0;
+    }
+    if model.form.active_pane().map(|p| p.target.clone()) != before {
+        capture_selected(&mut model.form, model.now)
+    } else {
+        vec![]
     }
 }
 
@@ -1056,16 +1098,91 @@ mod tests {
     }
 
     #[test]
-    fn esc_closes_the_picker_keeping_the_prior_pane() {
+    fn esc_then_esc_cancels_the_picker_keeping_the_prior_pane() {
         let mut m = form_model();
         m.form.pane_idx = 0;
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('v')));
-        update(&mut m, Msg::Key(crossterm::event::KeyCode::Esc));
-        assert!(m.form.picker.is_none());
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Esc)); // Insert -> Normal
+        assert!(
+            m.form.picker.is_some(),
+            "the first Esc leaves Insert for Normal, it does not close"
+        );
+        assert_eq!(m.form.picker.as_ref().unwrap().mode, PickerMode::Normal);
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Esc)); // Normal -> cancel
+        assert!(m.form.picker.is_none(), "Esc in Normal cancels the picker");
         assert_eq!(
             m.form.pane_idx, 0,
-            "Esc keeps the pane that was selected before"
+            "cancel keeps the pane that was selected before"
+        );
+    }
+
+    #[test]
+    fn the_picker_opens_in_insert_mode() {
+        let mut m = form_model();
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
+        assert_eq!(m.form.picker.as_ref().unwrap().mode, PickerMode::Insert);
+    }
+
+    #[test]
+    fn normal_mode_jk_navigate_and_typing_does_not_filter() {
+        let mut m = form_model();
+        m.form.panes = vec![
+            Pane {
+                target: "s:0.1".into(),
+                title: "claude".into(),
+            },
+            Pane {
+                target: "s:0.2".into(),
+                title: "vim".into(),
+            },
+        ];
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/'))); // open (Insert)
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Esc)); // -> Normal
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('j')));
+        assert_eq!(
+            m.form.picker.as_ref().unwrap().highlight,
+            1,
+            "j moves down in Normal"
+        );
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('k')));
+        assert_eq!(
+            m.form.picker.as_ref().unwrap().highlight,
+            0,
+            "k moves up in Normal"
+        );
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('z')));
+        assert_eq!(
+            m.form.picker.as_ref().unwrap().query,
+            "",
+            "typing does not filter in Normal mode"
+        );
+    }
+
+    #[test]
+    fn normal_mode_i_a_return_to_insert() {
+        for key in ['i', 'a', 'A', 'I'] {
+            let mut m = form_model();
+            update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
+            update(&mut m, Msg::Key(crossterm::event::KeyCode::Esc)); // Normal
+            update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(key)));
+            assert_eq!(
+                m.form.picker.as_ref().unwrap().mode,
+                PickerMode::Insert,
+                "{key} re-enters Insert"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_mode_q_cancels_the_picker() {
+        let mut m = form_model();
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Esc)); // Normal
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('q')));
+        assert!(
+            m.form.picker.is_none(),
+            "q cancels the picker in Normal mode"
         );
     }
 
