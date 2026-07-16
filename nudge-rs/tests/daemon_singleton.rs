@@ -122,7 +122,7 @@ fn run_refuses_to_start_while_another_daemon_holds_the_lock() {
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let r = nudge::daemon::run(&paths, None, None, jiff::ToSpan::hours(6));
+        let r = nudge::daemon::run(&paths, None, None, None, jiff::ToSpan::hours(6));
         let _ = tx.send(r.map(|_| ()).map_err(|e| e.kind()));
     });
 
@@ -170,12 +170,13 @@ fn a_running_daemon_holds_the_lock_for_its_whole_life() {
         // in this file, exit 1, attributed to nothing. Parking instead leaves
         // the failure to be reported as what it is: the "daemon under test
         // never came up" assertion below.
-        let _ = nudge::daemon::run_with(&paths, None, None, jiff::ToSpan::hours(6), |result| {
-            eprintln!("in-process daemon's ipc server exited: {result:?}");
-            loop {
-                std::thread::park();
-            }
-        });
+        let _ =
+            nudge::daemon::run_with(&paths, None, None, None, jiff::ToSpan::hours(6), |result| {
+                eprintln!("in-process daemon's ipc server exited: {result:?}");
+                loop {
+                    std::thread::park();
+                }
+            });
     });
 
     // Wait until it's actually up (its socket appears / accepts).

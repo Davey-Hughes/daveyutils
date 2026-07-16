@@ -38,6 +38,7 @@ pub fn run(cli: cli::Cli) -> anyhow::Result<()> {
             &p,
             std::env::var("NUDGE_CLOCK_PATTERN").ok(),
             std::env::var("NUDGE_DURATION_PATTERN").ok(),
+            std::env::var("NUDGE_WEEKLY_PATTERN").ok(),
             jiff::ToSpan::hours(6),
         ) {
             Ok(()) => Ok(()),
@@ -64,6 +65,7 @@ pub fn run(cli: cli::Cli) -> anyhow::Result<()> {
     detect::validate_patterns(
         std::env::var("NUDGE_CLOCK_PATTERN").ok().as_deref(),
         std::env::var("NUDGE_DURATION_PATTERN").ok().as_deref(),
+        std::env::var("NUDGE_WEEKLY_PATTERN").ok().as_deref(),
     )?;
     // scheduling / job-management dispatch is added in Tasks 3-4 & 6.
     app::dispatch(cli)

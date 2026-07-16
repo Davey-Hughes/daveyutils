@@ -54,15 +54,15 @@ fn compile(base: &str, ext: &str) -> Result<Regex, regex::Error> {
 ///
 /// So the CLI, which has a user to talk to, checks up front and says so. The
 /// daemon keeps the warn-and-degrade: a bad pattern still must not kill it.
-pub fn validate_patterns(clock_ext: Option<&str>, dur_ext: Option<&str>) -> anyhow::Result<()> {
+pub fn validate_patterns(
+    clock_ext: Option<&str>,
+    dur_ext: Option<&str>,
+    weekly_ext: Option<&str>,
+) -> anyhow::Result<()> {
     for (var, base, ext) in [
         ("NUDGE_CLOCK_PATTERN", CLOCK_BASE, clock_ext),
         ("NUDGE_DURATION_PATTERN", DURATION_BASE, dur_ext),
-        (
-            "NUDGE_WEEKLY_PATTERN",
-            WEEKLY_BASE,
-            std::env::var("NUDGE_WEEKLY_PATTERN").ok().as_deref(),
-        ),
+        ("NUDGE_WEEKLY_PATTERN", WEEKLY_BASE, weekly_ext),
     ] {
         // Unset and empty both mean "no extension", which is the common case.
         if let Some(e) = ext.filter(|e| !e.is_empty()) {
@@ -144,6 +144,7 @@ pub fn detect_reset(
     now: &Zoned,
     clock_ext: Option<&str>,
     dur_ext: Option<&str>,
+    weekly_ext: Option<&str>,
 ) -> Detection {
     let clean = strip_ansi_escapes::strip_str(pane_text);
 
@@ -165,7 +166,7 @@ pub fn detect_reset(
     // weekly banner schedules up to six days early -- the exact bug this shape
     // exists to prevent. Weekly must win.
     banners.extend(
-        weekly_re(std::env::var("NUDGE_WEEKLY_PATTERN").ok().as_deref())
+        weekly_re(weekly_ext)
             .find_iter(&clean)
             .map(|m| (m.start(), m.end(), Shape::Weekly)),
     );
@@ -362,7 +363,7 @@ mod tests {
     #[test]
     fn detects_claude_clock_banner_with_padding() {
         let pane = "Approaching usage limit — current session resets 3:00pm";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         // 15:00 + 3 minutes padding.
         assert_eq!((z.hour(), z.minute()), (15, 3));
     }
@@ -370,7 +371,7 @@ mod tests {
     #[test]
     fn detects_agy_duration_banner_with_padding() {
         let pane = "quota reached. Resets in 1h30m";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         // now 10:00 + 1h30m + 3m padding = 11:33.
         assert_eq!((z.hour(), z.minute()), (11, 33));
     }
@@ -378,7 +379,7 @@ mod tests {
     #[test]
     fn duration_is_case_insensitive() {
         let pane = "QUOTA REACHED — RESETS IN 45M";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         assert_eq!((z.hour(), z.minute()), (10, 48));
     }
 
@@ -386,7 +387,7 @@ mod tests {
     fn ignores_ansi_colour_codes() {
         let pane = "\x1b[31mquota reached\x1b[0m Resets in 45m";
         assert!(matches!(
-            detect_reset(pane, &now(), None, None),
+            detect_reset(pane, &now(), None, None, None),
             Detection::Reset(_)
         ));
     }
@@ -395,21 +396,39 @@ mod tests {
     fn custom_patterns_extend_detection() {
         let clock = "codex is rate limited — try again at 4pm";
         assert!(matches!(
-            detect_reset(clock, &now(), Some("rate limited"), None),
+            detect_reset(clock, &now(), Some("rate limited"), None, None),
             Detection::Reset(_)
         ));
 
         let dur = "out of credits, back in 20m";
         assert!(matches!(
-            detect_reset(dur, &now(), None, Some("out of credits")),
+            detect_reset(dur, &now(), None, Some("out of credits"), None),
             Detection::Reset(_)
+        ));
+    }
+
+    /// The weekly extension is threaded in like clock_ext/dur_ext, so a custom
+    /// NUDGE_WEEKLY_PATTERN can be tested directly without mutating process env.
+    #[test]
+    fn custom_weekly_pattern_extends_detection() {
+        // A weekly-shaped banner that the built-in WEEKLY_BASE ("weekly limit
+        // .*resets") does not match, but a custom pattern does.
+        let pane = "plan usage exhausted for the week, resets 8am";
+        assert!(matches!(
+            detect_reset(pane, &now(), None, None, Some("usage exhausted.*resets")),
+            Detection::Reset(_)
+        ));
+        // Without the extension it is not a weekly banner at all.
+        assert!(matches!(
+            detect_reset(pane, &now(), None, None, None),
+            Detection::None
         ));
     }
 
     #[test]
     fn no_banner_returns_none() {
         assert!(matches!(
-            detect_reset("all good here", &now(), None, None),
+            detect_reset("all good here", &now(), None, None, None),
             Detection::None
         ));
     }
@@ -419,7 +438,7 @@ mod tests {
         // A scrollback line with a duration-shaped phrase ABOVE the real banner
         // must not hijack the reset time.
         let pane = "commit abc123 16 minutes ago\nquota reached. Resets in 45m";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         // now 10:00 + 45m + 3m padding = 10:48, NOT 10:00 + 16m + 3m.
         assert_eq!((z.hour(), z.minute()), (10, 48));
     }
@@ -429,7 +448,7 @@ mod tests {
         // A scrollback clock time ABOVE the real banner must not hijack the
         // reset time either.
         let pane = "started at 9:15\ncurrent session resets 3:00pm";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         // 15:00 + 3m padding = 15:03, NOT derived from the 9:15 scrollback time.
         assert_eq!((z.hour(), z.minute()), (15, 3));
     }
@@ -439,13 +458,17 @@ mod tests {
         // The daemon must degrade, but the CLI has a user standing right there
         // and should say so. Same metacharacter typos as the fallback test.
         for bad in ["codex (", "*", "a[b"] {
-            let e = validate_patterns(Some(bad), None).unwrap_err().to_string();
+            let e = validate_patterns(Some(bad), None, None)
+                .unwrap_err()
+                .to_string();
             assert!(
                 e.contains("invalid NUDGE_CLOCK_PATTERN"),
                 "clock ext {bad:?} must be reported against its own variable, got: {e}"
             );
 
-            let e = validate_patterns(None, Some(bad)).unwrap_err().to_string();
+            let e = validate_patterns(None, Some(bad), None)
+                .unwrap_err()
+                .to_string();
             assert!(
                 e.contains("invalid NUDGE_DURATION_PATTERN"),
                 "duration ext {bad:?} must be reported against its own variable, got: {e}"
@@ -457,9 +480,9 @@ mod tests {
     fn validate_patterns_accepts_what_detect_reset_accepts() {
         // Whatever this passes, `build_re` must actually be able to use -- and
         // unset/empty is the overwhelmingly common case and not an error.
-        assert!(validate_patterns(None, None).is_ok());
-        assert!(validate_patterns(Some(""), Some("")).is_ok());
-        assert!(validate_patterns(Some("rate limited"), Some("out of credits")).is_ok());
+        assert!(validate_patterns(None, None, None).is_ok());
+        assert!(validate_patterns(Some(""), Some(""), None).is_ok());
+        assert!(validate_patterns(Some("rate limited"), Some("out of credits"), None).is_ok());
     }
 
     #[test]
@@ -474,6 +497,7 @@ mod tests {
                 &now(),
                 Some(bad),
                 None,
+                None,
             ));
             assert_eq!(
                 (z.hour(), z.minute()),
@@ -486,6 +510,7 @@ mod tests {
                 &now(),
                 None,
                 Some(bad),
+                None,
             ));
             assert_eq!(
                 (d.hour(), d.minute()),
@@ -501,7 +526,7 @@ mod tests {
         // up the screen is superseded by the live 3h one below it.
         let pane =
             "quota reached. Resets in 45m\n... hours of work ...\nquota reached. Resets in 3h";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         // now 10:00 + 3h + 3m padding = 13:03, NOT the stale banner's 10:48.
         assert_eq!((z.hour(), z.minute()), (13, 3));
     }
@@ -512,7 +537,7 @@ mod tests {
         // screen, so it is the live one even though the duration branch used to
         // run first unconditionally.
         let pane = "quota reached. Resets in 45m\nlater output\ncurrent session resets 3:00pm";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         // 15:00 + 3m padding = 15:03, NOT the stale duration banner's 10:48.
         assert_eq!((z.hour(), z.minute()), (15, 3));
     }
@@ -522,7 +547,7 @@ mod tests {
         // The mirror case, so "last banner wins" is not accidentally satisfied
         // by simply flipping the hardcoded branch order.
         let pane = "current session resets 3:00pm\nlater output\nquota reached. Resets in 45m";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         // now 10:00 + 45m + 3m padding = 10:48, NOT the stale clock banner's 15:03.
         assert_eq!((z.hour(), z.minute()), (10, 48));
     }
@@ -533,7 +558,7 @@ mod tests {
     #[test]
     fn a_stated_zone_is_honored_over_the_local_one() {
         let pane = "current session resets 3:00pm (America/New_York)";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         // 15:00 New York + 3m padding == 19:03 UTC.
         assert_eq!(z.timestamp().to_string(), "2026-07-13T19:03:00Z");
     }
@@ -546,6 +571,7 @@ mod tests {
             &now(),
             None,
             None,
+            None,
         ));
         assert_eq!((z.hour(), z.minute()), (15, 3));
     }
@@ -555,7 +581,7 @@ mod tests {
     #[test]
     fn an_unknown_zone_falls_back_to_local_without_panicking() {
         let pane = "current session resets 3:00pm (Mars/Olympus_Mons)";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         assert_eq!((z.hour(), z.minute()), (15, 3));
     }
 
@@ -564,7 +590,7 @@ mod tests {
     #[test]
     fn a_zone_on_a_later_line_is_not_the_banners() {
         let pane = "current session resets 3:00pm\nTZ set to (America/New_York)";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         assert_eq!((z.hour(), z.minute()), (15, 3));
     }
 
@@ -573,11 +599,11 @@ mod tests {
     #[test]
     fn detection_distinguishes_absent_from_unreadable() {
         assert!(matches!(
-            detect_reset("all good here", &now(), None, None),
+            detect_reset("all good here", &now(), None, None, None),
             Detection::None
         ));
         assert!(matches!(
-            detect_reset("current session resets 3:00pm", &now(), None, None),
+            detect_reset("current session resets 3:00pm", &now(), None, None, None),
             Detection::Reset(_)
         ));
         // The third answer, Detection::Unreadable, gets real coverage when the
@@ -591,7 +617,7 @@ mod tests {
     #[test]
     fn detects_the_captured_weekly_banner() {
         let pane = "You've hit your weekly limit · resets 8am (America/Los_Angeles)";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         // 08:00 America/Los_Angeles + 3m padding == 15:03 UTC.
         assert_eq!(z.timestamp().to_string(), "2026-07-13T15:03:00Z");
     }
@@ -606,7 +632,7 @@ mod tests {
             "You've hit your weekly limit · resets on 3:00pm",
             "You've hit your weekly limit · resets · 3:00pm",
         ] {
-            let z = reset_of(detect_reset(pane, &now(), None, None));
+            let z = reset_of(detect_reset(pane, &now(), None, None, None));
             assert_eq!(
                 (z.hour(), z.minute()),
                 (15, 3),
@@ -620,12 +646,12 @@ mod tests {
     fn a_weekday_in_the_gap_sets_the_day() {
         // now() is Monday 2026-07-13 10:00 UTC.
         let pane = "You've hit your weekly limit · resets Wed 3:00pm";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         assert_eq!(z.date(), jiff::civil::date(2026, 7, 15));
         assert_eq!((z.hour(), z.minute()), (15, 3));
 
         let pane = "You've hit your weekly limit · resets Wednesday at 3:00pm";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         assert_eq!(z.date(), jiff::civil::date(2026, 7, 15));
     }
 
@@ -634,7 +660,7 @@ mod tests {
     #[test]
     fn an_unreadable_gap_refuses_and_quotes_the_text() {
         let pane = "You've hit your weekly limit · resets Jul 16, 8am";
-        match detect_reset(pane, &now(), None, None) {
+        match detect_reset(pane, &now(), None, None, None) {
             Detection::Unreadable { banner, gap } => {
                 assert!(gap.contains("Jul"), "the gap must be quoted: {gap:?}");
                 assert!(
@@ -654,7 +680,7 @@ mod tests {
     fn a_recognized_day_that_resolves_to_nothing_still_refuses() {
         let pane = "You've hit your weekly limit · resets today 8am";
         assert!(matches!(
-            detect_reset(pane, &now(), None, None),
+            detect_reset(pane, &now(), None, None, None),
             Detection::Unreadable { .. }
         ));
     }
@@ -667,7 +693,7 @@ mod tests {
             "current session resets 3:00pm\nYou've hit your weekly limit · resets Jul 16, 8am";
         assert!(
             matches!(
-                detect_reset(pane, &now(), None, None),
+                detect_reset(pane, &now(), None, None, None),
                 Detection::Unreadable { .. }
             ),
             "the newest banner is unreadable; falling back to the stale one above \
@@ -680,7 +706,7 @@ mod tests {
     #[test]
     fn a_newer_session_banner_below_a_weekly_one_still_wins() {
         let pane = "You've hit your weekly limit · resets Jul 16, 8am\nlater\ncurrent session resets 3:00pm";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         assert_eq!((z.hour(), z.minute()), (15, 3));
     }
 
@@ -693,7 +719,7 @@ mod tests {
     #[test]
     fn a_weekly_banner_without_a_clock_token_falls_back_to_an_older_banner() {
         let pane = "current session resets 3:00pm\nYou've hit your weekly limit · resets";
-        let z = reset_of(detect_reset(pane, &now(), None, None));
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
         assert_eq!((z.hour(), z.minute()), (15, 3));
     }
 
@@ -706,7 +732,7 @@ mod tests {
         let pane = "You've hit your weekly limit · resets Jul 16, 8am";
         assert!(
             matches!(
-                detect_reset(pane, &now(), Some("weekly limit"), None),
+                detect_reset(pane, &now(), Some("weekly limit"), None, None),
                 Detection::Unreadable { .. }
             ),
             "the Clock shape would read '8am' and schedule six days early; \
