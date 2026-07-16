@@ -15,6 +15,9 @@ const CLOCK_BASE: &str = r"(?:session limit|current session).*resets";
 /// The built-in duration-shape banner alternation.
 const DURATION_BASE: &str = r"quota reached";
 
+/// The built-in weekly-shape banner alternation.
+const WEEKLY_BASE: &str = r"weekly limit.*resets";
+
 /// Built-in clock-shape banner alternation, optionally extended by the user's
 /// `NUDGE_CLOCK_PATTERN`.
 fn clock_re(ext: Option<&str>) -> Regex {
@@ -25,6 +28,12 @@ fn clock_re(ext: Option<&str>) -> Regex {
 /// `NUDGE_DURATION_PATTERN`.
 fn duration_re(ext: Option<&str>) -> Regex {
     build_re("NUDGE_DURATION_PATTERN", DURATION_BASE, ext)
+}
+
+/// Built-in weekly-shape banner alternation, optionally extended by
+/// `NUDGE_WEEKLY_PATTERN`.
+fn weekly_re(ext: Option<&str>) -> Regex {
+    build_re("NUDGE_WEEKLY_PATTERN", WEEKLY_BASE, ext)
 }
 
 /// The one place a `base`/`ext` pair becomes a regex, so that what
@@ -49,6 +58,11 @@ pub fn validate_patterns(clock_ext: Option<&str>, dur_ext: Option<&str>) -> anyh
     for (var, base, ext) in [
         ("NUDGE_CLOCK_PATTERN", CLOCK_BASE, clock_ext),
         ("NUDGE_DURATION_PATTERN", DURATION_BASE, dur_ext),
+        (
+            "NUDGE_WEEKLY_PATTERN",
+            WEEKLY_BASE,
+            std::env::var("NUDGE_WEEKLY_PATTERN").ok().as_deref(),
+        ),
     ] {
         // Unset and empty both mean "no extension", which is the common case.
         if let Some(e) = ext.filter(|e| !e.is_empty()) {
@@ -100,6 +114,10 @@ enum Shape {
     Duration,
     /// "... resets 3:00pm" / "... try again at 4pm".
     Clock,
+    /// "You've hit your weekly limit · resets 8am (America/Los_Angeles)".
+    /// The only shape whose reset may be days away, so the only one that must
+    /// read a day out of the gap before its clock token means anything.
+    Weekly,
 }
 
 /// What `detect_reset` concluded about a pane.
@@ -141,6 +159,16 @@ pub fn detect_reset(
             .find_iter(&clean)
             .map(|m| (m.start(), m.end(), Shape::Duration)),
     );
+    // Pushed BEFORE Clock: the sort below is stable, so insertion order breaks
+    // an exact-offset tie. A user whose NUDGE_CLOCK_PATTERN is "weekly limit"
+    // makes both shapes match at the same offset, and the Clock shape reading a
+    // weekly banner schedules up to six days early -- the exact bug this shape
+    // exists to prevent. Weekly must win.
+    banners.extend(
+        weekly_re(std::env::var("NUDGE_WEEKLY_PATTERN").ok().as_deref())
+            .find_iter(&clean)
+            .map(|m| (m.start(), m.end(), Shape::Weekly)),
+    );
     banners.extend(
         clock_re(clock_ext)
             .find_iter(&clean)
@@ -150,7 +178,7 @@ pub fn detect_reset(
     // offset keep the duration-first order callers have always seen.
     banners.sort_by_key(|b| std::cmp::Reverse(b.0));
 
-    for (_, end, shape) in banners {
+    for (start, end, shape) in banners {
         // Scan only the text *after* the banner match: a captured pane includes
         // scrollback, and an unrelated duration-shaped substring earlier in the
         // pane (e.g. "16 minutes ago" in a shell prompt) must not be mistaken
@@ -162,9 +190,51 @@ pub fn detect_reset(
         let line_rest = rest.split('\n').next().unwrap_or("");
         let now = &now_in_zone(now, find_zone_token(line_rest).as_deref());
 
+        if let Shape::Weekly = shape {
+            // The weekly banner is the only one whose reset may be days away,
+            // and the only one that names no day in its bare form. What sits
+            // between the banner and the clock token is the entire signal.
+            let Some(m) = find_clock_token_match(line_rest) else {
+                continue; // no clock token on this line; try the banner above.
+            };
+            let gap = &line_rest[..m.start()];
+            let token = m.as_str().to_string();
+            let words = gap_words(gap);
+            let day_words: Vec<&str> = words
+                .iter()
+                .map(|w| w.as_str())
+                .filter(|w| !GAP_FILLER.contains(w))
+                .collect();
+
+            let resolved = match day_words.as_slice() {
+                // Nothing but filler: the bare form. Per the design, this means
+                // the reset is within 24h, which is exactly at_clock's rule.
+                [] => parse_timespec(&token, now).ok(),
+                // Exactly one word, and we know it.
+                [d] => match crate::timespec::parse_day(d) {
+                    Some(day) => crate::timespec::resolve_day_clock(now, day, &token),
+                    None => None,
+                },
+                // Two or more words is a shape we have never seen.
+                _ => None,
+            };
+
+            return match resolved.and_then(|z| z.checked_add(PADDING_MINUTES.minutes()).ok()) {
+                Some(padded) => Detection::Reset(padded),
+                // Refuse. Do NOT fall through to the banner above: this is the
+                // newest banner on screen, and scheduling off a superseded one
+                // is the misfire in a different costume.
+                None => Detection::Unreadable {
+                    banner: banner_line(&clean, start),
+                    gap: gap.to_string(),
+                },
+            };
+        }
+
         let token = match shape {
             Shape::Duration => find_duration_token(rest),
             Shape::Clock => find_clock_token(rest),
+            Shape::Weekly => unreachable!("handled above"),
         };
         if let Some(token) = token {
             if let Ok(z) = parse_timespec(&token, now) {
@@ -217,8 +287,43 @@ fn now_in_zone(now: &Zoned, zone: Option<&str>) -> Zoned {
 
 /// Extract the first "3pm" / "3:00 PM" / "14:30" token from the text.
 fn find_clock_token(text: &str) -> Option<String> {
+    // Delegate to the match-returning form so the clock-token regex lives in
+    // exactly one place: the Weekly gap path reads its token through
+    // find_clock_token_match and the Clock path through here, and two copies of
+    // the pattern could silently diverge under a later edit.
+    find_clock_token_match(text).map(|m| m.as_str().to_string())
+}
+
+/// `find_clock_token`, but keeping the match position so the caller can see what
+/// preceded it.
+fn find_clock_token_match(text: &str) -> Option<regex::Match<'_>> {
     let re = Regex::new(r"(?i)\b(\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2})\b").unwrap();
-    re.find(text).map(|m| m.as_str().to_string())
+    re.find(text)
+}
+
+/// Words that may sit between the banner and its clock token without naming a
+/// day. Anything else in the gap is either a day or a refusal.
+const GAP_FILLER: &[&str] = &["at", "on"];
+
+/// The gap's significant words: lowercased, stripped of surrounding punctuation,
+/// with pure-punctuation tokens ("·", "-") dropped entirely.
+fn gap_words(gap: &str) -> Vec<String> {
+    gap.split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// The whole line `offset` falls on, trimmed — the banner as the user saw it.
+fn banner_line(clean: &str, offset: usize) -> String {
+    let start = clean[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let end = clean[offset..]
+        .find('\n')
+        .map_or(clean.len(), |i| offset + i);
+    clean[start..end].trim().to_string()
 }
 
 /// Extract the first duration-shaped token ("1h30m", "45m", "20m", ...) from
@@ -479,5 +584,133 @@ mod tests {
         // weekly shape lands and detect_reset actually produces it (Task 4). No
         // production path constructs it yet, so asserting on a hand-built value
         // here would only re-check the compiler; left to the shape that earns it.
+    }
+
+    /// The captured banner, verbatim, from a live pane on 2026-07-15. now() is
+    /// 10:00 UTC == 03:00 in Los Angeles, so 8am LA is later the same day.
+    #[test]
+    fn detects_the_captured_weekly_banner() {
+        let pane = "You've hit your weekly limit · resets 8am (America/Los_Angeles)";
+        let z = reset_of(detect_reset(pane, &now(), None, None));
+        // 08:00 America/Los_Angeles + 3m padding == 15:03 UTC.
+        assert_eq!(z.timestamp().to_string(), "2026-07-13T15:03:00Z");
+    }
+
+    /// A bare gap, and gaps that carry only filler, all mean "the next such
+    /// hour" -- there is no day to read.
+    #[test]
+    fn a_filler_only_gap_reads_as_the_bare_form() {
+        for pane in [
+            "You've hit your weekly limit · resets 3:00pm",
+            "You've hit your weekly limit · resets at 3:00pm",
+            "You've hit your weekly limit · resets on 3:00pm",
+            "You've hit your weekly limit · resets · 3:00pm",
+        ] {
+            let z = reset_of(detect_reset(pane, &now(), None, None));
+            assert_eq!(
+                (z.hour(), z.minute()),
+                (15, 3),
+                "{pane:?} has no day in its gap and must read as the bare form"
+            );
+        }
+    }
+
+    /// A weekday in the gap moves the reset off "today or tomorrow" entirely.
+    #[test]
+    fn a_weekday_in_the_gap_sets_the_day() {
+        // now() is Monday 2026-07-13 10:00 UTC.
+        let pane = "You've hit your weekly limit · resets Wed 3:00pm";
+        let z = reset_of(detect_reset(pane, &now(), None, None));
+        assert_eq!(z.date(), jiff::civil::date(2026, 7, 15));
+        assert_eq!((z.hour(), z.minute()), (15, 3));
+
+        let pane = "You've hit your weekly limit · resets Wednesday at 3:00pm";
+        let z = reset_of(detect_reset(pane, &now(), None, None));
+        assert_eq!(z.date(), jiff::civil::date(2026, 7, 15));
+    }
+
+    /// The tripwire. An unrecognized gap must refuse -- and quote itself, so the
+    /// report IS the capture needed to teach the parser this shape.
+    #[test]
+    fn an_unreadable_gap_refuses_and_quotes_the_text() {
+        let pane = "You've hit your weekly limit · resets Jul 16, 8am";
+        match detect_reset(pane, &now(), None, None) {
+            Detection::Unreadable { banner, gap } => {
+                assert!(gap.contains("Jul"), "the gap must be quoted: {gap:?}");
+                assert!(
+                    banner.contains("weekly limit"),
+                    "the banner line must be quoted: {banner:?}"
+                );
+            }
+            other => panic!(
+                "an unreadable weekly gap must refuse, not guess a reset time; got {other:?}"
+            ),
+        }
+    }
+
+    /// A recognized day that cannot describe a future time is still a refusal,
+    /// never a guess: "today 8am" at 10:00 is self-contradictory.
+    #[test]
+    fn a_recognized_day_that_resolves_to_nothing_still_refuses() {
+        let pane = "You've hit your weekly limit · resets today 8am";
+        assert!(matches!(
+            detect_reset(pane, &now(), None, None),
+            Detection::Unreadable { .. }
+        ));
+    }
+
+    /// An unreadable weekly banner must NOT fall back to an older banner above
+    /// it: that would schedule off stale scrollback.
+    #[test]
+    fn an_unreadable_weekly_banner_does_not_fall_back_to_an_older_one() {
+        let pane =
+            "current session resets 3:00pm\nYou've hit your weekly limit · resets Jul 16, 8am";
+        assert!(
+            matches!(
+                detect_reset(pane, &now(), None, None),
+                Detection::Unreadable { .. }
+            ),
+            "the newest banner is unreadable; falling back to the stale one above \
+             would schedule from superseded information"
+        );
+    }
+
+    /// But a weekly banner in the scrollback ABOVE a newer session banner is
+    /// simply older, and the bottom-up walk never reaches it.
+    #[test]
+    fn a_newer_session_banner_below_a_weekly_one_still_wins() {
+        let pane = "You've hit your weekly limit · resets Jul 16, 8am\nlater\ncurrent session resets 3:00pm";
+        let z = reset_of(detect_reset(pane, &now(), None, None));
+        assert_eq!((z.hour(), z.minute()), (15, 3));
+    }
+
+    /// A weekly banner whose own line carries no clock token is not a refusal --
+    /// there is nothing unreadable, just nothing to read here -- so the walk
+    /// continues to the banner above. The newest banner is the weekly one (it is
+    /// lowest), so this drives the Weekly `continue` branch specifically: if that
+    /// branch instead returned None or refused, `reset_of` would panic rather
+    /// than fall back to the older session banner's 3:00pm.
+    #[test]
+    fn a_weekly_banner_without_a_clock_token_falls_back_to_an_older_banner() {
+        let pane = "current session resets 3:00pm\nYou've hit your weekly limit · resets";
+        let z = reset_of(detect_reset(pane, &now(), None, None));
+        assert_eq!((z.hour(), z.minute()), (15, 3));
+    }
+
+    /// Weekly is pushed before Clock so it wins an exact-offset tie. A user
+    /// whose NUDGE_CLOCK_PATTERN is "weekly limit" makes both shapes match at
+    /// the same offset, and the Clock shape reading this banner is precisely the
+    /// six-day-early misfire.
+    #[test]
+    fn weekly_beats_clock_on_an_exact_offset_tie() {
+        let pane = "You've hit your weekly limit · resets Jul 16, 8am";
+        assert!(
+            matches!(
+                detect_reset(pane, &now(), Some("weekly limit"), None),
+                Detection::Unreadable { .. }
+            ),
+            "the Clock shape would read '8am' and schedule six days early; \
+             Weekly must win the tie and refuse"
+        );
     }
 }
