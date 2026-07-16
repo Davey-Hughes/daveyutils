@@ -137,9 +137,40 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
         super::model::Mode::New => "New nudge",
         super::model::Mode::Editing(_) => "Edit nudge",
     };
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(10)]) // preview grows, form fixed
+        .split(area);
+    let preview_area = rows[0];
+    let form_area = rows[1];
+
+    // Preview panel (top): the selected pane's screen, bottom-anchored so the
+    // banner (at the pane's bottom) stays visible when the panel is shorter.
+    let pane_name = form
+        .selected_pane()
+        .map(|p| p.target.as_str())
+        .unwrap_or("(no pane)");
+    let preview_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("preview: {pane_name}"));
+    let inner_h = preview_area.height.saturating_sub(2) as usize; // minus borders
+    let preview_text = match &form.preview {
+        Some(screen) => {
+            let lines: Vec<&str> = screen.lines().collect();
+            let start = lines.len().saturating_sub(inner_h);
+            lines[start..].join("\n")
+        }
+        None => "(preview unavailable)".to_string(),
+    };
+    f.render_widget(
+        Paragraph::new(preview_text).block(preview_block),
+        preview_area,
+    );
+
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
-        area,
+        form_area,
     );
 }
 
@@ -215,5 +246,27 @@ mod tests {
         let out = render(&m);
         assert!(out.contains("Message"), "{out}");
         assert!(out.contains("please continue"), "{out}");
+    }
+
+    #[test]
+    fn the_form_shows_a_pane_preview_on_top() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.form.panes = vec![crate::tmux_panes::Pane {
+            target: "bot:0.1".into(),
+            title: String::new(),
+        }];
+        m.form.preview = Some("current session limit · resets 3:00pm".into());
+        let out = render(&m); // NewNudge is the default tab
+        assert!(out.contains("preview: bot:0.1"), "{out}");
+        assert!(out.contains("resets 3:00pm"), "{out}");
+        assert!(out.contains("Message"), "form fields still render: {out}");
+    }
+
+    #[test]
+    fn a_missing_preview_says_unavailable() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.form.preview = None;
+        let out = render(&m);
+        assert!(out.contains("preview unavailable"), "{out}");
     }
 }
