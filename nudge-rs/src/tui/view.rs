@@ -100,7 +100,15 @@ fn preview_text(preview: &Option<String>, inner_h: usize) -> Text<'static> {
                 .into_text()
                 .unwrap_or_else(|_| Text::raw(strip_ansi_escapes::strip_str(screen)));
             let start = text.lines.len().saturating_sub(inner_h);
-            Text::from(text.lines[start..].to_vec())
+            let tail = &text.lines[start..];
+            // Bottom-align: pad the top so the pane's tail (where the banner sits)
+            // rests at the bottom of the panel.
+            let pad = inner_h.saturating_sub(tail.len());
+            let mut lines: Vec<Line> = std::iter::repeat_with(|| Line::from(""))
+                .take(pad)
+                .collect();
+            lines.extend_from_slice(tail);
+            Text::from(lines)
         }
         None => Text::from("(preview unavailable)"),
     }
@@ -195,15 +203,17 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     );
 }
 
+/// The picker occupies this fraction of the tab body; the preview gets the rest.
+/// Fixed (not content-sized) so it doesn't resize as the match count changes —
+/// the list scrolls inside it instead.
+const PICKER_HEIGHT_PCT: u32 = 50;
+
 fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     let form = &model.form;
     let picker = form.picker.as_ref().unwrap();
-    // Preview on top grows to fill the space; the search + list below is sized to
-    // its content (search line + matches + 2 borders), capped at two-thirds so a
-    // short filtered list leaves no empty gap and a long list can't crowd out the
-    // preview. This keeps the two balanced as the match count changes.
-    let content_h = picker.matches.len().max(1) as u16 + 3;
-    let picker_h = content_h.min(area.height.saturating_mul(2) / 3).max(4);
+    // Preview on top, the search + list block below at a fixed fraction of the
+    // body. The block does NOT resize with the match count; its list scrolls.
+    let picker_h = ((area.height as u32 * PICKER_HEIGHT_PCT / 100) as u16).max(4);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(picker_h)])
@@ -243,10 +253,21 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     let list_area = inner_rows[0];
     let search_area = inner_rows[1];
 
-    // The match list, above the search line.
+    // The match list, above the search line: a scrolling window that keeps the
+    // highlight visible (when there are more matches than rows, the highlighted
+    // row rides the bottom of the window), bottom-aligned so the results rest
+    // just above the prompt.
+    let h = list_area.height as usize;
+    let m = picker.matches.len();
+    let (start, end) = if m <= h {
+        (0, m)
+    } else {
+        let end = (picker.highlight + 1).clamp(h, m);
+        (end - h, end)
+    };
     let mut lines = Vec::new();
-    for (row, &pane_i) in picker.matches.iter().enumerate() {
-        let Some(p) = form.panes.get(pane_i) else {
+    for row in start..end {
+        let Some(p) = form.panes.get(picker.matches[row]) else {
             continue;
         };
         let mark = if row == picker.highlight {
@@ -267,7 +288,13 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     if picker.matches.is_empty() {
         lines.push(Line::from("  (no matching panes)"));
     }
-    f.render_widget(Paragraph::new(lines), list_area);
+    // Bottom-align: pad the top so the results rest just above the search line.
+    let pad = h.saturating_sub(lines.len());
+    let mut padded: Vec<Line> = std::iter::repeat_with(|| Line::from(""))
+        .take(pad)
+        .collect();
+    padded.extend(lines);
+    f.render_widget(Paragraph::new(padded), list_area);
 
     // The search line, pinned at the bottom of the block.
     f.render_widget(Paragraph::new(format!("> {}", picker.query)), search_area);
@@ -382,6 +409,33 @@ mod tests {
     }
 
     #[test]
+    fn the_picker_list_scrolls_to_keep_the_highlight_visible() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.form.panes = (0..30)
+            .map(|i| crate::tmux_panes::Pane {
+                target: format!("s:0.{i}"),
+                title: format!("pane{i}"),
+            })
+            .collect();
+        m.form.picker = Some(super::super::model::Picker {
+            query: String::new(),
+            matches: (0..30).collect(),
+            highlight: 27,
+            mode: super::super::model::PickerMode::Insert,
+        });
+        // 80x20: the fixed-height picker can't show 30 rows, so it scrolls.
+        let out = render(&m);
+        assert!(
+            out.contains("pane27"),
+            "the highlighted pane is scrolled into view: {out}"
+        );
+        assert!(
+            !out.contains("pane0 "),
+            "an early pane scrolled out of the window: {out}"
+        );
+    }
+
+    #[test]
     fn the_tab_bar_lists_nudge_first_then_jobs() {
         let m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
         let out = render(&m);
@@ -411,11 +465,14 @@ mod tests {
 
     #[test]
     fn the_preview_renders_ansi_colors_as_styled_text() {
-        // A red "RED" via SGR should parse into a span styled red.
+        // A red "RED" via SGR should parse into a span styled red. The preview is
+        // bottom-aligned and padded to the panel height, so the content is on the
+        // last line.
         let text = preview_text(&Some("\x1b[31mRED\x1b[0m".into()), 10);
-        let span = &text.lines[0].spans[0];
-        assert_eq!(span.content.as_ref(), "RED");
-        assert_eq!(span.style.fg, Some(ratatui::style::Color::Red));
+        assert_eq!(text.lines.len(), 10, "padded to the panel height");
+        let last = text.lines.last().unwrap();
+        assert_eq!(last.spans[0].content.as_ref(), "RED");
+        assert_eq!(last.spans[0].style.fg, Some(ratatui::style::Color::Red));
     }
 
     #[test]
