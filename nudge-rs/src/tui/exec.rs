@@ -50,6 +50,7 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
         }
         Effect::Cancel(id) => match client::request(socket, &Request::Cancel(id)) {
             Ok(Response::Cancelled(b)) => Msg::Cancelled(b),
+            Ok(Response::Error(e)) => Msg::ActionFailed(format!("failed to cancel: {e}")),
             Ok(other) => Msg::ActionFailed(format!("unexpected response: {other:?}")),
             Err(e) => Msg::ActionFailed(format!("daemon request failed: {e}")),
         },
