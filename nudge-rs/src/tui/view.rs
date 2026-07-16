@@ -207,10 +207,34 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
         preview_area,
     );
 
-    f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
-        form_area,
-    );
+    let form_block = Block::default().borders(Borders::ALL).title(title);
+    let inner = form_block.inner(form_area);
+    f.render_widget(Paragraph::new(lines).block(form_block), form_area);
+
+    // In Insert mode, put the terminal cursor at the end of the focused text
+    // field (manual time / message) so it reads as an editable field — same as
+    // the picker's search line. Position+show only (no DECSCUSR style escape),
+    // so it keeps the terminal's own cursor shape and blink. Non-text fields
+    // (pane / when / toggles / submit) get no cursor, and Normal mode shows none.
+    if form.nav_mode == VimMode::Insert {
+        // (line index within the block, value char count) of the focused field.
+        let field = match form.focus {
+            FormField::ManualTime => Some((2u16, form.manual_time.chars().count())),
+            FormField::Message => match &form.message {
+                MessageField::Editable(s) => Some((3u16, s.chars().count())),
+                // Preserved messages aren't editable in the TUI — no cursor.
+                MessageField::Preserved(_) => None,
+            },
+            _ => None,
+        };
+        if let Some((line_idx, value_len)) = field {
+            // Each row is "▶ " (2 cols) + "Manual:  " / "Message: " (9 cols) then
+            // the value, so the value starts 11 cols into the inner area.
+            let cursor_x = (inner.x + 11 + value_len as u16).min(inner.right().saturating_sub(1));
+            let cursor_y = (inner.y + line_idx).min(inner.bottom().saturating_sub(1));
+            f.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
 }
 
 /// The picker occupies this fraction of the tab body; the preview gets the rest.
@@ -527,5 +551,35 @@ mod tests {
             pos.y, 17,
             "on the picker's search line, pinned at the bottom"
         );
+    }
+
+    #[test]
+    fn insert_mode_puts_the_cursor_after_the_focused_text_field() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge; // opens in Insert
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable("hi".into());
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        // Message is line 3 of the form block; the block sits below the 8-row
+        // preview (body y=1..18, preview 8 rows, form starts y=9 → inner y=10).
+        // x = block inset(1) + "▶ Message: "(11) + "hi"(2) = 14.
+        let pos = term.get_cursor_position().unwrap();
+        assert_eq!(pos.x, 14, "just after '▶ Message: hi'");
+        assert_eq!(pos.y, 13, "on the Message row (inner y 10 + line 3)");
+    }
+
+    #[test]
+    fn manual_time_field_gets_the_cursor_too() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge; // Insert
+        m.form.focus = FormField::ManualTime;
+        m.form.manual_time = "3pm".into();
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        // Manual is line 2; x = inset(1) + "▶ Manual:  "(11) + "3pm"(3) = 15.
+        let pos = term.get_cursor_position().unwrap();
+        assert_eq!(pos.x, 15, "just after '▶ Manual:  3pm'");
+        assert_eq!(pos.y, 12, "on the Manual row (inner y 10 + line 2)");
     }
 }
