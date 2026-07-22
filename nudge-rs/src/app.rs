@@ -576,7 +576,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
 /// Interactively choose a tmux pane.
 pub fn pick_pane() -> anyhow::Result<String> {
-    let panes = crate::tmux_panes::list()?;
+    let (panes, _default_idx) = crate::tmux_panes::list()?;
     if panes.is_empty() {
         anyhow::bail!("no tmux panes found; pass -p <pane>");
     }
