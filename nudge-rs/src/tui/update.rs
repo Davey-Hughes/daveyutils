@@ -22,7 +22,10 @@ pub enum Msg {
     Quit,
     Tick(Timestamp),
     JobsLoaded(Vec<Job>),
-    PanesLoaded(Vec<Pane>),
+    PanesLoaded {
+        panes: Vec<Pane>,
+        default_idx: usize,
+    },
     PaneCaptured {
         screen: Option<String>,
         detection: Detection,
@@ -90,11 +93,17 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             Tab::NewNudge if model.form.picker.is_some() => picker_key(model, code),
             Tab::NewNudge => form_key(model, code),
         },
-        Msg::PanesLoaded(panes) => {
+        Msg::PanesLoaded { panes, default_idx } => {
             model.form.panes = panes;
-            if model.form.pane_idx >= model.form.panes.len() {
-                model.form.pane_idx = 0;
-            }
+            // Pre-select the last-active pane of nudge's own window; fall back to
+            // the first pane if the index is somehow out of range. This only ever
+            // fires while `panes` is empty (startup / first Tab into the form), so
+            // it cannot stomp a selection the user has since made.
+            model.form.pane_idx = if default_idx < model.form.panes.len() {
+                default_idx
+            } else {
+                0
+            };
             if model.tab == Tab::NewNudge {
                 return capture_selected(&mut model.form, model.now);
             }
@@ -995,18 +1004,49 @@ mod tests {
     }
 
     #[test]
-    fn panes_loaded_populates_the_dropdown_and_clamps_index() {
+    fn panes_loaded_populates_the_dropdown_and_clamps_a_bad_default() {
         let mut m = form_model();
-        m.form.pane_idx = 5;
         update(
             &mut m,
-            Msg::PanesLoaded(vec![Pane {
-                target: "s:0.9".into(),
-                title: String::new(),
-            }]),
+            Msg::PanesLoaded {
+                panes: vec![Pane {
+                    target: "s:0.9".into(),
+                    title: String::new(),
+                }],
+                default_idx: 5, // out of range -> clamps to 0
+            },
         );
         assert_eq!(m.form.panes.len(), 1);
         assert_eq!(m.form.pane_idx, 0);
+    }
+
+    #[test]
+    fn panes_loaded_selects_the_default_idx() {
+        let mut m = form_model();
+        update(
+            &mut m,
+            Msg::PanesLoaded {
+                panes: vec![
+                    Pane {
+                        target: "s:0.0".into(),
+                        title: String::new(),
+                    },
+                    Pane {
+                        target: "s:0.1".into(),
+                        title: String::new(),
+                    },
+                    Pane {
+                        target: "s:0.2".into(),
+                        title: String::new(),
+                    },
+                ],
+                default_idx: 2,
+            },
+        );
+        assert_eq!(
+            m.form.pane_idx, 2,
+            "the pre-selected pane follows tmux's last-active default"
+        );
     }
 
     #[test]
@@ -1648,10 +1688,13 @@ mod tests {
         let mut m = Model::new(defaults(), t0()); // NewNudge default
         let fx = update(
             &mut m,
-            Msg::PanesLoaded(vec![Pane {
-                target: "s:0.1".into(),
-                title: String::new(),
-            }]),
+            Msg::PanesLoaded {
+                panes: vec![Pane {
+                    target: "s:0.1".into(),
+                    title: String::new(),
+                }],
+                default_idx: 0,
+            },
         );
         assert_eq!(
             fx,
