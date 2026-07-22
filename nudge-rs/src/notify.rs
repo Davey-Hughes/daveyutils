@@ -3,7 +3,7 @@
 /// Fire a desktop notification. Never fails the caller — logs and moves on.
 pub fn send(body: &str) {
     if let Err(e) = notify_rust::Notification::new()
-        .summary("AI Nudge")
+        .summary("nudge")
         .body(body)
         .show()
     {
