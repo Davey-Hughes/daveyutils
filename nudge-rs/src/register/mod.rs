@@ -86,6 +86,19 @@ pub fn install(exec: &Path) -> anyhow::Result<()> {
         std::fs::write(path, contents)?;
         println!("nudge: wrote {}", path.display());
     }
+    // `launchctl bootstrap` fails with EIO ("Bootstrap failed: 5: Input/output
+    // error") when the label is already loaded, so re-running --install-daemon
+    // over a live managed unit -- e.g. after the binary moved -- errored on an
+    // otherwise-valid plist, defeating the idempotency the caller guard above
+    // deliberately allows. Unload first, best-effort: on a fresh install there
+    // is nothing to bootout (it exits non-zero, "No such process"), which is why
+    // the status is discarded rather than checked. systemd's `enable` is already
+    // idempotent, so this is launchd-only.
+    if Manager::current() == Manager::Launchd {
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &format!("gui/{uid}/{}", launchd::LABEL)])
+            .status();
+    }
     for cmd in &plan.commands {
         let (prog, args) = cmd.split_first().expect("non-empty command");
         let status = std::process::Command::new(prog).args(args).status()?;
@@ -129,6 +142,11 @@ pub fn uninstall() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("$HOME is not set"))?;
     let xdg_config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    // Captured before we stop it: if a managed daemon was live, the socket it
+    // holds will still answer for a moment after we tear it down (see the wait
+    // below), and that dying daemon must not be mistaken for a separate ad-hoc
+    // one in the note at the end.
+    let managed_was_active = managed_daemon_is_active();
     match Manager::current() {
         Manager::Systemd => {
             let _ = std::process::Command::new("systemctl")
@@ -153,6 +171,20 @@ pub fn uninstall() -> anyhow::Result<()> {
     // <unit>" tells the user the daemon is gone while it demonstrably is not.
     // `install` pings the same socket for the same reason.
     let paths = crate::paths::resolve();
+    // `launchctl bootout` is asynchronous: the managed daemon we just removed
+    // keeps answering the socket for a beat while it exits. Without this wait the
+    // check below saw that dying daemon and printed "a daemon is still running...
+    // not started by the registration just removed" -- about the very daemon it
+    // had just removed. Only one daemon can hold the socket (singleton lock), so
+    // once ours releases it, anything still answering is a genuine ad-hoc daemon.
+    if managed_was_active {
+        for _ in 0..30 {
+            if std::os::unix::net::UnixStream::connect(&paths.socket).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
     if std::os::unix::net::UnixStream::connect(&paths.socket).is_ok() {
         println!(
             "nudge: note: a daemon is still running (socket {}) and will still fire \
