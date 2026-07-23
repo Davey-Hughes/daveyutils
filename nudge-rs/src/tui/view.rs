@@ -31,23 +31,57 @@ pub fn view(model: &Model, f: &mut Frame) {
         Tab::NewNudge => form_view(model, f, chunks[1]),
     }
 
-    let hint = match model.tab {
-        Tab::Jobs => "[↑↓] select  [c] cancel  [e] edit  [r] refresh  [Tab] new  [q] quit",
+    // The footer stays minimal — the vim mode (shown only here now, not in the
+    // form title) plus the one affordance we advertise. `?` toggles the rest in.
+    let footer = if model.show_help {
+        full_keys(model).to_string()
+    } else {
+        model
+            .status
+            .0
+            .clone()
+            .unwrap_or_else(|| minimal_hint(model).to_string())
+    };
+    f.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
+/// The collapsed footer: the vim mode (form only) plus the one affordance we
+/// advertise. Everything else hides behind `?` to cut the clutter.
+fn minimal_hint(model: &Model) -> &'static str {
+    match model.tab {
+        Tab::Jobs => "[?] help",
+        Tab::NewNudge => {
+            let mode = model
+                .form
+                .picker
+                .as_ref()
+                .map_or(model.form.nav_mode, |p| p.mode);
+            if mode == VimMode::Normal {
+                "NORMAL · [?] help"
+            } else {
+                "INSERT · [?] help"
+            }
+        }
+    }
+}
+
+/// The full keybind reference, shown only while help is toggled on (`?`).
+fn full_keys(model: &Model) -> &'static str {
+    match model.tab {
+        Tab::Jobs => "[↑↓] select  [c] cancel  [e] edit  [r] refresh  [Tab] new  [q] quit  ·  [?] hide",
         Tab::NewNudge => match &model.form.picker {
             Some(p) if p.mode == VimMode::Normal => {
                 "NORMAL · [j/k] move  [i] insert  [enter] pick  [esc/q] cancel"
             }
             Some(_) => "INSERT · type to filter  ·  [↑↓] move  [enter] pick  [esc] normal",
             None if model.form.nav_mode == VimMode::Normal => {
-                "NORMAL · [j/k] field  [h/l] move/change  [i/a] insert  [x/dd] delete  [/] search  [enter] schedule  [q] quit  [esc] jobs"
+                "NORMAL · [j/k] field  [h/l] move/change  [i/a] insert  [x/dd] delete  [/] search  [enter] schedule  [q] quit  [esc] jobs  ·  [?] hide"
             }
             None => {
                 "INSERT · [↑↓] field  [←→] change  [space] toggle  [/] search  [enter] schedule  [esc] normal  [^C] quit"
             }
         },
-    };
-    let status = model.status.0.clone().unwrap_or_else(|| hint.to_string());
-    f.render_widget(Paragraph::new(status), chunks[2]);
+    }
 }
 
 fn jobs_view(model: &Model, f: &mut Frame, area: Rect) {
@@ -173,17 +207,11 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
         format!("{}[ Schedule ]", mark(FormField::Submit)),
     ];
     let mut lines: Vec<Line> = rows_txt.iter().map(|s| Line::from(s.clone())).collect();
-    let base_title = match form.mode {
+    // The vim mode lives in the bottom bar now — no duplicate in this title.
+    let title = match form.mode {
         super::model::Mode::New => "nudge",
         super::model::Mode::Editing(_) => "edit nudge",
     };
-    let title = format!(
-        "{base_title} · {}",
-        match form.nav_mode {
-            VimMode::Insert => "INSERT",
-            VimMode::Normal => "NORMAL",
-        }
-    );
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -428,6 +456,38 @@ mod tests {
     }
 
     #[test]
+    fn the_footer_advertises_only_help_until_toggled() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::Jobs;
+        let collapsed = render(&m);
+        assert!(collapsed.contains("[?] help"), "{collapsed}");
+        assert!(
+            !collapsed.contains("[c] cancel"),
+            "the keys stay hidden until asked for: {collapsed}"
+        );
+
+        m.show_help = true;
+        let expanded = render(&m);
+        assert!(expanded.contains("[c] cancel"), "{expanded}");
+        assert!(expanded.contains("[e] edit"), "{expanded}");
+    }
+
+    #[test]
+    fn the_form_footer_stays_minimal_until_help_is_toggled() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge; // opens in Insert
+        let collapsed = render(&m);
+        assert!(collapsed.contains("INSERT · [?] help"), "{collapsed}");
+        assert!(
+            !collapsed.contains("[space] toggle"),
+            "form keys hidden until asked for: {collapsed}"
+        );
+
+        m.show_help = true;
+        assert!(render(&m).contains("[space] toggle"), "{}", render(&m));
+    }
+
+    #[test]
     fn a_job_row_shows_pane_and_a_countdown() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
         m.tab = Tab::Jobs;
@@ -464,12 +524,20 @@ mod tests {
     }
 
     #[test]
-    fn the_form_title_shows_the_vim_mode() {
+    fn the_vim_mode_shows_in_the_bottom_bar_not_the_form_title() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
         m.tab = Tab::NewNudge; // opens in Insert
-        assert!(render(&m).contains("nudge · INSERT"), "{}", render(&m));
+        let out = render(&m);
+        assert!(
+            out.contains("INSERT · [?] help"),
+            "the mode is in the bottom bar: {out}"
+        );
+        assert!(
+            !out.contains("nudge · INSERT"),
+            "and not duplicated in the form title: {out}"
+        );
         m.form.nav_mode = VimMode::Normal;
-        assert!(render(&m).contains("nudge · NORMAL"), "{}", render(&m));
+        assert!(render(&m).contains("NORMAL · [?] help"), "{}", render(&m));
     }
 
     #[test]

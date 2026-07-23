@@ -158,6 +158,10 @@ fn jobs_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
             vec![]
         }
         KeyCode::Char('r') => vec![Effect::PollJobs],
+        KeyCode::Char('?') => {
+            model.show_help = !model.show_help;
+            vec![]
+        }
         KeyCode::Char('q') => {
             model.should_quit = true;
             vec![]
@@ -372,6 +376,12 @@ fn insert_key(model: &mut Model, code: KeyCode, text: bool) -> Vec<Effect> {
         }
         // `/` opens the pane picker unless you're typing into a text field.
         KeyCode::Char('/') if !text => open_picker(model),
+        // `?` toggles the help footer, but only where it isn't a literal you're
+        // typing — on a text field it inserts a `?` like any other character.
+        KeyCode::Char('?') if !text => {
+            model.show_help = !model.show_help;
+            vec![]
+        }
         // Typing on the When field starts (or continues) the manual time: any
         // text switches it out of Auto/Keep into Manual, at a fresh cursor.
         KeyCode::Char(c) if model.form.focus == FormField::When => {
@@ -411,6 +421,10 @@ fn normal_key(model: &mut Model, code: KeyCode, text: bool) -> Vec<Effect> {
         KeyCode::Char('A') => enter_insert(model, InsertAt::End),
         KeyCode::Char('I') => enter_insert(model, InsertAt::Start),
         KeyCode::Char('/') => open_picker(model),
+        KeyCode::Char('?') => {
+            model.show_help = !model.show_help;
+            vec![]
+        }
         KeyCode::Char('q') => {
             model.should_quit = true;
             vec![]
@@ -586,6 +600,10 @@ fn picker_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
         VimMode::Normal => match code {
             KeyCode::Char('j') => picker_move(model, 1),
             KeyCode::Char('k') => picker_move(model, -1),
+            KeyCode::Char('?') => {
+                model.show_help = !model.show_help;
+                vec![]
+            }
             // The usual vim ways back into Insert; a single-line search box has
             // no distinct cursor position, so i/a/A/I are all equivalent.
             KeyCode::Char('i' | 'a' | 'A' | 'I') => {
@@ -1227,6 +1245,47 @@ mod tests {
         m.form.focus = FormField::Verify;
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(' ')));
         assert!(m.form.verify);
+    }
+
+    #[test]
+    fn question_mark_toggles_the_help_footer_on_the_jobs_tab() {
+        let mut m = with_jobs(2);
+        assert!(!m.show_help, "help starts hidden");
+        press(&mut m, '?');
+        assert!(m.show_help, "? reveals the keybinds");
+        press(&mut m, '?');
+        assert!(!m.show_help, "? again hides them");
+    }
+
+    #[test]
+    fn question_mark_toggles_help_in_form_normal_mode() {
+        let mut m = form_model();
+        m.form.nav_mode = VimMode::Normal;
+        press(&mut m, '?');
+        assert!(m.show_help);
+    }
+
+    #[test]
+    fn question_mark_toggles_help_from_a_selector_field_in_insert() {
+        // The dashboard opens in Insert on the Pane field (a selector, not text),
+        // so `?` there must open help rather than be swallowed as a dead key.
+        let mut m = form_model();
+        assert_eq!(m.form.nav_mode, VimMode::Insert);
+        assert_eq!(m.form.focus, FormField::Pane);
+        press(&mut m, '?');
+        assert!(m.show_help);
+    }
+
+    #[test]
+    fn question_mark_is_a_literal_while_typing_a_message() {
+        // On a text field in Insert, `?` is just a character — it must not steal
+        // the keystroke to toggle help.
+        let mut m = form_model();
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable(String::new());
+        press(&mut m, '?');
+        assert!(!m.show_help, "? does not toggle help while typing");
+        assert_eq!(m.form.message, MessageField::Editable("?".into()));
     }
 
     /// A Normal-mode message field at a given cursor, for the vim-editing tests.
