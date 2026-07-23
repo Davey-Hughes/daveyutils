@@ -309,6 +309,9 @@ pub struct Model {
     pub last_poll: Timestamp,
     pub defaults: ScheduleDefaults,
     pub should_quit: bool,
+    /// Whether the footer shows the full keybind reference. Off by default — the
+    /// bar advertises only `?`, and pressing it toggles the rest in / out.
+    pub show_help: bool,
 }
 
 impl Model {
@@ -323,6 +326,7 @@ impl Model {
             last_poll: now,
             defaults,
             should_quit: false,
+            show_help: false,
         }
     }
 
