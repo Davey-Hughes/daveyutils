@@ -42,11 +42,18 @@ nudge --cancel 3 / --edit 3      # manage a job
 
 Run `nudge` with no arguments in a terminal to open the interactive dashboard:
 
-- **Jobs** — a live table of pending nudges with a countdown to each; `↑↓` to
-  select, `c` to cancel, `e` to edit, `r` to refresh, `q` to quit.
-- **New nudge** — `Tab` to it: pick a pane, let nudge auto-detect the reset (or
-  type a time), set a message and the verify/notify/auto-retry toggles, `Enter`
-  to schedule.
+- **New nudge** — the tab it opens on, focused on `[ Schedule ]`: auto-detection
+  has already read the reset off the pane it preselected, so a bare `Enter`
+  schedules it, prints a one-line summary, and quits. `↑↓` first to change the
+  pane, the time, the message, or the verify/notify/auto-retry toggles; `^S`
+  schedules without quitting and drops you on the Jobs tab.
+- **Jobs** — `Tab` to it: a live table of pending nudges with a countdown to
+  each; `↑↓` to select, `c` to cancel, `e` to edit, `r` to refresh.
+
+`q` quits from anywhere it isn't a character you are typing: the message field, a
+manual time, and the pane picker's query keep it as text, and in the picker's
+Normal mode it closes the picker rather than the dashboard. Everywhere else it
+quits. `^C` always quits, and `?` toggles the full key reference in the footer.
 
 Passing any scheduling flag (`-p`, `-m`, `-i`, …) schedules directly and skips
 the dashboard, as before. `nudge --list-plain`, or `nudge`/`--list` with output

@@ -39,6 +39,11 @@ pub fn map_event(ev: Event) -> Option<update::Msg> {
                     crossterm::event::KeyCode::Char('c') | crossterm::event::KeyCode::Char('d') => {
                         Some(update::Msg::Quit)
                     }
+                    // Schedule but stay. A Ctrl-chord (not Shift-Enter) because
+                    // terminals only distinguish Shift-Enter under the kitty
+                    // keyboard protocol — raw mode clears IXON, so ^S arrives
+                    // here as a key rather than as flow control.
+                    crossterm::event::KeyCode::Char('s') => Some(update::Msg::SubmitStay),
                     _ => None,
                 }
             } else if k.modifiers.contains(KeyModifiers::ALT) {
@@ -100,7 +105,7 @@ pub fn run() -> anyhow::Result<()> {
         prev_hook(info);
     }));
 
-    let _guard = TerminalGuard::enter().context("entering the alternate screen")?;
+    let guard = TerminalGuard::enter().context("entering the alternate screen")?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal: Terminal<CrosstermBackend<Stdout>> = Terminal::new(backend)?;
 
@@ -124,6 +129,14 @@ pub fn run() -> anyhow::Result<()> {
             let effects = update::update(&mut model, msg);
             dispatch_effects(&mut model, effects, &socket);
         }
+    }
+    // Leave the alternate screen *before* the summary prints, or it would land
+    // on the screen we're about to tear down and vanish with it. The terminal
+    // goes first so it un-hides the cursor while its screen is still current.
+    drop(terminal);
+    drop(guard);
+    if let Some(summary) = &model.exit_summary {
+        println!("{summary}");
     }
     Ok(())
 }
@@ -178,6 +191,12 @@ mod tests {
         // Jobs tab's plain `c` handler, which cancels the selected job.
         let ev = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(map_event(ev), Some(update::Msg::Quit));
+    }
+
+    #[test]
+    fn ctrl_s_maps_to_schedule_and_stay() {
+        let ev = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(map_event(ev), Some(update::Msg::SubmitStay));
     }
 
     #[test]

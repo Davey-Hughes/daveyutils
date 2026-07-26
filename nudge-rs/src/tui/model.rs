@@ -58,6 +58,70 @@ mod tests {
     }
 
     #[test]
+    fn a_new_form_opens_focused_on_the_schedule_button() {
+        // Auto-detection is good enough that the common path is a bare Enter.
+        assert_eq!(Form::fresh().focus, FormField::Submit);
+    }
+
+    #[test]
+    fn the_summary_names_the_job_its_time_pane_and_flags() {
+        let spec = JobSpec {
+            target: TargetSpec::Tmux {
+                pane: "bot:0.1".into(),
+            },
+            messages: vec!["please continue".into()],
+            send_delay_secs: 0.75,
+            fire_at: "2026-07-16T14:14:00Z".parse().unwrap(),
+            notify: true,
+            verify: false,
+            auto_retry: true,
+            retries_left: 2,
+            settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
+        };
+        let s = schedule_summary(
+            7,
+            &spec,
+            &jiff::tz::TimeZone::UTC,
+            "2026-07-16T12:00:00Z".parse().unwrap(),
+        );
+        assert_eq!(
+            s,
+            "nudge: scheduled job 7 for 2026-07-16 14:14 (in 2h 14m)\n       \
+             bot:0.1 · \"please continue\" · notify, auto-retry (2)"
+        );
+    }
+
+    #[test]
+    fn a_multi_message_summary_counts_rather_than_quotes() {
+        let mut spec = JobSpec {
+            target: TargetSpec::Tmux {
+                pane: "s:0.2".into(),
+            },
+            messages: vec!["one".into(), "two".into()],
+            send_delay_secs: 0.75,
+            fire_at: "2026-07-16T12:00:30Z".parse().unwrap(),
+            notify: false,
+            verify: false,
+            auto_retry: false,
+            retries_left: 0,
+            settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
+        };
+        spec.verify = true;
+        let s = schedule_summary(
+            3,
+            &spec,
+            &jiff::tz::TimeZone::UTC,
+            "2026-07-16T12:00:00Z".parse().unwrap(),
+        );
+        assert!(s.contains("2 messages"), "{s}");
+        assert!(s.ends_with("· verify"), "{s}");
+    }
+
+    #[test]
     fn active_pane_tracks_the_picker_highlight_then_falls_back_to_pane_idx() {
         let mut form = Form::fresh();
         form.panes = vec![
@@ -93,7 +157,7 @@ mod tests {
 use jiff::Timestamp;
 
 use crate::detect::Detection;
-use crate::job::Job;
+use crate::job::{Job, JobSpec, TargetSpec};
 use crate::tmux_panes::Pane;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -170,6 +234,53 @@ pub struct Picker {
     pub mode: VimMode,
 }
 
+/// Where the dashboard lands once an in-flight schedule/replace comes back.
+/// Enter on a new nudge means "I'm done" — quit and print the summary to the
+/// real terminal; `^S` (and any edit, which you reached *from* the list) keeps
+/// the dashboard open on the Jobs tab.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AfterSubmit {
+    Quit,
+    Jobs,
+}
+
+/// The one-shot line printed after the TUI tears down: what got scheduled, when,
+/// and where. `now` is the model's clock, so the countdown matches the dashboard
+/// the user was just looking at.
+pub fn schedule_summary(
+    id: u64,
+    spec: &JobSpec,
+    tz: &jiff::tz::TimeZone,
+    now: Timestamp,
+) -> String {
+    let TargetSpec::Tmux { pane } = &spec.target;
+    let when = spec.fire_at.to_zoned(tz.clone());
+    let countdown = human_countdown(spec.fire_at.duration_since(now).as_secs());
+    let what = match spec.messages.len() {
+        1 => format!("{:?}", spec.messages[0]),
+        n => format!("{n} messages"),
+    };
+    let mut flags: Vec<String> = Vec::new();
+    if spec.verify {
+        flags.push("verify".to_string());
+    }
+    if spec.notify {
+        flags.push("notify".to_string());
+    }
+    if spec.auto_retry {
+        flags.push(format!("auto-retry ({})", spec.retries_left));
+    }
+    let flags = if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", flags.join(", "))
+    };
+    format!(
+        "nudge: scheduled job {id} for {} (in {countdown})\n       {pane} · {what}{flags}",
+        when.strftime("%Y-%m-%d %H:%M")
+    )
+}
+
 /// The transient bottom line: last error or confirmation.
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct Status(pub Option<String>);
@@ -243,7 +354,9 @@ impl Form {
             verify: false,
             notify: false,
             auto_retry: false,
-            focus: FormField::Pane,
+            // Open on the button: auto-detection fills the time before the first
+            // frame, so the common case is "launch, glance at the preview, Enter".
+            focus: FormField::Submit,
             mode: Mode::New,
             nav_mode: VimMode::Insert,
             cursor: 0,
@@ -312,6 +425,15 @@ pub struct Model {
     /// Whether the footer shows the full keybind reference. Off by default — the
     /// bar advertises only `?`, and pressing it toggles the rest in / out.
     pub show_help: bool,
+    /// Where to land when the in-flight submit resolves; set by the key that
+    /// started it (Enter → `Quit`, `^S` → `Jobs`).
+    pub after_submit: AfterSubmit,
+    /// The spec of the in-flight submit, kept so the `Scheduled`/`Replaced`
+    /// reply can be summarised — by then the form has been reset.
+    pub pending_spec: Option<JobSpec>,
+    /// Printed to the real terminal by `tui::run` after the alternate screen is
+    /// torn down. `None` unless we quit straight out of a successful schedule.
+    pub exit_summary: Option<String>,
 }
 
 impl Model {
@@ -327,6 +449,9 @@ impl Model {
             defaults,
             should_quit: false,
             show_help: false,
+            after_submit: AfterSubmit::Quit,
+            pending_spec: None,
+            exit_summary: None,
         }
     }
 

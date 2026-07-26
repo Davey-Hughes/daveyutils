@@ -3,19 +3,60 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs};
+use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
 use super::model::{human_countdown, FormField, MessageField, Model, Tab, VimMode, WhenMode};
 use crate::job::TargetSpec;
 
+/// How many terminal rows `s` needs at `width`, greedily wrapping on spaces the
+/// way `Paragraph`'s `Wrap` does. The footer sizes itself from this so a key
+/// reference longer than the terminal wraps instead of losing its tail.
+fn wrapped_height(s: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let mut lines = 1u16;
+    let mut col = 0usize;
+    for word in s.split_whitespace() {
+        let w = word.chars().count();
+        if col == 0 {
+            col = w;
+        } else if col + 1 + w <= width {
+            col += 1 + w;
+        } else {
+            lines = lines.saturating_add(1);
+            col = w;
+        }
+        // A word wider than the terminal spills onto further lines of its own.
+        while col > width {
+            lines = lines.saturating_add(1);
+            col -= width;
+        }
+    }
+    lines
+}
+
 pub fn view(model: &Model, f: &mut Frame) {
+    // The footer stays minimal — the vim mode (shown only here now, not in the
+    // form title) plus the one affordance we advertise. `?` toggles the rest in.
+    let footer = if model.show_help {
+        full_keys(model).to_string()
+    } else {
+        model
+            .status
+            .0
+            .clone()
+            .unwrap_or_else(|| minimal_hint(model).to_string())
+    };
+    // Give the footer the rows it actually needs (capped, so a pathological
+    // status can't eat the screen) — the key reference no longer fits on 80.
+    let footer_h = wrapped_height(&footer, f.area().width).min(4);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(footer_h),
         ])
         .split(f.area());
 
@@ -31,18 +72,7 @@ pub fn view(model: &Model, f: &mut Frame) {
         Tab::NewNudge => form_view(model, f, chunks[1]),
     }
 
-    // The footer stays minimal — the vim mode (shown only here now, not in the
-    // form title) plus the one affordance we advertise. `?` toggles the rest in.
-    let footer = if model.show_help {
-        full_keys(model).to_string()
-    } else {
-        model
-            .status
-            .0
-            .clone()
-            .unwrap_or_else(|| minimal_hint(model).to_string())
-    };
-    f.render_widget(Paragraph::new(footer), chunks[2]);
+    f.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), chunks[2]);
 }
 
 /// The collapsed footer: the vim mode (form only) plus the one affordance we
@@ -75,10 +105,15 @@ fn full_keys(model: &Model) -> &'static str {
             }
             Some(_) => "INSERT · type to filter  ·  [↑↓] move  [enter] pick  [esc] normal",
             None if model.form.nav_mode == VimMode::Normal => {
-                "NORMAL · [j/k] field  [h/l] move/change  [i/a] insert  [x/dd] delete  [/] search  [enter] schedule  [q] quit  [esc] jobs  ·  [?] hide"
+                "NORMAL · [j/k] field  [h/l] move/change  [i/a] insert  [x/dd] delete  [/] search  [enter] schedule+quit  [^S] schedule+jobs  [q] quit  [esc] jobs  ·  [?] hide"
+            }
+            // In Insert, `q` is a command only where it isn't a character you'd
+            // be typing — so it is advertised only off a text field.
+            None if model.form.focused_text().is_none() => {
+                "INSERT · [↑↓] field  [←→] change  [space] toggle  [/] search  [enter] schedule+quit  [^S] schedule+jobs  [q] quit  [esc] normal"
             }
             None => {
-                "INSERT · [↑↓] field  [←→] change  [space] toggle  [/] search  [enter] schedule  [esc] normal  [^C] quit"
+                "INSERT · [↑↓] field  [←→] change  [space] toggle  [/] search  [enter] schedule+quit  [^S] schedule+jobs  [esc] normal  [^C] quit"
             }
         },
     }
@@ -470,6 +505,35 @@ mod tests {
         let expanded = render(&m);
         assert!(expanded.contains("[c] cancel"), "{expanded}");
         assert!(expanded.contains("[e] edit"), "{expanded}");
+    }
+
+    #[test]
+    fn wrapped_height_counts_the_rows_a_line_needs() {
+        assert_eq!(wrapped_height("", 80), 1);
+        assert_eq!(wrapped_height("abc def", 80), 1);
+        assert_eq!(
+            wrapped_height("abc def", 7),
+            1,
+            "an exact fit stays one row"
+        );
+        assert_eq!(wrapped_height("abc def", 6), 2);
+        assert_eq!(
+            wrapped_height("abcdefgh", 4),
+            2,
+            "a word wider than the terminal spills"
+        );
+    }
+
+    #[test]
+    fn the_key_reference_wraps_rather_than_losing_its_tail() {
+        // The form's reference no longer fits on 80 columns; the footer grows to
+        // fit it so the last binding is not silently cut off.
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        m.show_help = true;
+        let out = render(&m);
+        assert!(out.contains("[q]"), "{out}");
+        assert!(out.contains("normal"), "the tail survives the wrap: {out}");
     }
 
     #[test]

@@ -3,7 +3,10 @@
 use crossterm::event::KeyCode;
 use jiff::Timestamp;
 
-use super::model::{CarriedEdit, Form, FormField, MessageField, Mode, Model, Tab, WhenMode};
+use super::model::{
+    schedule_summary, AfterSubmit, CarriedEdit, Form, FormField, MessageField, Mode, Model, Tab,
+    WhenMode,
+};
 use crate::detect::Detection;
 use crate::job::{Job, JobSpec, TargetSpec};
 use crate::timespec::parse_timespec;
@@ -19,6 +22,10 @@ const CAPTURE_MILLIS: i64 = 1500;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
     Key(KeyCode),
+    /// `^S`: schedule (or save an edit) and stay in the dashboard on the Jobs
+    /// tab, where plain Enter would schedule and quit. Its own `Msg` because a
+    /// Ctrl-chord is not a `KeyCode` the form's key handling can see.
+    SubmitStay,
     Quit,
     Tick(Timestamp),
     JobsLoaded(Vec<Job>),
@@ -93,6 +100,11 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             Tab::NewNudge if model.form.picker.is_some() => picker_key(model, code),
             Tab::NewNudge => form_key(model, code),
         },
+        // Only the form can submit, and not while the picker owns the keyboard.
+        Msg::SubmitStay => match model.tab {
+            Tab::NewNudge if model.form.picker.is_none() => submit(model, AfterSubmit::Jobs),
+            _ => vec![],
+        },
         Msg::PanesLoaded { panes, default_idx } => {
             model.form.panes = panes;
             // Pre-select the last-active pane of nudge's own window; fall back to
@@ -114,19 +126,10 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             model.form.detected = Some(detection);
             vec![]
         }
-        Msg::Scheduled(id) => {
-            model.status.set(format!("scheduled job {id}"));
-            model.tab = Tab::Jobs;
-            model.form = super::model::Form::fresh();
-            vec![Effect::PollJobs]
-        }
-        Msg::Replaced(Some(id)) => {
-            model.status.set(format!("edited — now job {id}"));
-            model.tab = Tab::Jobs;
-            model.form = super::model::Form::fresh();
-            vec![Effect::PollJobs]
-        }
+        Msg::Scheduled(id) => finish_submit(model, id, "scheduled job"),
+        Msg::Replaced(Some(id)) => finish_submit(model, id, "edited — now job"),
         Msg::Replaced(None) => {
+            model.pending_spec = None;
             model.status.set("that job is already gone");
             vec![Effect::PollJobs]
         }
@@ -141,6 +144,31 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         Msg::ActionFailed(e) => {
             model.status.set(e);
             vec![]
+        }
+    }
+}
+
+/// Land a successful schedule/replace, per the destination the submitting key
+/// chose: quit the dashboard with a summary for the real terminal, or drop back
+/// to the Jobs tab with a status line.
+fn finish_submit(model: &mut Model, id: u64, verb: &str) -> Vec<Effect> {
+    let spec = model.pending_spec.take();
+    match model.after_submit {
+        AfterSubmit::Quit => {
+            model.exit_summary = Some(match spec {
+                Some(s) => schedule_summary(id, &s, &model.defaults.tz, model.now),
+                // The spec is always stashed by `submit`; keep the exit line
+                // informative rather than empty if that ever stops being true.
+                None => format!("nudge: {verb} {id}"),
+            });
+            model.should_quit = true;
+            vec![]
+        }
+        AfterSubmit::Jobs => {
+            model.status.set(format!("{verb} {id}"));
+            model.tab = Tab::Jobs;
+            model.form = Form::fresh();
+            vec![Effect::PollJobs]
         }
     }
 }
@@ -330,9 +358,10 @@ fn form_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
             model.form.pending_op = None;
             return open_picker(model);
         }
+        // Enter is the whole point of the form: schedule and get out of the way.
         KeyCode::Enter => {
             model.form.pending_op = None;
-            return submit(model);
+            return submit(model, AfterSubmit::Quit);
         }
         _ => {}
     }
@@ -380,6 +409,13 @@ fn insert_key(model: &mut Model, code: KeyCode, text: bool) -> Vec<Effect> {
         // typing — on a text field it inserts a `?` like any other character.
         KeyCode::Char('?') if !text => {
             model.show_help = !model.show_help;
+            vec![]
+        }
+        // Same rule for `q`: on a selector field there is nothing to type into,
+        // so it quits as it does everywhere else. Only an actual text field
+        // (the message, a manual time) keeps it as a character.
+        KeyCode::Char('q') if !text => {
+            model.should_quit = true;
             vec![]
         }
         // Typing on the When field starts (or continues) the manual time: any
@@ -851,7 +887,10 @@ fn prev_word(chars: &[char], i: usize) -> usize {
     j
 }
 
-fn submit(model: &mut Model) -> Vec<Effect> {
+/// Validate the form and emit the schedule/replace. `after` is where a
+/// successful reply lands us — an edit always returns to the Jobs tab you
+/// reached it from, whichever key saved it.
+fn submit(model: &mut Model, after: AfterSubmit) -> Vec<Effect> {
     let now_zoned = model.now.to_zoned(model.defaults.tz.clone());
     let Some(pane) = model.form.selected_pane().map(|p| p.target.clone()) else {
         model
@@ -900,16 +939,24 @@ fn submit(model: &mut Model) -> Vec<Effect> {
 
     let spec = build_spec(model, &pane, fire_at);
     let snapshot_pane = model.form.verify.then(|| pane.clone());
+    // Stash the spec for the reply's summary — the form is reset by then.
+    model.pending_spec = Some(spec.clone());
     match model.form.mode {
-        super::model::Mode::New => vec![Effect::Schedule {
-            spec,
-            snapshot_pane,
-        }],
-        super::model::Mode::Editing(id) => vec![Effect::Replace {
-            id,
-            spec,
-            snapshot_pane,
-        }],
+        Mode::New => {
+            model.after_submit = after;
+            vec![Effect::Schedule {
+                spec,
+                snapshot_pane,
+            }]
+        }
+        Mode::Editing(id) => {
+            model.after_submit = AfterSubmit::Jobs;
+            vec![Effect::Replace {
+                id,
+                spec,
+                snapshot_pane,
+            }]
+        }
     }
 }
 
@@ -1108,7 +1155,13 @@ mod tests {
     #[test]
     fn focus_cycles_with_arrows() {
         let mut m = form_model();
-        assert_eq!(m.form.focus, FormField::Pane);
+        assert_eq!(
+            m.form.focus,
+            FormField::Submit,
+            "the form opens on the button"
+        );
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Down));
+        assert_eq!(m.form.focus, FormField::Pane, "Submit is last — Down wraps");
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Down));
         assert_eq!(m.form.focus, FormField::When);
     }
@@ -1170,7 +1223,8 @@ mod tests {
     fn leaving_a_blank_manual_input_reverts_to_auto() {
         // Navigating onto When in Insert shows a blank manual input; navigating
         // away without typing must not leave an empty Manual behind.
-        let mut m = form_model(); // Insert, focus Pane
+        let mut m = form_model(); // Insert
+        m.form.focus = FormField::Pane;
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Down)); // Pane -> When
         assert_eq!(m.form.focus, FormField::When);
         assert_eq!(
@@ -1267,13 +1321,67 @@ mod tests {
 
     #[test]
     fn question_mark_toggles_help_from_a_selector_field_in_insert() {
-        // The dashboard opens in Insert on the Pane field (a selector, not text),
-        // so `?` there must open help rather than be swallowed as a dead key.
+        // The dashboard opens in Insert on a selector field (not text), so `?`
+        // there must open help rather than be swallowed as a dead key.
         let mut m = form_model();
         assert_eq!(m.form.nav_mode, VimMode::Insert);
-        assert_eq!(m.form.focus, FormField::Pane);
+        m.form.focus = FormField::Pane;
         press(&mut m, '?');
         assert!(m.show_help);
+    }
+
+    #[test]
+    fn q_quits_from_every_selector_field_in_insert() {
+        // The form opens in Insert on a selector, where `q` used to be a dead
+        // key — it quits there, as it does in Normal and on the Jobs tab.
+        for field in [
+            FormField::Pane,
+            FormField::Verify,
+            FormField::Notify,
+            FormField::AutoRetry,
+            FormField::Submit,
+        ] {
+            let mut m = form_model();
+            m.form.focus = field;
+            press(&mut m, 'q');
+            assert!(m.should_quit, "q on {field:?} in Insert must quit");
+        }
+    }
+
+    #[test]
+    fn q_is_a_literal_while_typing_a_message_or_a_time() {
+        let mut m = form_model();
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable(String::new());
+        press(&mut m, 'q');
+        assert!(!m.should_quit, "q is a character while typing a message");
+        assert_eq!(m.form.message, MessageField::Editable("q".into()));
+
+        // A manual time is a text field too — mid-"8:30" a stray q must not quit.
+        let mut m = form_model();
+        m.form.focus = FormField::When;
+        m.form.when = WhenMode::Manual;
+        m.form.manual_time = "8:3".into();
+        m.form.cursor = 3;
+        press(&mut m, 'q');
+        assert!(!m.should_quit);
+        assert_eq!(m.form.manual_time, "8:3q");
+    }
+
+    #[test]
+    fn q_filters_in_the_picker_rather_than_quitting() {
+        // The picker's query is text entry in Insert; in Normal `q` backs out of
+        // the picker (the modal) rather than out of the dashboard.
+        let mut m = form_model();
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
+        press(&mut m, 'q');
+        assert!(!m.should_quit);
+        assert_eq!(m.form.picker.as_ref().unwrap().query, "q");
+
+        m.form.picker.as_mut().unwrap().mode = VimMode::Normal;
+        press(&mut m, 'q');
+        assert!(!m.should_quit, "q closes the picker, not the dashboard");
+        assert!(m.form.picker.is_none());
     }
 
     #[test]
@@ -1448,6 +1556,7 @@ mod tests {
         let mut m = form_model();
         m.form.message = MessageField::Editable("hello".into());
         m.form.nav_mode = VimMode::Normal;
+        m.form.focus = FormField::Pane;
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Down)); // Pane -> When
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Down)); // When -> Message
         assert_eq!(m.form.focus, FormField::Message);
@@ -1686,9 +1795,41 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_confirms_switches_to_jobs_and_refreshes() {
+    fn enter_schedules_then_quits_with_a_summary_to_print() {
         let mut m = form_model();
+        m.form.detected = Some(Detection::Reset(
+            t0().checked_add(jiff::ToSpan::hours(2))
+                .unwrap()
+                .to_zoned(jiff::tz::TimeZone::UTC),
+        ));
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
+        assert!(matches!(fx.as_slice(), [Effect::Schedule { .. }]));
+        assert_eq!(m.after_submit, AfterSubmit::Quit);
+
         let fx = update(&mut m, Msg::Scheduled(12));
+        assert!(m.should_quit, "a plain Enter is done with the dashboard");
+        assert!(fx.is_empty(), "nothing left to poll for — we're leaving");
+        let summary = m.exit_summary.as_ref().expect("a summary to print");
+        assert!(summary.contains("job 12"), "{summary}");
+        assert!(summary.contains("s:0.1"), "{summary}");
+        assert!(summary.contains("in 2h 0m"), "{summary}");
+    }
+
+    #[test]
+    fn ctrl_s_schedules_and_stays_on_the_jobs_tab() {
+        let mut m = form_model();
+        m.form.detected = Some(Detection::Reset(
+            t0().checked_add(jiff::ToSpan::hours(2))
+                .unwrap()
+                .to_zoned(jiff::tz::TimeZone::UTC),
+        ));
+        let fx = update(&mut m, Msg::SubmitStay);
+        assert!(matches!(fx.as_slice(), [Effect::Schedule { .. }]));
+        assert_eq!(m.after_submit, AfterSubmit::Jobs);
+
+        let fx = update(&mut m, Msg::Scheduled(12));
+        assert!(!m.should_quit);
+        assert!(m.exit_summary.is_none(), "nothing to print — we stayed");
         assert_eq!(m.tab, Tab::Jobs);
         assert!(m.status.0.as_ref().unwrap().contains("12"));
         assert!(fx.contains(&Effect::PollJobs));
@@ -1696,6 +1837,35 @@ mod tests {
             matches!(m.form.mode, Mode::New),
             "the form resets after a successful schedule"
         );
+    }
+
+    #[test]
+    fn ctrl_s_is_ignored_where_there_is_nothing_to_submit() {
+        // The Jobs tab has no form, and the picker owns the keyboard while open.
+        let mut m = with_jobs(1);
+        assert!(update(&mut m, Msg::SubmitStay).is_empty());
+        let mut m = form_model();
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
+        assert!(update(&mut m, Msg::SubmitStay).is_empty());
+    }
+
+    #[test]
+    fn saving_an_edit_returns_to_the_jobs_tab_even_on_enter() {
+        // You reached the edit form *from* the list, so Enter puts you back
+        // there rather than quitting out from under you.
+        let mut m = with_jobs(1);
+        m.jobs = vec![multi_msg_job()];
+        m.form.panes = vec![Pane {
+            target: "s:0.7".into(),
+            title: String::new(),
+        }];
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('e')));
+        m.form.focus = FormField::Submit;
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
+        assert_eq!(m.after_submit, AfterSubmit::Jobs);
+        update(&mut m, Msg::Replaced(Some(8)));
+        assert!(!m.should_quit);
+        assert_eq!(m.tab, Tab::Jobs);
     }
 
     #[test]
@@ -1770,24 +1940,16 @@ mod tests {
     }
 
     #[test]
-    fn q_quits_only_in_normal_mode() {
-        // Insert (the default): q on a non-text field is a no-op, not a quit.
-        let mut m = form_model(); // focus defaults to Pane
-        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('q')));
-        assert!(!m.should_quit, "q does not quit while in Insert mode");
-
-        // Normal mode: q quits.
+    fn q_quits_from_normal_mode_even_on_a_text_field() {
+        // Normal is navigation, not typing — `q` is a command there whatever
+        // field you are sitting on.
+        let mut m = form_model();
         m.form.nav_mode = VimMode::Normal;
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable("hello".into());
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('q')));
-        assert!(m.should_quit, "q quits from Normal mode");
-
-        // Insert mode on a text field: q types, never quits.
-        let mut m2 = form_model();
-        m2.form.focus = FormField::Message;
-        m2.form.message = MessageField::Editable(String::new());
-        update(&mut m2, Msg::Key(crossterm::event::KeyCode::Char('q')));
-        assert!(!m2.should_quit, "q types, not quits, in a text field");
-        assert_eq!(m2.form.message, MessageField::Editable("q".into()));
+        assert!(m.should_quit);
+        assert_eq!(m.form.message, MessageField::Editable("hello".into()));
     }
 
     #[test]
@@ -1815,7 +1977,7 @@ mod tests {
     fn normal_jk_move_the_focused_field() {
         let mut m = form_model();
         m.form.nav_mode = VimMode::Normal;
-        assert_eq!(m.form.focus, FormField::Pane);
+        m.form.focus = FormField::Pane;
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('j')));
         assert_eq!(m.form.focus, FormField::When, "j moves down a field");
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('k')));
