@@ -14,18 +14,22 @@ Random command-line utilities. Each one has a `--help`; run it for usage.
 
 ## Install
 
-`make` collects every utility into `./bin` (gitignored). Put that on your PATH once:
+`make all` collects every utility into `./bin` (gitignored). Put that on your
+PATH once:
 
 ```sh
-make
+make all
 export PATH="$PWD/bin:$PATH"     # add to your shell rc
 ```
 
 The bash scripts are **symlinked**, so editing one takes effect immediately.
-`nudge` is built from `nudge-rs/` (`cargo build --release`) and linked in.
+`nudge` is built from `nudge-rs/` (`cargo build --release`) and linked in — and
+since it is the only utility here that needs compiling, bare `make` rebuilds and
+relinks just it.
 
 ```sh
-make          # build nudge + link everything into ./bin
+make          # build nudge + link it into ./bin
+make all      # that, plus a symlink for every script
 make check    # run the bash and Rust test suites
 make clean    # remove ./bin
 make help     # list targets

@@ -71,8 +71,10 @@ jobs:
       - name: Install tmux (for nudge-rs's tests)
         run: sudo apt-get update && sudo apt-get install -y tmux
 
-      - name: make
-        run: make
+      # `all`, not bare `make`: the default goal builds and links nudge alone,
+      # and the assertions below cover both halves of the install.
+      - name: make all
+        run: make all
 
       # `test -x` follows the symlink, so a dangling bin/nudge fails here
       # instead of reporting success -- precisely the failure mode the rest of
