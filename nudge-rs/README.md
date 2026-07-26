@@ -56,25 +56,65 @@ piped, prints a static table instead.
 
 nudge also detects Claude's weekly banner:
 
-    You've hit your weekly limit · resets 8am (America/Los_Angeles)
+    You've hit your weekly limit · resets Jul 28 at 8am (America/Los_Angeles)
 
 The stated time zone is honored, so the reset resolves on the clock the banner
 quotes rather than your machine's.
 
-A weekly reset may be days away, and the bare form above names no day. nudge
-reads a day when the banner gives one (`resets Wed 8am`, `resets Wednesday at
-8am`, `tomorrow`), and treats the bare form as the next such hour.
+A weekly reset may be days away, so nudge reads the day off the banner's line.
+The wording there is not a stable interface — it has already drifted from
+`resets Jul 16, 8am` to `resets Jul 28 at 8am` — so nudge scans the line for a
+date rather than matching one phrasing, and the connective tissue around it does
+not matter:
 
-If the banner names its day in a form nudge does not recognize, it **refuses to
-schedule** rather than guessing — guessing would fire the nudge up to six days
-early, silently. The error quotes the text it could not read:
+    resets Jul 28 at 8am          resets on the 28th of July at 8am
+    resets Jul 28, 8am            resets Tue, Jul 28 at 8am
+    resets 28 Jul at 8am          resets at 8am on Jul 28
+    resets Wed 8am                resets tomorrow at 8am
 
-    weekly limit banner found in bot:0.1, but I can't read its reset day: " Jul 16, "
-    (from "You've hit your weekly limit · resets Jul 16, 8am")
+A banner with no day at all (`resets 8am`) means the next such hour. Anything
+trailing the time in its own `·` segment — the usual `/upgrade to increase your
+limits` — is prose, and is ignored rather than mistaken for a day.
+
+All-numeric dates read too, and nudge works out which field is the month rather
+than assuming a convention:
+
+    resets 7/16 at 8am            resets 2026-07-16 at 8am
+    resets 16/7 at 8am            resets 7/16/2026 at 8am
+
+Three things decide `7/16` against `16/7`, in that order:
+
+1. **The calendar.** There are only twelve months, so a field above twelve can
+   only be a day. That alone settles most real dates.
+2. **The week.** A weekly reset is at most seven days out, which rules out the
+   reading that lands months away — and it does so identically everywhere, so a
+   US and a UK machine agree.
+3. **The locale.** Only if both readings are real *and* both fall inside the week
+   does convention get a vote: `M/D` for an `en_US` locale, `D/M` otherwise.
+
+In practice step 3 never runs. The two readings of `a/b` sit in month `a` and
+month `b`, so when they differ at all they are about a month apart — and two
+dates a month apart cannot both be a week away. It is kept as a backstop, and an
+unset or `C` locale is treated as *no* answer rather than as US.
+
+What nudge will **not** do is guess. A day it cannot read unambiguously makes it
+**refuse to schedule** — guessing would fire the nudge days early, silently. A
+two-digit year is the standing example: `7/28/26` is three fields that could each
+be the month, the day, or the year. The error quotes the text it could not read:
+
+    weekly limit banner found in bot:0.1, but I can't read its reset day: " 7/28/26 at "
+    (from "You've hit your weekly limit · resets 7/28/26 at 8am")
     Schedule it by hand with -m, and please file this text.
 
-That text is exactly what an issue needs. `NUDGE_WEEKLY_PATTERN` extends the
-weekly banner pattern the same way `NUDGE_CLOCK_PATTERN` extends the clock one.
+That text is exactly what an issue needs. A date is also refused if it lands
+more than a month out, since no rate-limit window is that long — that guard is
+what keeps a bare `Jul 28` from silently resolving into next year.
+
+`NUDGE_WEEKLY_PATTERN` extends the weekly banner pattern the same way
+`NUDGE_CLOCK_PATTERN` extends the clock one.
+
+One gap worth knowing: only the IANA `(Region/City)` zone form is understood. A
+banner that says `8am PT` resolves 8am on *your* machine's clock, not Pacific.
 
 ### `--verify`
 

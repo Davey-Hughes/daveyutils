@@ -4,7 +4,7 @@
 use jiff::{ToSpan, Zoned};
 use regex::Regex;
 
-use crate::timespec::parse_timespec;
+use crate::timespec::{parse_timespec, DayWords};
 
 /// Padding added to every detected reset time to absorb scheduler latency.
 const PADDING_MINUTES: i64 = 3;
@@ -114,7 +114,7 @@ enum Shape {
     Duration,
     /// "... resets 3:00pm" / "... try again at 4pm".
     Clock,
-    /// "You've hit your weekly limit · resets 8am (America/Los_Angeles)".
+    /// "You've hit your weekly limit · resets Jul 28 at 8am (America/Los_Angeles)".
     /// The only shape whose reset may be days away, so the only one that must
     /// read a day out of the gap before its clock token means anything.
     Weekly,
@@ -147,6 +147,14 @@ pub fn detect_reset(
     weekly_ext: Option<&str>,
 ) -> Detection {
     let clean = strip_ansi_escapes::strip_str(pane_text);
+    // The machine's date convention. It is the last resort for an all-numeric
+    // date, consulted only once the calendar and the weekly window have both
+    // failed to tell "7/16" from "16/7" -- which, for real reset dates, they
+    // almost always do. Read here rather than threaded in like the NUDGE_*
+    // patterns: those are configuration a caller varies, this is ambient system
+    // state with one consumer, and `resolve_day_clock` stays pure for the tests
+    // that actually exercise the tie.
+    let order = crate::timespec::locale_date_order();
 
     // A captured pane is chronological top-to-bottom, so the banner *lowest* on
     // screen is the live one. `Regex::find` is leftmost, and checking one shape
@@ -193,31 +201,44 @@ pub fn detect_reset(
 
         if let Shape::Weekly = shape {
             // The weekly banner is the only one whose reset may be days away,
-            // and the only one that names no day in its bare form. What sits
-            // between the banner and the clock token is the entire signal.
-            let Some(m) = find_clock_token_match(line_rest) else {
+            // and the only one that names no day in its bare form. Its own line
+            // — minus the clock token — is the entire signal.
+            //
+            // Parenthetical asides are not part of it. The zone was read off
+            // this line just above, and "(America/Los_Angeles)" reaching the
+            // word scanner is three unreadable words and a needless refusal.
+            let line = strip_parentheticals(line_rest);
+            let Some(m) = find_clock_token_match(&line) else {
                 continue; // no clock token on this line; try the banner above.
             };
-            let gap = &line_rest[..m.start()];
+            let gap = &line[..m.start()];
             let token = m.as_str().to_string();
-            let words = gap_words(gap);
-            let day_words: Vec<&str> = words
-                .iter()
-                .map(|w| w.as_str())
-                .filter(|w| !GAP_FILLER.contains(w))
-                .collect();
 
-            let resolved = match day_words.as_slice() {
-                // Nothing but filler: the bare form. Per the design, this means
-                // the reset is within 24h, which is exactly at_clock's rule.
-                [] => parse_timespec(&token, now).ok(),
-                // Exactly one word, and we know it.
-                [d] => match crate::timespec::parse_day(d) {
-                    Some(day) => crate::timespec::resolve_day_clock(now, day, &token),
-                    None => None,
-                },
-                // Two or more words is a shape we have never seen.
-                _ => None,
+            let resolved = match crate::timespec::parse_day_words(&significant_words(gap)) {
+                // A day named where the banner has always put it.
+                Some(DayWords::Named(day)) => {
+                    crate::timespec::resolve_day_clock(now, day, &token, order)
+                }
+                // Only connectives before the time. Either this is the bare
+                // form, or the banner has put its date *after* the time
+                // ("resets at 8am on Jul 28") — and reading that as bare is the
+                // days-early misfire, so look there too.
+                //
+                // Only within this segment, and only for a date: a banner
+                // routinely trails an unrelated "· /upgrade to increase your
+                // limits", which is prose, not a reset day, and must not refuse.
+                Some(DayWords::Unnamed) => {
+                    let trailing = first_segment(&line[m.end()..]);
+                    match crate::timespec::find_day_words(&significant_words(trailing)) {
+                        Some(day) => crate::timespec::resolve_day_clock(now, day, &token, order),
+                        // The bare form. Per the design this means the reset is
+                        // within 24h, which is exactly at_clock's rule.
+                        None => parse_timespec(&token, now).ok(),
+                    }
+                }
+                // Words between "resets" and the time that are not a day we
+                // know. This is the tripwire; refuse and quote them.
+                None => None,
             };
 
             return match resolved.and_then(|z| z.checked_add(PADDING_MINUTES.minutes()).ok()) {
@@ -302,14 +323,33 @@ fn find_clock_token_match(text: &str) -> Option<regex::Match<'_>> {
     re.find(text)
 }
 
-/// Words that may sit between the banner and its clock token without naming a
-/// day. Anything else in the gap is either a day or a refusal.
-const GAP_FILLER: &[&str] = &["at", "on"];
+/// `text` with every parenthetical aside removed.
+fn strip_parentheticals(text: &str) -> String {
+    Regex::new(r"\([^)]*\)")
+        .unwrap()
+        .replace_all(text, " ")
+        .into_owned()
+}
 
-/// The gap's significant words: lowercased, stripped of surrounding punctuation,
-/// with pure-punctuation tokens ("·", "-") dropped entirely.
-fn gap_words(gap: &str) -> Vec<String> {
-    gap.split_whitespace()
+/// `text` up to its first separator.
+///
+/// A banner's segments are independent claims — "· /upgrade to increase your
+/// limits" is its own sentence — so a day word found past one belongs to that
+/// claim, not to this reset. Without the cut, a trailing "see you Monday" would
+/// schedule the nudge for Monday.
+fn first_segment(text: &str) -> &str {
+    text.split(['·', '•', '—', '–', '|', ';'])
+        .next()
+        .unwrap_or(text)
+}
+
+/// The significant words of `text`: lowercased, stripped of surrounding
+/// punctuation, with pure-punctuation tokens ("·", "-") dropped entirely.
+///
+/// Trimming punctuation off the edges is what lets the same code read "Jul 16,
+/// 8am" and "Jul 28 at 8am" — the separator a banner chooses is not signal.
+fn significant_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
         .map(|w| {
             w.trim_matches(|c: char| !c.is_alphanumeric())
                 .to_lowercase()
@@ -622,6 +662,170 @@ mod tests {
         assert_eq!(z.timestamp().to_string(), "2026-07-13T15:03:00Z");
     }
 
+    /// The captured banner, verbatim, from a live pane on 2026-07-25 -- the
+    /// dated form. now() is 2026-07-13 10:00 UTC == 03:00 in Los Angeles, so
+    /// Jul 28 is fifteen days out and the year is the current one.
+    #[test]
+    fn detects_the_captured_dated_weekly_banner() {
+        let pane = "You've hit your weekly limit · resets Jul 28 at 8am (America/Los_Angeles)";
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
+        // 08:00 America/Los_Angeles on Jul 28 + 3m padding == 15:03 UTC.
+        assert_eq!(z.timestamp().to_string(), "2026-07-28T15:03:00Z");
+    }
+
+    /// The banner's wording is not a stable interface -- it has already moved
+    /// from "resets Jul 16, 8am" to "resets Jul 28 at 8am" -- so the connective
+    /// tissue around the date must not change the reading. Every one of these
+    /// names Tuesday 2026-07-28 at 8am and must resolve to exactly that.
+    #[test]
+    fn the_connectives_around_a_date_do_not_change_it() {
+        for tail in [
+            "Jul 28 at 8am",
+            "Jul 28, 8am",
+            "Jul 28 · 8am",
+            "on Jul 28 at 8am",
+            "by July 28th at 8am",
+            "on the 28th of July at 8am",
+            "28 Jul at 8am",
+            // A weekday beside the date corroborates it rather than competing.
+            "Tue, Jul 28 at 8am",
+            // The date may follow the time instead of leading it.
+            "at 8am on Jul 28",
+            "8am, Jul 28",
+            // A year, when one is stated, must agree rather than confuse.
+            "Jul 28, 2026 at 8am",
+        ] {
+            let pane = format!("You've hit your weekly limit · resets {tail}");
+            let z = reset_of(detect_reset(&pane, &now(), None, None, None));
+            assert_eq!(
+                (z.date(), z.hour(), z.minute()),
+                (jiff::civil::date(2026, 7, 28), 8, 3),
+                "{tail:?} names Jul 28 at 8am"
+            );
+        }
+    }
+
+    /// The relative day words the README promises, alongside the dated forms
+    /// above -- so the documented table cannot drift from what the parser does.
+    #[test]
+    fn the_documented_relative_day_forms_still_read() {
+        // now() is Monday 2026-07-13 10:00.
+        for (tail, want) in [
+            ("Wed 8am", jiff::civil::date(2026, 7, 15)),
+            ("tomorrow at 8am", jiff::civil::date(2026, 7, 14)),
+        ] {
+            let pane = format!("You've hit your weekly limit · resets {tail}");
+            let z = reset_of(detect_reset(&pane, &now(), None, None, None));
+            assert_eq!((z.date(), z.hour(), z.minute()), (want, 8, 3), "{tail:?}");
+        }
+    }
+
+    /// An all-numeric date, end to end. now() is 2026-07-13, so Jul 16 is three
+    /// days out and 16 is not a month -- the calendar settles the field order
+    /// on its own, and the answer is the same on a US and a UK machine.
+    #[test]
+    fn an_all_numeric_date_reads_without_a_locale() {
+        for tail in [
+            "7/16 at 8am",
+            "16/7 at 8am",
+            "2026-07-16 at 8am",
+            "16-7 at 8am",
+        ] {
+            let pane = format!("You've hit your weekly limit · resets {tail}");
+            let z = reset_of(detect_reset(&pane, &now(), None, None, None));
+            assert_eq!(
+                (z.date(), z.hour(), z.minute()),
+                (jiff::civil::date(2026, 7, 16), 8, 3),
+                "{tail:?}"
+            );
+        }
+    }
+
+    /// A banner does not end at its time. The real one trails an unrelated
+    /// upgrade pitch, which names no day and must not be read as one -- and
+    /// must not refuse either, or every live banner refuses.
+    #[test]
+    fn trailing_prose_after_the_time_is_ignored_not_refused() {
+        let pane = "You've hit your weekly limit · resets 8am (America/Los_Angeles) \
+                    · /upgrade to increase your limits";
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
+        // The bare form, in the stated zone: 08:00 LA + 3m == 15:03 UTC.
+        assert_eq!(z.timestamp().to_string(), "2026-07-13T15:03:00Z");
+    }
+
+    /// The segment cut earns its keep here: a day word in a *later* segment
+    /// belongs to that sentence, not to this reset.
+    #[test]
+    fn a_day_word_past_a_separator_does_not_become_the_reset_day() {
+        let pane = "You've hit your weekly limit · resets 8am · see you Monday";
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
+        // now() is Monday 10:00, so a bare 8am is tomorrow -- NOT next Monday,
+        // which is what reading the trailing sentence would have produced.
+        assert_eq!(z.date(), jiff::civil::date(2026, 7, 14));
+        assert_eq!((z.hour(), z.minute()), (8, 3));
+    }
+
+    /// Every separator a banner segments itself with must cut the trailing
+    /// scan, not just the "·" the current one happens to use.
+    #[test]
+    fn every_segment_separator_cuts_the_trailing_scan() {
+        for sep in ['·', '•', '—', '–', '|', ';'] {
+            let pane = format!("You've hit your weekly limit · resets 8am {sep} see you Monday");
+            let z = reset_of(detect_reset(&pane, &now(), None, None, None));
+            assert_eq!(
+                z.date(),
+                jiff::civil::date(2026, 7, 14),
+                "{sep:?} must cut the trailing sentence off the day scan"
+            );
+        }
+    }
+
+    /// An ASCII hyphen is NOT a separator: it is the inside of an ISO date, and
+    /// cutting there would leave "2026" facing a scanner with no month or day.
+    #[test]
+    fn a_hyphen_is_part_of_a_date_not_a_separator() {
+        let pane = "You've hit your weekly limit · resets 2026-07-28 at 8am";
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
+        assert_eq!(z.date(), jiff::civil::date(2026, 7, 28));
+    }
+
+    /// More than one parenthetical, and one left unclosed -- neither may leave
+    /// stray words in the scanner or swallow the date.
+    #[test]
+    fn parentheticals_are_stripped_without_eating_the_date() {
+        for pane in [
+            "You've hit your weekly limit · resets (finally) Jul 28 at 8am (America/Los_Angeles)",
+            "You've hit your weekly limit · resets Jul 28 at 8am (unclosed",
+        ] {
+            let z = reset_of(detect_reset(pane, &now(), None, None, None));
+            assert_eq!(
+                z.date(),
+                jiff::civil::date(2026, 7, 28),
+                "{pane:?} must still yield Jul 28"
+            );
+        }
+    }
+
+    /// The relative connectives, which the date table does not reach.
+    #[test]
+    fn next_and_this_read_as_connectives_not_days() {
+        // now() is Monday 2026-07-13; Wednesday is the 15th either way.
+        for tail in ["next Wed 8am", "this Wed at 8am"] {
+            let pane = format!("You've hit your weekly limit · resets {tail}");
+            let z = reset_of(detect_reset(&pane, &now(), None, None, None));
+            assert_eq!(z.date(), jiff::civil::date(2026, 7, 15), "{tail:?}");
+        }
+    }
+
+    /// The zone parenthetical is read separately and must not also arrive at
+    /// the day scanner as unreadable words -- including when it leads the time.
+    #[test]
+    fn a_zone_parenthetical_before_the_time_is_not_a_day_word() {
+        let pane = "You've hit your weekly limit · resets (America/Los_Angeles) Jul 28 at 8am";
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
+        assert_eq!(z.timestamp().to_string(), "2026-07-28T15:03:00Z");
+    }
+
     /// A bare gap, and gaps that carry only filler, all mean "the next such
     /// hour" -- there is no day to read.
     #[test]
@@ -657,12 +861,16 @@ mod tests {
 
     /// The tripwire. An unrecognized gap must refuse -- and quote itself, so the
     /// report IS the capture needed to teach the parser this shape.
+    ///
+    /// A two-digit year is the standing example: "7/28/26" is three fields that
+    /// could each be the month, the day or the year, and no amount of calendar
+    /// arithmetic narrows three unknowns to one reading.
     #[test]
     fn an_unreadable_gap_refuses_and_quotes_the_text() {
-        let pane = "You've hit your weekly limit · resets Jul 16, 8am";
+        let pane = "You've hit your weekly limit · resets 7/28/26 at 8am";
         match detect_reset(pane, &now(), None, None, None) {
             Detection::Unreadable { banner, gap } => {
-                assert!(gap.contains("Jul"), "the gap must be quoted: {gap:?}");
+                assert!(gap.contains("7/28/26"), "the gap must be quoted: {gap:?}");
                 assert!(
                     banner.contains("weekly limit"),
                     "the banner line must be quoted: {banner:?}"
@@ -690,7 +898,7 @@ mod tests {
     #[test]
     fn an_unreadable_weekly_banner_does_not_fall_back_to_an_older_one() {
         let pane =
-            "current session resets 3:00pm\nYou've hit your weekly limit · resets Jul 16, 8am";
+            "current session resets 3:00pm\nYou've hit your weekly limit · resets 7/28/26 at 8am";
         assert!(
             matches!(
                 detect_reset(pane, &now(), None, None, None),
@@ -726,17 +934,17 @@ mod tests {
     /// Weekly is pushed before Clock so it wins an exact-offset tie. A user
     /// whose NUDGE_CLOCK_PATTERN is "weekly limit" makes both shapes match at
     /// the same offset, and the Clock shape reading this banner is precisely the
-    /// six-day-early misfire.
+    /// days-early misfire: it sees only "8am", which at 10:00 on Monday the 13th
+    /// means tomorrow, three days before the date the banner actually names.
     #[test]
     fn weekly_beats_clock_on_an_exact_offset_tie() {
         let pane = "You've hit your weekly limit · resets Jul 16, 8am";
-        assert!(
-            matches!(
-                detect_reset(pane, &now(), Some("weekly limit"), None, None),
-                Detection::Unreadable { .. }
-            ),
-            "the Clock shape would read '8am' and schedule six days early; \
-             Weekly must win the tie and refuse"
+        let z = reset_of(detect_reset(pane, &now(), Some("weekly limit"), None, None));
+        assert_eq!(
+            z.date(),
+            jiff::civil::date(2026, 7, 16),
+            "Weekly must win the tie and read the date; the Clock shape would \
+             have scheduled tomorrow"
         );
     }
 }
