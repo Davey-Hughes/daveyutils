@@ -71,6 +71,25 @@ jobs:
       - name: Install tmux (for nudge-rs's tests)
         run: sudo apt-get update && sudo apt-get install -y tmux
 
+      # Not for speed -- nextest saves ~2s here, against a job that spends
+      # minutes on the toolchain and the build. It is so that CI drives the
+      # branch of `make check` that developers actually take: that target
+      # prefers nextest and falls back to `cargo test` when it is absent, so a
+      # runner without it silently exercises only the fallback, leaving the
+      # primary path -- and the `cargo test --doc` pairing, which exists ONLY on
+      # that branch -- covered by nobody until someone's laptop finds the typo.
+      #
+      # nextest's own installer rather than a third-party action: it adds no
+      # trust relationship beyond depending on nextest at all. `$HOME/.cargo/bin`
+      # is spelled out and not the upstream snippet's `${CARGO_HOME:-~/.cargo}`,
+      # because bash does NOT tilde-expand inside a parameter default -- with
+      # CARGO_HOME unset that hands tar a literal `~` and the step fails.
+      - name: Install cargo-nextest (so `make check` runs its real path)
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
+          cargo nextest --version
+
       # `all`, not bare `make`: the default goal builds and links nudge alone,
       # and the assertions below cover both halves of the install.
       - name: make all
