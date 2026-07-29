@@ -5,7 +5,10 @@
 
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{thread, time::Duration};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
 use jiff::{civil::date, tz::TimeZone};
 use nudge::inject::{run_injection, InjectOutcome};
@@ -42,6 +45,16 @@ impl Server {
         };
         let ok = Command::new("tmux")
             .args([
+                // `-L` gives us a private *server*; `-f /dev/null` gives us a
+                // private *config*, and the second is not optional. Without it a
+                // new server still sources the developer's ~/.tmux.conf, so what
+                // these tests capture depends on their personal settings -- the
+                // exact coupling the header promises is absent. It is also what
+                // made these the slowest tests in the suite: sourcing one real
+                // config (plugin manager, shell-outs) measured 5.3s per server,
+                // against 0.02s for a bare one, and every test starts one.
+                "-f",
+                "/dev/null",
                 "-L",
                 &socket,
                 "new-session",
@@ -91,6 +104,68 @@ fn fixed_now() -> jiff::Zoned {
         .unwrap()
 }
 
+// ---- waiting for tmux ----
+//
+// These tests used to `sleep(500ms)` after every send and hope the pane had
+// rendered by then. That is the worst of both: 500ms is dead time on an idle
+// machine, and it is not enough on a loaded one -- which is why these were the
+// slowest tests in the suite AND the ones that slowed down further under
+// parallelism. A poll pays only what it actually waits.
+//
+// `PATIENCE` is a failure deadline, not a delay: a passing test never spends it.
+
+const PATIENCE: Duration = Duration::from_secs(10);
+const TICK: Duration = Duration::from_millis(20);
+
+/// Poll until `cond` holds, or fail with `what`.
+fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::sleep(TICK);
+    }
+}
+
+/// Poll until the pane's captured text contains `needle`; return that capture.
+///
+/// Replaces "sleep, capture once, assert" — the assertion is the wait, so a
+/// slow render costs time instead of a spurious failure.
+fn wait_for_text(target: &TmuxTarget, needle: &str, why: &str) -> String {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let screen = target.capture().unwrap_or_default();
+        if screen.contains(needle) {
+            return screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {needle:?} in the pane: {why}\nlast capture:\n{screen}"
+        );
+        thread::sleep(TICK);
+    }
+}
+
+/// Poll until two consecutive captures are byte-identical.
+///
+/// The verify gate compares a fingerprint taken now against the pane later, so
+/// a baseline snapped while the pane was still rendering reads as "the user
+/// resumed" and the test flakes to `SkippedResumed`. Waiting for the pane to
+/// stop moving states that precondition instead of guessing a sleep long
+/// enough to cover it.
+fn wait_until_quiet(target: &TmuxTarget) {
+    let mut last = target.capture().unwrap_or_default();
+    wait_until(
+        || {
+            thread::sleep(TICK);
+            let now = target.capture().unwrap_or_default();
+            let settled = now == last;
+            last = now;
+            settled
+        },
+        "the pane to stop rendering",
+    );
+}
+
 #[test]
 fn send_line_reaches_pane_and_capture_reads_it() {
     if !tmux_available() {
@@ -104,12 +179,11 @@ fn send_line_reaches_pane_and_capture_reads_it() {
     // only appears in the pane if `sh` actually evaluated the echo, which
     // requires that `Enter` was sent after the literal text.
     target.send_line("echo nudge_marker_$((6*7))").unwrap();
-    thread::sleep(Duration::from_millis(500)); // let the shell run + render
-
-    let screen = target.capture().unwrap();
-    assert!(
-        screen.contains("nudge_marker_42"),
-        "captured pane missing the marker; got:\n{screen}"
+    wait_for_text(
+        &target,
+        "nudge_marker_42",
+        "the marker only appears if `sh` evaluated the echo, which needs the \
+         Enter that follows the literal text",
     );
 }
 
@@ -123,11 +197,10 @@ fn send_line_handles_leading_dash_message() {
     let target = server.target();
     // A message starting with '-' must not be parsed as tmux flags (would Err without `--`).
     target.send_line("-dash_marker_ok").unwrap();
-    thread::sleep(Duration::from_millis(500));
-    let screen = target.capture().unwrap();
-    assert!(
-        screen.contains("-dash_marker_ok"),
-        "leading-dash literal missing; got:\n{screen}"
+    wait_for_text(
+        &target,
+        "-dash_marker_ok",
+        "a leading '-' must reach the pane as literal text, not as tmux flags",
     );
 }
 
@@ -138,11 +211,15 @@ fn end_to_end_injection_verifies_then_sends() {
         return;
     }
     let server = Server::start();
+    let target = server.target();
     // Stage a rate-limit banner into the pane so the verify-gate passes.
     server.stage("printf 'quota reached. Resets in 45m\\n'");
-    thread::sleep(Duration::from_millis(500));
+    wait_for_text(
+        &target,
+        "quota reached",
+        "the verify gate only passes with the banner actually on screen",
+    );
 
-    let target = server.target();
     let job = Job {
         id: 1,
         target: TargetSpec::Tmux { pane: "s".into() },
@@ -161,11 +238,10 @@ fn end_to_end_injection_verifies_then_sends() {
     let out = run_injection(&target, &job, &fixed_now(), None, None, None).unwrap();
     assert_eq!(out, InjectOutcome::Sent(1));
 
-    thread::sleep(Duration::from_millis(500));
-    let screen = target.capture().unwrap();
-    assert!(
-        screen.contains("nudge_done_42"),
-        "sent message not visible in pane; got:\n{screen}"
+    wait_for_text(
+        &target,
+        "nudge_done_42",
+        "a job that reported Sent must actually have reached the pane",
     );
 }
 
@@ -234,7 +310,12 @@ fn dims_notices_a_width_only_resize() {
         eprintln!("skipping: this tmux cannot resize-window");
         return;
     }
-    thread::sleep(Duration::from_millis(300));
+    // Poll on the *change*, then assert the value: waiting for `width == 120`
+    // would make the assertion below tautological.
+    wait_until(
+        || server.target().dims().is_some_and(|d| d != before),
+        "tmux to apply the width-only resize",
+    );
 
     let after = server.target().dims().unwrap();
     assert_ne!(
@@ -254,18 +335,28 @@ fn end_to_end_verify_skips_a_pane_that_moved_after_the_snapshot() {
         return;
     }
     let server = Server::start();
-    server.stage("printf 'quota reached. Resets in 45m\\n'");
-    thread::sleep(Duration::from_millis(500));
-
     let target = server.target();
+    server.stage("printf 'quota reached. Resets in 45m\\n'");
+    wait_for_text(
+        &target,
+        "quota reached",
+        "the banner must be up before the pane is snapshotted",
+    );
+    // Snapshot a pane that has stopped moving, or the baseline disagrees with
+    // the pane a moment later for reasons the user had nothing to do with.
+    wait_until_quiet(&target);
+
     // Schedule time: snapshot the pane parked at its banner.
     let base = nudge::verify::capture_baseline(&target).expect("a live pane must snapshot");
 
     // The user resumes by hand: real output lands, and the banner scrolls up but
     // stays on screen -- which is the whole of finding I19.
     server.stage("printf 'resumed by hand\\n'");
-    thread::sleep(Duration::from_millis(500));
-    let screen = target.capture().unwrap();
+    let screen = wait_for_text(
+        &target,
+        "resumed by hand",
+        "the user's own output must have landed before the gate runs",
+    );
     assert!(
         screen.contains("quota reached"),
         "precondition: the stale banner is still on screen, so the banner check \
@@ -289,8 +380,18 @@ fn end_to_end_verify_skips_a_pane_that_moved_after_the_snapshot() {
     let out = run_injection(&target, &job, &fixed_now(), None, None, None).unwrap();
     assert_eq!(out, InjectOutcome::SkippedResumed);
 
-    thread::sleep(Duration::from_millis(300));
-    let after = target.capture().unwrap();
+    // Absence is the one thing polling cannot wait for, so make it observable:
+    // push a sentinel through the same path and wait for that. tmux delivers to
+    // a pane in order, so once the sentinel has rendered, anything the injection
+    // had sent would have rendered before it -- which turns "nothing arrived"
+    // into a claim with a barrier behind it. A fixed sleep proves the same thing
+    // only on a machine that happened to be fast enough.
+    server.stage("printf 'flush_marker_ok\\n'");
+    let after = wait_for_text(
+        &target,
+        "flush_marker_ok",
+        "the sentinel orders this check after anything the injection sent",
+    );
     assert!(
         !after.contains("nudge_should_not_appear_42"),
         "nothing may reach a pane the user already resumed; got:\n{after}"
@@ -307,13 +408,19 @@ fn end_to_end_verify_still_fires_into_a_pane_nobody_touched() {
         return;
     }
     let server = Server::start();
-    server.stage("printf 'quota reached. Resets in 45m\\n'");
-    thread::sleep(Duration::from_millis(500));
-
     let target = server.target();
+    server.stage("printf 'quota reached. Resets in 45m\\n'");
+    wait_for_text(
+        &target,
+        "quota reached",
+        "the banner must be up before the pane is snapshotted",
+    );
+    // Nobody touches the pane from here on. Waiting for it to stop rendering
+    // *before* the snapshot is what makes "a parked pane is byte-identical"
+    // true: a baseline taken mid-render differs from the pane a moment later,
+    // and the gate reads that difference as the user having resumed.
+    wait_until_quiet(&target);
     let base = nudge::verify::capture_baseline(&target).expect("a live pane must snapshot");
-    // Nobody touches the pane. A parked pane is idle, and idle is byte-identical.
-    thread::sleep(Duration::from_millis(700));
 
     let job = Job {
         id: 1,
@@ -336,10 +443,9 @@ fn end_to_end_verify_still_fires_into_a_pane_nobody_touched() {
         "an untouched pane still parked at its banner is exactly what nudge exists for"
     );
 
-    thread::sleep(Duration::from_millis(500));
-    let after = target.capture().unwrap();
-    assert!(
-        after.contains("nudge_fired_42"),
-        "the message must reach the pane; got:\n{after}"
+    wait_for_text(
+        &target,
+        "nudge_fired_42",
+        "the message must reach a pane the gate cleared to fire into",
     );
 }

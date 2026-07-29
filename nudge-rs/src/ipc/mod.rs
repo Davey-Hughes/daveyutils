@@ -176,6 +176,21 @@ mod tests {
     }
 
     #[test]
+    fn io_timeout_is_five_seconds() {
+        // `ipc_timeout.rs` proves the give-up path fires, but it passes its own
+        // short timeout so the suite does not spend five seconds watching a
+        // clock. That leaves the production value asserted nowhere else: this is
+        // where a drift in it gets caught, so the two tests together still cover
+        // what one slow test used to.
+        assert_eq!(
+            IO_TIMEOUT,
+            Duration::from_secs(5),
+            "the CLI and daemon both bound one exchange by this; changing it \
+             changes how long a stalled peer holds a worker"
+        );
+    }
+
+    #[test]
     fn ping_pongs() {
         let dir = tempfile::tempdir().unwrap();
         let mut q = Queue::load(dir.path().join("q.json")).unwrap();

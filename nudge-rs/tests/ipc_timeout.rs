@@ -37,18 +37,27 @@ fn wait_for_socket(socket: &Path) {
     panic!("server never started listening on {}", socket.display());
 }
 
-/// Run `client::request` on its own thread so a hang is a test failure rather
-/// than a hung suite.
+/// What the give-up test hands the client instead of `IO_TIMEOUT`.
+///
+/// The test is about whether the client gives up at all, not about the number
+/// it gives up after — and waiting out the real five seconds to watch that
+/// happen was the single slowest test in the suite. `ipc::tests::
+/// io_timeout_is_five_seconds` pins the production value.
+const GIVE_UP_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Run `client::request_with_timeout` on its own thread so a hang is a test
+/// failure rather than a hung suite.
 fn request_within(
     socket: &Path,
     req: Request,
+    client_timeout: Duration,
     within: Duration,
     ctx: &str,
 ) -> std::io::Result<Response> {
     let (tx, rx) = mpsc::channel();
     let socket = socket.to_path_buf();
     thread::spawn(move || {
-        let _ = tx.send(client::request(&socket, &req));
+        let _ = tx.send(client::request_with_timeout(&socket, &req, client_timeout));
     });
     rx.recv_timeout(within).unwrap_or_else(|_| panic!("{ctx}"))
 }
@@ -75,6 +84,7 @@ fn a_client_that_never_sends_a_newline_does_not_wedge_the_server() {
     let resp = request_within(
         &socket,
         Request::Ping,
+        IO_TIMEOUT,
         patience(),
         "a stuck client wedged the control plane: Ping never came back",
     )
@@ -104,7 +114,10 @@ fn the_client_gives_up_on_a_daemon_that_never_replies() {
     let result = request_within(
         &socket,
         Request::Ping,
-        patience(),
+        GIVE_UP_TIMEOUT,
+        // Generous next to the timeout under test, so a machine under load
+        // fails this on a real hang rather than on a scheduling hiccup.
+        GIVE_UP_TIMEOUT * 4 + Duration::from_secs(5),
         "client::request hung on an unresponsive daemon: the CLI must fail fast",
     );
     assert!(

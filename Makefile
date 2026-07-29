@@ -77,9 +77,27 @@ distclean: clean
 	@echo "removed nudge-rs build artifacts"
 
 ## check: run the bash test-suite and the Rust tests
+#
+# nextest when it is available: it pools every test from every binary instead of
+# running the binaries one at a time, which on this suite measured ~2x faster.
+#
+# The `--doc` run is not optional garnish. rustdoc compiles doctests separately
+# and nextest DOES NOT RUN THEM -- `cargo test` was running them as a side
+# effect, so swapping the runner alone would drop that coverage silently. There
+# are zero doctests today, which is exactly why the pairing goes in now: the
+# first one written must not be the one that discovers this.
+#
+# The fallback branch needs no `--doc` of its own; plain `cargo test` includes
+# doctests already.
 check:
 	@bash tests/run.sh
-	@cargo test --manifest-path nudge-rs/Cargo.toml
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		cargo nextest run --manifest-path nudge-rs/Cargo.toml && \
+		cargo test --manifest-path nudge-rs/Cargo.toml --doc; \
+	else \
+		printf 'note: cargo-nextest not installed, using cargo test (slower)\n' >&2; \
+		cargo test --manifest-path nudge-rs/Cargo.toml; \
+	fi
 
 ## help: list targets
 help:
