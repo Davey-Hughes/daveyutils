@@ -41,6 +41,7 @@ jobs:
         run: |
           for f in scripts/*; do bash -n "$f"; done
           for f in tests/*.sh; do bash -n "$f"; done
+          for f in dev/*.sh; do bash -n "$f"; done
 
       - name: Run test-suite
         run: bash tests/run.sh
