@@ -32,6 +32,7 @@ pub enum Route {
 /// Bare `nudge` (none of these) is the dashboard's front door instead.
 pub fn has_scheduling_flags(cli: &Cli) -> bool {
     cli.pane.is_some()
+        || cli.auto
         || cli.time.is_some()
         || !cli.input.is_empty()
         || cli.delay.is_some()
@@ -351,8 +352,11 @@ pub fn spawn_daemon(exe: &Path, paths: &paths::Paths) -> std::io::Result<std::pr
 
 /// Schedule a nudge.
 pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
+    // `--auto` and `-p` conflict at the parser, so `Some(p)` with `cli.auto`
+    // set never reaches here and the arms cannot disagree about precedence.
     let pane = match &cli.pane {
         Some(p) => p.clone(),
+        None if cli.auto => crate::tmux_panes::auto_target()?,
         None => crate::app::pick_pane()?,
     };
     let opts = resolve_options(cli);
@@ -651,6 +655,16 @@ mod tests {
         assert_eq!(route(&cli(&["nudge", "-m", "3pm"]), true), Route::Schedule);
         assert_eq!(route(&cli(&["nudge", "-i", "go"]), true), Route::Schedule);
         assert_eq!(route(&cli(&["nudge", "-v"]), true), Route::Schedule);
+    }
+
+    /// `--auto` carries no pane, time, or message, so unless `route` counts it
+    /// as scheduling intent a bare `nudge --auto` on a terminal opens the
+    /// dashboard -- the exact prompt the flag exists to avoid.
+    #[test]
+    fn auto_alone_schedules_rather_than_opening_the_dashboard() {
+        assert!(has_scheduling_flags(&cli(&["nudge", "--auto"])));
+        assert_eq!(route(&cli(&["nudge", "--auto"]), true), Route::Schedule);
+        assert_eq!(route(&cli(&["nudge", "-a"]), true), Route::Schedule);
     }
 
     #[test]

@@ -24,6 +24,26 @@ pub struct Cli {
     #[arg(short, long)]
     pub pane: Option<String>,
 
+    /// No prompts: target the pane you were last in, read its reset time, send the default message.
+    //
+    // Plain `//` below, not `///`: clap renders every paragraph after the first
+    // as long help, so this rationale would otherwise be printed by `--help`.
+    //
+    // The conflicts are the flag's contract, not tidiness. `-p` names a pane
+    // while this one picks one, with no sensible precedence between them; and
+    // `route` reaches --edit/--cancel/--list before it ever reads this, so
+    // without the conflict those combinations would silently ignore the flag
+    // rather than refuse it. The `-p` case additionally matters because `-a`
+    // used to mean --auto-retry: the pair `-p <pane> -a` appears in older
+    // invocations, and failing loudly is the only way it does not quietly
+    // change meaning.
+    #[arg(
+        short = 'a',
+        long = "auto",
+        conflicts_with_all = ["pane", "edit", "cancel", "list", "list_plain"]
+    )]
+    pub auto: bool,
+
     /// Specific target time (e.g. "14:30" or "now + 45 min"); else auto-detect.
     #[arg(short = 'm', long = "time")]
     pub time: Option<String>,
@@ -44,7 +64,11 @@ pub struct Cli {
     pub no_notify: bool,
 
     /// If rate-limited, autonomously schedule another nudge (default 2 retries).
-    #[arg(short = 'a', long = "auto-retry")]
+    //
+    // No short flag: `-a` moved to --auto. `-r <n>` still implies this one, so
+    // the shortest way to arm it is unchanged for anyone who was setting a
+    // count anyway.
+    #[arg(long = "auto-retry")]
     pub auto_retry: bool,
     /// Disable auto-retry (overrides NUDGE_AUTO_RETRY).
     #[arg(long = "no-auto-retry")]
@@ -331,5 +355,59 @@ mod tests {
         // NUDGE_NOTIFY=1 in the environment, --no-notify on the command line.
         let t = resolve_flags(&env(true), &["nudge", "-p", "x", "--no-notify"]);
         assert!(!t.notify);
+    }
+
+    /// `-a` used to mean `--auto-retry` and now means `--auto`. The two do
+    /// entirely different things, so this pins which one the short spelling
+    /// reaches -- the whole hazard of moving a short flag between options.
+    #[test]
+    fn the_short_a_now_means_auto_and_not_auto_retry() {
+        let c = parse(&["nudge", "-a"]);
+        assert!(c.auto, "-a is --auto");
+        assert!(
+            !c.auto_retry,
+            "-a must no longer arm auto-retry; a job that quietly retried \
+             forever is exactly the surprise this move risks"
+        );
+    }
+
+    #[test]
+    fn auto_retry_survives_in_its_long_form() {
+        let c = parse(&["nudge", "-p", "x", "--auto-retry"]);
+        assert!(c.auto_retry);
+        assert!(!c.auto);
+    }
+
+    /// `--auto` picks a pane; `-p` names one. There is no sensible precedence
+    /// between them, and refusing the pair is what turns the invocation the
+    /// README used to advertise into a loud error instead of a silent change of
+    /// meaning -- `-a` there meant auto-retry, and would now auto-pick a pane
+    /// while the user believes they named one.
+    #[test]
+    fn auto_refuses_to_share_a_command_line_with_an_explicit_pane() {
+        assert!(Cli::try_parse_from(["nudge", "-a", "-p", "bot:0.1"]).is_err());
+        assert!(
+            Cli::try_parse_from(["nudge", "-p", "bot:0.1", "-a", "-r", "-1", "-v"]).is_err(),
+            "the exact line nudge-rs/README.md used to advertise must now fail \
+             loudly rather than mean something new"
+        );
+    }
+
+    /// `--auto` schedules a fresh job. The job-management modes are not that,
+    /// and `route` reaches them first -- so without this the flag would be
+    /// silently ignored rather than refused.
+    #[test]
+    fn auto_refuses_to_share_a_command_line_with_a_job_management_mode() {
+        for args in [
+            &["nudge", "-a", "--edit", "5"][..],
+            &["nudge", "-a", "--cancel", "5"][..],
+            &["nudge", "-a", "--list"][..],
+            &["nudge", "-a", "--list-plain"][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "{args:?} must be refused"
+            );
+        }
     }
 }

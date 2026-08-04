@@ -30,13 +30,35 @@ automatically).
 ## Usage
 
 ```sh
+nudge -a                         # no prompts: last pane, its reset time, default message
 nudge -p bot:0.1                 # auto-detect the reset time from the pane
 nudge -p bot:0.1 -m "14:30"      # explicit time
-nudge -p bot:0.1 -a -r -1 -v     # auto-retry forever, verify before each send
+nudge -p bot:0.1 --auto-retry -r -1 -v   # retry forever, verify before each send
 nudge                            # interactive pane picker
 nudge --list                     # pending jobs
 nudge --cancel 3 / --edit 3      # manage a job
 ```
+
+### `-a` / `--auto`
+
+`nudge -a` schedules without asking anything. It targets the pane you were last
+in — the same one the dashboard preselects, the last-active pane of nudge's own
+tmux window — reads the reset time off it, and queues the default message
+(`please continue`).
+
+It refuses rather than guesses. If nudge is not running inside tmux, or that
+window has no other recently-used pane, `--auto` says so and names `-p`; it will
+not fall back to an arbitrary pane, because unlike the dashboard's preselection
+nobody sees its choice before the message is delivered. A pane with no
+recognisable rate-limit banner is the same story — pass `-m` to set the time
+yourself.
+
+It composes with the other scheduling flags (`-m`, `-i`, `-v`, `-n`, `-r`), and
+conflicts with `-p` and with `--list`/`--cancel`/`--edit`.
+
+> **Note** — `-a` used to be short for `--auto-retry`, which is now long-only.
+> `-r <n>` still implies it. Anything passing `-p <pane> -a` together will now
+> fail to parse rather than change meaning.
 
 ### Dashboard
 

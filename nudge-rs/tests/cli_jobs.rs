@@ -120,7 +120,7 @@ fn edit_turning_on_auto_retry_gets_the_default_budget() {
     // does on a fresh schedule.
     let spec = nudge::app::merge_edit(
         &no_retry_job(5),
-        &cli(&["nudge", "--edit", "5", "-a"]),
+        &cli(&["nudge", "--edit", "5", "--auto-retry"]),
         &noon(),
         2,
         &no_snapshot,
@@ -139,7 +139,7 @@ fn edit_auto_retry_with_an_explicit_count_uses_that_count() {
     // The explicit -r is the user's stated intent and must beat the fallback.
     let spec = nudge::app::merge_edit(
         &no_retry_job(5),
-        &cli(&["nudge", "--edit", "5", "-a", "-r", "7"]),
+        &cli(&["nudge", "--edit", "5", "--auto-retry", "-r", "7"]),
         &noon(),
         2,
         &no_snapshot,
