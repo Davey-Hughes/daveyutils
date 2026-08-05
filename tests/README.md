@@ -9,7 +9,9 @@ bash tests/test_cue2flac.sh    # run one file
 
 CI runs the same `tests/run.sh` on every push / PR, on both Linux (GNU
 coreutils) and macOS (BSD `date`/`sed`/`grep`/`awk`), so the scripts' dual
-GNU/BSD code paths are both exercised (see `.github/workflows/tests.yml`).
+GNU/BSD code paths are both exercised. That takes two forges: Forgejo has docker
+runners only and covers the Linux half (`.forgejo/workflows/ci.yml`), and the
+macOS half runs on GitHub (`.github/workflows/tests.yml`).
 
 The suite needs nothing but bash and coreutils. Tests that would otherwise
 shell out to a heavy dependency (`ffmpeg`, `img2pdf`, ImageMagick, …) stub it

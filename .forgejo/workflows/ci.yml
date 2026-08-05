@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# This file is the Forgejo half of a two-forge CI. The GitHub half lives on in
+# .github/workflows/ and is NOT redundant: this instance has docker runners
+# only, so every macOS leg -- the bash suite against Apple's userland, and
+# nudge-rs against a non-glibc target -- is covered there and nowhere here. The
+# `macos-latest` entries in those files are the reason they still exist; deleting
+# them would silently drop the BSD `date`/`sed`/`grep`/`awk` code paths that
+# tests/README.md says are gated.
+#
+# Every job clones with git rather than with actions/checkout, and the reason is
+# worth stating because the failure it avoids is silent. checkout is a
+# JavaScript action, and a JS action needs a node inside the job's container to
+# execute. rust:1-bookworm carries none, and this runner does not inject one, so
+# a job combining `container:` with any JS action dies before its first step.
+# dtolnay/rust-toolchain is gone for the same reason -- and it had nothing left
+# to do regardless, since here the container image IS the toolchain.
+#
+# The clone is authenticated because the instance requires sign-in for all
+# content, so an anonymous fetch is refused even for a public repository. The
+# runner supplies FORGEJO_TOKEN for exactly this, and FORGEJO_SERVER_URL is the
+# runner's own view of the forge -- an address on its container network --
+# rather than the public hostname.
+#
+# The block is repeated per job rather than factored out. Extracting it would
+# need either a composite action, which reintroduces the node problem, or a
+# script from the repository, which is not on disk until after the clone.
+#
+# There are no `paths:` filters, unlike .github/workflows/nudge-rs.yml. That
+# split exists to keep a Rust build off unrelated pushes on metered runners;
+# this runner is self-hosted and bills nobody, and one file cannot filter
+# per-job anyway. Everything runs on every push.
+
+jobs:
+  # rust:1-bookworm for a job with no Rust in it, deliberately. It is the image
+  # the other two jobs already pull, so reusing it here costs one image on the
+  # runner instead of two, and it carries both bash 5.2 -- the media scripts
+  # need 4.3+ for namerefs -- and the git that the checkout block above depends
+  # on, which a bare debian:bookworm does not ship.
+  #
+  # Nothing is installed for the suite itself: it is hermetic. The media
+  # scripts' own dependencies (ffmpeg, img2pdf, ...) are stubbed on PATH by the
+  # tests, and the `at`/tmux that the old bash nudge needed went with it.
+  scripts:
+    name: bash test-suite
+    runs-on: docker
+    container:
+      image: rust:1-bookworm
+    steps:
+      - name: Checkout
+        env:
+          TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          host="${FORGEJO_SERVER_URL#http://}"; host="${host#https://}"
+          scheme="${FORGEJO_SERVER_URL%%://*}"
+          git init -q .
+          git remote add origin "${scheme}://x-access-token:${TOKEN}@${host}/${FORGEJO_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "$FORGEJO_REF"
+          git checkout -q FETCH_HEAD
+
+      # Every script, unconditionally. Most are covered only incidentally, by
+      # test files that source them -- and cue2flac was not covered at all until
+      # it got a test file, so a stray quote or missing `fi` in it reached main
+      # with CI green. Sourcing is a side effect, not a syntax check; this is the
+      # one that is actually about syntax.
+      - name: Syntax check
+        run: |
+          for f in scripts/*; do bash -n "$f"; done
+          for f in tests/*.sh; do bash -n "$f"; done
+          for f in dev/*.sh; do bash -n "$f"; done
+
+      - name: Run test-suite
+        run: bash tests/run.sh
+
+  # Spelled with --manifest-path rather than a `defaults.run.working-directory`,
+  # for two reasons. The checkout step would inherit that default and try to run
+  # in a nudge-rs/ that does not exist until it has finished; and these are then
+  # character-for-character the commands in dev/check-all.sh, whose whole premise
+  # is that the local gate and the CI gate cannot drift.
+  nudge-rs:
+    name: nudge-rs
+    runs-on: docker
+    container:
+      image: rust:1-bookworm
+    steps:
+      - name: Checkout
+        env:
+          TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          host="${FORGEJO_SERVER_URL#http://}"; host="${host#https://}"
+          scheme="${FORGEJO_SERVER_URL%%://*}"
+          git init -q .
+          git remote add origin "${scheme}://x-access-token:${TOKEN}@${host}/${FORGEJO_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "$FORGEJO_REF"
+          git checkout -q FETCH_HEAD
+
+      # No sudo: container jobs run as root and the image has no sudo to find.
+      - name: Install tmux (nudge-rs's tests drive a real server)
+        run: apt-get update && apt-get install -y --no-install-recommends tmux
+
+      - run: cargo fmt --manifest-path nudge-rs/Cargo.toml --all --check
+      - run: cargo clippy --manifest-path nudge-rs/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path nudge-rs/Cargo.toml
+
+  # The Makefile is how every utility here gets onto a PATH, and a `make` that
+  # exits 0 while installing a non-functional bin/ ships green -- which is
+  # exactly how the CARGO_TARGET_DIR dangling-symlink bug got out, caught only by
+  # hand. This job is the one that drives it.
+  make:
+    name: make
+    runs-on: docker
+    container:
+      image: rust:1-bookworm
+    steps:
+      - name: Checkout
+        env:
+          TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          host="${FORGEJO_SERVER_URL#http://}"; host="${host#https://}"
+          scheme="${FORGEJO_SERVER_URL%%://*}"
+          git init -q .
+          git remote add origin "${scheme}://x-access-token:${TOKEN}@${host}/${FORGEJO_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "$FORGEJO_REF"
+          git checkout -q FETCH_HEAD
+
+      # tmux is for `cargo test`, NOT for the bash suite: `make check` runs both,
+      # and nudge-rs's tests drive a real tmux server. The bash half needs
+      # nothing (see the `scripts` job).
+      - name: Install tmux (for nudge-rs's tests)
+        run: apt-get update && apt-get install -y --no-install-recommends tmux
+
+      # Not for speed -- nextest saves ~2s here, against a job that spends
+      # minutes on the build. It is so that CI drives the branch of `make check`
+      # that developers actually take: that target prefers nextest and falls back
+      # to `cargo test` when it is absent, so a runner without it silently
+      # exercises only the fallback, leaving the primary path -- and the
+      # `cargo test --doc` pairing, which exists ONLY on that branch -- covered
+      # by nobody until someone's laptop finds the typo.
+      #
+      # $CARGO_HOME/bin, and NOT the $HOME/.cargo/bin that the GitHub copy of
+      # this step uses. In this image HOME is /root while CARGO_HOME is
+      # /usr/local/cargo, so $HOME/.cargo/bin is not on PATH -- `make check`
+      # probes with `command -v cargo-nextest`, would not find it there, and
+      # would quietly take the fallback branch this step exists to avoid. The
+      # default is spelled out because CARGO_HOME being unset would otherwise
+      # hand tar a literal `/bin`.
+      - name: Install cargo-nextest (so `make check` runs its real path)
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux \
+            | tar zxf - -C "${CARGO_HOME:-/usr/local/cargo}/bin"
+          command -v cargo-nextest
+          cargo nextest --version
+
+      # `all`, not bare `make`: the default goal builds and links nudge alone,
+      # and the assertions below cover both halves of the install.
+      - name: make all
+        run: make all
+
+      # `test -x` follows the symlink, so a dangling bin/nudge fails here
+      # instead of reporting success -- precisely the failure mode the rest of
+      # CI cannot see. `test -L` pins the other half of the Makefile's promise:
+      # the scripts are symlinked, so editing one takes effect immediately.
+      - name: Installed utilities resolve
+        run: |
+          test -x bin/nudge
+          test -L bin/bisect_img
+          test -x bin/bisect_img
+          ./bin/nudge --version
+
+      # The documented entry point itself, rather than a parallel copy of what
+      # it happens to run today.
+      - name: make check
+        run: make check
