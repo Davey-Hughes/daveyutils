@@ -1,19 +1,29 @@
 name: CI
 
+# `branches: [main]` on push, rather than every push everywhere. main is
+# protected and takes changes only through a pull request, so a push event on a
+# feature branch would just run the same jobs the PR is already running, twice.
+# What is left is the two moments that matter: the PR, and main after the merge.
 on:
   push:
+    branches: [main]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
-# This file is the Forgejo half of a two-forge CI. The GitHub half lives on in
-# .github/workflows/ and is NOT redundant: this instance has docker runners
-# only, so every macOS leg -- the bash suite against Apple's userland, and
-# nudge-rs against a non-glibc target -- is covered there and nowhere here. The
-# `macos-latest` entries in those files are the reason they still exist; deleting
-# them would silently drop the BSD `date`/`sed`/`grep`/`awk` code paths that
-# tests/README.md says are gated.
+# This file is the Forgejo half of a two-forge CI, and the half that gates.
+# .github/workflows/ lives on because this instance has docker runners only, so
+# the macOS legs -- the bash suite against Apple's BSD userland, and nudge-rs
+# against macOS -- exist there and nowhere here. Deleting those files would
+# silently drop the BSD `date`/`sed`/`grep`/`awk` code paths tests/README.md
+# says are covered.
+#
+# They are NOT a pre-merge gate, though, and it is worth being precise about
+# why. Nothing pushes to GitHub by hand; the forge mirrors main there after a
+# merge. A Forgejo pull request never reaches GitHub, so the macOS jobs run on
+# already-merged code. Treat a macOS failure as "main is broken, fix forward",
+# not as something a review would have caught.
 #
 # Every job clones with git rather than with actions/checkout, and the reason is
 # worth stating because the failure it avoids is silent. checkout is a
@@ -104,6 +114,22 @@ jobs:
       # No sudo: container jobs run as root and the image has no sudo to find.
       - name: Install tmux (nudge-rs's tests drive a real server)
         run: apt-get update && apt-get install -y --no-install-recommends tmux
+
+      # rust:1-bookworm installs its toolchain with rustup's minimal profile, so
+      # it has cargo and rustc and neither rustfmt nor clippy. This step is the
+      # `with: components: rustfmt, clippy` that .github/workflows/nudge-rs.yml
+      # passes to dtolnay/rust-toolchain -- dropping the action does not drop the
+      # requirement, and the two steps below are the only ones in this file that
+      # need it, which is why `make` gets green without it.
+      #
+      # The alternative, a rust-toolchain.toml declaring the components (as
+      # taiyaku does), is not used here: rustup resolves that file from the
+      # working directory, and everything in this repository drives cargo from
+      # the repository root via --manifest-path, so it would have to sit at the
+      # top of a tree that is mostly bash. It would also pin `channel` and make
+      # the image's own pinned toolchain a second, unused download.
+      - name: Install rustfmt and clippy
+        run: rustup component add rustfmt clippy
 
       - run: cargo fmt --manifest-path nudge-rs/Cargo.toml --all --check
       - run: cargo clippy --manifest-path nudge-rs/Cargo.toml --all-targets -- -D warnings

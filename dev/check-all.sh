@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The local mirror of CI (.forgejo/workflows/ci.yml, and its macOS-only counterpart in
-# .github/workflows/tests.yml + nudge-rs.yml). Run it before landing a branch — dev/land.sh runs it
-# for you, on the merged tree, before the commit exists.
+# .github/workflows/tests.yml + nudge-rs.yml). Run it before you push a branch and open a PR: CI
+# runs these same jobs there, and this is them several minutes earlier.
 #
 #   dev/check-all.sh            # everything CI gates on
 #   dev/check-all.sh --no-rust  # bash only; skip the nudge-rs leg
