@@ -367,14 +367,111 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
     // parked-at-the-banner pane as we can get it.
     let spec = build_spec(&pane, fire_at, cli, &opts, snapshot_pane(&pane, &opts));
 
-    match request(&live_socket()?, &Request::Schedule(spec))? {
+    // The clone is the summary's: the request takes the spec by value, and the
+    // confirmation line needs it back once the daemon has answered with an id.
+    match request(&live_socket()?, &Request::Schedule(spec.clone()))? {
         Response::Scheduled(id) => {
-            println!("nudge: scheduled job {id} for {}", fire_at);
+            println!(
+                "{}",
+                schedule_summary(id, &spec, now.time_zone(), now.timestamp())
+            );
             Ok(())
         }
         Response::Error(e) => bail!("daemon rejected the job: {e}"),
         other => bail!("unexpected response: {other:?}"),
     }
+}
+
+/// Format a signed seconds delta as a compact countdown: `2h 14m`, `6d 3h`,
+/// `45m`, `12s`. A non-positive delta (the job's time is here or past) renders
+/// as `now` — the daemon fires within its grace window, and a dashboard that
+/// showed a negative countdown would look broken.
+pub fn human_countdown(delta_secs: i64) -> String {
+    if delta_secs <= 0 {
+        return "now".to_string();
+    }
+    let d = delta_secs / 86_400;
+    let h = (delta_secs % 86_400) / 3_600;
+    let m = (delta_secs % 3_600) / 60;
+    let s = delta_secs % 60;
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// The one-shot line confirming a scheduled job: what got scheduled, when, and
+/// where. Printed by `schedule` above and by the dashboard as it tears down, so
+/// that `nudge -a` and a bare `nudge` confirm the same job the same way — the
+/// CLI used to print a raw UTC timestamp and nothing else, which said nothing
+/// about which pane it had picked or what it would send there.
+///
+/// `now` is the caller's clock (the model's, from the dashboard), so the
+/// countdown matches whatever the user was just looking at.
+pub fn schedule_summary(
+    id: u64,
+    spec: &JobSpec,
+    tz: &jiff::tz::TimeZone,
+    now: jiff::Timestamp,
+) -> String {
+    job_summary(&format!("scheduled job {id}"), spec, tz, now)
+}
+
+/// The same confirmation for [`edit`], which replaces a job rather than adding
+/// one. An edit is the case where the summary earns the most: the merge keeps
+/// every field no flag overrode, so `-m` alone silently carries the pane,
+/// message and toggles forward, and `edited job 1 -> 2` on its own never showed
+/// what was carried. Both ids are named because the replacement gets a new one
+/// and the user's next `--cancel` needs it.
+pub fn edit_summary(
+    old_id: u64,
+    new_id: u64,
+    spec: &JobSpec,
+    tz: &jiff::tz::TimeZone,
+    now: jiff::Timestamp,
+) -> String {
+    job_summary(&format!("edited job {old_id} -> {new_id}"), spec, tz, now)
+}
+
+/// The shared body: `lead` names what happened to the job, the rest describes
+/// the job it happened to.
+fn job_summary(
+    lead: &str,
+    spec: &JobSpec,
+    tz: &jiff::tz::TimeZone,
+    now: jiff::Timestamp,
+) -> String {
+    let TargetSpec::Tmux { pane } = &spec.target;
+    let when = spec.fire_at.to_zoned(tz.clone());
+    let countdown = human_countdown(spec.fire_at.duration_since(now).as_secs());
+    let what = match spec.messages.len() {
+        1 => format!("{:?}", spec.messages[0]),
+        n => format!("{n} messages"),
+    };
+    let mut flags: Vec<String> = Vec::new();
+    if spec.verify {
+        flags.push("verify".to_string());
+    }
+    if spec.notify {
+        flags.push("notify".to_string());
+    }
+    if spec.auto_retry {
+        flags.push(format!("auto-retry ({})", spec.retries_left));
+    }
+    let flags = if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", flags.join(", "))
+    };
+    format!(
+        "nudge: {lead} for {} (in {countdown})\n       {pane} · {what}{flags}",
+        when.strftime("%Y-%m-%d %H:%M")
+    )
 }
 
 /// Render pending jobs as a plain table.
@@ -553,9 +650,20 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
         &snapshot_pane,
     )?;
 
-    match request(&socket, &Request::Replace { id, spec })? {
+    // Cloned for the same reason `schedule` clones: the request consumes the
+    // spec, and the confirmation describes it once the daemon has replied.
+    match request(
+        &socket,
+        &Request::Replace {
+            id,
+            spec: spec.clone(),
+        },
+    )? {
         Response::Replaced(Some(new_id)) => {
-            println!("nudge: edited job {id} -> {new_id}");
+            println!(
+                "{}",
+                edit_summary(id, new_id, &spec, now.time_zone(), now.timestamp())
+            );
             Ok(())
         }
         // It fired or was cancelled between the List above and now. Nothing was
@@ -620,6 +728,105 @@ mod tests {
 
     fn cli(args: &[&str]) -> Cli {
         <Cli as clap::Parser>::try_parse_from(args).unwrap()
+    }
+
+    fn a_spec(pane: &str, messages: &[&str], fire_at: &str) -> JobSpec {
+        JobSpec {
+            target: TargetSpec::Tmux {
+                pane: pane.to_string(),
+            },
+            messages: messages.iter().map(|m| m.to_string()).collect(),
+            send_delay_secs: 0.75,
+            fire_at: fire_at.parse().unwrap(),
+            notify: false,
+            verify: false,
+            auto_retry: false,
+            retries_left: 0,
+            settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
+        }
+    }
+
+    #[test]
+    fn countdown_formats_by_largest_unit() {
+        assert_eq!(human_countdown(45 * 60), "45m");
+        assert_eq!(human_countdown(2 * 3600 + 14 * 60), "2h 14m");
+        assert_eq!(human_countdown(6 * 86400 + 3 * 3600), "6d 3h");
+        assert_eq!(human_countdown(12), "12s");
+    }
+
+    #[test]
+    fn a_past_or_zero_delta_reads_now_not_a_negative() {
+        assert_eq!(human_countdown(0), "now");
+        assert_eq!(human_countdown(-500), "now");
+    }
+
+    #[test]
+    fn the_summary_names_the_job_its_time_pane_and_flags() {
+        let mut spec = a_spec("bot:0.1", &["please continue"], "2026-07-16T14:14:00Z");
+        spec.notify = true;
+        spec.auto_retry = true;
+        spec.retries_left = 2;
+        let s = schedule_summary(
+            7,
+            &spec,
+            &jiff::tz::TimeZone::UTC,
+            "2026-07-16T12:00:00Z".parse().unwrap(),
+        );
+        assert_eq!(
+            s,
+            "nudge: scheduled job 7 for 2026-07-16 14:14 (in 2h 14m)\n       \
+             bot:0.1 · \"please continue\" · notify, auto-retry (2)"
+        );
+    }
+
+    #[test]
+    fn a_multi_message_summary_counts_rather_than_quotes() {
+        let mut spec = a_spec("s:0.2", &["one", "two"], "2026-07-16T12:00:30Z");
+        spec.verify = true;
+        let s = schedule_summary(
+            3,
+            &spec,
+            &jiff::tz::TimeZone::UTC,
+            "2026-07-16T12:00:00Z".parse().unwrap(),
+        );
+        assert!(s.contains("2 messages"), "{s}");
+        assert!(s.ends_with("· verify"), "{s}");
+    }
+
+    /// An edit names both ids — the old one the user typed and the new one the
+    /// replacement got — and then describes the job exactly as a schedule does.
+    #[test]
+    fn an_edit_summary_names_both_ids_and_the_merged_job() {
+        let spec = a_spec("bot:0.1", &["keep going"], "2026-07-16T14:14:00Z");
+        let s = edit_summary(
+            1,
+            2,
+            &spec,
+            &jiff::tz::TimeZone::UTC,
+            "2026-07-16T12:00:00Z".parse().unwrap(),
+        );
+        assert_eq!(
+            s,
+            "nudge: edited job 1 -> 2 for 2026-07-16 14:14 (in 2h 14m)\n       \
+             bot:0.1 · \"keep going\""
+        );
+    }
+
+    /// The summary renders in the caller's zone, not UTC. `nudge -a` prints it
+    /// with `Zoned::now()`'s zone, and a user in UTC+2 reading a UTC clock time
+    /// would think the nudge fires two hours off.
+    #[test]
+    fn the_summary_renders_the_fire_time_in_the_callers_zone() {
+        let spec = a_spec("bot:0.1", &["go"], "2026-07-16T14:14:00Z");
+        let s = schedule_summary(
+            1,
+            &spec,
+            &jiff::tz::TimeZone::get("America/New_York").unwrap(),
+            "2026-07-16T12:00:00Z".parse().unwrap(),
+        );
+        assert!(s.contains("2026-07-16 10:14"), "{s}");
     }
 
     #[test]

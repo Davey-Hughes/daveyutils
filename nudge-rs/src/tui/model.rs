@@ -1,45 +1,12 @@
 //! Dashboard state and its pure helpers.
-
-/// Format a signed seconds delta as a compact countdown: `2h 14m`, `6d 3h`,
-/// `45m`, `12s`. A non-positive delta (the job's time is here or past) renders
-/// as `now` — the daemon fires within its grace window, and a dashboard that
-/// showed a negative countdown would look broken.
-pub fn human_countdown(delta_secs: i64) -> String {
-    if delta_secs <= 0 {
-        return "now".to_string();
-    }
-    let d = delta_secs / 86_400;
-    let h = (delta_secs % 86_400) / 3_600;
-    let m = (delta_secs % 3_600) / 60;
-    let s = delta_secs % 60;
-    if d > 0 {
-        format!("{d}d {h}h")
-    } else if h > 0 {
-        format!("{h}h {m}m")
-    } else if m > 0 {
-        format!("{m}m")
-    } else {
-        format!("{s}s")
-    }
-}
+//!
+//! `human_countdown` and `schedule_summary` live in [`crate::app`]: the CLI
+//! prints the same summary line that the dashboard prints on its way out, so
+//! the formatting cannot belong to the dashboard alone.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn countdown_formats_by_largest_unit() {
-        assert_eq!(human_countdown(45 * 60), "45m");
-        assert_eq!(human_countdown(2 * 3600 + 14 * 60), "2h 14m");
-        assert_eq!(human_countdown(6 * 86400 + 3 * 3600), "6d 3h");
-        assert_eq!(human_countdown(12), "12s");
-    }
-
-    #[test]
-    fn a_past_or_zero_delta_reads_now_not_a_negative() {
-        assert_eq!(human_countdown(0), "now");
-        assert_eq!(human_countdown(-500), "now");
-    }
 
     #[test]
     fn the_dashboard_opens_on_the_new_nudge_tab() {
@@ -61,64 +28,6 @@ mod tests {
     fn a_new_form_opens_focused_on_the_schedule_button() {
         // Auto-detection is good enough that the common path is a bare Enter.
         assert_eq!(Form::fresh().focus, FormField::Submit);
-    }
-
-    #[test]
-    fn the_summary_names_the_job_its_time_pane_and_flags() {
-        let spec = JobSpec {
-            target: TargetSpec::Tmux {
-                pane: "bot:0.1".into(),
-            },
-            messages: vec!["please continue".into()],
-            send_delay_secs: 0.75,
-            fire_at: "2026-07-16T14:14:00Z".parse().unwrap(),
-            notify: true,
-            verify: false,
-            auto_retry: true,
-            retries_left: 2,
-            settle_secs: 5.0,
-            verify_fingerprint: None,
-            verify_dims: None,
-        };
-        let s = schedule_summary(
-            7,
-            &spec,
-            &jiff::tz::TimeZone::UTC,
-            "2026-07-16T12:00:00Z".parse().unwrap(),
-        );
-        assert_eq!(
-            s,
-            "nudge: scheduled job 7 for 2026-07-16 14:14 (in 2h 14m)\n       \
-             bot:0.1 · \"please continue\" · notify, auto-retry (2)"
-        );
-    }
-
-    #[test]
-    fn a_multi_message_summary_counts_rather_than_quotes() {
-        let mut spec = JobSpec {
-            target: TargetSpec::Tmux {
-                pane: "s:0.2".into(),
-            },
-            messages: vec!["one".into(), "two".into()],
-            send_delay_secs: 0.75,
-            fire_at: "2026-07-16T12:00:30Z".parse().unwrap(),
-            notify: false,
-            verify: false,
-            auto_retry: false,
-            retries_left: 0,
-            settle_secs: 5.0,
-            verify_fingerprint: None,
-            verify_dims: None,
-        };
-        spec.verify = true;
-        let s = schedule_summary(
-            3,
-            &spec,
-            &jiff::tz::TimeZone::UTC,
-            "2026-07-16T12:00:00Z".parse().unwrap(),
-        );
-        assert!(s.contains("2 messages"), "{s}");
-        assert!(s.ends_with("· verify"), "{s}");
     }
 
     #[test]
@@ -157,7 +66,7 @@ mod tests {
 use jiff::Timestamp;
 
 use crate::detect::Detection;
-use crate::job::{Job, JobSpec, TargetSpec};
+use crate::job::{Job, JobSpec};
 use crate::tmux_panes::Pane;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -242,43 +151,6 @@ pub struct Picker {
 pub enum AfterSubmit {
     Quit,
     Jobs,
-}
-
-/// The one-shot line printed after the TUI tears down: what got scheduled, when,
-/// and where. `now` is the model's clock, so the countdown matches the dashboard
-/// the user was just looking at.
-pub fn schedule_summary(
-    id: u64,
-    spec: &JobSpec,
-    tz: &jiff::tz::TimeZone,
-    now: Timestamp,
-) -> String {
-    let TargetSpec::Tmux { pane } = &spec.target;
-    let when = spec.fire_at.to_zoned(tz.clone());
-    let countdown = human_countdown(spec.fire_at.duration_since(now).as_secs());
-    let what = match spec.messages.len() {
-        1 => format!("{:?}", spec.messages[0]),
-        n => format!("{n} messages"),
-    };
-    let mut flags: Vec<String> = Vec::new();
-    if spec.verify {
-        flags.push("verify".to_string());
-    }
-    if spec.notify {
-        flags.push("notify".to_string());
-    }
-    if spec.auto_retry {
-        flags.push(format!("auto-retry ({})", spec.retries_left));
-    }
-    let flags = if flags.is_empty() {
-        String::new()
-    } else {
-        format!(" · {}", flags.join(", "))
-    };
-    format!(
-        "nudge: scheduled job {id} for {} (in {countdown})\n       {pane} · {what}{flags}",
-        when.strftime("%Y-%m-%d %H:%M")
-    )
 }
 
 /// The transient bottom line: last error or confirmation.

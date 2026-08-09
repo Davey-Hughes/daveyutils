@@ -4,9 +4,9 @@ use crossterm::event::KeyCode;
 use jiff::Timestamp;
 
 use super::model::{
-    schedule_summary, AfterSubmit, CarriedEdit, Form, FormField, MessageField, Mode, Model, Tab,
-    WhenMode,
+    AfterSubmit, CarriedEdit, Form, FormField, MessageField, Mode, Model, Tab, WhenMode,
 };
+use crate::app::schedule_summary;
 use crate::detect::Detection;
 use crate::job::{Job, JobSpec, TargetSpec};
 use crate::timespec::parse_timespec;

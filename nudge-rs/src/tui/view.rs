@@ -6,7 +6,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
-use super::model::{human_countdown, FormField, MessageField, Model, Tab, VimMode, WhenMode};
+use super::model::{FormField, MessageField, Model, Tab, VimMode, WhenMode};
+use crate::app::human_countdown;
 use crate::job::TargetSpec;
 
 /// How many terminal rows `s` needs at `width`, greedily wrapping on spaces the
