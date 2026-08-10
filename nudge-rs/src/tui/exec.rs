@@ -139,7 +139,7 @@ mod tests {
         let q = Arc::clone(&queue);
         let s = socket.clone();
         std::thread::spawn(move || {
-            let _ = server::serve(&s, q);
+            let _ = server::serve(&s, &q);
         });
         // Give the server a beat to bind.
         std::thread::sleep(std::time::Duration::from_millis(200));

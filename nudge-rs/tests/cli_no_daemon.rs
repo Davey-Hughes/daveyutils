@@ -10,7 +10,7 @@
 //! These drive the real `nudge` binary against an isolated HOME/XDG state dir.
 //! No real daemon survives, by construction: each test holds the singleton lock
 //! on its own state dir, so the daemon the CLI spawns loses the lock and exits
-//! immediately (`lib::run` maps WouldBlock to a clean exit). Standing in for it
+//! immediately (`lib::run` maps `WouldBlock` to a clean exit). Standing in for it
 //! is an in-process IPC server that binds the socket *after a delay* — the delay
 //! is the point, since it is what makes "no daemon is listening when the CLI
 //! starts" true, and a server bound up front would let the pre-fix code pass.
@@ -101,7 +101,7 @@ fn fixture() -> Fixture {
     let socket = paths.socket.clone();
     std::thread::spawn(move || {
         std::thread::sleep(DAEMON_START_DELAY);
-        let _ = server::serve(&socket, q);
+        let _ = server::serve(&socket, &q);
     });
 
     Fixture {

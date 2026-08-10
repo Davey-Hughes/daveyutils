@@ -18,7 +18,7 @@ use crate::queue::Queue;
 /// stalled peer holds a worker for the whole `IO_TIMEOUT`, so an unbounded
 /// spawn is all it takes to turn a flood of them into exactly that. Past the
 /// cap a connection is served inline instead: the loop pauses for at worst
-/// IO_TIMEOUT, which is a far better failure than an unbounded one.
+/// `IO_TIMEOUT`, which is a far better failure than an unbounded one.
 const MAX_WORKERS: usize = 64;
 
 /// Releases a worker slot however the worker leaves — including a panic, which
@@ -68,13 +68,15 @@ fn serve_conn(stream: &UnixStream, queue: &Mutex<Queue>) {
 /// escapes instead of returning — would leave the daemon headless but still
 /// firing. Worker threads are capped ([`MAX_WORKERS`]) and a refused one is
 /// served inline, so neither a flood nor a stingy OS can panic us.
-pub fn serve(socket: &Path, queue: Arc<Mutex<Queue>>) -> std::io::Result<()> {
+// Takes `&Arc` rather than the `Arc`: the accept loop clones a handle per
+// connection, so it needs the `Arc` itself, but it never consumes the caller's.
+pub fn serve(socket: &Path, queue: &Arc<Mutex<Queue>>) -> std::io::Result<()> {
     serve_with(socket, queue, worker_builder, MAX_WORKERS)
 }
 
 fn serve_with<B>(
     socket: &Path,
-    queue: Arc<Mutex<Queue>>,
+    queue: &Arc<Mutex<Queue>>,
     builder: B,
     max_workers: usize,
 ) -> std::io::Result<()>
@@ -87,21 +89,17 @@ where
     // Never steal a live socket. If something answers, another daemon owns it.
     // Only a socket nobody is listening on is stale and safe to reclaim.
     if socket.exists() {
-        match UnixStream::connect(socket) {
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    format!(
-                        "another nudge daemon is already listening on {}",
-                        socket.display()
-                    ),
-                ));
-            }
-            Err(_) => {
-                tracing::warn!("nudge ipc: reclaiming stale socket {}", socket.display());
-                std::fs::remove_file(socket)?;
-            }
+        if UnixStream::connect(socket).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "another nudge daemon is already listening on {}",
+                    socket.display()
+                ),
+            ));
         }
+        tracing::warn!("nudge ipc: reclaiming stale socket {}", socket.display());
+        std::fs::remove_file(socket)?;
     }
     let listener = UnixListener::bind(socket)?;
     tracing::info!("nudge ipc: listening on {}", socket.display());
@@ -119,12 +117,12 @@ where
                     tracing::warn!(
                         "nudge ipc: {max_workers} workers already in flight; serving inline"
                     );
-                    serve_conn(&stream, &queue);
+                    serve_conn(&stream, queue);
                     continue;
                 }
                 live.fetch_add(1, Ordering::SeqCst);
                 let slot = WorkerSlot(Arc::clone(&live));
-                let q = Arc::clone(&queue);
+                let q = Arc::clone(queue);
                 let s = Arc::clone(&stream);
                 let worker = move || {
                     let _slot = slot;
@@ -140,19 +138,19 @@ where
                 if let Err(e) = builder().spawn(worker) {
                     // Dropping the closure released the slot.
                     tracing::warn!("nudge ipc: could not spawn a worker ({e}); serving inline");
-                    serve_conn(&stream, &queue);
+                    serve_conn(&stream, queue);
                 }
             }
             Err(e) => match e.kind() {
                 // A peer vanished mid-handshake, or a signal interrupted us.
+                // Falls through to the next accept() -- which is the retry.
                 std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted => {
                     tracing::debug!("nudge ipc: transient accept error: {e}");
-                    continue;
                 }
                 _ => {
                     // EMFILE/ENFILE (out of descriptors) is also transient, but
                     // hammering accept() would spin: back off briefly and retry.
-                    if matches!(e.raw_os_error(), Some(24) | Some(23)) {
+                    if matches!(e.raw_os_error(), Some(24 | 23)) {
                         tracing::warn!("nudge ipc: accept: {e}; backing off");
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         continue;
@@ -188,7 +186,9 @@ fn handle_conn(stream: &UnixStream, queue: &Mutex<Queue>) -> std::io::Result<()>
         // fatal exit that would replace this daemon never runs. The user gets a
         // daemon that fires jobs, cannot be listed or cancelled, and cannot be
         // superseded (the singleton lock is doing its job).
-        let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         handle_request(req, &mut q)
     };
     write_msg(&mut &*stream, &resp)
@@ -243,7 +243,7 @@ mod tests {
         let socket = dir.join("nudge.sock");
         let s = socket.clone();
         std::thread::spawn(move || {
-            let _ = serve_with(&s, queue, builder, max_workers);
+            let _ = serve_with(&s, &queue, builder, max_workers);
         });
         wait_until(|| socket.exists(), "the socket to be bound");
         socket

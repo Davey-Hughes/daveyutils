@@ -41,12 +41,12 @@ fn one_shot(
     listener: &Arc<UnixListener>,
     socket: &Path,
     queue: &Arc<Mutex<Queue>>,
-    req: Request,
+    req: &Request,
 ) -> Response {
     let l = Arc::clone(listener);
     let q = Arc::clone(queue);
     let handle = thread::spawn(move || server::serve_once(&l, &q).unwrap());
-    let resp = client::request(socket, &req).unwrap();
+    let resp = client::request(socket, req).unwrap();
     handle.join().unwrap();
     resp
 }
@@ -61,28 +61,28 @@ fn socket_roundtrip_schedule_list_cancel() {
     let queue = Arc::new(Mutex::new(Queue::load(queue_path).unwrap()));
 
     assert_eq!(
-        one_shot(&listener, &socket, &queue, Request::Ping),
+        one_shot(&listener, &socket, &queue, &Request::Ping),
         Response::Pong {
             version: nudge::VERSION.to_string()
         }
     );
 
-    match one_shot(&listener, &socket, &queue, Request::Schedule(spec())) {
+    match one_shot(&listener, &socket, &queue, &Request::Schedule(spec())) {
         Response::Scheduled(id) => assert_eq!(id, 1),
         other => panic!("expected Scheduled, got {other:?}"),
     }
 
-    match one_shot(&listener, &socket, &queue, Request::List) {
+    match one_shot(&listener, &socket, &queue, &Request::List) {
         Response::Jobs(jobs) => assert_eq!(jobs.len(), 1),
         other => panic!("expected Jobs, got {other:?}"),
     }
 
     assert_eq!(
-        one_shot(&listener, &socket, &queue, Request::Cancel(1)),
+        one_shot(&listener, &socket, &queue, &Request::Cancel(1)),
         Response::Cancelled(true)
     );
     assert_eq!(
-        one_shot(&listener, &socket, &queue, Request::Cancel(1)),
+        one_shot(&listener, &socket, &queue, &Request::Cancel(1)),
         Response::Cancelled(false)
     );
 }

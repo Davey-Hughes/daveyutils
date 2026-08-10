@@ -24,8 +24,7 @@ fn tmux_available() -> bool {
     Command::new("tmux")
         .arg("-V")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Owns a uniquely-named throwaway session on the *default* tmux server; kills
@@ -89,12 +88,16 @@ impl Drop for Session {
 
 #[test]
 fn daemon_fires_a_due_job_into_the_pane() {
+    // Declared before the early return, not beside its first use: a `static` in
+    // a function body exists from the start of the scope regardless, so putting
+    // it mid-body only makes it read as if it were per-call state.
+    static N: AtomicU64 = AtomicU64::new(0);
+
     if !tmux_available() {
         eprintln!("skipping: tmux not installed");
         return;
     }
 
-    static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let session_name = format!("nudge_daemon_{}_{}", std::process::id(), n);
     let session = Session::start(&session_name);

@@ -38,8 +38,7 @@ fn tmux_available() -> bool {
     Command::new("tmux")
         .arg("-V")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 fn os() -> Os {

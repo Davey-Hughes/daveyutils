@@ -48,3 +48,15 @@ ansi-to-tui = "8.0.1"
 
 [dev-dependencies]
 tempfile = "3"
+
+# CI gates on `cargo clippy --all-targets -- -D warnings`, so everything left at
+# `warn` here is effectively deny. The allows below are lints whose cost here is
+# churn, not correctness -- each one was measured against this tree, not assumed.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# nudge ships a binary. `pub` marks the CLI/daemon seam between this crate's own
+# modules, not an API anyone downstream calls, so the three doc/attribute lints
+# aimed at library authors would add ~90 annotations that no caller ever reads.
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

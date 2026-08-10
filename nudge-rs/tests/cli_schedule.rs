@@ -1,4 +1,4 @@
-//! `build_spec` assembles a JobSpec from CLI options; a hermetic IPC round-trip
+//! `build_spec` assembles a `JobSpec` from CLI options; a hermetic IPC round-trip
 //! confirms a scheduled spec reaches the queue. No real daemon is spawned.
 
 use std::os::unix::net::UnixListener;
@@ -67,6 +67,10 @@ fn build_spec_stores_no_snapshot_without_verify() {
 }
 
 #[test]
+// float_cmp: these assert a literal survived the CLI -> JobSpec round trip
+// unchanged, not the result of any arithmetic. Exact equality is the
+// property under test; an epsilon would weaken it to "close enough".
+#[allow(clippy::float_cmp)]
 fn build_spec_defaults_message_and_delay() {
     let c = cli(&["nudge", "-p", "bot:0.1"]);
     let opts = resolve_options(&c);
@@ -84,6 +88,10 @@ fn build_spec_defaults_message_and_delay() {
 }
 
 #[test]
+// float_cmp: these assert a literal survived the CLI -> JobSpec round trip
+// unchanged, not the result of any arithmetic. Exact equality is the
+// property under test; an epsilon would weaken it to "close enough".
+#[allow(clippy::float_cmp)]
 fn build_spec_takes_custom_messages_and_delay() {
     let c = cli(&[
         "nudge", "-p", "x", "-i", "npm test", "-i", "yes", "-w", "1.5",

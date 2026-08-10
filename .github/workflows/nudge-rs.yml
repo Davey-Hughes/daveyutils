@@ -34,6 +34,11 @@ jobs:
         env:
           HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
         run: brew install tmux
-      - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      # Keep these three in step with .forgejo/workflows/ci.yml: the Forgejo
+      # gate runs the same three commands with --manifest-path, and a flag added
+      # to one file but not the other silently narrows a gate on one host only.
+      # --all-targets is what makes clippy see tests/ and benches/, not just the
+      # lib and bin.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test

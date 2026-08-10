@@ -165,7 +165,7 @@ fn jobs_view(model: &Model, f: &mut Frame, area: Rect) {
 /// text, bottom-anchored to the last `inner_h` lines. Parsing (not raw
 /// passthrough) confines a pane's escapes to SGR styling. Degrades to stripped
 /// plain text on a parse error, and to a placeholder when there is no capture.
-fn preview_text(preview: &Option<String>, inner_h: usize) -> Text<'static> {
+fn preview_text(preview: Option<&str>, inner_h: usize) -> Text<'static> {
     use ansi_to_tui::IntoText;
     match preview {
         Some(screen) => {
@@ -187,6 +187,12 @@ fn preview_text(preview: &Option<String>, inner_h: usize) -> Text<'static> {
     }
 }
 
+// too_many_lines (126/100): this is one screen's layout, and it reads top to
+// bottom in the order the widgets appear. Splitting it to satisfy the counter
+// would mean helpers that each take `model`, `f`, and a slice of the same Rect
+// tree -- more surface, same logic, and the row/cursor arithmetic below would
+// no longer sit next to the rows it measures.
+#[allow(clippy::too_many_lines)]
 fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     let form = &model.form;
     if form.picker.is_some() {
@@ -194,15 +200,14 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     }
     let pane = form
         .selected_pane()
-        .map(|p| p.target.as_str())
-        .unwrap_or("(no panes)");
+        .map_or("(no panes)", |p| p.target.as_str());
     // The When field is a single editable control: Auto shows the detected time,
     // Manual shows the time you type (empty = Auto, so any text means Manual),
     // Keep (edit-only) leaves the job's time alone.
     let when = match form.when {
         WhenMode::Keep => "keep current fire time".to_string(),
         WhenMode::Auto => match &form.detected {
-            Some(crate::detect::Detection::Reset(z)) => format!("auto → {}", z),
+            Some(crate::detect::Detection::Reset(z)) => format!("auto → {z}"),
             Some(crate::detect::Detection::None) => "auto → no banner detected".to_string(),
             Some(crate::detect::Detection::Unreadable { gap, .. }) => {
                 format!("auto → weekly, day unreadable ({gap:?})")
@@ -260,14 +265,13 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     // banner (at the pane's bottom) stays visible when the panel is shorter.
     let pane_name = form
         .selected_pane()
-        .map(|p| p.target.as_str())
-        .unwrap_or("(no pane)");
+        .map_or("(no pane)", |p| p.target.as_str());
     let preview_block = Block::default()
         .borders(Borders::ALL)
         .title(format!("preview: {pane_name}"));
     let inner_h = preview_area.height.saturating_sub(2) as usize; // minus borders
     f.render_widget(
-        Paragraph::new(preview_text(&form.preview, inner_h)).block(preview_block),
+        Paragraph::new(preview_text(form.preview.as_deref(), inner_h)).block(preview_block),
         preview_area,
     );
 
@@ -318,8 +322,8 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     if form.when == WhenMode::Manual && !form.manual_time.is_empty() {
         let now_zoned = model.now.to_zoned(model.defaults.tz.clone());
         if crate::timespec::parse_timespec(&form.manual_time, &now_zoned).is_err() {
-            let value_len = form.manual_time.chars().count() as u16;
-            let vstart = (rows_txt[1].chars().count() as u16).saturating_sub(value_len);
+            let value_len = cols(form.manual_time.chars().count());
+            let vstart = cols(rows_txt[1].chars().count()).saturating_sub(value_len);
             let y = inner.y + 1; // the When row
             let buf = f.buffer_mut();
             for col in 0..value_len {
@@ -336,12 +340,23 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     if form.nav_mode == VimMode::Insert {
         if let Some((idx, value_len)) = editable {
             let vstart = rows_txt[idx].chars().count() - value_len;
-            let cursor_x = (inner.x + vstart as u16 + form.cursor.min(value_len) as u16)
+            let cursor_x = (inner.x + cols(vstart) + cols(form.cursor.min(value_len)))
                 .min(inner.right().saturating_sub(1));
-            let cursor_y = (inner.y + idx as u16).min(inner.bottom().saturating_sub(1));
+            let cursor_y = (inner.y + cols(idx)).min(inner.bottom().saturating_sub(1));
             f.set_cursor_position((cursor_x, cursor_y));
         }
     }
+}
+
+/// A character count as a terminal column/row offset.
+///
+/// Ratatui measures the screen in `u16`, so a count past `u16::MAX` is already
+/// far off the right-hand edge; saturating there lands it outside the visible
+/// area, which is where the callers' own `.min(inner.right())` clamps put it
+/// regardless. Truncating with `as` would instead wrap it back on-screen at a
+/// nonsense column.
+fn cols(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
 }
 
 /// The picker occupies this fraction of the tab body; the preview gets the rest.
@@ -354,7 +369,11 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     let picker = form.picker.as_ref().unwrap();
     // Preview on top, the search + list block below at a fixed fraction of the
     // body. The block does NOT resize with the match count; its list scrolls.
-    let picker_h = ((area.height as u32 * PICKER_HEIGHT_PCT / 100) as u16).max(4);
+    // The product is a fraction of a u16 height, so it always fits; try_from
+    // keeps that a fact rather than an assumption if PICKER_HEIGHT_PCT changes.
+    let picker_h = u16::try_from(u32::from(area.height) * PICKER_HEIGHT_PCT / 100)
+        .unwrap_or(u16::MAX)
+        .max(4);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(picker_h)])
@@ -365,14 +384,13 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     // Live preview of the highlighted pane (top) — same source as the form.
     let name = form
         .active_pane()
-        .map(|p| p.target.as_str())
-        .unwrap_or("(no pane)");
+        .map_or("(no pane)", |p| p.target.as_str());
     let preview_block = Block::default()
         .borders(Borders::ALL)
         .title(format!("preview: {name}"));
     let inner_h = preview_area.height.saturating_sub(2) as usize;
     f.render_widget(
-        Paragraph::new(preview_text(&form.preview, inner_h)).block(preview_block),
+        Paragraph::new(preview_text(form.preview.as_deref(), inner_h)).block(preview_block),
         preview_area,
     );
 
@@ -447,7 +465,7 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
     // so no cursor is shown. x = "> " prefix + query width, clamped inside the
     // right edge; y = the pinned search line.
     if picker.mode == VimMode::Insert {
-        let cursor_x = (search_area.x + 2 + picker.query.chars().count() as u16)
+        let cursor_x = (search_area.x + 2 + cols(picker.query.chars().count()))
             .min(search_area.right().saturating_sub(1));
         f.set_cursor_position((cursor_x, search_area.y));
     }
@@ -687,7 +705,7 @@ mod tests {
         // A red "RED" via SGR should parse into a span styled red. The preview is
         // bottom-aligned and padded to the panel height, so the content is on the
         // last line.
-        let text = preview_text(&Some("\x1b[31mRED\x1b[0m".into()), 10);
+        let text = preview_text(Some("\x1b[31mRED\x1b[0m"), 10);
         assert_eq!(text.lines.len(), 10, "padded to the panel height");
         let last = text.lines.last().unwrap();
         assert_eq!(last.spans[0].content.as_ref(), "RED");
@@ -696,7 +714,7 @@ mod tests {
 
     #[test]
     fn a_missing_capture_previews_unavailable() {
-        let text = preview_text(&None, 10);
+        let text = preview_text(None, 10);
         assert_eq!(
             text.lines[0].spans[0].content.as_ref(),
             "(preview unavailable)"

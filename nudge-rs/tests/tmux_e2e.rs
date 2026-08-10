@@ -19,8 +19,7 @@ fn tmux_available() -> bool {
     Command::new("tmux")
         .arg("-V")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Owns a private tmux server; kills it on drop (even on panic).
@@ -76,7 +75,7 @@ impl Server {
     fn target(&self) -> TmuxTarget {
         TmuxTarget::with_socket("s", &self.socket)
     }
-    /// Type a raw line straight into the pane via tmux (bypassing TmuxTarget),
+    /// Type a raw line straight into the pane via tmux (bypassing `TmuxTarget`),
     /// used only to stage pane contents for a test.
     fn stage(&self, line: &str) {
         Command::new("tmux")

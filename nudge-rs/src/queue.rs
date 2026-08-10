@@ -280,7 +280,7 @@ mod tests {
     }
 
     /// A queue whose parent directory is a regular file, so `save`'s
-    /// create_dir_all — and thus every persist — fails. Stands in for the
+    /// `create_dir_all` — and thus every persist — fails. Stands in for the
     /// ENOSPC / read-only state dir of the real failure, and unlike a chmod'd
     /// directory it still fails when the suite runs as root.
     fn block_saving(parent: &std::path::Path) {
@@ -441,6 +441,10 @@ mod tests {
     }
 
     /// Every `.tmp` sibling of `path` left in `dir`.
+    // case_sensitive_file_extension_comparisons: exact match is the point. These
+    // are files `save` itself wrote, always lowercase `.tmp`; a case-insensitive
+    // check would start counting unrelated files as leaked temps.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     fn temps_in(dir: &std::path::Path) -> Vec<String> {
         std::fs::read_dir(dir)
             .unwrap()

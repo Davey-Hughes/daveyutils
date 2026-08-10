@@ -27,7 +27,7 @@ use crate::target::{PaneDims, Target};
 /// SKIP, so it is the one place this design can be over-eager. It is confined
 /// to panes the user actually touched, and the skip is reported by name.
 pub fn normalize(capture: &str) -> String {
-    let mut lines: Vec<&str> = capture.lines().map(|l| l.trim_end()).collect();
+    let mut lines: Vec<&str> = capture.lines().map(str::trim_end).collect();
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
@@ -45,7 +45,7 @@ pub fn normalize(capture: &str) -> String {
 pub fn fingerprint(capture: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in normalize(capture).as_bytes() {
-        h ^= *b as u64;
+        h ^= u64::from(*b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{h:016x}")

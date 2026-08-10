@@ -1,5 +1,6 @@
 //! Command implementations for the CLI modes.
 
+use std::fmt::Write as _;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
@@ -73,7 +74,7 @@ pub fn route(cli: &Cli, is_tty: bool) -> Route {
     }
 }
 
-/// Split a `--verify` snapshot into the two fields a JobSpec stores.
+/// Split a `--verify` snapshot into the two fields a `JobSpec` stores.
 ///
 /// `None` in, `None`s out — a pane that could not be snapshotted arms no
 /// recency gate, and a job with no snapshot fails open at fire time to the
@@ -85,7 +86,7 @@ fn baseline_fields(b: Option<crate::verify::Baseline>) -> (Option<String>, Optio
     }
 }
 
-/// Assemble a JobSpec from resolved options.
+/// Assemble a `JobSpec` from resolved options.
 ///
 /// `baseline` is the pane snapshot the recency gate compares against at fire
 /// time; the caller takes it (only when `--verify` is on) so this stays pure.
@@ -142,7 +143,7 @@ fn snapshot_pane(pane: &str, opts: &Toggles) -> Option<crate::verify::Baseline> 
 /// baseline when `--verify` is off, which is what makes the *stored* job right;
 /// what this guard alone still decides is whether nudge shells out to tmux
 /// twice for a snapshot no job will ever consult. That is invisible in the
-/// JobSpec, so it takes a test of its own.
+/// `JobSpec`, so it takes a test of its own.
 fn snapshot_gate(
     opts: &Toggles,
     take: impl FnOnce() -> Option<crate::verify::Baseline>,
@@ -208,7 +209,7 @@ fn stale_daemon(detail: &str) -> String {
 ///
 /// ENOENT (no socket file) and ECONNREFUSED (a socket file nobody is listening
 /// on) are the two shapes of not-running. Everything else means somebody
-/// answered: most of all the InvalidData of an old daemon's unit `"Pong"`,
+/// answered: most of all the `InvalidData` of an old daemon's unit `"Pong"`,
 /// which this build cannot parse. Spawning a daemon on top of one of those
 /// only loses the singleton lock and reports `daemon did not come up`, which
 /// tells the user nothing about the daemon they actually have.
@@ -338,9 +339,7 @@ fn daemon_log(state_dir: &Path) -> Option<std::fs::File> {
 /// spawn: losing the diagnostics is bad, but it is nothing next to a read-only
 /// state dir meaning no nudge ever fires again.
 pub fn spawn_daemon(exe: &Path, paths: &paths::Paths) -> std::io::Result<std::process::Child> {
-    let log = daemon_log(&paths.state_dir)
-        .map(Stdio::from)
-        .unwrap_or_else(Stdio::null);
+    let log = daemon_log(&paths.state_dir).map_or_else(Stdio::null, Stdio::from);
     std::process::Command::new(exe)
         .arg("--daemon")
         .stdin(Stdio::null())
@@ -482,13 +481,16 @@ pub fn format_jobs(jobs: &[Job]) -> String {
     let mut out = String::from("ID   PANE                 FIRE (UTC)            MSGS\n");
     for j in jobs {
         let TargetSpec::Tmux { pane } = &j.target;
-        out.push_str(&format!(
-            "{:<4} {:<20} {:<20} {}\n",
+        // `writeln!` formats straight into `out`; `push_str(&format!(..))` would
+        // allocate a String per row first. Writing to a String cannot fail.
+        let _ = writeln!(
+            out,
+            "{:<4} {:<20} {:<20} {}",
             j.id,
             pane,
             j.fire_at,
             j.messages.len()
-        ));
+        );
     }
     out
 }
@@ -576,12 +578,11 @@ pub fn merge_edit(
         settle_secs: None,
     };
     let opts = crate::config::resolve(&base, &overrides);
-    let pane = match &cli.pane {
-        Some(p) => p.clone(),
-        None => {
-            let TargetSpec::Tmux { pane } = &job.target;
-            pane.clone()
-        }
+    let pane = if let Some(p) = &cli.pane {
+        p.clone()
+    } else {
+        let TargetSpec::Tmux { pane } = &job.target;
+        pane.clone()
     };
     let fire_at = match &cli.time {
         Some(_) => fire_time(cli, &pane, now)?,
@@ -675,14 +676,14 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
 }
 
 /// Dispatch non-daemon modes.
-pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
+pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    match route(&cli, is_tty) {
+    match route(cli, is_tty) {
         Route::Cancel(id) => cancel(id),
-        Route::Edit(id) => edit(id, &cli),
+        Route::Edit(id) => edit(id, cli),
         Route::StaticList => list(),
         Route::Dashboard => crate::tui::run(),
-        Route::Schedule => schedule(&cli),
+        Route::Schedule => schedule(cli),
     }
 }
 
@@ -735,7 +736,7 @@ mod tests {
             target: TargetSpec::Tmux {
                 pane: pane.to_string(),
             },
-            messages: messages.iter().map(|m| m.to_string()).collect(),
+            messages: messages.iter().map(ToString::to_string).collect(),
             send_delay_secs: 0.75,
             fire_at: fire_at.parse().unwrap(),
             notify: false,
@@ -965,7 +966,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("nudge");
         std::fs::create_dir_all(&state).unwrap();
-        std::fs::write(log_path(&state), vec![b'x'; (LOG_MAX_BYTES + 1) as usize]).unwrap();
+        let oversized = usize::try_from(LOG_MAX_BYTES + 1).expect("the cap must fit in memory");
+        std::fs::write(log_path(&state), vec![b'x'; oversized]).unwrap();
 
         let mut f = daemon_log(&state).expect("an oversized log must still open");
         writeln!(f, "fresh start").unwrap();
@@ -1006,7 +1008,7 @@ mod tests {
     /// Without `--verify`, nudge must not capture the pane at all.
     ///
     /// `build_spec` and `merge_edit` both drop a baseline when the flag is off,
-    /// so the *stored job* is right either way and no JobSpec assertion can see
+    /// so the *stored job* is right either way and no `JobSpec` assertion can see
     /// this. What is left for the guard to decide is whether scheduling shells
     /// out to tmux twice (`display-message`, `capture-pane`) to build a
     /// snapshot that is then thrown away — on every plain `nudge`, which is the

@@ -76,7 +76,7 @@ mod tests {
     fn filter_keeps_only_matches_best_first() {
         let cands: Vec<String> = ["bot:0.1 claude", "work:1.2 vim", "side:0.0 clock"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect();
         let out = filter("cl", &cands);
         assert!(out.contains(&0), "claude matches");
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn empty_query_lists_all_in_order() {
-        let cands: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let cands: Vec<String> = ["a", "b", "c"].iter().map(ToString::to_string).collect();
         assert_eq!(filter("", &cands), vec![0, 1, 2]);
     }
 }

@@ -46,8 +46,8 @@ fn serve_refuses_to_steal_a_live_socket() {
     let (tx, rx) = mpsc::channel();
     let s = socket.clone();
     std::thread::spawn(move || {
-        let r = nudge::ipc::server::serve(&s, queue);
-        let _ = tx.send(r.map(|_| ()).map_err(|e| e.kind()));
+        let r = nudge::ipc::server::serve(&s, &queue);
+        let _ = tx.send(r.map_err(|e| e.kind()));
     });
 
     match rx.recv_timeout(Duration::from_secs(5)) {
@@ -57,11 +57,17 @@ fn serve_refuses_to_steal_a_live_socket() {
             "serve must refuse a live socket with AddrInUse"
         ),
         Ok(Ok(())) => panic!("serve returned Ok — it must refuse to bind over a live socket"),
-        Err(_) => panic!(
+        // Split from Disconnected deliberately: a timeout is the regression this
+        // test is for, a dead sender is the test's own scaffolding breaking. One
+        // message for both would send the reader hunting the wrong bug.
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
             "serve did NOT refuse: it stole the live socket and entered its accept loop \
              (does it still probe the socket with UnixStream::connect before unlinking, \
              and only unlink when nothing answers?)"
         ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the serve thread died without reporting — the panic above is the real failure")
+        }
     }
 
     // The original listener must still own a working socket.
@@ -85,7 +91,7 @@ fn serve_reclaims_a_stale_socket_file() {
     let queue = Arc::new(Mutex::new(Queue::load(dir.path().join("q.json")).unwrap()));
     let s = socket.clone();
     std::thread::spawn(move || {
-        let _ = nudge::ipc::server::serve(&s, queue);
+        let _ = nudge::ipc::server::serve(&s, &queue);
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut ok = false;
@@ -123,7 +129,7 @@ fn run_refuses_to_start_while_another_daemon_holds_the_lock() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let r = nudge::daemon::run(&paths, None, None, None, jiff::ToSpan::hours(6));
-        let _ = tx.send(r.map(|_| ()).map_err(|e| e.kind()));
+        let _ = tx.send(r.map_err(|e| e.kind()));
     });
 
     match rx.recv_timeout(Duration::from_secs(5)) {
@@ -133,11 +139,15 @@ fn run_refuses_to_start_while_another_daemon_holds_the_lock() {
             "run must refuse with WouldBlock while another daemon holds the lock"
         ),
         Ok(Ok(())) => panic!("run returned Ok — it must refuse while the lock is held"),
-        Err(_) => panic!(
+        // See the split above: timeout is the regression, disconnect is scaffolding.
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
             "run did NOT refuse: it started a second daemon while the lock was held \
              (is `run` still taking the singleton lock, and binding it to a named \
              variable so it isn't dropped immediately?)"
         ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the run thread died without reporting — the panic above is the real failure")
+        }
     }
 }
 

@@ -33,6 +33,11 @@ fn usable(p: Option<&Path>) -> Option<&Path> {
 }
 
 /// Resolve paths from explicit inputs (pure; used by tests and `resolve`).
+// map_unwrap_or: `map_or_else` takes the fallback first, which here inverts the
+// rule these three sites encode -- "the XDG var wins, the home-relative path is
+// the fallback". The transform is a bare `to_path_buf`; the fallback is the part
+// worth reading, and it belongs after the thing it falls back from.
+#[allow(clippy::map_unwrap_or)]
 pub fn resolve_from(
     home: &Path,
     xdg_state: Option<&Path>,
@@ -64,6 +69,9 @@ pub fn resolve_from(
 }
 
 /// The user config dir: `$XDG_CONFIG_HOME`, else `<home>/.config`.
+// map_unwrap_or: see `resolve_from` -- same XDG-wins-else-home rule, same reason
+// to keep the fallback last.
+#[allow(clippy::map_unwrap_or)]
 pub fn config_dir(home: &Path, xdg_config: Option<&Path>) -> PathBuf {
     usable(xdg_config)
         .map(Path::to_path_buf)
@@ -72,12 +80,11 @@ pub fn config_dir(home: &Path, xdg_config: Option<&Path>) -> PathBuf {
 
 /// Resolve paths from the current environment and OS.
 pub fn resolve() -> Paths {
-    let home = match std::env::var_os("HOME") {
-        Some(h) => PathBuf::from(h),
-        None => {
-            eprintln!("nudge: warning: $HOME is unset; using '.' for state paths");
-            PathBuf::from(".")
-        }
+    let home = if let Some(h) = std::env::var_os("HOME") {
+        PathBuf::from(h)
+    } else {
+        eprintln!("nudge: warning: $HOME is unset; using '.' for state paths");
+        PathBuf::from(".")
     };
     let xdg_state = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
     let xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);

@@ -27,7 +27,7 @@ fn daemon_survives_a_malformed_request() {
     let sock2 = socket.clone();
     let q2 = Arc::clone(&queue);
     std::thread::spawn(move || {
-        let _ = server::serve(&sock2, q2); // loops forever; reaped at process exit
+        let _ = server::serve(&sock2, &q2); // loops forever; reaped at process exit
     });
     wait_for_socket(&socket);
 

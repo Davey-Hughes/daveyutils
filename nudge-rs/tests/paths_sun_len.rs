@@ -1,7 +1,7 @@
 //! Pins the arithmetic that `common::short_tempdir` and
 //! `common::assert_socket_path_fits` rest on.
 //!
-//! CI is Linux-only, and Linux's SUN_LEN (108) is looser than macOS's (104),
+//! CI is Linux-only, and Linux's `SUN_LEN` (108) is looser than macOS's (104),
 //! so a passing Linux suite proves nothing about the macOS budget on its own
 //! -- that's exactly how `tests/cli_daemon_version.rs` broke on macOS while
 //! staying green everywhere this project's CI actually runs. This test cannot

@@ -72,9 +72,9 @@ fn on_serve_exit(result: std::io::Result<()>) -> ! {
 /// Call [`init_tracing`] first if you want the daemon's logs.
 pub fn run(
     paths: &Paths,
-    clock_ext: Option<String>,
-    dur_ext: Option<String>,
-    weekly_ext: Option<String>,
+    clock_ext: Option<&str>,
+    dur_ext: Option<&str>,
+    weekly_ext: Option<&str>,
     grace: Span,
 ) -> std::io::Result<()> {
     run_with(paths, clock_ext, dur_ext, weekly_ext, grace, on_serve_exit)
@@ -93,9 +93,9 @@ pub fn run(
 /// has already lost its control plane.
 pub fn run_with(
     paths: &Paths,
-    clock_ext: Option<String>,
-    dur_ext: Option<String>,
-    weekly_ext: Option<String>,
+    clock_ext: Option<&str>,
+    dur_ext: Option<&str>,
+    weekly_ext: Option<&str>,
     grace: Span,
     on_serve_exit: fn(std::io::Result<()>) -> !,
 ) -> std::io::Result<()> {
@@ -111,20 +111,24 @@ pub fn run_with(
     // IPC server on its own thread.
     let q_ipc = Arc::clone(&queue);
     let socket = paths.socket.clone();
-    std::thread::spawn(move || on_serve_exit(crate::ipc::server::serve(&socket, q_ipc)));
+    std::thread::spawn(move || on_serve_exit(crate::ipc::server::serve(&socket, &q_ipc)));
 
     loop {
         let now = Zoned::now();
 
         // 1. Snapshot due jobs and stale ids under the lock.
         let plan_now = {
-            let q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            let q = queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             plan(q.all(), &now, &grace)
         };
 
         // 2. Drop stale jobs under the lock.
         if !plan_now.drop_stale.is_empty() {
-            let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut q = queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             drop_stale(&mut q, &plan_now.drop_stale);
         }
 
@@ -134,9 +138,9 @@ pub fn run_with(
                 &*job.target.connect(),
                 job,
                 &now,
-                clock_ext.as_deref(),
-                dur_ext.as_deref(),
-                weekly_ext.as_deref(),
+                clock_ext,
+                dur_ext,
+                weekly_ext,
             );
             match &outcome {
                 // Not "fired": two of the three outcomes deliberately send
@@ -149,11 +153,20 @@ pub fn run_with(
                 crate::notify::send(&body);
             }
             let retry_secs = job.settle_secs.max(MIN_RETRY_SECS);
+            // `as` on a float is saturating (and NaN -> 0) since Rust 1.45, which
+            // is the behavior we want from a settle_secs that arrived from a
+            // config file: an absurd value pins the retry at the largest span
+            // jiff will take and `checked_add` then declines it, falling back to
+            // `now` below. Truncation here is the documented escape hatch, not a
+            // lurking wrap.
+            #[allow(clippy::cast_possible_truncation)]
+            let retry_ms = (retry_secs * 1000.0) as i64;
             let retry_at = now
-                .checked_add(Span::new().milliseconds((retry_secs * 1000.0) as i64))
-                .map(|z| z.timestamp())
-                .unwrap_or(now.timestamp());
-            let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                .checked_add(Span::new().milliseconds(retry_ms))
+                .map_or(now.timestamp(), |z| z.timestamp());
+            let mut q = queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Err(e) = apply_outcome(&mut q, job, &outcome, retry_at) {
                 tracing::warn!("nudge: persisting job {} outcome failed: {e}", job.id);
             }
@@ -161,7 +174,9 @@ pub fn run_with(
 
         // 4. Sleep until the next job is due (capped).
         let wake = {
-            let q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            let q = queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             next_wake(q.all(), &now, MAX_POLL)
         };
         std::thread::sleep(wake.max(Duration::from_millis(50)));
@@ -212,7 +227,7 @@ pub fn notification(
     job: &crate::job::Job,
     outcome: &anyhow::Result<crate::inject::InjectOutcome>,
 ) -> Option<String> {
-    use crate::inject::InjectOutcome::*;
+    use crate::inject::InjectOutcome::{Sent, SkippedNoBanner, SkippedResumed};
     if !job.notify {
         return None;
     }

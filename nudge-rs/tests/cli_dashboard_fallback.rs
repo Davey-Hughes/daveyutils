@@ -71,7 +71,7 @@ fn fixture() -> Fixture {
     let socket = paths.socket.clone();
     std::thread::spawn(move || {
         std::thread::sleep(DAEMON_START_DELAY);
-        let _ = server::serve(&socket, q);
+        let _ = server::serve(&socket, &q);
     });
     Fixture {
         home,

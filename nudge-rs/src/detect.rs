@@ -84,7 +84,7 @@ fn builtin_re(base: &str) -> Regex {
 ///
 /// `ext` is raw env input interpolated into a regex, so it is routinely
 /// invalid: `(`, `*` and `a[b` all read as plain text to someone writing a
-/// banner phrase. Nothing user-supplied may panic here — detect_reset runs on
+/// banner phrase. Nothing user-supplied may panic here — `detect_reset` runs on
 /// the daemon's scheduler thread, where a panic takes down every pending job.
 /// An unusable extension degrades to the built-in banner with a warning naming
 /// the variable to fix.
@@ -108,13 +108,13 @@ fn build_re(var: &str, base: &str, ext: Option<&str>) -> Regex {
 /// after the banner is read, not which banner wins.
 #[derive(Clone, Copy)]
 enum Shape {
-    /// "... Resets in 1h30m / 45m", or a fully custom NUDGE_DURATION_PATTERN
+    /// "... Resets in 1h30m / 45m", or a fully custom `NUDGE_DURATION_PATTERN`
     /// banner (e.g. "out of credits, back in 20m") whose countdown need not
     /// follow the literal word "resets".
     Duration,
     /// "... resets 3:00pm" / "... try again at 4pm".
     Clock,
-    /// "You've hit your weekly limit · resets Jul 28 at 8am (America/Los_Angeles)".
+    /// "You've hit your weekly limit · resets Jul 28 at 8am (`America/Los_Angeles`)".
     /// The only shape whose reset may be days away, so the only one that must
     /// read a day out of the gap before its clock token means anything.
     Weekly,
@@ -277,7 +277,7 @@ pub fn detect_reset(
 ///
 /// Requires the `Region/City` slash form, so it cannot mistake ordinary
 /// parenthesised prose for a zone. Accepts multi-segment names
-/// ("America/Argentina/Buenos_Aires").
+/// ("`America/Argentina/Buenos_Aires`").
 fn find_zone_token(text: &str) -> Option<String> {
     let re = Regex::new(r"\(([A-Za-z]+(?:/[A-Za-z0-9_+-]+)+)\)").unwrap();
     re.captures(text).map(|c| c[1].to_string())
@@ -447,8 +447,8 @@ mod tests {
         ));
     }
 
-    /// The weekly extension is threaded in like clock_ext/dur_ext, so a custom
-    /// NUDGE_WEEKLY_PATTERN can be tested directly without mutating process env.
+    /// The weekly extension is threaded in like `clock_ext/dur_ext`, so a custom
+    /// `NUDGE_WEEKLY_PATTERN` can be tested directly without mutating process env.
     #[test]
     fn custom_weekly_pattern_extends_detection() {
         // A weekly-shaped banner that the built-in WEEKLY_BASE ("weekly limit
@@ -593,7 +593,7 @@ mod tests {
     }
 
     /// A banner naming a zone must resolve in THAT zone, not the machine's.
-    /// now() is 10:00 UTC; 3pm in New York is 19:00 UTC, so a local-zone reading
+    /// `now()` is 10:00 UTC; 3pm in New York is 19:00 UTC, so a local-zone reading
     /// would say 15:03 and be four hours wrong.
     #[test]
     fn a_stated_zone_is_honored_over_the_local_one() {
@@ -603,7 +603,7 @@ mod tests {
         assert_eq!(z.timestamp().to_string(), "2026-07-13T19:03:00Z");
     }
 
-    /// No zone in the banner: unchanged behavior, resolved in now()'s zone.
+    /// No zone in the banner: unchanged behavior, resolved in `now()`'s zone.
     #[test]
     fn a_banner_without_a_zone_still_uses_the_local_one() {
         let z = reset_of(detect_reset(
@@ -652,7 +652,7 @@ mod tests {
         // here would only re-check the compiler; left to the shape that earns it.
     }
 
-    /// The captured banner, verbatim, from a live pane on 2026-07-15. now() is
+    /// The captured banner, verbatim, from a live pane on 2026-07-15. `now()` is
     /// 10:00 UTC == 03:00 in Los Angeles, so 8am LA is later the same day.
     #[test]
     fn detects_the_captured_weekly_banner() {
@@ -663,7 +663,7 @@ mod tests {
     }
 
     /// The captured banner, verbatim, from a live pane on 2026-07-25 -- the
-    /// dated form. now() is 2026-07-13 10:00 UTC == 03:00 in Los Angeles, so
+    /// dated form. `now()` is 2026-07-13 10:00 UTC == 03:00 in Los Angeles, so
     /// Jul 28 is fifteen days out and the year is the current one.
     #[test]
     fn detects_the_captured_dated_weekly_banner() {
@@ -720,7 +720,7 @@ mod tests {
         }
     }
 
-    /// An all-numeric date, end to end. now() is 2026-07-13, so Jul 16 is three
+    /// An all-numeric date, end to end. `now()` is 2026-07-13, so Jul 16 is three
     /// days out and 16 is not a month -- the calendar settles the field order
     /// on its own, and the answer is the same on a US and a UK machine.
     #[test]
@@ -932,7 +932,7 @@ mod tests {
     }
 
     /// Weekly is pushed before Clock so it wins an exact-offset tie. A user
-    /// whose NUDGE_CLOCK_PATTERN is "weekly limit" makes both shapes match at
+    /// whose `NUDGE_CLOCK_PATTERN` is "weekly limit" makes both shapes match at
     /// the same offset, and the Clock shape reading this banner is precisely the
     /// days-early misfire: it sees only "8am", which at 10:00 on Monday the 13th
     /// means tomorrow, three days before the date the banner actually names.

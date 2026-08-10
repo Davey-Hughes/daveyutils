@@ -204,16 +204,14 @@ fn managed_daemon_is_active() -> bool {
         Manager::Systemd => std::process::Command::new("systemctl")
             .args(["--user", "is-active", "--quiet", "nudged.service"])
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false),
+            .is_ok_and(|s| s.success()),
         Manager::Launchd => std::process::Command::new("launchctl")
             .args([
                 "print",
                 &format!("gui/{}/{}", current_uid(), launchd::LABEL),
             ])
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false),
+            .is_ok_and(|o| o.status.success()),
     }
 }
 

@@ -85,7 +85,7 @@ fn fixture(seeded: &[JobSpec]) -> Fixture {
     let socket = paths.socket.clone();
     std::thread::spawn(move || {
         std::thread::sleep(DAEMON_START_DELAY);
-        let _ = server::serve(&socket, queue);
+        let _ = server::serve(&socket, &queue);
     });
     Fixture {
         home,

@@ -193,7 +193,7 @@ mod tests {
         Job {
             id: 1,
             target: TargetSpec::Tmux { pane: "x".into() },
-            messages: messages.iter().map(|s| s.to_string()).collect(),
+            messages: messages.iter().map(ToString::to_string).collect(),
             send_delay_secs: 0.0,
             fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
             notify: false,

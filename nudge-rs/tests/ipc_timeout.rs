@@ -3,7 +3,7 @@
 //! Connections are handled serially by `serve`'s accept loop, and `read_line`
 //! blocks until a newline or EOF, so one client that connects and writes a
 //! partial line (`nc -U $XDG_RUNTIME_DIR/nudge.sock`, then idles) used to block
-//! accept() forever -- every later `--list`, `--cancel` and schedule hung too,
+//! `accept()` forever -- every later `--list`, `--cancel` and schedule hung too,
 //! with no way to cancel the jobs the scheduler kept firing.
 //!
 //! Both tests are bounded by `recv_timeout`, so a regression FAILS with a clear
@@ -21,7 +21,7 @@ use nudge::ipc::{client, server, Request, Response, IO_TIMEOUT};
 use nudge::queue::Queue;
 
 /// Generous next to `IO_TIMEOUT` (the stuck peer must time out first, and the
-/// server only then gets back to accept()), but still bounded.
+/// server only then gets back to `accept()`), but still bounded.
 fn patience() -> Duration {
     IO_TIMEOUT * 4 + Duration::from_secs(5)
 }
@@ -70,7 +70,7 @@ fn a_client_that_never_sends_a_newline_does_not_wedge_the_server() {
 
     let serve_socket = socket.clone();
     thread::spawn(move || {
-        let _ = server::serve(&serve_socket, queue);
+        let _ = server::serve(&serve_socket, &queue);
     });
     wait_for_socket(&socket);
 
@@ -108,7 +108,7 @@ fn the_client_gives_up_on_a_daemon_that_never_replies() {
     // A daemon that accepts the connection and then never answers.
     thread::spawn(move || {
         let (_held_open, _) = listener.accept().unwrap();
-        thread::sleep(Duration::from_secs(600));
+        thread::sleep(Duration::from_mins(10));
     });
 
     let result = request_within(

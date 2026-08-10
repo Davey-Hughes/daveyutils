@@ -27,7 +27,7 @@ pub mod tui;
 pub mod verify;
 
 /// Dispatch a parsed CLI to the right mode.
-pub fn run(cli: cli::Cli) -> anyhow::Result<()> {
+pub fn run(cli: &cli::Cli) -> anyhow::Result<()> {
     if let Some(shell) = cli.completions {
         app::print_completions(shell);
         return Ok(());
@@ -35,11 +35,16 @@ pub fn run(cli: cli::Cli) -> anyhow::Result<()> {
     if cli.daemon {
         daemon::init_tracing();
         let p = paths::resolve();
+        // Bound to locals, not passed inline: `run` borrows these for the life
+        // of the call, and it does not return until the daemon is done.
+        let clock_ext = std::env::var("NUDGE_CLOCK_PATTERN").ok();
+        let dur_ext = std::env::var("NUDGE_DURATION_PATTERN").ok();
+        let weekly_ext = std::env::var("NUDGE_WEEKLY_PATTERN").ok();
         return match daemon::run(
             &p,
-            std::env::var("NUDGE_CLOCK_PATTERN").ok(),
-            std::env::var("NUDGE_DURATION_PATTERN").ok(),
-            std::env::var("NUDGE_WEEKLY_PATTERN").ok(),
+            clock_ext.as_deref(),
+            dur_ext.as_deref(),
+            weekly_ext.as_deref(),
             jiff::ToSpan::hours(6),
         ) {
             Ok(()) => Ok(()),

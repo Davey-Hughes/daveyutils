@@ -18,7 +18,7 @@ use crate::queue::Queue;
 /// machine, so a peer this slow has stopped participating. Without it:
 ///
 /// - the server blocks in `read_line` forever, and because `serve` handles
-///   connections serially that wedges accept() and with it every later
+///   connections serially that wedges `accept()` and with it every later
 ///   `--list`/`--cancel`/schedule;
 /// - the client hangs the CLI instead of reporting an error.
 ///
@@ -136,6 +136,9 @@ mod tests {
     }
 
     #[test]
+    // naive_bytecount: the fix is the `bytecount` crate. Counting two newlines
+    // in a two-message buffer does not justify a dependency.
+    #[allow(clippy::naive_bytecount)]
     fn framing_roundtrips_one_message_per_line() {
         let mut buf: Vec<u8> = Vec::new();
         write_msg(&mut buf, &Request::Ping).unwrap();

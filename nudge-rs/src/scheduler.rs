@@ -23,10 +23,7 @@ pub struct Plan {
 /// than `grace` are dropped (stale catch-up); future jobs are left alone.
 pub fn plan(jobs: &[Job], now: &Zoned, grace: &Span) -> Plan {
     let now_ts = now.timestamp();
-    let cutoff = now
-        .checked_sub(*grace)
-        .map(|z| z.timestamp())
-        .unwrap_or(now_ts);
+    let cutoff = now.checked_sub(*grace).map_or(now_ts, |z| z.timestamp());
     let mut fire = Vec::new();
     let mut drop_stale = Vec::new();
     for j in jobs {
@@ -168,7 +165,7 @@ mod tests {
         assert_eq!(w2, MAX_POLL);
     }
 
-    fn q_with(job: Job) -> (tempfile::TempDir, Queue) {
+    fn q_with(job: &Job) -> (tempfile::TempDir, Queue) {
         let dir = tempfile::tempdir().unwrap();
         let mut q = Queue::load(dir.path().join("q.json")).unwrap();
         // add via JobSpec then overwrite fields to match `job`
@@ -192,7 +189,7 @@ mod tests {
     #[test]
     fn apply_sent_without_retry_removes() {
         let j = job(1, "2026-07-13T11:59:00Z", false, 0);
-        let (_d, mut q) = q_with(j.clone());
+        let (_d, mut q) = q_with(&j);
         let cur = q.get(1).unwrap().clone();
         apply_outcome(&mut q, &cur, &Ok(InjectOutcome::Sent(1)), now().timestamp()).unwrap();
         assert!(q.get(1).is_none());
@@ -201,7 +198,7 @@ mod tests {
     #[test]
     fn apply_sent_with_retry_reschedules_and_decrements() {
         let j = job(1, "2026-07-13T11:59:00Z", true, 2);
-        let (_d, mut q) = q_with(j);
+        let (_d, mut q) = q_with(&j);
         let retry_at: jiff::Timestamp = "2026-07-13T12:05:00Z".parse().unwrap();
         let cur = q.get(1).unwrap().clone();
         apply_outcome(&mut q, &cur, &Ok(InjectOutcome::Sent(1)), retry_at).unwrap();
@@ -213,7 +210,7 @@ mod tests {
     #[test]
     fn apply_infinite_retry_stays_negative_one() {
         let j = job(1, "2026-07-13T11:59:00Z", true, -1);
-        let (_d, mut q) = q_with(j);
+        let (_d, mut q) = q_with(&j);
         let cur = q.get(1).unwrap().clone();
         apply_outcome(&mut q, &cur, &Ok(InjectOutcome::Sent(1)), now().timestamp()).unwrap();
         assert_eq!(q.get(1).unwrap().retries_left, -1);
@@ -228,7 +225,7 @@ mod tests {
     #[test]
     fn apply_err_with_retries_reschedules_instead_of_deleting() {
         let j = job(1, "2026-07-13T11:59:00Z", true, 2);
-        let (_d, mut q) = q_with(j);
+        let (_d, mut q) = q_with(&j);
         let retry_at: jiff::Timestamp = "2026-07-13T12:05:00Z".parse().unwrap();
         let cur = q.get(1).unwrap().clone();
         apply_outcome(&mut q, &cur, &inject_err(), retry_at).unwrap();
@@ -244,7 +241,7 @@ mod tests {
         // The README's own `nudge -p bot:0.1 -a -r -1` -- "retry forever" must
         // not mean "deleted after the first transient tmux blip".
         let j = job(1, "2026-07-13T11:59:00Z", true, -1);
-        let (_d, mut q) = q_with(j);
+        let (_d, mut q) = q_with(&j);
         let cur = q.get(1).unwrap().clone();
         apply_outcome(&mut q, &cur, &inject_err(), now().timestamp()).unwrap();
         assert_eq!(
@@ -275,7 +272,7 @@ mod tests {
             width: 80,
             height: 24,
         });
-        let (_d, mut q) = q_with(j);
+        let (_d, mut q) = q_with(&j);
         let cur = q.get(1).unwrap().clone();
         assert!(cur.verify_baseline().is_some(), "precondition: armed");
 
@@ -300,7 +297,7 @@ mod tests {
     #[test]
     fn apply_err_with_retries_exhausted_removes() {
         let j = job(1, "2026-07-13T11:59:00Z", true, 0);
-        let (_d, mut q) = q_with(j);
+        let (_d, mut q) = q_with(&j);
         let cur = q.get(1).unwrap().clone();
         apply_outcome(&mut q, &cur, &inject_err(), now().timestamp()).unwrap();
         assert!(q.get(1).is_none(), "a job out of retries is done");
@@ -309,7 +306,7 @@ mod tests {
     #[test]
     fn apply_err_without_auto_retry_removes() {
         let j = job(1, "2026-07-13T11:59:00Z", false, 0);
-        let (_d, mut q) = q_with(j);
+        let (_d, mut q) = q_with(&j);
         let cur = q.get(1).unwrap().clone();
         apply_outcome(&mut q, &cur, &inject_err(), now().timestamp()).unwrap();
         assert!(q.get(1).is_none(), "no retry was asked for");
@@ -318,7 +315,7 @@ mod tests {
     #[test]
     fn apply_skipped_verify_removes_even_with_retry() {
         let j = job(1, "2026-07-13T11:59:00Z", true, 2);
-        let (_d, mut q) = q_with(j);
+        let (_d, mut q) = q_with(&j);
         let cur = q.get(1).unwrap().clone();
         apply_outcome(
             &mut q,

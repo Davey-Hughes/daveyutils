@@ -31,14 +31,12 @@ use model::{Model, ScheduleDefaults};
 /// nothing from `KeyEvent`, but a naive `Some(Msg::Key(k.code))` would
 /// discard `k.modifiers` and let Ctrl-C fall through to the plain `c`
 /// handler (cancel, on the Jobs tab) instead of quitting.
-pub fn map_event(ev: Event) -> Option<update::Msg> {
+pub fn map_event(ev: &Event) -> Option<update::Msg> {
     match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => {
             if k.modifiers.contains(KeyModifiers::CONTROL) {
                 match k.code {
-                    crossterm::event::KeyCode::Char('c') | crossterm::event::KeyCode::Char('d') => {
-                        Some(update::Msg::Quit)
-                    }
+                    crossterm::event::KeyCode::Char('c' | 'd') => Some(update::Msg::Quit),
                     // Schedule but stay. A Ctrl-chord (not Shift-Enter) because
                     // terminals only distinguish Shift-Enter under the kitty
                     // keyboard protocol — raw mode clears IXON, so ^S arrives
@@ -121,7 +119,7 @@ pub fn run() -> anyhow::Result<()> {
 
         // ~4 wakeups/sec: responsive input, smooth 1s countdowns.
         let msg = if event::poll(Duration::from_millis(250))? {
-            map_event(event::read()?)
+            map_event(&event::read()?)
         } else {
             Some(update::Msg::Tick(jiff::Timestamp::now()))
         };
@@ -164,7 +162,7 @@ mod tests {
     #[test]
     fn a_key_press_maps_to_a_key_msg() {
         assert_eq!(
-            map_event(press(KeyCode::Char('q'))),
+            map_event(&press(KeyCode::Char('q'))),
             Some(update::Msg::Key(KeyCode::Char('q')))
         );
     }
@@ -177,12 +175,12 @@ mod tests {
             KeyModifiers::NONE,
             KeyEventKind::Release,
         ));
-        assert_eq!(map_event(release), None);
+        assert_eq!(map_event(&release), None);
     }
 
     #[test]
     fn non_key_events_are_ignored() {
-        assert_eq!(map_event(Event::Resize(80, 24)), None);
+        assert_eq!(map_event(&Event::Resize(80, 24)), None);
     }
 
     #[test]
@@ -190,18 +188,18 @@ mod tests {
         // Regression: dropping k.modifiers let Ctrl-C fall through to the
         // Jobs tab's plain `c` handler, which cancels the selected job.
         let ev = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert_eq!(map_event(ev), Some(update::Msg::Quit));
+        assert_eq!(map_event(&ev), Some(update::Msg::Quit));
     }
 
     #[test]
     fn ctrl_s_maps_to_schedule_and_stay() {
         let ev = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        assert_eq!(map_event(ev), Some(update::Msg::SubmitStay));
+        assert_eq!(map_event(&ev), Some(update::Msg::SubmitStay));
     }
 
     #[test]
     fn other_ctrl_combos_are_ignored_rather_than_read_as_bare_commands() {
         let ev = Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
-        assert_eq!(map_event(ev), None);
+        assert_eq!(map_event(&ev), None);
     }
 }

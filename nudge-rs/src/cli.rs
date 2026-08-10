@@ -19,6 +19,12 @@ Linux, or ~/Library/Application Support/nudge on macOS. That is the place to \
 look when a nudge did not fire and you want to know why. Use --notify to be \
 told at the time instead."
 )]
+// struct_excessive_bools: the lint's advice is to group the flags into an enum
+// or a sub-struct, but this *is* the flag surface -- clap derives the parser
+// from these fields, so every bool here is one `--flag` the user types. Folding
+// them into state machines would move the flags away from their own docs and
+// arg attributes without removing a single one.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Cli {
     /// Target tmux pane (e.g. bot:0.1). Prompts interactively if omitted.
     #[arg(short, long)]
@@ -59,7 +65,7 @@ pub struct Cli {
     /// Send a desktop notification when the injection fires.
     #[arg(short = 'n', long = "notify")]
     pub notify: bool,
-    /// Disable notifications (overrides NUDGE_NOTIFY).
+    /// Disable notifications (overrides `NUDGE_NOTIFY`).
     #[arg(long = "no-notify")]
     pub no_notify: bool,
 
@@ -70,7 +76,7 @@ pub struct Cli {
     // count anyway.
     #[arg(long = "auto-retry")]
     pub auto_retry: bool,
-    /// Disable auto-retry (overrides NUDGE_AUTO_RETRY).
+    /// Disable auto-retry (overrides `NUDGE_AUTO_RETRY`).
     #[arg(long = "no-auto-retry")]
     pub no_auto_retry: bool,
 
@@ -93,7 +99,7 @@ pub struct Cli {
     /// Don't inject if you already resumed: skip unless the pane is untouched since scheduling and still shows a rate-limit banner.
     #[arg(short = 'v', long = "verify")]
     pub verify: bool,
-    /// Disable verification (overrides NUDGE_VERIFY).
+    /// Disable verification (overrides `NUDGE_VERIFY`).
     #[arg(long = "no-verify")]
     pub no_verify: bool,
 
@@ -216,7 +222,7 @@ mod tests {
             .get_arguments()
             .find(|a| a.get_id() == name)
             .unwrap_or_else(|| panic!("no --{name} arg"));
-        arg.get_help().map(|h| h.to_string()).unwrap_or_default()
+        arg.get_help().map(ToString::to_string).unwrap_or_default()
     }
 
     #[test]

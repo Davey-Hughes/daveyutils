@@ -29,8 +29,8 @@ pub const SOCKET_PATH_BUDGET: usize = 104;
 /// on its own, before anything is joined onto it. macOS has no
 /// `XDG_RUNTIME_DIR`, so `paths::resolve_from` puts the socket at
 /// `<home>/Library/Application Support/nudge/nudge.sock`, another ~45 bytes.
-/// Put together that's 104: AT the SUN_LEN budget, so `UnixListener::bind`
-/// fails with "path must be shorter than SUN_LEN" before the test gets to
+/// Put together that's 104: AT the `SUN_LEN` budget, so `UnixListener::bind`
+/// fails with "path must be shorter than `SUN_LEN`" before the test gets to
 /// exercise anything.
 ///
 /// Rooting at `/tmp` instead gives a path like `/tmp/nudge-XXXXXX` -- ~21
@@ -40,7 +40,7 @@ pub const SOCKET_PATH_BUDGET: usize = 104;
 /// this is purely a hazard of using a tempdir as `HOME` in a test.
 ///
 /// DO NOT "helpfully" change this back to `tempfile::tempdir()`. On Linux
-/// (SUN_LEN 108, and often a short `$TMPDIR` already) that revert keeps
+/// (`SUN_LEN` 108, and often a short `$TMPDIR` already) that revert keeps
 /// passing locally and in CI, which is exactly why this got missed the first
 /// time -- it only breaks for a macOS user, who is not the one reverting it.
 pub fn short_tempdir() -> TempDir {
@@ -62,11 +62,14 @@ pub fn short_tempdir() -> TempDir {
 /// with a byte count and the path attached, instead of mysteriously.
 pub fn assert_socket_path_fits(socket: &Path) {
     let len = socket.as_os_str().len();
+    // `display()`, not `{socket:?}`: the Debug form escapes and quotes, which is
+    // noise in a message whose whole job is to show you a path you can measure.
+    let shown = socket.display();
     assert!(
         len < SOCKET_PATH_BUDGET,
         "socket path is {len} bytes, budget is {SOCKET_PATH_BUDGET} (macOS's \
          SUN_LEN; Linux's is a looser 108, but this suite always targets the \
-         tighter number): {socket:?}\n\
+         tighter number): {shown}\n\
          UnixListener::bind will fail with 'path must be shorter than SUN_LEN' \
          at this length. If this fixture builds HOME from a tempdir, use \
          common::short_tempdir() instead of tempfile::tempdir()."

@@ -70,7 +70,7 @@ fn serving_queue(pane: &str) -> (tempfile::TempDir, std::path::PathBuf, Arc<Mute
     let s = socket.clone();
     let q = Arc::clone(&queue);
     std::thread::spawn(move || {
-        let _ = server::serve(&s, q);
+        let _ = server::serve(&s, &q);
     });
     wait_for_socket(&socket);
     (dir, socket, queue)

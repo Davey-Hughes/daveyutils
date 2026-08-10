@@ -1,4 +1,4 @@
-//! launchd LaunchAgent generation.
+//! launchd `LaunchAgent` generation.
 
 use std::path::{Path, PathBuf};
 
@@ -47,7 +47,7 @@ pub fn plist_path(home: &Path) -> PathBuf {
         .join(format!("{LABEL}.plist"))
 }
 
-/// Files to write and commands to run to install the LaunchAgent.
+/// Files to write and commands to run to install the `LaunchAgent`.
 pub fn install_plan(exec: &Path, plist_path: &Path, uid: u32) -> InstallPlan {
     let xml = String::from_utf8(plist_bytes(exec)).expect("plist is valid utf-8");
     InstallPlan {

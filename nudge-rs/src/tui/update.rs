@@ -80,10 +80,9 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             // pane about every 1.5s. Gated by last_capture so it fires at the
             // cadence, not on every 250ms idle tick.
             if model.tab == Tab::NewNudge && model.form.selected_pane().is_some() {
-                let due = model
-                    .form
-                    .last_capture
-                    .is_none_or(|t| now.duration_since(t).as_millis() >= CAPTURE_MILLIS as i128);
+                let due = model.form.last_capture.is_none_or(|t| {
+                    now.duration_since(t).as_millis() >= i128::from(CAPTURE_MILLIS)
+                });
                 if due {
                     effects.extend(capture_selected(&mut model.form, now));
                 }
@@ -270,13 +269,32 @@ const FORM_ORDER: [FormField; 7] = [
     FormField::Submit,
 ];
 
+/// Step `idx` by `delta` positions through `len` items, wrapping at both ends.
+///
+/// The obvious spelling casts index and length through `i32` so `rem_euclid`
+/// can absorb a negative `delta`, then casts back -- three truncating casts per
+/// call site, for lists that are a handful of form fields or the panes on one
+/// screen. This stays in `usize` throughout: reduce the step modulo `len`
+/// first, then move backwards by *adding* `len - step`, so no intermediate is
+/// ever negative and none can wrap.
+fn wrap_index(idx: usize, delta: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let step = usize::try_from(delta.unsigned_abs()).unwrap_or(0) % len;
+    if delta >= 0 {
+        (idx + step) % len
+    } else {
+        (idx + (len - step)) % len
+    }
+}
+
 fn move_focus(form: &mut super::model::Form, delta: i32) {
     let i = FORM_ORDER
         .iter()
         .position(|f| *f == form.focus)
-        .unwrap_or(0) as i32;
-    let n = FORM_ORDER.len() as i32;
-    let next = (i + delta).rem_euclid(n) as usize;
+        .unwrap_or(0);
+    let next = wrap_index(i, delta, FORM_ORDER.len());
     // Leaving a blank manual time abandons it back to Auto (don't strand an
     // empty Manual behind you). Then reconcile the field we land on.
     if form.focus == FormField::When && form.when == WhenMode::Manual && form.manual_time.is_empty()
@@ -303,8 +321,7 @@ fn move_focus(form: &mut super::model::Form, delta: i32) {
 fn change_value(model: &mut Model, dir: i32) -> Vec<Effect> {
     match model.form.focus {
         FormField::Pane if !model.form.panes.is_empty() => {
-            let n = model.form.panes.len() as i32;
-            model.form.pane_idx = ((model.form.pane_idx as i32 + dir).rem_euclid(n)) as usize;
+            model.form.pane_idx = wrap_index(model.form.pane_idx, dir, model.form.panes.len());
             // Always refresh: the preview title tracks the selected pane live, so
             // a stale screen from the old pane would otherwise show under the new
             // pane's name until the next tick. Re-detecting in non-Auto is
@@ -482,13 +499,13 @@ fn normal_text_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
     let cur = model.form.cursor.min(chars.len());
     match code {
         KeyCode::Char('h') | KeyCode::Left => cursor_left(&mut model.form),
-        KeyCode::Char('l') | KeyCode::Right | KeyCode::Char(' ') => {
-            cursor_right_normal(&mut model.form)
+        KeyCode::Char('l' | ' ') | KeyCode::Right => {
+            cursor_right_normal(&mut model.form);
         }
         KeyCode::Char('0') | KeyCode::Home => model.form.cursor = 0,
         KeyCode::Char('$') | KeyCode::End => model.form.cursor = chars.len().saturating_sub(1),
         KeyCode::Char('w') => {
-            model.form.cursor = next_word(&chars, cur).min(chars.len().saturating_sub(1))
+            model.form.cursor = next_word(&chars, cur).min(chars.len().saturating_sub(1));
         }
         KeyCode::Char('b') => model.form.cursor = prev_word(&chars, cur),
         // x deletes the char under the cursor; D/C delete to end (C then inserts).
@@ -664,14 +681,13 @@ fn picker_move(model: &mut Model, delta: i32) -> Vec<Effect> {
     let before = model.form.active_pane().map(|p| p.target.clone());
     if let Some(picker) = model.form.picker.as_mut() {
         if !picker.matches.is_empty() {
-            let n = picker.matches.len() as i32;
-            picker.highlight = (picker.highlight as i32 + delta).rem_euclid(n) as usize;
+            picker.highlight = wrap_index(picker.highlight, delta, picker.matches.len());
         }
     }
-    if model.form.active_pane().map(|p| p.target.clone()) != before {
-        capture_selected(&mut model.form, model.now)
-    } else {
+    if model.form.active_pane().map(|p| p.target.clone()) == before {
         vec![]
+    } else {
+        capture_selected(&mut model.form, model.now)
     }
 }
 
@@ -685,10 +701,10 @@ fn picker_filter(model: &mut Model, edit: impl FnOnce(&mut String)) -> Vec<Effec
         picker.matches = crate::tui::fuzzy::filter(&picker.query, &labels);
         picker.highlight = 0;
     }
-    if model.form.active_pane().map(|p| p.target.clone()) != before {
-        capture_selected(&mut model.form, model.now)
-    } else {
+    if model.form.active_pane().map(|p| p.target.clone()) == before {
         vec![]
+    } else {
+        capture_selected(&mut model.form, model.now)
     }
 }
 
@@ -700,8 +716,8 @@ fn cycle_when(cur: WhenMode, dir: i32, mode: super::model::Mode) -> WhenMode {
         super::model::Mode::Editing(_) => &[WhenMode::Keep, WhenMode::Auto],
         super::model::Mode::New => &[WhenMode::Auto],
     };
-    let i = opts.iter().position(|w| *w == cur).unwrap_or(0) as i32;
-    opts[((i + dir).rem_euclid(opts.len() as i32)) as usize]
+    let i = opts.iter().position(|w| *w == cur).unwrap_or(0);
+    opts[wrap_index(i, dir, opts.len())]
 }
 
 fn is_flag(f: FormField) -> bool {
@@ -721,6 +737,9 @@ fn toggle_flag(form: &mut super::model::Form) {
 }
 
 /// Where `i`/`a`/`A`/`I` place the cursor before entering Insert.
+// Copy rather than passing `&InsertAt`: it is four fieldless variants, so a
+// reference costs a pointer to save nothing.
+#[derive(Clone, Copy)]
 enum InsertAt {
     Here,
     After,
@@ -900,13 +919,14 @@ fn submit(model: &mut Model, after: AfterSubmit) -> Vec<Effect> {
     };
     // fire time
     let fire_at = match model.form.when {
-        WhenMode::Keep => match &model.form.carried {
-            Some(c) => c.fire_at,
-            None => {
+        WhenMode::Keep => {
+            if let Some(c) = &model.form.carried {
+                c.fire_at
+            } else {
                 model.status.set("nothing to keep — pick Auto or Manual");
                 return vec![];
             }
-        },
+        }
         WhenMode::Auto => match &model.form.detected {
             Some(Detection::Reset(z)) => z.timestamp(),
             Some(Detection::None) => {
@@ -960,18 +980,17 @@ fn submit(model: &mut Model, after: AfterSubmit) -> Vec<Effect> {
     }
 }
 
-/// Build the JobSpec from the form + carried edit fields. Baseline is left
+/// Build the `JobSpec` from the form + carried edit fields. Baseline is left
 /// `None` here; `exec` fills it when `snapshot_pane` is set.
 fn build_spec(model: &Model, pane: &str, fire_at: Timestamp) -> JobSpec {
     let form = &model.form;
     let messages = match &form.message {
         MessageField::Editable(s) if s.trim().is_empty() => vec!["please continue".to_string()],
         MessageField::Editable(s) => vec![s.clone()],
-        MessageField::Preserved(_) => form
-            .carried
-            .as_ref()
-            .map(|c| c.messages.clone())
-            .unwrap_or_else(|| vec!["please continue".to_string()]),
+        MessageField::Preserved(_) => form.carried.as_ref().map_or_else(
+            || vec!["please continue".to_string()],
+            |c| c.messages.clone(),
+        ),
     };
     let retry_base = form.retry_base(model.defaults.retries);
     let (send_delay_secs, settle_secs) = match &form.carried {
@@ -1010,6 +1029,37 @@ mod tests {
             retries: 2,
             tz: jiff::tz::TimeZone::UTC,
         }
+    }
+
+    /// `wrap_index` replaced an `i32` round-trip through `rem_euclid`. It is
+    /// only worth having if it is that formula exactly, so pin it against the
+    /// original over every index/length the TUI can produce and well past the
+    /// ±1 deltas the call sites actually pass.
+    #[test]
+    fn wrap_index_matches_the_rem_euclid_form_it_replaced() {
+        for len in 1..40usize {
+            for idx in 0..len {
+                for delta in -80i32..=80 {
+                    let want = (i32::try_from(idx).unwrap() + delta)
+                        .rem_euclid(i32::try_from(len).unwrap());
+                    let want = usize::try_from(want).unwrap();
+                    assert_eq!(
+                        wrap_index(idx, delta, len),
+                        want,
+                        "idx={idx} delta={delta} len={len}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The call sites guard emptiness themselves today; the helper still has to
+    /// be total, because an index into an empty list has no right answer to
+    /// return and panicking here would take the whole TUI down.
+    #[test]
+    fn wrap_index_on_an_empty_list_is_zero_not_a_panic() {
+        assert_eq!(wrap_index(0, -1, 0), 0);
+        assert_eq!(wrap_index(7, 3, 0), 0);
     }
 
     fn t0() -> jiff::Timestamp {
@@ -1741,6 +1791,9 @@ mod tests {
     }
 
     #[test]
+    // float_cmp: the assertion is that an untouched edit carried these through
+    // byte for byte. "Preserved" means equal, so equality is the test.
+    #[allow(clippy::float_cmp)]
     fn e_enters_edit_prefilled_and_preserves_hidden_fields_on_save() {
         let mut m = with_jobs(0);
         m.jobs = vec![multi_msg_job()];

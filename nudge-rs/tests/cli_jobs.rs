@@ -1,4 +1,4 @@
-//! format_jobs is a pure renderer; cancel/list are verified via a hermetic IPC
+//! `format_jobs` is a pure renderer; cancel/list are verified via a hermetic IPC
 //! server. No real daemon.
 
 use std::os::unix::net::UnixListener;
@@ -99,7 +99,7 @@ fn cli(args: &[&str]) -> nudge::cli::Cli {
     <nudge::cli::Cli as clap::Parser>::try_parse_from(args).unwrap()
 }
 
-/// A job scheduled *without* auto-retry: `build_spec` stores retries_left == 0.
+/// A job scheduled *without* auto-retry: `build_spec` stores `retries_left` == 0.
 fn no_retry_job(id: u64) -> nudge::job::Job {
     JobSpec {
         auto_retry: false,
@@ -165,6 +165,10 @@ fn edit_without_auto_retry_keeps_a_no_retry_job_at_zero() {
 }
 
 #[test]
+// float_cmp: these assert a literal survived the CLI -> JobSpec round trip
+// unchanged, not the result of any arithmetic. Exact equality is the
+// property under test; an epsilon would weaken it to "close enough".
+#[allow(clippy::float_cmp)]
 fn merge_edit_preserves_options_not_passed() {
     let now = noon();
 
