@@ -937,7 +937,13 @@ fn submit(model: &mut Model, after: AfterSubmit) -> Vec<Effect> {
             }
             Some(Detection::Unreadable { gap, .. }) => {
                 model.status.set(format!(
-                    "weekly banner day unreadable ({gap:?}) — enter a time manually"
+                    "banner day unreadable ({gap:?}) — enter a time manually"
+                ));
+                return vec![];
+            }
+            Some(Detection::Elapsed { time, .. }) => {
+                model.status.set(format!(
+                    "that banner's reset ({time}) has already passed — enter a time manually"
                 ));
                 return vec![];
             }
@@ -1718,7 +1724,7 @@ mod tests {
         let mut m = form_model();
         m.form.focus = FormField::Submit; // when=Auto, detected=None
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
-        assert!(fx.is_empty());
+        assert_eq!(fx, [] as [Effect; 0]);
         assert!(
             m.status.0.is_some(),
             "must explain why nothing was scheduled"
@@ -1896,10 +1902,10 @@ mod tests {
     fn ctrl_s_is_ignored_where_there_is_nothing_to_submit() {
         // The Jobs tab has no form, and the picker owns the keyboard while open.
         let mut m = with_jobs(1);
-        assert!(update(&mut m, Msg::SubmitStay).is_empty());
+        assert_eq!(update(&mut m, Msg::SubmitStay), [] as [Effect; 0]);
         let mut m = form_model();
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
-        assert!(update(&mut m, Msg::SubmitStay).is_empty());
+        assert_eq!(update(&mut m, Msg::SubmitStay), [] as [Effect; 0]);
     }
 
     #[test]

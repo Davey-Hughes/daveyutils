@@ -186,6 +186,133 @@ fn send_line_reaches_pane_and_capture_reads_it() {
     );
 }
 
+/// Codex reads keystrokes that arrive faster than anyone types as a paste, and
+/// for 120ms after the last of them (`PASTE_ENTER_SUPPRESS_WINDOW` in codex-rs
+/// `tui/src/bottom_pane/paste_burst.rs`) it takes Enter as a newline inside that
+/// paste rather than a submit. Seen live on codex 0.162.1: the nudge's message
+/// sat in the composer, unsent, until a second Enter arrived on its own.
+///
+/// So the Enter has to reach the pane well after the text, not just after it.
+#[test]
+fn send_line_lets_the_text_settle_before_pressing_enter() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let log = KeyLog::attach(&server);
+
+    server.target().send_line("please continue").unwrap();
+
+    let keys = log.until(b'\r');
+    assert_eq!(text_of(&keys), "please continue\r");
+    let gap = keys[keys.len() - 1].0 - keys[keys.len() - 2].0;
+    assert!(
+        gap > PASTE_WINDOW,
+        "Enter reached the pane {gap:?} after the text, inside Codex's 120ms \
+         window, so Codex would add a newline and not submit"
+    );
+}
+
+/// The same window from the other side. A key pressed just ahead of the text
+/// is the first character of the paste, unless it is given time to be read as
+/// a keypress first.
+#[test]
+fn send_key_is_read_before_the_text_that_follows_it() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let log = KeyLog::attach(&server);
+    let target = server.target();
+
+    target.send_key("i").unwrap();
+    target.send_line("go").unwrap();
+
+    let keys = log.until(b'\r');
+    assert_eq!(text_of(&keys), "igo\r");
+    let gap = keys[1].0 - keys[0].0;
+    assert!(
+        gap > PASTE_WINDOW,
+        "the text reached the pane {gap:?} after the key, close enough to be \
+         read as one paste with it"
+    );
+}
+
+/// Codex's `PASTE_ENTER_SUPPRESS_WINDOW`, the longest of the intervals its
+/// paste detection runs on.
+const PASTE_WINDOW: Duration = Duration::from_millis(120);
+
+/// A pane that reports every keystroke it is sent, and when.
+///
+/// It runs `cat` on a raw tty into a FIFO, which hands the test each write as
+/// tmux delivers it. The gap between two keys is therefore measured on the
+/// pane's side, not inferred from when this process asked for them.
+struct KeyLog {
+    rx: std::sync::mpsc::Receiver<Option<(Instant, Vec<u8>)>>,
+    _dir: tempfile::TempDir,
+}
+
+impl KeyLog {
+    fn attach(server: &Server) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("keys");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success(),
+            "mkfifo failed"
+        );
+
+        // Every chunk the pane writes, stamped on arrival. The first message
+        // only says the pane's `cat` has opened the FIFO -- which it does after
+        // `stty` has put the tty in raw mode, so nothing sent from then on is
+        // held back for a line discipline to release all at once.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        thread::spawn(move || {
+            let mut f = std::fs::File::open(&path).unwrap();
+            let _ = tx.send(None);
+            let mut buf = [0u8; 256];
+            while let Ok(n @ 1..) = std::io::Read::read(&mut f, &mut buf) {
+                if tx.send(Some((Instant::now(), buf[..n].to_vec()))).is_err() {
+                    break;
+                }
+            }
+        });
+        server.stage(&format!("stty raw -echo; exec cat > '{}'", fifo.display()));
+        assert_eq!(
+            rx.recv_timeout(PATIENCE)
+                .expect("the pane's cat never opened the FIFO"),
+            None
+        );
+        KeyLog { rx, _dir: dir }
+    }
+
+    /// Every byte the pane receives up to and including `last`, each stamped
+    /// with the arrival of the chunk that carried it. Two bytes with the same
+    /// stamp reached the pane together.
+    fn until(&self, last: u8) -> Vec<(Instant, u8)> {
+        let mut keys = Vec::new();
+        while keys.last().is_none_or(|&(_, b)| b != last) {
+            let (at, bytes) = self
+                .rx
+                .recv_timeout(PATIENCE)
+                .expect("the pane never received the last key")
+                .expect("only the first message is the FIFO opening");
+            keys.extend(bytes.into_iter().map(|b| (at, b)));
+        }
+        keys
+    }
+}
+
+fn text_of(keys: &[(Instant, u8)]) -> String {
+    String::from_utf8(keys.iter().map(|&(_, b)| b).collect()).unwrap()
+}
+
 #[test]
 fn send_line_handles_leading_dash_message() {
     if !tmux_available() {

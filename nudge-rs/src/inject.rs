@@ -87,6 +87,10 @@ pub fn run_injection(
         // limit-shaped is still on screen and we could not read its reset day;
         // per this module's polarity, every ambiguity resolves toward inject,
         // because a false skip is the nudge silently never firing.
+        //
+        // Detection::Elapsed does too, and is no ambiguity at all: a nudge fires
+        // after the time its banner named, so for a Codex pane still parked at
+        // its limit this is the answer every single time.
         if matches!(
             detect_reset(&screen, now, clock_ext, dur_ext, weekly_ext),
             crate::detect::Detection::None
@@ -99,6 +103,19 @@ pub fn run_injection(
     for (i, msg) in job.messages.iter().enumerate() {
         if i > 0 && !delay.is_zero() {
             std::thread::sleep(delay);
+        }
+        // A composer waiting in Vim Normal mode reads typed text as commands,
+        // so it is put in Insert mode the way a person would do it. Read again
+        // for every message, since submitting one is what changes the screen.
+        //
+        // A capture that fails here is not an error: not knowing the mode is no
+        // reason to withhold the nudge, and if the pane is truly gone the send
+        // below is what will say so.
+        if target
+            .capture()
+            .is_ok_and(|screen| crate::composer::vim_normal(&screen))
+        {
+            target.send_key("i")?;
         }
         target.send_line(msg)?;
     }
@@ -119,21 +136,43 @@ mod tests {
             .unwrap()
     }
 
-    /// In-memory Target: returns a fixed screen, records what was sent.
+    /// In-memory Target: returns a scripted screen, records what was sent.
     struct FakeTarget {
-        screen: String,
+        /// What successive `capture()` calls answer, in order; the last entry
+        /// repeats forever, so one entry is a pane that never changes.
+        screens: RefCell<Vec<String>>,
         /// What successive `dims()` calls answer, in order; the last entry
         /// repeats forever. A one-element script is therefore a pane whose size
         /// is not changing, however many times it is read.
         dims_reads: RefCell<Vec<Option<crate::target::PaneDims>>>,
         sent: RefCell<Vec<String>>,
+        /// Each lone key pressed, with how many lines had been sent before it.
+        keys: RefCell<Vec<(usize, String)>>,
+        /// Whether `capture()` fails, as it does for a pane tmux cannot read.
+        capture_fails: bool,
     }
     impl FakeTarget {
         fn new(screen: &str) -> Self {
             FakeTarget {
-                screen: screen.to_string(),
+                screens: RefCell::new(vec![screen.to_string()]),
                 dims_reads: RefCell::new(vec![Some(DIMS)]),
                 sent: RefCell::new(Vec::new()),
+                keys: RefCell::new(Vec::new()),
+                capture_fails: false,
+            }
+        }
+        /// A pane that shows each of `screens` in turn, one per capture.
+        fn showing(screens: &[&str]) -> Self {
+            FakeTarget {
+                screens: RefCell::new(screens.iter().map(ToString::to_string).collect()),
+                ..FakeTarget::new("")
+            }
+        }
+        /// A pane that takes keys but will not give up its screen.
+        fn unreadable() -> Self {
+            FakeTarget {
+                capture_fails: true,
+                ..FakeTarget::new("")
             }
         }
         /// A pane whose size tmux will not report (it went away, or tmux
@@ -173,10 +212,23 @@ mod tests {
     };
     impl Target for FakeTarget {
         fn capture(&self) -> anyhow::Result<String> {
-            Ok(self.screen.clone())
+            if self.capture_fails {
+                anyhow::bail!("can't find pane");
+            }
+            let mut screens = self.screens.borrow_mut();
+            Ok(if screens.len() > 1 {
+                screens.remove(0)
+            } else {
+                screens[0].clone()
+            })
         }
         fn send_line(&self, text: &str) -> anyhow::Result<()> {
             self.sent.borrow_mut().push(text.to_string());
+            Ok(())
+        }
+        fn send_key(&self, key: &str) -> anyhow::Result<()> {
+            let lines_before = self.sent.borrow().len();
+            self.keys.borrow_mut().push((lines_before, key.to_string()));
             Ok(())
         }
         fn dims(&self) -> Option<crate::target::PaneDims> {
@@ -229,6 +281,98 @@ mod tests {
         let out = run_injection(&t, &job(true, &["go"]), &now(), None, None, None).unwrap();
         assert_eq!(out, InjectOutcome::SkippedNoBanner);
         assert!(t.sent.borrow().is_empty());
+    }
+
+    /// Codex names a wall-clock time and a nudge fires after it, so by the time
+    /// this gate looks, the banner's own time has always gone by. That is the
+    /// pane still parked at its limit -- the one case nudge exists for -- and
+    /// must never read as "no banner".
+    #[test]
+    fn verify_sends_into_a_codex_pane_parked_past_its_banner_time() {
+        // now() is 10:00; the banner said 9:57.
+        let t = FakeTarget::new(
+            "■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), \
+             visit https://chatgpt.com/settings/usage to purchase more credits or try again at\n\
+             9:57 AM.\n\n\n› Ask Codex to do anything",
+        );
+        let out = run_injection(&t, &job(true, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Sent(1));
+    }
+
+    /// The dated form is past its time at fire time too, and is no more a
+    /// reason to stand down than the bare one.
+    #[test]
+    fn verify_sends_into_a_codex_pane_parked_past_a_dated_banner() {
+        // now() is 2026-07-13 10:00.
+        let t = FakeTarget::new(
+            "■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), \
+             visit https://chatgpt.com/settings/usage to purchase more credits or try again at Jul\n\
+             13th, 2026 9:57 AM.\n\n\n› Ask Codex to do anything",
+        );
+        let out = run_injection(&t, &job(true, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Sent(1));
+    }
+
+    // ---- a composer in Vim Normal mode ----
+
+    /// The bottom of a parked Codex pane whose composer was left in Normal
+    /// mode, as captured live on 2026-10-12 (the path on its status line
+    /// abridged).
+    const VIM_NORMAL: &str = "\
+› Ask Codex to do anything
+
+  GPT-6.1-Sol xhigh · ~/src                                        Vim: Normal
+  ← for agents · ? for shortcuts
+";
+
+    /// Typed into Normal mode, "go" is two commands, not a message. An `i`
+    /// first is what a person would press, and it has to come before the text.
+    #[test]
+    fn a_composer_in_vim_normal_mode_is_put_in_insert_mode_before_the_message() {
+        let t = FakeTarget::new(VIM_NORMAL);
+        let out = run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Sent(1));
+        assert_eq!(*t.keys.borrow(), vec![(0, "i".to_string())]);
+        assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
+    }
+
+    /// Everywhere else an `i` is a stray letter on the front of the message.
+    #[test]
+    fn a_composer_already_taking_text_gets_no_extra_key() {
+        for screen in [
+            VIM_NORMAL.replace("Vim: Normal", "Vim: Insert"),
+            "❯ \n\n  ? for shortcuts\n".to_string(),
+        ] {
+            let t = FakeTarget::new(&screen);
+            run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+            assert!(t.keys.borrow().is_empty(), "{screen:?}");
+            assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
+        }
+    }
+
+    /// The mode is read again for every message: submitting the first one is
+    /// exactly the kind of thing that changes it.
+    #[test]
+    fn the_composer_mode_is_checked_before_each_message() {
+        // Codex is back in Insert mode once the first message is submitted, and
+        // a second `i` pressed on the strength of the first reading would be
+        // typed: "itwo".
+        let insert = VIM_NORMAL.replace("Vim: Normal", "Vim: Insert");
+        let t = FakeTarget::showing(&[VIM_NORMAL, &insert]);
+        run_injection(&t, &job(false, &["one", "two"]), &now(), None, None, None).unwrap();
+        assert_eq!(*t.keys.borrow(), vec![(0, "i".to_string())]);
+        assert_eq!(*t.sent.borrow(), vec!["one".to_string(), "two".to_string()]);
+    }
+
+    /// Not being able to read the mode is no reason to withhold the nudge. The
+    /// send goes ahead exactly as it did before this check existed.
+    #[test]
+    fn a_pane_whose_mode_cannot_be_read_is_still_sent_to() {
+        let t = FakeTarget::unreadable();
+        let out = run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Sent(1));
+        assert!(t.keys.borrow().is_empty());
+        assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
     }
 
     // ---- the recency gate (finding I19) ----

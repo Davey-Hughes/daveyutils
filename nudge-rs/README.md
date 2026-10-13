@@ -1,10 +1,12 @@
 # nudge
 
-Rate-limit auto-resumer for AI CLIs (Claude Code, Antigravity) running in tmux.
+Rate-limit auto-resumer for AI CLIs (Claude Code, Codex, Antigravity) running in
+tmux.
 
-nudge watches a tmux pane for a rate-limit banner ("resets 3:00pm" / "resets in
-1h30m"), and re-injects your messages when the limit clears — via a small
-resident daemon it manages itself. No `at`, no `fzf`, no coreutils; Linux + macOS.
+nudge watches a tmux pane for a rate-limit banner ("resets 3:00pm" / "try again
+at 6:26 PM" / "resets in 1h30m"), and re-injects your messages when the limit
+clears — via a small resident daemon it manages itself. No `at`, no `fzf`, no
+coreutils; Linux + macOS.
 
 ## Install
 
@@ -131,7 +133,7 @@ What nudge will **not** do is guess. A day it cannot read unambiguously makes it
 two-digit year is the standing example: `7/28/26` is three fields that could each
 be the month, the day, or the year. The error quotes the text it could not read:
 
-    weekly limit banner found in bot:0.1, but I can't read its reset day: " 7/28/26 at "
+    rate-limit banner found in bot:0.1, but I can't read its reset day: " 7/28/26 at "
     (from "You've hit your weekly limit · resets 7/28/26 at 8am")
     Schedule it by hand with -m, and please file this text.
 
@@ -144,6 +146,63 @@ what keeps a bare `Jul 28` from silently resolving into next year.
 
 One gap worth knowing: only the IANA `(Region/City)` zone form is understood. A
 banner that says `8am PT` resolves 8am on *your* machine's clock, not Pacific.
+
+### Codex
+
+nudge reads Codex's usage-limit banner:
+
+    ■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit
+    https://chatgpt.com/settings/usage to purchase more credits or try again at 6:26 PM.
+
+Codex wraps that to the pane itself, so where it breaks depends on how wide the
+pane is, and the time can land alone on the next line. nudge reads the banner as
+the paragraph it is, so the width does not change the answer as long as Codex
+breaks it between words, which is what it does by default. The sentence between
+`hit your usage limit` and `try again at` varies with your plan and is not part
+of the match. Nothing after the time is read, so a line that happens to sit
+directly under the banner cannot change the day.
+
+The `/status` card that Codex's "Run /status for a breakdown" points you to has
+a `Weekly limit: ... (resets ...)` row. That is a usage report, not a limit you
+have hit, and nudge ignores it.
+
+A reset that is not today carries its date, which goes through the same day
+scanner as the weekly banner above, with the same refusal for a day it cannot
+read:
+
+    ... or try again at Oct 14th, 2026 6:26 PM.
+
+Because Codex dates every reset that is not today, a bare time means *today's*.
+One whose hour has already gone by today is a reset that has happened, not
+tomorrow's, and nudge says so rather than schedule a day late. A dated banner
+whose time has passed gets the same answer:
+
+    the rate-limit banner in bot:0.1 says to try again at 4:20 AM, and that has already passed
+    (from "■ You’ve hit your usage limit. ... or try again at 4:20 AM.")
+    Its reset has come and gone, so the pane no longer says when to nudge. Pass -m to set a time.
+
+What nudge cannot catch is a bare banner left on screen from an earlier day
+whose hour has not yet come round today. `try again at 9:49 PM` from last night,
+read this morning, is identical to one printed this morning, and is scheduled
+for tonight. Check the time nudge reports when the pane has been sitting a
+while. The time is also read on your machine's clock, so a Codex running in
+another time zone, over ssh for instance, needs `-m`.
+
+`try again later`, which Codex prints when it has no reset to quote, names no
+time and is not detected. Use `-m`, and leave `-v` off for that job: with no
+banner it recognises, the verify gate would skip it.
+
+If Codex's Vim keys are on and you left the composer in Normal mode, typed text
+would be read as commands: `please continue` arrives as `se continue`. nudge
+checks for a status line ending in `Vim: Normal` and presses `i` first. It looks
+only at the last two lines of the pane, where Codex draws that line, so a pane
+that merely mentions those words, or a draft that ends in them, is left alone.
+This relies on the Vim mode being shown in Codex's status line.
+
+When a nudge fires, nudge waits half a second between typing the message and
+pressing Enter. Codex treats keystrokes that arrive faster than anyone types as
+a paste, and an Enter within 120ms of one as a newline inside it, so an Enter
+sent straight after the text left the message sitting in the composer, unsent.
 
 ### `--verify`
 

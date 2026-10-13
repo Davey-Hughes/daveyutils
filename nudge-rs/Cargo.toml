@@ -13,7 +13,11 @@ name = "nudge"
 # the wire format.
 # 0.4.0 adds the client-side TUI dashboard: no wire/daemon change, so this bump
 # is a feature marker, not compat-load-bearing like the ones above.
-version = "0.4.0"
+# 0.5.0 adds the Codex banner, and is load-bearing the way 0.3.0 was: a 0.4.0
+# daemon does not know that banner either, and under --verify would skip it. It
+# also presses Enter too soon after the text for Codex, which leaves the
+# message sitting in the composer, unsent.
+version = "0.5.0"
 edition = "2021"
 description = "Rate-limit auto-resumer for AI CLIs in tmux"
 license = "GPL-3.0-or-later"

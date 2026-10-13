@@ -84,7 +84,7 @@ fn cancel_over_ipc_removes_the_job() {
     let resp = client::request(&socket, &Request::Cancel(1)).unwrap();
     h.join().unwrap();
     assert_eq!(resp, Response::Cancelled(true));
-    assert!(queue.lock().unwrap().all().is_empty());
+    assert_eq!(queue.lock().unwrap().all(), []);
 }
 
 fn noon() -> jiff::Zoned {

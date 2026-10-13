@@ -9,6 +9,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod app;
 pub mod cli;
+pub mod composer;
 pub mod config;
 pub mod daemon;
 pub mod detect;

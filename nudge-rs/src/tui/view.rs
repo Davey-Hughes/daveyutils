@@ -210,7 +210,10 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
             Some(crate::detect::Detection::Reset(z)) => format!("auto → {z}"),
             Some(crate::detect::Detection::None) => "auto → no banner detected".to_string(),
             Some(crate::detect::Detection::Unreadable { gap, .. }) => {
-                format!("auto → weekly, day unreadable ({gap:?})")
+                format!("auto → day unreadable ({gap:?})")
+            }
+            Some(crate::detect::Detection::Elapsed { time, .. }) => {
+                format!("auto → reset already passed ({time})")
             }
             None => "auto → (select a pane)".to_string(),
         },

@@ -179,9 +179,15 @@ pub fn fire_time(cli: &Cli, pane: &str, now: &Zoned) -> anyhow::Result<jiff::Tim
             bail!("no rate-limit banner detected in {pane}; pass -m to set a time")
         }
         crate::detect::Detection::Unreadable { banner, gap } => bail!(
-            "weekly limit banner found in {pane}, but I can't read its reset day: {gap:?}\n\
+            "rate-limit banner found in {pane}, but I can't read its reset day: {gap:?}\n\
              (from {banner:?})\n\
              Schedule it by hand with -m, and please file this text."
+        ),
+        crate::detect::Detection::Elapsed { banner, time } => bail!(
+            "the rate-limit banner in {pane} says to try again at {time}, and that has already passed\n\
+             (from {banner:?})\n\
+             Its reset has come and gone, so the pane no longer says when to nudge. \
+             Pass -m to set a time."
         ),
     }
 }
@@ -1095,7 +1101,7 @@ mod tests {
             script.contains("nudge"),
             "completion script should mention the binary"
         );
-        assert!(!script.is_empty());
+        assert_ne!(script, "");
     }
 
     #[test]

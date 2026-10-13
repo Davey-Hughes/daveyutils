@@ -2,8 +2,21 @@
 
 use anyhow::{bail, Context, Result};
 use std::process::{Command, Output};
+use std::time::Duration;
 
 use super::{PaneDims, Target};
+
+/// How long to leave between typed text and a key that has to be read as a
+/// keypress of its own: the Enter after a message, or a key pressed before one.
+///
+/// Codex reads keystrokes that arrive faster than anyone types as a paste, and
+/// for 120ms after the last of them (`PASTE_ENTER_SUPPRESS_WINDOW` in codex-rs
+/// `tui/src/bottom_pane/paste_burst.rs`) takes Enter as a newline inside that
+/// paste rather than a submit. `send-keys -l` delivers the whole message at
+/// once and the Enter followed it by about 2ms, so in Codex the nudge sat in
+/// the composer, unsent. Several times that window, and still nothing a person
+/// waiting on a rate limit would notice.
+const KEYPRESS_PAUSE: Duration = Duration::from_millis(500);
 
 /// A specific tmux pane, addressed by tmux's target syntax (e.g. "bot:0.1").
 /// An optional server socket (`tmux -L <socket>`) supports non-default servers
@@ -64,9 +77,18 @@ impl Target for TmuxTarget {
 
     fn send_line(&self, text: &str) -> Result<()> {
         // `-l` sends the text literally so tmux doesn't interpret key names;
-        // a separate `Enter` submits it.
+        // a separate `Enter`, after KEYPRESS_PAUSE, submits it.
         self.run(&["send-keys", "-t", &self.pane, "-l", "--", text])?;
+        std::thread::sleep(KEYPRESS_PAUSE);
         self.run(&["send-keys", "-t", &self.pane, "Enter"])?;
+        Ok(())
+    }
+
+    fn send_key(&self, key: &str) -> Result<()> {
+        // The pause comes after the key, so that the caller's next send cannot
+        // run into it.
+        self.run(&["send-keys", "-t", &self.pane, "-l", "--", key])?;
+        std::thread::sleep(KEYPRESS_PAUSE);
         Ok(())
     }
 

@@ -540,6 +540,34 @@ pub fn resolve_day_clock(
     }
 }
 
+/// Whether `day` + `clock_token` name a moment already behind `now`.
+///
+/// Only a date that states its own year can say so. Without one, a month and
+/// day that have gone by are read as next year's, which is what
+/// [`resolve_day_clock`] does before refusing it for being past the horizon —
+/// and the relative days never name the past at all.
+pub fn day_clock_has_passed(now: &Zoned, day: DaySpec, clock_token: &str) -> bool {
+    let DaySpec::MonthDay {
+        month,
+        day,
+        year: Some(year),
+    } = day
+    else {
+        return false;
+    };
+    let Some((hour, minute)) = clock_hm(clock_token) else {
+        return false;
+    };
+    jiff::civil::Date::new(year, month, day)
+        .ok()
+        .and_then(|date| {
+            date.at(hour, minute, 0, 0)
+                .to_zoned(now.time_zone().clone())
+                .ok()
+        })
+        .is_some_and(|moment| &moment <= now)
+}
+
 /// Choose between two readings of a numeric date that both name a real,
 /// imminent instant.
 ///
@@ -1247,5 +1275,37 @@ mod tests {
             resolve_day_clock(&now(), on(9, 31), "8am", DateOrder::Unknown),
             None
         );
+    }
+
+    /// `now()` is 2026-07-13 10:00.
+    #[test]
+    fn a_date_with_its_year_can_be_seen_to_have_passed() {
+        let dated = |month, day, year| DaySpec::MonthDay {
+            month,
+            day,
+            year: Some(year),
+        };
+        assert!(day_clock_has_passed(&now(), dated(7, 13, 2026), "9:57 AM"));
+        assert!(day_clock_has_passed(&now(), dated(7, 12, 2026), "11pm"));
+        assert!(day_clock_has_passed(&now(), dated(12, 25, 2025), "8am"));
+        // Still ahead, whether by a minute or by months.
+        assert!(!day_clock_has_passed(&now(), dated(7, 13, 2026), "10:01"));
+        assert!(!day_clock_has_passed(&now(), dated(12, 25, 2026), "8am"));
+    }
+
+    /// Nothing else is past, only unresolvable: a yearless date behind us means
+    /// next year's, a date that does not exist is not a moment, and a clock that
+    /// does not parse says nothing.
+    #[test]
+    fn only_a_real_dated_moment_can_have_passed() {
+        assert!(!day_clock_has_passed(&now(), on(7, 12), "8am"));
+        assert!(!day_clock_has_passed(&now(), DaySpec::Today, "8am"));
+        let dated = |month, day| DaySpec::MonthDay {
+            month,
+            day,
+            year: Some(2026),
+        };
+        assert!(!day_clock_has_passed(&now(), dated(2, 30), "8am"));
+        assert!(!day_clock_has_passed(&now(), dated(7, 12), "25:00"));
     }
 }

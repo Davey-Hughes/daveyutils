@@ -16,7 +16,24 @@ const CLOCK_BASE: &str = r"(?:session limit|current session).*resets";
 const DURATION_BASE: &str = r"quota reached";
 
 /// The built-in weekly-shape banner alternation.
-const WEEKLY_BASE: &str = r"weekly limit.*resets";
+///
+/// No colon may come between the two halves. Claude's banner has none, and the
+/// weekly row of Codex's `/status` card — "Weekly limit:  [███░░] 21% left
+/// (resets 09:12 on 18 Oct)" — has one. That row is a usage report, not a limit
+/// anyone has hit, and it is drawn under the banner that is.
+const WEEKLY_BASE: &str = r"weekly limit[^:\n]*resets";
+
+/// The built-in Codex banner: "You've hit your usage limit. <a sentence that
+/// depends on the plan> try again at". Matched against [`unwrap_paragraphs`]'
+/// output, where the banner is one line however the pane broke it — which is
+/// also what keeps `.*?` from pairing a "usage limit" with a "try again at"
+/// that belongs to some other paragraph.
+///
+/// "hit your" is required because unwrapping joins any two adjacent lines, and
+/// "usage limit ... try again at" alone is two phrases prose can put side by
+/// side. It sits outside the group because the banner is taken to start at
+/// "usage limit": see where this is pushed in [`detect_reset`].
+const CODEX_BASE: &str = r"hit[ \t]+your[ \t]+(usage[ \t]+limit.*?try[ \t]+again[ \t]+at\b)";
 
 /// Built-in clock-shape banner alternation, optionally extended by the user's
 /// `NUDGE_CLOCK_PATTERN`.
@@ -118,6 +135,11 @@ enum Shape {
     /// The only shape whose reset may be days away, so the only one that must
     /// read a day out of the gap before its clock token means anything.
     Weekly,
+    /// "You've hit your usage limit. ... or try again at Oct 14th, 2026 6:26 PM."
+    /// Codex's banner. Dated like the weekly one, and read the same way, but a
+    /// paragraph rather than a line: Codex wraps its own output to the pane, so
+    /// a capture holds the banner in pieces.
+    Codex,
 }
 
 /// What `detect_reset` concluded about a pane.
@@ -132,9 +154,14 @@ pub enum Detection {
     None,
     /// A banner, and the padded absolute reset time it names.
     Reset(Zoned),
-    /// A weekly banner whose reset day this parser does not understand.
+    /// A dated banner whose reset day this parser does not understand.
     /// Carries the offending text verbatim so the report *is* the bug capture.
     Unreadable { banner: String, gap: String },
+    /// A banner whose reset has already happened: the time it names, read
+    /// perfectly well, has gone by. Only a banner that dates every reset *not*
+    /// today can say this of a bare time — for any other, an hour already past
+    /// is simply tomorrow's.
+    Elapsed { banner: String, time: String },
 }
 
 /// Returns the padded absolute reset time, or `Detection::None` if no banner is
@@ -168,6 +195,22 @@ pub fn detect_reset(
             .find_iter(&clean)
             .map(|m| (m.start(), m.end(), Shape::Duration)),
     );
+    // Codex's banner is matched, and later read, on the unwrapped text. The two
+    // strings are the same length, so these offsets sort against the others.
+    //
+    // Pushed BEFORE Clock for the reason Weekly is, below: `NUDGE_CLOCK_PATTERN=
+    // "usage limit"` is the obvious way to have taught nudge about Codex by
+    // hand, it matches at this banner's own offset, and the Clock shape reads a
+    // dated banner days early. Like Weekly's, this settles an exact tie and no
+    // more: a user pattern that matches further into the banner is lower on
+    // screen as far as the walk below can tell, and still wins it.
+    let flat = unwrap_paragraphs(&clean);
+    banners.extend(
+        builtin_re(CODEX_BASE)
+            .captures_iter(&flat)
+            .filter_map(|c| c.get(1))
+            .map(|m| (m.start(), m.end(), Shape::Codex)),
+    );
     // Pushed BEFORE Clock: the sort below is stable, so insertion order breaks
     // an exact-offset tie. A user whose NUDGE_CLOCK_PATTERN is "weekly limit"
     // makes both shapes match at the same offset, and the Clock shape reading a
@@ -192,6 +235,16 @@ pub fn detect_reset(
         // scrollback, and an unrelated duration-shaped substring earlier in the
         // pane (e.g. "16 minutes ago" in a shell prompt) must not be mistaken
         // for the banner's own countdown.
+        if let Shape::Codex = shape {
+            // A Codex banner is a paragraph, which is a line only in the
+            // unwrapped text.
+            let after = flat[end..].split('\n').next().unwrap_or("");
+            match read_codex(after, &banner_line(&flat, start), now, order) {
+                Some(detection) => return detection,
+                // It names no time. Try the banner above.
+                None => continue,
+            }
+        }
         let rest = &clean[end..];
         // The zone belongs to the banner's line. `rest` runs to the end of the
         // capture, and a "(Region/City)" further down the scrollback is not this
@@ -200,9 +253,10 @@ pub fn detect_reset(
         let now = &now_in_zone(now, find_zone_token(line_rest).as_deref());
 
         if let Shape::Weekly = shape {
-            // The weekly banner is the only one whose reset may be days away,
-            // and the only one that names no day in its bare form. Its own line
-            // — minus the clock token — is the entire signal.
+            // Of the banners read off a single line, the weekly one is the only
+            // one whose reset may be days away, and the only one that names no
+            // day in its bare form. Its own line — minus the clock token — is
+            // the entire signal.
             //
             // Parenthetical asides are not part of it. The zone was read off
             // this line just above, and "(America/Los_Angeles)" reaching the
@@ -256,7 +310,7 @@ pub fn detect_reset(
         let token = match shape {
             Shape::Duration => find_duration_token(rest),
             Shape::Clock => find_clock_token(rest),
-            Shape::Weekly => unreachable!("handled above"),
+            Shape::Weekly | Shape::Codex => unreachable!("handled above"),
         };
         if let Some(token) = token {
             if let Ok(z) = parse_timespec(&token, now) {
@@ -271,6 +325,86 @@ pub fn detect_reset(
     }
 
     Detection::None
+}
+
+/// Read the reset out of the rest of a Codex banner — what follows "try again
+/// at" in its paragraph. `None` means it names no time at all.
+///
+/// Codex prints `6:26 PM` for a reset later today and `Oct 14th, 2026 6:26 PM`
+/// for one on any other day, in the machine's own zone, and its sentence ends
+/// there. So nothing is read past the clock token, and no zone is looked for: a
+/// line that happens to sit directly under the banner is joined to its
+/// paragraph, and still says nothing about the reset.
+///
+/// That formatting rule is also why a bare time means today's and no other —
+/// and so why one already behind us is a reset that has happened, where for
+/// any other banner it would simply be tomorrow's. What it cannot tell apart is
+/// a banner left on screen from an earlier day whose hour has not yet come
+/// round: that is byte-identical to one printed this morning, and reads as
+/// today's.
+fn read_codex(
+    after: &str,
+    banner: &str,
+    now: &Zoned,
+    order: crate::timespec::DateOrder,
+) -> Option<Detection> {
+    let m = find_clock_token_match(after)?;
+    let gap = &after[..m.start()];
+    let token = m.as_str();
+    let unreadable = || Detection::Unreadable {
+        banner: banner.to_string(),
+        gap: gap.to_string(),
+    };
+    let elapsed = |time: String| Detection::Elapsed {
+        banner: banner.to_string(),
+        time,
+    };
+
+    let reset = match crate::timespec::parse_day_words(&significant_words(gap)) {
+        Some(DayWords::Named(day)) => {
+            match crate::timespec::resolve_day_clock(now, day, token, order) {
+                Some(reset) => reset,
+                // A date read perfectly well that will not resolve because it
+                // has gone by is not one this parser failed to read.
+                None if crate::timespec::day_clock_has_passed(now, day, token) => {
+                    return Some(elapsed(format!("{} {token}", gap.trim())));
+                }
+                None => return Some(unreadable()),
+            }
+        }
+        Some(DayWords::Unnamed) => match parse_timespec(token, now) {
+            Ok(next) if next.date() == now.date() => next,
+            // The next such hour is tomorrow's, so today's has gone by.
+            Ok(_) => return Some(elapsed(token.to_string())),
+            Err(_) => return Some(unreadable()),
+        },
+        // The tripwire the weekly banner has, for the day Codex rewords this.
+        None => return Some(unreadable()),
+    };
+    Some(match reset.checked_add(PADDING_MINUTES.minutes()) {
+        Ok(padded) => Detection::Reset(padded),
+        Err(_) => unreadable(),
+    })
+}
+
+/// `text` with every line break that falls inside a paragraph turned into a
+/// space, so that a banner its CLI wrapped to the pane reads as the one line it
+/// was written as.
+///
+/// A blank line still ends a paragraph: only a break with text on both sides of
+/// it is a wrap. And a break is swapped for a space byte for byte, so an offset
+/// into the result is the same offset into `text`.
+fn unwrap_paragraphs(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in lines.iter().enumerate() {
+        out.push_str(line);
+        if let Some(next) = lines.get(i + 1) {
+            let wrapped = !line.trim().is_empty() && !next.trim().is_empty();
+            out.push(if wrapped { ' ' } else { '\n' });
+        }
+    }
+    out
 }
 
 /// Extract an IANA zone name from a trailing `(America/Los_Angeles)`.
@@ -946,5 +1080,299 @@ mod tests {
             "Weekly must win the tie and read the date; the Clock shape would \
              have scheduled tomorrow"
         );
+    }
+
+    // ---- Codex ----
+
+    /// Codex's banner up to its timestamp, as one logical line. A capture never
+    /// sees it this way: Codex lays its own output out to the pane, breaking at
+    /// word boundaries, and [`wrapped`] reproduces that.
+    const CODEX: &str = "■ You’ve hit your usage limit. Upgrade to Pro \
+        (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage \
+        to purchase more credits or try again at";
+
+    /// What sits under the banner in a parked Codex pane.
+    const CODEX_COMPOSER: &str = "\n\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol xhigh · ~/src";
+
+    /// `text` wrapped to `width` columns at word boundaries.
+    fn wrapped(text: &str, width: usize) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        for word in text.split(' ') {
+            match lines.last_mut() {
+                Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
+                    line.push(' ');
+                    line.push_str(word);
+                }
+                _ => lines.push(word.to_string()),
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// The banner and composer, verbatim, from a live 166-column pane on
+    /// 2026-10-12 (the status line under them is abridged). The timestamp did
+    /// not fit on the banner's line and sits alone on the next.
+    #[test]
+    fn detects_the_captured_codex_banner() {
+        let pane = "    + Show details\n\n\
+            ■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), \
+            visit https://chatgpt.com/settings/usage to purchase more credits or try again at\n\
+            6:26 PM.\n\n\n\
+            › Ask Codex to do anything\n\n  GPT-6.1-Sol xhigh · ~/src";
+        // The helper every wrap test below leans on must agree with the one
+        // layout that was actually observed.
+        assert!(
+            pane.contains(&wrapped(&format!("{CODEX} 6:26 PM."), 166)),
+            "wrapped() does not reproduce the live capture at the live width"
+        );
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
+        // 18:26 + 3 minutes padding.
+        assert_eq!(
+            (z.date(), z.hour(), z.minute()),
+            (jiff::civil::date(2026, 7, 13), 18, 29)
+        );
+    }
+
+    /// Where the banner breaks is the pane's width and nothing else, so no break
+    /// may change the reading -- not one between "usage limit" and "try again
+    /// at", not one inside "try again at", and not one that parts "6:26" from
+    /// its "PM".
+    #[test]
+    fn a_codex_banner_reads_the_same_however_the_pane_wraps_it() {
+        // 36 columns is the narrowest pane that holds the banner's longest word.
+        for width in 36..=200 {
+            let pane = format!(
+                "{}{CODEX_COMPOSER}",
+                wrapped(&format!("{CODEX} 6:26 PM."), width)
+            );
+            let z = reset_of(detect_reset(&pane, &now(), None, None, None));
+            assert_eq!(
+                (z.date(), z.hour(), z.minute()),
+                (jiff::civil::date(2026, 7, 13), 18, 29),
+                "wrapped to {width} columns:\n{pane}"
+            );
+        }
+    }
+
+    /// The dated form, verbatim, from that same 166-column pane at 21:58 that
+    /// evening, in a zone seven hours behind UTC. The reset was past midnight,
+    /// so the banner carries its date -- and the wrap falls inside it.
+    #[test]
+    fn detects_the_captured_dated_codex_banner() {
+        let pane =
+            "■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), \
+            visit https://chatgpt.com/settings/usage to purchase more credits or try again at Oct\n\
+            13th, 2026 1:40 AM.\n\n\n\
+            › Ask Codex to do anything";
+        let now = date(2026, 10, 12)
+            .at(21, 58, 0, 0)
+            .to_zoned(TimeZone::fixed(jiff::tz::offset(-7)))
+            .unwrap();
+        let z = reset_of(detect_reset(pane, &now, None, None, None));
+        // 01:40 the next morning + 3 minutes padding.
+        assert_eq!(
+            (z.date(), z.hour(), z.minute()),
+            (jiff::civil::date(2026, 10, 13), 1, 43)
+        );
+    }
+
+    /// A reset that is not today carries its date, and reading only the clock
+    /// off it is the days-early misfire. Wherever the pane breaks that date, it
+    /// is the same date.
+    #[test]
+    fn a_dated_codex_banner_resolves_on_the_day_it_names() {
+        for width in 36..=200 {
+            let pane = format!(
+                "{}{CODEX_COMPOSER}",
+                wrapped(&format!("{CODEX} Jul 16th, 2026 6:26 PM."), width)
+            );
+            let z = reset_of(detect_reset(&pane, &now(), None, None, None));
+            assert_eq!(
+                (z.date(), z.hour(), z.minute()),
+                (jiff::civil::date(2026, 7, 16), 18, 29),
+                "wrapped to {width} columns:\n{pane}"
+            );
+        }
+    }
+
+    /// The sentence before "try again at" depends on the plan. These are the
+    /// other wordings in the 0.162.1 binary; none may be missed for its prose.
+    #[test]
+    fn every_codex_plan_wording_is_the_same_banner() {
+        for lead in [
+            "Visit https://chatgpt.com/settings/usage to purchase more credits or try again at",
+            "To get more access now, send a request to your admin or try again at",
+            "Try again at",
+        ] {
+            let pane = format!("■ You’ve hit your usage limit. {lead} 6:26 PM.{CODEX_COMPOSER}");
+            let z = reset_of(detect_reset(&pane, &now(), None, None, None));
+            assert_eq!((z.hour(), z.minute()), (18, 29), "{lead:?}");
+        }
+    }
+
+    /// `NUDGE_CLOCK_PATTERN="usage limit"` is how anyone taught nudge about
+    /// Codex before it knew, and it matches at the banner's own offset. The
+    /// Clock shape reads only "6:26 PM" off a dated banner -- today, three days
+    /// before the date it names -- so the built-in shape must win the tie.
+    #[test]
+    fn codex_beats_clock_on_an_exact_offset_tie() {
+        let pane = format!("{CODEX} Jul 16th, 2026 6:26 PM.{CODEX_COMPOSER}");
+        let z = reset_of(detect_reset(&pane, &now(), Some("usage limit"), None, None));
+        assert_eq!(z.date(), jiff::civil::date(2026, 7, 16));
+    }
+
+    /// Captured the same afternoon as the banner above, at 14:52, from a pane
+    /// that had sat since before dawn. Codex dates every reset that is not
+    /// today, so a bare time already behind us is a reset that has happened --
+    /// and reading it as "the next 4:20 AM" schedules a nudge for tomorrow, most
+    /// of a day after the limit it was waiting on lifted.
+    #[test]
+    fn a_bare_codex_time_already_past_is_elapsed_not_tomorrow() {
+        let pane = format!(
+            "{}{CODEX_COMPOSER}",
+            wrapped(&format!("{CODEX} 4:20 AM."), 166)
+        );
+        match detect_reset(&pane, &now(), None, None, None) {
+            Detection::Elapsed { banner, time } => {
+                assert_eq!(time, "4:20 AM");
+                assert!(
+                    banner.contains("usage limit") && banner.contains("4:20 AM."),
+                    "the whole banner must be quoted, unwrapped: {banner:?}"
+                );
+            }
+            other => panic!("4:20 AM read at 10:00 is a reset gone by; got {other:?}"),
+        }
+    }
+
+    /// The newest banner decides, as it does for an unreadable weekly one: an
+    /// older banner further up is superseded, not a second opinion.
+    #[test]
+    fn an_elapsed_codex_banner_does_not_fall_back_to_an_older_one() {
+        let pane = format!("current session resets 3:00pm\n\n{CODEX} 4:20 AM.{CODEX_COMPOSER}");
+        assert!(matches!(
+            detect_reset(&pane, &now(), None, None, None),
+            Detection::Elapsed { .. }
+        ));
+    }
+
+    /// The tripwire the weekly banner has, for the day Codex rewords this one.
+    #[test]
+    fn an_unreadable_codex_gap_refuses_and_quotes_the_text() {
+        let pane = format!("{CODEX} roughly 6:26 PM.{CODEX_COMPOSER}");
+        match detect_reset(&pane, &now(), None, None, None) {
+            Detection::Unreadable { banner, gap } => {
+                assert!(gap.contains("roughly"), "the gap must be quoted: {gap:?}");
+                assert!(banner.contains("usage limit"), "{banner:?}");
+            }
+            other => panic!("an unread word before the time must refuse; got {other:?}"),
+        }
+    }
+
+    /// With no reset to quote, Codex ends the sentence "try again later." There
+    /// is no time in that, and so nothing for nudge to schedule from.
+    #[test]
+    fn a_codex_banner_that_names_no_time_is_not_a_banner() {
+        let pane = format!("■ You’ve hit your usage limit. Try again later.{CODEX_COMPOSER}");
+        assert_eq!(
+            detect_reset(&pane, &now(), None, None, None),
+            Detection::None
+        );
+    }
+
+    /// Unwrapping stops at a blank line, so the two halves of the pattern
+    /// cannot be assembled out of two unrelated paragraphs.
+    #[test]
+    fn a_blank_line_ends_a_codex_banner() {
+        let pane = "■ You’ve hit your usage limit.\n\nWe could try again at 9:00 PM";
+        assert_eq!(
+            detect_reset(pane, &now(), None, None, None),
+            Detection::None
+        );
+    }
+
+    /// Unwrapping joins any two adjacent lines, so the pattern has to be worth
+    /// more than two phrases that prose puts side by side. Here that prose sits
+    /// below a real banner, where it would have decided the pane.
+    #[test]
+    fn two_lines_of_prose_about_limits_are_not_a_codex_banner() {
+        let pane = "current session resets 3:00pm\n\n\
+                    notes on the usage limit\nwe could try again at 9:00 PM";
+        let z = reset_of(detect_reset(pane, &now(), None, None, None));
+        assert_eq!((z.hour(), z.minute()), (15, 3));
+    }
+
+    /// Codex's sentence ends at its time. A line that happens to sit directly
+    /// under the banner is joined to its paragraph, and is still not part of it:
+    /// it names neither the reset's day nor its zone.
+    #[test]
+    fn text_under_a_codex_banner_is_not_part_of_it() {
+        for under in [
+            "Run it again Friday if that fails",
+            "(Asia/Tokyo) is where the build server lives",
+        ] {
+            let pane = format!("{CODEX} 6:26 PM.\n{under}");
+            let z = reset_of(detect_reset(&pane, &now(), None, None, None));
+            assert_eq!(
+                z.timestamp().to_string(),
+                "2026-07-13T18:29:00Z",
+                "{under:?}"
+            );
+        }
+    }
+
+    /// The `/status` card, as Codex 0.162.1's own snapshot test draws it (not
+    /// yet captured live). Its weekly row says "Weekly limit ... resets", which
+    /// is Claude's weekly banner as far as a loose pattern can tell -- and the
+    /// card is what Codex's "Run /status for a breakdown" asks for, so it lands
+    /// under the banner and would decide the pane.
+    const CODEX_STATUS_CARD: &str = "\
+│  5h limit:         [░░░░░░░░░░░░░░░░░░░░] 0% left (resets 18:26)            │
+│  Weekly limit:     [████░░░░░░░░░░░░░░░░] 21% left (resets 09:12 on 18 Oct) │";
+
+    #[test]
+    fn a_codex_status_card_under_the_banner_does_not_decide_the_reset() {
+        let pane = format!("{CODEX} 6:26 PM.\n\n{CODEX_STATUS_CARD}{CODEX_COMPOSER}");
+        let z = reset_of(detect_reset(&pane, &now(), None, None, None));
+        assert_eq!(
+            (z.date(), z.hour(), z.minute()),
+            (jiff::civil::date(2026, 7, 13), 18, 29)
+        );
+    }
+
+    /// And by itself it is a usage report, not a limit anyone has hit.
+    #[test]
+    fn a_codex_status_card_is_not_a_banner() {
+        assert_eq!(
+            detect_reset(CODEX_STATUS_CARD, &now(), None, None, None),
+            Detection::None
+        );
+    }
+
+    /// The dated banner captured above, read twenty minutes after the time it
+    /// names. That is a reset that has happened, and saying "I can't read its
+    /// reset day, please file this text" about a date read perfectly well sends
+    /// the user off to report a bug that is not one.
+    #[test]
+    fn a_dated_codex_banner_already_past_is_elapsed_not_unreadable() {
+        let pane = format!("{CODEX} Oct\n13th, 2026 1:40 AM.{CODEX_COMPOSER}");
+        let now = date(2026, 10, 13)
+            .at(2, 0, 0, 0)
+            .to_zoned(TimeZone::fixed(jiff::tz::offset(-7)))
+            .unwrap();
+        match detect_reset(&pane, &now, None, None, None) {
+            Detection::Elapsed { time, .. } => assert_eq!(time, "Oct 13th, 2026 1:40 AM"),
+            other => panic!("a date that has gone by is elapsed; got {other:?}"),
+        }
+    }
+
+    /// A date this far out is not a rate limit, whoever prints it. Being past
+    /// is the one new way for a date not to resolve; this is still the old one.
+    #[test]
+    fn a_dated_codex_banner_past_the_horizon_still_refuses() {
+        let pane = format!("{CODEX} Dec 25th, 2026 6:26 PM.{CODEX_COMPOSER}");
+        assert!(matches!(
+            detect_reset(&pane, &now(), None, None, None),
+            Detection::Unreadable { .. }
+        ));
     }
 }

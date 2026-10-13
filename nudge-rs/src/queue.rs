@@ -258,7 +258,7 @@ mod tests {
     fn load_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::load(dir.path().join("nope.json")).unwrap();
-        assert!(q.all().is_empty());
+        assert_eq!(q.all(), []);
     }
 
     #[test]

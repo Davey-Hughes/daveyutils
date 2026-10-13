@@ -44,6 +44,10 @@ pub trait Target {
     /// Type `text` into the target and submit it (as if Enter were pressed).
     fn send_line(&self, text: &str) -> Result<()>;
 
+    /// Press `key` by itself, as a person would: a keypress the target reads on
+    /// its own, not the first character of whatever is typed next.
+    fn send_key(&self, key: &str) -> Result<()>;
+
     /// The target's current geometry, or `None` if it cannot be determined.
     ///
     /// `None`, not `Err`: not knowing the size is never a reason to fail a
