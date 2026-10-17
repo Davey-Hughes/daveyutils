@@ -142,3 +142,37 @@ fn verbose_reports_the_read_path() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("5 events via Walk"), "{err}");
 }
+
+#[test]
+fn a_truncated_file_is_warned_about_and_still_extracted() {
+    let dir = tempfile::tempdir().unwrap();
+    let whole = subcheck(
+        dir.path(),
+        &[
+            "extract",
+            fixture("ass-plain.mkv").to_str().unwrap(),
+            "-o",
+            "-",
+        ],
+    );
+    assert!(
+        whole.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&whole.stderr)
+    );
+
+    // One byte short: only the Tags at the end are lost, so the subtitles all come out.
+    let (_copy, file) = common::copied("ass-plain.mkv");
+    let full = std::fs::metadata(&file).unwrap().len();
+    common::cut(&file, full - 1);
+    let out = subcheck(dir.path(), &["extract", file.to_str().unwrap(), "-o", "-"]);
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    let warning = format!(
+        "warning: {}: truncated: file has {} of the {full} bytes its Segment declares (99.9%)",
+        file.display(),
+        full - 1
+    );
+    assert!(err.contains(&warning), "{err}");
+    assert_eq!(out.stdout, whole.stdout);
+}

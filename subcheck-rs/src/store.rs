@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+use crate::mkv::Truncated;
 use crate::text::Occurrence;
 
 /// The state directory, from explicit inputs. An empty or relative `XDG_STATE_HOME` is ignored,
@@ -69,6 +70,10 @@ pub struct FileRecord {
     pub tracks: Vec<TrackRecord>,
     /// Distinct lines checked.
     pub lines: usize,
+    /// Set when the file is shorter than its Segment says: the findings cover only what is there.
+    /// Left out of the JSON otherwise, so run files from before it read the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<Truncated>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -422,6 +427,36 @@ mod tests {
         assert_eq!(run.state_of(1), State::Rejected);
         assert_eq!(run.state_of(2), State::Pending);
         assert_eq!(run.name, w.name);
+    }
+
+    #[test]
+    fn a_file_record_says_truncated_only_when_it_was() {
+        let file = |truncated| FileRecord {
+            path: "/m/a.mkv".into(),
+            size: 1,
+            mtime: Timestamp::UNIX_EPOCH,
+            error: None,
+            tracks: vec![],
+            lines: 0,
+            truncated,
+        };
+        // Whole files are written as before, so run files from before the field read the same.
+        let whole = serde_json::to_string(&Record::File(file(None))).unwrap();
+        assert!(!whole.contains("truncated"), "{whole}");
+        assert_eq!(
+            serde_json::from_str::<Record>(&whole).unwrap(),
+            Record::File(file(None))
+        );
+        let cut = Record::File(file(Some(Truncated {
+            declared_end: 2,
+            file_size: 1,
+        })));
+        let line = serde_json::to_string(&cut).unwrap();
+        assert!(
+            line.contains(r#""truncated":{"declared_end":2,"file_size":1}"#),
+            "{line}"
+        );
+        assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), cut);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use std::fmt::Write;
 
+use crate::mkv::Truncated;
 use crate::store::{FileRecord, Finding, Run, State};
 use crate::text::timestamp;
 
@@ -75,6 +76,17 @@ pub fn render(run: &Run, filter: Filter, mpv: bool) -> String {
             let _ = writeln!(out, "  {}: {}", f.path, f.error.as_deref().unwrap_or(""));
         }
     }
+    let truncated: Vec<(&str, Truncated)> = run
+        .files
+        .iter()
+        .filter_map(|f| Some((f.path.as_str(), f.truncated?)))
+        .collect();
+    if !truncated.is_empty() {
+        let _ = writeln!(out, "\nTruncated (replace these copies):");
+        for (path, t) in truncated {
+            let _ = writeln!(out, "  {path}: {}", t.shortfall());
+        }
+    }
     out
 }
 
@@ -140,6 +152,7 @@ mod tests {
             error: None,
             tracks: vec![track(5, 1, true), track(6, 2, false)],
             lines: 486,
+            truncated: None,
         };
         let path = file.path.clone();
         let finding = |id, original: &str, suggestion: &str, occ: Vec<(usize, i64)>| Finding {
@@ -215,6 +228,21 @@ mod tests {
         assert_eq!(
             mpv_command(&r, &r.findings[0]),
             "mpv --start=0:02:43.06 --sid=1 '/m/K-On!! - E02.mkv'"
+        );
+    }
+
+    #[test]
+    fn truncated_files_are_listed_for_replacing() {
+        let mut r = run();
+        assert!(!render(&r, Filter::All, false).contains("Truncated"));
+        r.files[0].truncated = Some(Truncated {
+            declared_end: 2000,
+            file_size: 1000,
+        });
+        let text = render(&r, Filter::All, false);
+        assert!(
+            text.ends_with("\nTruncated (replace these copies):\n  /m/K-On!! - E02.mkv: file has 1000 of the 2000 bytes its Segment declares (50.0%)\n"),
+            "{text}"
         );
     }
 

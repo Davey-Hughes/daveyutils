@@ -15,7 +15,7 @@ use jiff::Timestamp;
 
 use crate::blocks::{self, ReadPath};
 use crate::llm::{self, Backend, Suggestion};
-use crate::mkv::{self, Track, TRACK_TYPE_SUBTITLE};
+use crate::mkv::{self, Track, Truncated, TRACK_TYPE_SUBTITLE};
 use crate::store::{
     Cache, CacheEntry, CheckedWith, FileRecord, Finding, Record, RunHeader, RunWriter, TrackRecord,
 };
@@ -144,6 +144,9 @@ struct Prepared {
     error: Option<String>,
     /// A track could not be read; the file is then not cached, so it is tried again.
     skipped_tracks: bool,
+    /// The file is shorter than its Segment says. Not cached either, so every scan says so until
+    /// the copy is replaced.
+    truncated: Option<Truncated>,
     /// Shown with `-v`.
     notes: Vec<String>,
 }
@@ -163,6 +166,7 @@ fn prepare(path: &Path, langs: &[String]) -> Prepared {
         lines: Vec::new(),
         error: None,
         skipped_tracks: false,
+        truncated: None,
         notes: Vec::new(),
     };
     match file_stamp(path) {
@@ -179,6 +183,7 @@ fn prepare(path: &Path, langs: &[String]) -> Prepared {
             return p;
         }
     };
+    p.truncated = layout.truncated;
     // The wanted tracks, in file order, with mpv's sid for each.
     let mut wanted = Vec::new();
     let mut sid = 0;
@@ -365,6 +370,9 @@ pub fn dry_run(
     let mut chunker = Chunker::new(opts.chunk_lines);
     for path in todo {
         let p = prepare(&path, &opts.langs);
+        if let Some(t) = p.truncated {
+            writeln!(log, "{}", t.warning(&path))?;
+        }
         if let Some(e) = &p.error {
             writeln!(out, "== {}: cannot read: {e}", path.display())?;
             continue;
@@ -560,6 +568,9 @@ impl Collector<'_> {
         }
         for job in std::mem::take(&mut self.waiting) {
             let p = job.prepared;
+            if let Some(t) = p.truncated {
+                writeln!(log, "{}", t.warning(&p.path))?;
+            }
             self.summary.failed += 1;
             let error = "no answer for some lines".to_string();
             self.writer.append(&[Record::File(FileRecord {
@@ -569,6 +580,7 @@ impl Collector<'_> {
                 error: Some(error.clone()),
                 tracks: p.tracks,
                 lines: p.lines.len(),
+                truncated: p.truncated,
             })])?;
             writeln!(log, "{}: FAILED: {error}", p.path.display())?;
         }
@@ -585,6 +597,9 @@ impl Collector<'_> {
             .unwrap_or_default();
         let progress = format!("[{}/{}] {name}", self.done, self.total);
         let path = p.path.to_string_lossy().into_owned();
+        if let Some(t) = p.truncated {
+            writeln!(log, "{}", t.warning(&p.path))?;
+        }
         let llm_error = refs
             .iter()
             .find_map(|(chunk, _)| self.answers[chunk].as_ref().err())
@@ -597,6 +612,7 @@ impl Collector<'_> {
             error: error.clone(),
             tracks: p.tracks,
             lines: p.lines.len(),
+            truncated: p.truncated,
         });
         if let Some(e) = error {
             self.summary.failed += 1;
@@ -614,7 +630,7 @@ impl Collector<'_> {
             let mut records = vec![file];
             records.extend(findings.into_iter().map(Record::Finding));
             self.writer.append(&records)?;
-            if !p.skipped_tracks {
+            if !p.skipped_tracks && p.truncated.is_none() {
                 Cache::append(
                     self.state,
                     &CacheEntry {

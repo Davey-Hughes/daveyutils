@@ -136,6 +136,43 @@ pub struct Layout {
     pub frame_counts: HashMap<u64, u64>,
     /// Absolute offset of the first Cluster.
     pub first_cluster: Option<u64>,
+    /// Set when the Segment's size says the file should be longer than it is.
+    pub truncated: Option<Truncated>,
+}
+
+/// A file cut short: its Segment declares more bytes than the file has. An interrupted copy or
+/// download leaves one; whatever lies past the cut (often the Cues and Tags) is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Truncated {
+    /// One past the Segment's last byte, as its size declares: the length the file should have.
+    pub declared_end: u64,
+    pub file_size: u64,
+}
+
+impl Truncated {
+    /// The line that reports it: `warning: <file>: truncated: …`.
+    pub fn warning(&self, file: &Path) -> String {
+        format!("warning: {}: {self}", file.display())
+    }
+
+    /// How much is there: `file has 1000 of the 2000 bytes its Segment declares (50.0%)`.
+    pub fn shortfall(&self) -> String {
+        // Tenths of a percent, in integers.
+        let permille = u128::from(self.file_size) * 1000 / u128::from(self.declared_end.max(1));
+        format!(
+            "file has {} of the {} bytes its Segment declares ({}.{}%)",
+            self.file_size,
+            self.declared_end,
+            permille / 10,
+            permille % 10
+        )
+    }
+}
+
+impl std::fmt::Display for Truncated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "truncated: {}", self.shortfall())
+    }
 }
 
 /// Open a file and read its layout.
@@ -157,6 +194,15 @@ pub fn read_layout(r: &Reader) -> Result<Layout> {
     if seg.id != SEGMENT {
         return ebml::parse_err(seg_at, "no Segment after the EBML header");
     }
+    // A Segment of unknown size ends where the file does. One of known size that ends past it is
+    // read up to the end of the file, and reported.
+    let truncated = seg
+        .end()
+        .filter(|&end| end > r.file_size())
+        .map(|declared_end| Truncated {
+            declared_end,
+            file_size: r.file_size(),
+        });
     let segment_end = seg.end().map_or(r.file_size(), |e| e.min(r.file_size()));
     let mut layout = Layout {
         segment_data: seg.data_start,
@@ -166,19 +212,35 @@ pub fn read_layout(r: &Reader) -> Result<Layout> {
         cues: Vec::new(),
         frame_counts: HashMap::new(),
         first_cluster: None,
+        truncated,
     };
+    match read_index(r, &mut layout) {
+        Ok(()) => Ok(layout),
+        // Whatever failed, in a file cut short the missing bytes are the likely reason.
+        Err(e) => Err(match layout.truncated {
+            Some(t) => Error::Truncated {
+                truncated: t.to_string(),
+                cause: Box::new(e),
+            },
+            None => e,
+        }),
+    }
+}
+
+/// The top-level elements before the first Cluster, then what the SeekHeads point to.
+fn read_index(r: &Reader, layout: &mut Layout) -> Result<()> {
     let mut loaded = HashSet::new();
     let mut pending = Vec::new();
 
     // Everything before the first Cluster, in order.
     let mut pos = layout.segment_data;
-    while pos < segment_end {
+    while pos < layout.segment_end {
         let h = r.header_at(pos)?;
         if h.id == CLUSTER {
             layout.first_cluster = Some(pos);
             break;
         }
-        load(r, &h, &mut layout, &mut pending, &mut loaded)?;
+        load(r, &h, layout, &mut pending, &mut loaded)?;
         let Some(end) = h.end() else {
             return Err(Error::Unsupported(format!(
                 "unknown-size element {:#X} at byte {pos}",
@@ -191,11 +253,23 @@ pub fn read_layout(r: &Reader) -> Result<Layout> {
     // after the Clusters.
     while let Some(at) = pending.pop() {
         if !loaded.contains(&at) {
-            let h = r.header_at(at)?;
-            load(r, &h, &mut layout, &mut pending, &mut loaded)?;
+            // A cut can fall inside an indexed element (the Cues or Tags at the end, usually): it
+            // went with the rest of the tail, like the elements wholly past the cut. Only the cut
+            // is excused: a header with all its bytes there must still parse.
+            let cut_in_header = layout.truncated.is_some()
+                && r.file_size().saturating_sub(at) < ebml::MAX_HEADER as u64;
+            let h = match r.header_at(at) {
+                Ok(h) => h,
+                Err(Error::Parse { .. }) if cut_in_header => continue,
+                Err(e) => return Err(e),
+            };
+            if layout.truncated.is_some() && h.end().is_some_and(|end| end > r.file_size()) {
+                continue;
+            }
+            load(r, &h, layout, &mut pending, &mut loaded)?;
         }
     }
-    Ok(layout)
+    Ok(())
 }
 
 /// Parse one top-level element into `layout`, queueing what a SeekHead points to.
@@ -448,6 +522,19 @@ mod tests {
         v.push(0x80 | u8::try_from(data.len()).unwrap());
         v.extend_from_slice(data);
         v
+    }
+
+    #[test]
+    fn truncation_reads_as_bytes_present_of_bytes_declared() {
+        // The copy of Tokyo Ghoul Root A E01 that found this: 4.2% of the file is there.
+        let t = Truncated {
+            declared_end: 7_976_268_468,
+            file_size: 338_132_992,
+        };
+        assert_eq!(
+            t.to_string(),
+            "truncated: file has 338132992 of the 7976268468 bytes its Segment declares (4.2%)"
+        );
     }
 
     #[test]

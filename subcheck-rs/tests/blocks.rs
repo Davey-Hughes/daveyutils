@@ -43,6 +43,32 @@ fn a_cue_pointing_at_the_wrong_byte_falls_back_to_the_walk() {
 }
 
 #[test]
+fn a_walk_stops_at_a_cut_inside_a_cluster() {
+    // multi.mkv's subtitle blocks sit among video blocks. Cut the file inside a block's header,
+    // or inside its data: the Cues at the end are gone, so the track is walked, and every block
+    // before the cut comes out.
+    let (r, layout) = mkv::open(&fixture("multi.mkv")).unwrap();
+    let whole = blocks::read_tracks(&r, &layout, &[2], true)
+        .unwrap()
+        .remove(0)
+        .blocks;
+    assert_eq!(whole.len(), 5);
+    for (k, block) in whole.iter().enumerate().skip(1) {
+        for into in [1, 6] {
+            let (_dir, path) = common::copied("multi.mkv");
+            common::cut(&path, block.position + into);
+            let (r, layout) = mkv::open(&path).unwrap();
+            assert!(layout.truncated.is_some());
+            let read = blocks::read_tracks(&r, &layout, &[2], false)
+                .unwrap()
+                .remove(0);
+            assert_eq!(read.path, ReadPath::Walk, "cut {into} bytes into block {k}");
+            assert_eq!(read.blocks, whole[..k], "cut {into} bytes into block {k}");
+        }
+    }
+}
+
+#[test]
 fn a_track_its_tags_call_empty_is_not_walked() {
     // Video plus an English track with no events: no Cues for it, and NUMBER_OF_FRAMES 0.
     let (r, layout) = mkv::open(&fixture("empty.mkv")).unwrap();

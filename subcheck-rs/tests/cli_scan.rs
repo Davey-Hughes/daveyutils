@@ -146,6 +146,42 @@ fn an_unchanged_file_is_skipped_until_forced() {
 }
 
 #[test]
+fn a_truncated_file_is_warned_about_on_every_scan() {
+    let env = Env::new();
+    // One byte short: the Tags at the end are cut, the subtitles are all there.
+    let (_copy, file) = common::copied("typos.mkv");
+    let full = std::fs::metadata(&file).unwrap().len();
+    common::cut(&file, full - 1);
+    let file = file.to_string_lossy().into_owned();
+    let warning = format!(
+        "warning: {file}: truncated: file has {} of the {full} bytes",
+        full - 1
+    );
+    for _ in 0..2 {
+        let out = env.subcheck(&["scan", &file], &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(stderr(&out).contains(&warning), "{}", stderr(&out));
+        assert!(stderr(&out).contains("1 checked"), "{}", stderr(&out));
+    }
+    // Not cached: the second scan checked it again (an_unchanged_file_is_skipped_until_forced
+    // shows the whole file is skipped).
+    assert_eq!(env.calls().len(), 2);
+    // The run file keeps it, for list.
+    assert!(env.newest_run().files[0].truncated.is_some());
+    let list = env.subcheck(&["list"], &[]);
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains(&format!(
+            "Truncated (replace these copies):\n  {file}: file has {} of the {full} bytes",
+            full - 1
+        )),
+        "{}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+    let out = env.subcheck(&["scan", "--dry-run", &file], &[]);
+    assert!(stderr(&out).contains(&warning), "{}", stderr(&out));
+}
+
+#[test]
 fn a_scan_with_nothing_to_check_records_no_run() {
     let env = Env::new();
     assert!(env

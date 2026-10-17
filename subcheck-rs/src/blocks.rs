@@ -344,7 +344,12 @@ fn walk_clusters(
         return Ok(out);
     };
     while pos < layout.segment_end {
-        let h = r.header_at(pos)?;
+        let h = match r.header_at(pos) {
+            Ok(h) => h,
+            // The cut in a file cut short fell inside this header: the walk is over.
+            Err(Error::Parse { .. }) if cut_in_header(r, layout, pos) => break,
+            Err(e) => return Err(e),
+        };
         let Some(end) = h.end() else {
             return Err(Error::Unsupported(format!(
                 "unknown-size element {:#X} at byte {pos}",
@@ -352,18 +357,27 @@ fn walk_clusters(
             )));
         };
         if h.id == mkv::CLUSTER {
-            walk_cluster(r, &h, end, tracks, &mut out)?;
+            // The Cluster the cut falls in is read up to the cut.
+            let cut = layout.truncated.is_some() && end > layout.segment_end;
+            walk_cluster(r, &h, end.min(layout.segment_end), cut, tracks, &mut out)?;
         }
         pos = end;
     }
     Ok(out)
 }
 
-/// One Cluster, whose data runs from `cluster.data_start` to `end`.
+/// Whether a file cut short ends within an element header's length of `pos`.
+fn cut_in_header(r: &Reader, layout: &Layout, pos: u64) -> bool {
+    layout.truncated.is_some() && r.file_size().saturating_sub(pos) < ebml::MAX_HEADER as u64
+}
+
+/// One Cluster, whose data runs from `cluster.data_start` to `end`. `cut`: the file ends at `end`,
+/// inside this Cluster, so an element that runs past it is where the walk stops, not an error.
 fn walk_cluster(
     r: &Reader,
     cluster: &Header,
     end: u64,
+    cut: bool,
     tracks: &HashSet<u64>,
     out: &mut HashMap<u64, Vec<Block>>,
 ) -> Result<()> {
@@ -371,10 +385,17 @@ fn walk_cluster(
     let mut pos = cluster.data_start;
     while pos < end {
         let head = r.peek(pos, 32)?;
-        let c = ebml::parse_header(&head, pos)?;
+        let c = match ebml::parse_header(&head, pos) {
+            Ok(c) => c,
+            Err(Error::Parse { .. }) if cut && end - pos < ebml::MAX_HEADER as u64 => break,
+            Err(e) => return Err(e),
+        };
         let Some(c_end) = c.end() else {
             return ebml::parse_err(pos, "unknown-size element inside a Cluster");
         };
+        if cut && c_end > end {
+            break;
+        }
         match c.id {
             mkv::TIMESTAMP => {
                 let v = bytes_at(r, &head, pos, c.data_start, c_end - c.data_start)?;

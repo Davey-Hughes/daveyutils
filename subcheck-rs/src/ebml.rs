@@ -14,6 +14,13 @@ pub enum Error {
     Parse { offset: u64, msg: String },
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// A read failed in a file cut short: the missing bytes are the likely reason. Not a
+    /// `source`, so the message, which scan stores, says both and anyhow does not repeat it.
+    #[error("{truncated}; {cause}")]
+    Truncated {
+        truncated: String,
+        cause: Box<Error>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -76,6 +83,9 @@ pub fn read_vint(buf: &[u8]) -> Option<(u64, usize, bool)> {
     let all_ones = value == (1u64 << (7 * len)) - 1;
     Some((value, len, all_ones))
 }
+
+/// The longest element header: a 4-byte ID and an 8-byte size.
+pub const MAX_HEADER: usize = 12;
 
 /// An element header parsed from bytes that were read at `offset`.
 pub fn parse_header(buf: &[u8], offset: u64) -> Result<Header> {
@@ -210,7 +220,7 @@ impl Reader {
 
     /// The element header at `offset`.
     pub fn header_at(&self, offset: u64) -> Result<Header> {
-        parse_header(&self.peek(offset, 12)?, offset)
+        parse_header(&self.peek(offset, MAX_HEADER)?, offset)
     }
 
     /// An element's whole data. Only for elements small enough to hold in memory: never a Cluster.

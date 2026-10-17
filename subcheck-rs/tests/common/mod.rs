@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A copy of fixture `name`, in a temporary directory, with `edit` applied to the first of the
 /// `count` places `pattern` occurs (the count is checked, so a regenerated fixture that moves the
@@ -20,6 +20,26 @@ pub fn patched(
     let path = dir.path().join(name);
     std::fs::write(&path, bytes).unwrap();
     (dir, path)
+}
+
+/// A copy of fixture `name`, in a temporary directory.
+#[allow(dead_code)] // only some test files copy fixtures
+pub fn copied(name: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(name);
+    std::fs::copy(fixture(name), &path).unwrap();
+    (dir, path)
+}
+
+/// Cut the file at `path` to its first `len` bytes, as an interrupted copy leaves one.
+#[allow(dead_code)] // only some test files cut fixtures
+pub fn cut(path: &Path, len: u64) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(len)
+        .unwrap();
 }
 
 /// A file under tests/fixtures/, built by dev/make-subcheck-fixtures.sh.

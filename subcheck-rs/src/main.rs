@@ -208,6 +208,10 @@ fn extract(
     walk: bool,
 ) -> Result<()> {
     let (r, layout) = mkv::open(file).with_context(|| format!("reading {}", file.display()))?;
+    // Said first, so it is seen even when what is left of the file fails to extract.
+    if let Some(t) = layout.truncated {
+        eprintln!("{}", t.warning(file));
+    }
     let track = pick_track(&layout.tracks, track)?;
 
     // Built in memory, then written in one go: a failed extraction leaves no partial file behind.
