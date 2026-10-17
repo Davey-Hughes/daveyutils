@@ -21,6 +21,9 @@ clap = { version = "4", features = ["derive"] }
 # Default backend is miniz_oxide: pure Rust, so no zlib to link.
 flate2 = "1"
 thiserror = "2"
+jiff = { version = "0.2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

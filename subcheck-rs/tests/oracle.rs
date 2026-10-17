@@ -19,6 +19,7 @@ const ORACLE: &[(&str, usize, &str)] = &[
     ("multi.mkv", 2, "multi.track2.ass"),
     ("multi.mkv", 3, "multi.track3.srt"),
     ("empty.mkv", 1, "empty.track1.ass"),
+    ("typos.mkv", 0, "typos.track0.ass"),
 ];
 
 #[test]

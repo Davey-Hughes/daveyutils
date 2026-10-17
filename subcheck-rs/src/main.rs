@@ -7,7 +7,11 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use subcheck::blocks::ReadPath;
+use subcheck::list::{self, Filter};
+use subcheck::llm::Backend;
 use subcheck::mkv::{self, Track};
+use subcheck::scan;
+use subcheck::store::{self, State};
 use subcheck::subs::{self, Kind};
 
 #[derive(Parser)]
@@ -44,11 +48,61 @@ enum Command {
         #[arg(long, hide = true)]
         walk: bool,
     },
+    /// Proofread the text subtitles of MKV files with an LLM and record each suggested fix.
+    ///
+    /// Files are walked recursively; files unchanged since an earlier scan are skipped. Findings
+    /// go to a run file under the state directory; read them with `subcheck list`.
+    Scan {
+        /// MKV files, or directories to search for them.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// claude, gpt (Codex) or ollama:<model>.
+        #[arg(long, default_value = "claude")]
+        llm: String,
+        /// Any other LLM: a shell command that reads the prompt on stdin and prints the reply.
+        #[arg(long, conflicts_with = "llm")]
+        llm_cmd: Option<String>,
+        /// Subtitle languages to check, as ISO 639-2 codes. Repeat for more (--lang eng --lang und).
+        #[arg(long = "lang", default_value = "eng")]
+        langs: Vec<String>,
+        /// LLM calls to run at once.
+        #[arg(short, long, default_value_t = 2)]
+        jobs: usize,
+        /// Lines per LLM call. Default 400, or 150 for ollama (its default context is 4k tokens).
+        #[arg(long)]
+        chunk_lines: Option<usize>,
+        /// Check files even if they are unchanged since an earlier scan.
+        #[arg(long)]
+        force: bool,
+        /// Print the prompts instead of sending them; records nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Show how each track was read.
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Show a run's findings as text: the newest run, or the one named.
+    List {
+        /// A run name (as `scan` prints it) or a run file. Default: the newest.
+        run: Option<String>,
+        /// Only findings you accepted.
+        #[arg(long, conflicts_with_all = ["rejected", "pending"])]
+        accepted: bool,
+        /// Only findings you rejected.
+        #[arg(long, conflicts_with = "pending")]
+        rejected: bool,
+        /// Only findings not yet decided.
+        #[arg(long)]
+        pending: bool,
+        /// Add the mpv command that opens each finding's moment.
+        #[arg(long)]
+        mpv: bool,
+    },
 }
 
 fn main() -> ExitCode {
     match run(Cli::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("subcheck: {e:#}");
             ExitCode::FAILURE
@@ -56,7 +110,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Extract {
             file,
@@ -65,7 +119,83 @@ fn run(cli: Cli) -> Result<()> {
             force,
             verbose,
             walk,
-        } => extract(&file, track, output, force, verbose, walk),
+        } => extract(&file, track, output, force, verbose, walk).map(|()| ExitCode::SUCCESS),
+        Command::Scan {
+            paths,
+            llm,
+            llm_cmd,
+            langs,
+            jobs,
+            chunk_lines,
+            force,
+            dry_run,
+            verbose,
+        } => {
+            let backend = match llm_cmd {
+                Some(cmd) => Backend::shell(&cmd),
+                None => Backend::preset(&llm).map_err(anyhow::Error::msg)?,
+            };
+            let opts = scan::Options {
+                chunk_lines: chunk_lines.unwrap_or(backend.chunk_lines),
+                backend,
+                jobs,
+                langs,
+                force,
+                verbose,
+            };
+            let state = store::state_dir()?;
+            if dry_run {
+                scan::dry_run(
+                    &paths,
+                    &opts,
+                    &state,
+                    &mut std::io::stdout().lock(),
+                    &mut std::io::stderr(),
+                )?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            let s = scan::run(&paths, &opts, &state, &mut std::io::stderr())?;
+            if s.run.is_empty() {
+                if s.files == 0 {
+                    eprintln!("Nothing to check: no MKV files found");
+                } else {
+                    eprintln!(
+                        "Nothing to check: {} unchanged since an earlier scan (--force to check again)",
+                        scan::files(s.cached)
+                    );
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            eprintln!(
+                "run {}: {} files, {} checked, {} failed, {} unchanged since an earlier scan; {} findings",
+                s.run, s.files, s.checked, s.failed, s.cached, s.findings
+            );
+            eprintln!("Read them with: subcheck list {}", s.run);
+            Ok(if s.failed == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        Command::List {
+            run,
+            accepted,
+            rejected,
+            pending,
+            mpv,
+        } => {
+            let path = store::find_run(&store::state_dir()?, run.as_deref())?;
+            let run =
+                store::read_run(&path).with_context(|| format!("reading {}", path.display()))?;
+            let filter = match (accepted, rejected, pending) {
+                (true, _, _) => Filter::Only(State::Accepted),
+                (_, true, _) => Filter::Only(State::Rejected),
+                (_, _, true) => Filter::Only(State::Pending),
+                _ => Filter::All,
+            };
+            print!("{}", list::render(&run, filter, mpv));
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

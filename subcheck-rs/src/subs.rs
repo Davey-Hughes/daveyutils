@@ -294,7 +294,7 @@ fn srt_time(ms: i128) -> String {
 }
 
 /// Bytes up to the first NUL, as text: mkvextract handles these as C strings.
-fn c_string(bytes: &[u8]) -> String {
+pub(crate) fn c_string(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }

@@ -63,6 +63,43 @@ EOF
 # CRLF on purpose, and millisecond times that ASS's centiseconds could not hold.
 printf '1\r\n00:00:01,005 --> 00:00:02,500\r\nHello <i>there</i>\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\nTwo\r\nrows\r\n\r\n' >"$src/b.srt"
 
+# What `subcheck scan` is tested on: two planted typos, "befor" in dialogue and "trough" spelled out
+# as per-letter karaoke (one event per letter, positioned with \pos, written right to left so only
+# the positions can put it back in order), plus a drawing, a line that repeats later, and a style of
+# romaji fragments that text::lines must drop.
+{
+  cat <<'EOF'
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+Style: Song,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+Style: Romaji,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,We should leave befor it rains.
+Dialogue: 0,0:00:04.00,0:00:06.00,Default,,0,0,0,,{\i1}Nothing{\i0} wrong here.
+Dialogue: 0,0:00:07.00,0:00:09.00,Default,,0,0,0,,{\p1}m 0 0 l 100 0 100 100 0 100{\p0}
+Dialogue: 0,0:00:10.00,0:00:12.00,Default,,0,0,0,,Nothing wrong here.
+Dialogue: 0,0:00:30.00,0:00:32.00,Default,,0,0,0,,The last line.
+EOF
+  lyric="go trough it"
+  for ((i = ${#lyric} - 1; i >= 0; i--)); do
+    c=${lyric:i:1}
+    [ "$c" = " " ] && c=""
+    printf 'Dialogue: 0,0:00:20.00,0:00:22.00,Song,,0,0,0,fx,{\\an5\\pos(%d,40)}%s\n' $((200 + 20 * i)) "$c"
+  done
+  syllables=(ka ze no)
+  for i in $(seq 0 11); do
+    printf 'Dialogue: 0,0:00:23.%02d,0:00:24.00,Romaji,,0,0,0,fx,%s\n' $((i * 5)) "${syllables[i % 3]}"
+  done
+} >"$src/typos.ass"
+
 mux() { mkvmerge --quiet --deterministic 2026 "$@"; }
 
 mux -o "$out/ass-plain.mkv" "$src/a.ass"
@@ -72,6 +109,7 @@ mux -o "$out/ass-nocues.mkv" --cues 0:none "$src/a.ass"
 mux -o "$out/ass-sync7.mkv" --sync 0:7 "$src/a.ass"
 mux -o "$out/ssa.mkv" "$src/c.ssa"
 mux -o "$out/srt.mkv" --language 0:eng "$src/b.srt"
+mux -o "$out/typos.mkv" --language 0:eng --track-name '0:English Full' "$src/typos.ass"
 
 # ffmpeg muxes differently from mkvmerge: CRC-32 elements in every Cluster, several
 # CueTrackPositions in one CuePoint, LF line endings in CodecPrivate, and no statistics tags.
