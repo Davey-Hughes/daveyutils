@@ -10,6 +10,8 @@ pub mod ebml;
 pub mod list;
 pub mod llm;
 pub mod mkv;
+pub mod player;
+pub mod review;
 pub mod scan;
 pub mod store;
 pub mod subs;

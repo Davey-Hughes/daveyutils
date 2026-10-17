@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
@@ -151,6 +151,30 @@ impl RunWriter {
             }
         }
         unreachable!("1.. never ends")
+    }
+
+    /// An existing run file, to append decisions to.
+    pub fn open(path: &Path) -> io::Result<RunWriter> {
+        let mut file = OpenOptions::new().read(true).append(true).open(path)?;
+        // A scan cut off mid-write leaves a last line with no newline. End it, or the first record
+        // appended here would join that broken line and be lost with it.
+        if file.metadata()?.len() > 0 {
+            let mut last = [0u8];
+            file.seek(SeekFrom::End(-1))?;
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Ok(RunWriter {
+            name,
+            path: path.to_path_buf(),
+            file,
+        })
     }
 
     /// Append records as JSON lines and flush them, so a crash loses nothing already written.
@@ -457,6 +481,53 @@ mod tests {
             "{line}"
         );
         assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), cut);
+    }
+
+    #[test]
+    fn decisions_appended_to_an_existing_run_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = RunWriter::create(dir.path()).unwrap();
+        w.append(&[Record::Finding(finding(1))]).unwrap();
+        let mut again = RunWriter::open(&w.path).unwrap();
+        assert_eq!(again.name, w.name);
+        again
+            .append(&[Record::Decision(Decision {
+                finding: 1,
+                state: State::Accepted,
+                edited: Some("Mine".into()),
+                at: Timestamp::UNIX_EPOCH,
+            })])
+            .unwrap();
+        let run = read_run(&w.path).unwrap();
+        assert_eq!(run.findings.len(), 1);
+        assert_eq!(run.state_of(1), State::Accepted);
+        assert!(RunWriter::open(&dir.path().join("runs/none.jsonl")).is_err());
+    }
+
+    #[test]
+    fn a_decision_after_a_line_cut_off_mid_write_is_kept() {
+        // A scan killed mid-write leaves its last line unfinished. The first decision appended
+        // after it must start a line of its own, or it is lost with the broken one.
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = RunWriter::create(dir.path()).unwrap();
+        w.append(&[Record::Finding(finding(1))]).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&w.path)
+            .unwrap()
+            .write_all(b"{\"type\":\"fin")
+            .unwrap();
+        RunWriter::open(&w.path)
+            .unwrap()
+            .append(&[Record::Decision(Decision {
+                finding: 1,
+                state: State::Accepted,
+                edited: None,
+                at: Timestamp::UNIX_EPOCH,
+            })])
+            .unwrap();
+        let run = read_run(&w.path).unwrap();
+        assert_eq!((run.state_of(1), run.bad_lines), (State::Accepted, 1));
     }
 
     #[test]

@@ -4,8 +4,8 @@
 use std::fmt::Write;
 
 use crate::mkv::Truncated;
-use crate::store::{FileRecord, Finding, Run, State};
-use crate::text::timestamp;
+use crate::store::{FileRecord, Finding, Run, State, TrackRecord};
+use crate::text::{timestamp, Occurrence};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {
@@ -90,7 +90,8 @@ pub fn render(run: &Run, filter: Filter, mpv: bool) -> String {
     out
 }
 
-fn label(state: State) -> &'static str {
+/// A state's name, as `list` and `review` show it.
+pub fn label(state: State) -> &'static str {
     match state {
         State::Pending => "pending",
         State::Accepted => "accepted",
@@ -98,9 +99,12 @@ fn label(state: State) -> &'static str {
     }
 }
 
-/// The mpv command that opens the file two seconds before the line, with the subtitle track that
-/// shows it: the occurrence on a default track if there is one, else the first.
-pub fn mpv_command(run: &Run, f: &Finding) -> String {
+/// Where a finding is shown: its occurrence on the file's default subtitle track if there is one,
+/// else its first, with the track it is on.
+pub fn shown_at<'a>(
+    run: &'a Run,
+    f: &'a Finding,
+) -> (Option<&'a Occurrence>, Option<&'a TrackRecord>) {
     let tracks = run
         .files
         .iter()
@@ -113,11 +117,24 @@ pub fn mpv_command(run: &Run, f: &Finding) -> String {
         .iter()
         .find(|o| tracks.iter().any(|t| t.id == o.track && t.default));
     let occurrence = on_default.or(f.occurrences.first());
-    let start = occurrence.map_or(0, |o| (o.start_ms - LEAD_MS).max(0));
-    let sid = occurrence
-        .and_then(|o| tracks.iter().find(|t| t.id == o.track))
-        .map(|t| format!(" --sid={}", t.sid))
-        .unwrap_or_default();
+    let track = occurrence.and_then(|o| tracks.iter().find(|t| t.id == o.track));
+    (occurrence, track)
+}
+
+/// Where mpv opens a finding: two seconds before its line (in ms), and mpv's sid for its track.
+pub fn mpv_moment(run: &Run, f: &Finding) -> (i64, Option<usize>) {
+    let (occurrence, track) = shown_at(run, f);
+    (
+        occurrence.map_or(0, |o| (o.start_ms - LEAD_MS).max(0)),
+        track.map(|t| t.sid),
+    )
+}
+
+/// The mpv command that opens the file two seconds before the line, with the subtitle track that
+/// shows it: the occurrence on a default track if there is one, else the first.
+pub fn mpv_command(run: &Run, f: &Finding) -> String {
+    let (start, sid) = mpv_moment(run, f);
+    let sid = sid.map(|s| format!(" --sid={s}")).unwrap_or_default();
     format!(
         "mpv --start={}{sid} {}",
         timestamp(start),
@@ -133,8 +150,7 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Decision, TrackRecord};
-    use crate::text::Occurrence;
+    use crate::store::Decision;
 
     fn run() -> Run {
         let track = |id, sid, default| TrackRecord {

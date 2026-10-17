@@ -11,7 +11,7 @@ Random command-line utilities. Each one has a `--help`; run it for usage.
 | `batch_makemkvcon` | Rip every Blu-ray/DVD disc image under a directory to MKV | `makemkvcon` |
 | `mkvpropedit_set_name` | Set each MKV's title tag from its filename | `mkvpropedit` |
 | `nudge` | Rate-limit auto-resumer for AI CLIs in tmux (Rust — see `nudge-rs/`) | `tmux` |
-| `subcheck` | Proofread the text subtitles in MKVs with an LLM; extract a track without reading the whole file (Rust — see `subcheck-rs/`) | `claude`, `codex` or `ollama` (for `scan`) |
+| `subcheck` | Proofread the text subtitles in MKVs with an LLM and review the fixes; extract a track without reading the whole file (Rust — see `subcheck-rs/`) | `claude`, `codex` or `ollama` (for `scan`); `mpv` (for `review`) |
 
 ## Install
 
@@ -51,8 +51,10 @@ make help     # list targets
   `dev/make-subcheck-fixtures.sh` and committed, with mkvextract's output for each as the oracle.
   `subcheck scan` sends the English lines to an LLM (`--llm claude`, `gpt` for Codex,
   `ollama:<model>`, or any command with `--llm-cmd`) and records each suggested fix in a run file
-  under `~/.local/state/subcheck/`; `subcheck list --mpv` prints them with a command that opens mpv
-  at each one. Files unchanged since an earlier scan are skipped.
+  under `~/.local/state/subcheck/`. Files unchanged since an earlier scan are skipped.
+  `subcheck review` steps through a run's fixes to accept, reject or reword each (a fix repeated
+  across episodes is one row), and `o` opens the moment in mpv, reusing one window.
+  `subcheck list` prints the same as text, and `--mpv` adds a command that opens each one.
 - `tests/` — bash test-suite (`bash tests/run.sh`); Rust tests live in each crate.
 - `dev/` — tooling for working on this repo, deliberately NOT in `scripts/`: the Makefile
   links every `scripts/*` onto your PATH, so a dev script placed there would ship as a

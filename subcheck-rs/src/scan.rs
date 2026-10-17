@@ -151,7 +151,8 @@ struct Prepared {
     notes: Vec<String>,
 }
 
-fn file_stamp(path: &Path) -> io::Result<(u64, Timestamp)> {
+/// A file's size and modification time: what the cache and review compare.
+pub fn file_stamp(path: &Path) -> io::Result<(u64, Timestamp)> {
     let meta = std::fs::metadata(path)?;
     let mtime = Timestamp::try_from(meta.modified()?).map_err(io::Error::other)?;
     Ok((meta.len(), mtime))

@@ -10,6 +10,7 @@ use subcheck::blocks::ReadPath;
 use subcheck::list::{self, Filter};
 use subcheck::llm::Backend;
 use subcheck::mkv::{self, Track};
+use subcheck::review;
 use subcheck::scan;
 use subcheck::store::{self, State};
 use subcheck::subs::{self, Kind};
@@ -80,6 +81,12 @@ enum Command {
         /// Show how each track was read.
         #[arg(short, long)]
         verbose: bool,
+    },
+    /// Accept, reject or reword each finding of a run, with a key that opens it in mpv: the newest
+    /// run, or the one named.
+    Review {
+        /// A run name (as `scan` prints it) or a run file. Default: the newest.
+        run: Option<String>,
     },
     /// Show a run's findings as text: the newest run, or the one named.
     List {
@@ -170,12 +177,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 "run {}: {} files, {} checked, {} failed, {} unchanged since an earlier scan; {} findings",
                 s.run, s.files, s.checked, s.failed, s.cached, s.findings
             );
-            eprintln!("Read them with: subcheck list {}", s.run);
+            eprintln!(
+                "Review them with: subcheck review {} (or print them: subcheck list {0})",
+                s.run
+            );
             Ok(if s.failed == 0 {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
             })
+        }
+        Command::Review { run } => {
+            let state = store::state_dir()?;
+            let path = store::find_run(&state, run.as_deref())?;
+            review::run(&path, &state)?;
+            Ok(ExitCode::SUCCESS)
         }
         Command::List {
             run,
