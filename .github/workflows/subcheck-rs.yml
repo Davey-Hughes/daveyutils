@@ -1,0 +1,36 @@
+name: subcheck-rs
+
+# The same shape as nudge-rs.yml, for the other crate. Makefile is in the filter
+# for the same reason it is there: it drives cargo for this crate too
+# (build-subcheck, check, distclean), so editing it can break the build without
+# touching subcheck-rs/.
+on:
+  push:
+    paths: ['subcheck-rs/**', 'Makefile', '.github/workflows/subcheck-rs.yml']
+  pull_request:
+    paths: ['subcheck-rs/**', 'Makefile', '.github/workflows/subcheck-rs.yml']
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: subcheck-rs
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # Nothing to install: the tests read MKV fixtures committed under
+      # tests/fixtures/, so neither mkvtoolnix nor ffmpeg is needed here.
+      #
+      # Keep these three in step with the subcheck-rs job in
+      # .forgejo/workflows/ci.yml, which runs them with --manifest-path.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test

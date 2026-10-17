@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # The local mirror of CI (.forgejo/workflows/ci.yml, and its macOS-only counterpart in
-# .github/workflows/tests.yml + nudge-rs.yml). Run it before you push a branch and open a PR: CI
-# runs these same jobs there, and this is them several minutes earlier.
+# .github/workflows/tests.yml + nudge-rs.yml + subcheck-rs.yml). Run it before you push a branch and
+# open a PR: CI runs these same jobs there, and this is them several minutes earlier.
 #
 #   dev/check-all.sh            # everything CI gates on
-#   dev/check-all.sh --no-rust  # bash only; skip the nudge-rs leg
+#   dev/check-all.sh --no-rust  # bash only; skip the Rust legs
 #
 # The point of this file is that the local gate and the CI gate cannot drift: CI's gating jobs are
 # reproduced here in the same order with the same commands. When a job changes there, change it here.
 #
-# `make check` is NOT this gate and never was — it runs the bash suite and nudge-rs's tests, but not
-# rustfmt, not clippy, and not the syntax sweep. Landing on `make check` alone would miss three
-# things CI fails on.
+# `make check` is NOT this gate and never was — it runs the bash suite and the Rust crates' tests,
+# but not rustfmt, not clippy, and not the syntax sweep. Landing on `make check` alone would miss
+# three things CI fails on.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -40,22 +40,26 @@ echo "    $(ls scripts | wc -l) scripts, $(ls tests/*.sh | wc -l) test files, $(
 
 run bash tests/run.sh
 
-# --- the `nudge-rs` job ---
+# --- the `nudge-rs` and `subcheck-rs` jobs: the same four legs for each crate ---
+crates=(nudge-rs subcheck-rs)
 if [ "$no_rust" -eq 1 ]; then
-  echo; echo "==> SKIPPED: nudge-rs (--no-rust)"
-  echo "    CI still runs it. Do not land on the strength of this run alone."
+  echo; echo "==> SKIPPED: ${crates[*]} (--no-rust)"
+  echo "    CI still runs them. Do not land on the strength of this run alone."
 else
-  run cargo fmt --manifest-path nudge-rs/Cargo.toml --all --check
-  run cargo clippy --manifest-path nudge-rs/Cargo.toml --all-targets -- -D warnings
-  # nextest when present, matching `make check`'s real path in CI; cargo test otherwise. Doctests are
-  # run explicitly either way — nextest cannot run them, so relying on it alone would drop them.
-  if cargo nextest --version >/dev/null 2>&1; then
-    run cargo nextest run --manifest-path nudge-rs/Cargo.toml
-  else
-    echo; echo "note: cargo-nextest not installed, using cargo test (slower)" >&2
-    run cargo test --manifest-path nudge-rs/Cargo.toml
-  fi
-  run cargo test --manifest-path nudge-rs/Cargo.toml --doc
+  for crate in "${crates[@]}"; do
+    manifest=$crate/Cargo.toml
+    run cargo fmt --manifest-path "$manifest" --all --check
+    run cargo clippy --manifest-path "$manifest" --all-targets -- -D warnings
+    # nextest when present, matching `make check`'s real path in CI; cargo test otherwise. Doctests
+    # are run explicitly either way — nextest cannot run them, so relying on it alone would drop them.
+    if cargo nextest --version >/dev/null 2>&1; then
+      run cargo nextest run --manifest-path "$manifest"
+    else
+      echo; echo "note: cargo-nextest not installed, using cargo test (slower)" >&2
+      run cargo test --manifest-path "$manifest"
+    fi
+    run cargo test --manifest-path "$manifest" --doc
+  done
 fi
 
 # --- the `make` job ---
@@ -64,7 +68,7 @@ fi
 # bug got out. bin/ is repo-local and gitignored, so running this here touches nothing outside the
 # working copy.
 if [ "$no_rust" -eq 1 ]; then
-  echo; echo "==> SKIPPED: make all (needs the nudge-rs build)"
+  echo; echo "==> SKIPPED: make all (needs the Rust builds)"
 else
   run make all
 fi

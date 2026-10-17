@@ -1,0 +1,38 @@
+[package]
+name = "subcheck"
+version = "0.1.0"
+edition = "2021"
+description = "Proofread the text subtitles embedded in MKV files"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "subcheck"
+path = "src/main.rs"
+
+[lib]
+name = "subcheck"
+path = "src/lib.rs"
+
+[dependencies]
+# posix_fadvise, for Reader::prefetch on Linux.
+libc = "0.2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# Default backend is miniz_oxide: pure Rust, so no zlib to link.
+flate2 = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Same policy as nudge-rs: CI gates on `cargo clippy --all-targets -- -D warnings`, so pedantic is
+# effectively deny. The three allows are the library-author lints nudge-rs turns off for the same
+# reason: `pub` here marks module seams inside one binary, not an API anyone downstream calls.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Matroska's element names (SimpleBlock, TimestampScale, CodecPrivate, ...) are the vocabulary of
+# nearly every doc comment here. Backticking each one would make the prose read like code.
+doc_markdown = "allow"

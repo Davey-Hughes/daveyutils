@@ -11,6 +11,7 @@ Random command-line utilities. Each one has a `--help`; run it for usage.
 | `batch_makemkvcon` | Rip every Blu-ray/DVD disc image under a directory to MKV | `makemkvcon` |
 | `mkvpropedit_set_name` | Set each MKV's title tag from its filename | `mkvpropedit` |
 | `nudge` | Rate-limit auto-resumer for AI CLIs in tmux (Rust — see `nudge-rs/`) | `tmux` |
+| `subcheck` | Extract an MKV's text subtitle track without reading the whole file (Rust — see `subcheck-rs/`) | — |
 
 ## Install
 
@@ -23,12 +24,12 @@ export PATH="$PWD/bin:$PATH"     # add to your shell rc
 ```
 
 The bash scripts are **symlinked**, so editing one takes effect immediately.
-`nudge` is built from `nudge-rs/` (`cargo build --release`) and linked in — and
-since it is the only utility here that needs compiling, bare `make` rebuilds and
-relinks just it.
+`nudge` and `subcheck` are built from `nudge-rs/` and `subcheck-rs/`
+(`cargo build --release`) and linked in — and since they are the only utilities
+here that need compiling, bare `make` rebuilds and relinks just them.
 
 ```sh
-make          # build nudge + link it into ./bin
+make          # build nudge and subcheck + link them into ./bin
 make all      # that, plus a symlink for every script
 make check    # run the bash and Rust test suites
 make clean    # remove ./bin
@@ -45,7 +46,10 @@ make help     # list targets
   the pane — to `<state dir>/nudge.log` (`~/.local/state/nudge/` on Linux,
   `~/Library/Application Support/nudge/` on macOS). That is where to look when a
   nudge did not fire; `--notify` reports the same outcomes at the time.
-- `tests/` — bash test-suite (`bash tests/run.sh`); Rust tests live in `nudge-rs/`.
+- `subcheck-rs/` — the Rust `subcheck`. It reads an MKV's subtitle packets through the file's own
+  index (Cues) instead of reading the whole file. Its test fixtures are small MKVs built by
+  `dev/make-subcheck-fixtures.sh` and committed, with mkvextract's output for each as the oracle.
+- `tests/` — bash test-suite (`bash tests/run.sh`); Rust tests live in each crate.
 - `dev/` — tooling for working on this repo, deliberately NOT in `scripts/`: the Makefile
   links every `scripts/*` onto your PATH, so a dev script placed there would ship as a
   utility.
@@ -59,12 +63,12 @@ squashed commit**, through a **pull request**. `main` is protected: it does not 
 direct push, so the PR is the only way in.
 
     git switch -c my-change
-    dev/check-all.sh            # the local mirror of CI — syntax sweep, bash suite, nudge-rs, make
-    dev/check-all.sh --no-rust  # same, skipping the nudge-rs leg
+    dev/check-all.sh            # the local mirror of CI — syntax sweep, bash suite, Rust crates, make
+    dev/check-all.sh --no-rust  # same, skipping the Rust legs
     git push -u origin my-change
     tea pr create               # or open it in the web UI
 
-`make check` is **not** this gate: it runs the bash suite and nudge-rs's tests, but not
+`make check` is **not** this gate: it runs the bash suite and the Rust crates' tests, but not
 rustfmt, not clippy, and not the syntax sweep. Opening a PR on `make check` alone misses
 three things CI fails on.
 

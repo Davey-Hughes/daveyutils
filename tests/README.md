@@ -17,8 +17,9 @@ The suite needs nothing but bash and coreutils. Tests that would otherwise
 shell out to a heavy dependency (`ffmpeg`, `img2pdf`, ImageMagick, …) stub it
 on `PATH` instead, so no test requires the real tool to be installed.
 
-The Rust `nudge` has its own tests in `nudge-rs/` (`cargo test`); those do
-require `tmux`. `make check` runs both suites.
+The Rust `nudge` and `subcheck` have their own tests in `nudge-rs/` and
+`subcheck-rs/` (`cargo test`); nudge's require `tmux`, subcheck's read committed
+MKV fixtures and need nothing installed. `make check` runs all three suites.
 
 ## Layout
 

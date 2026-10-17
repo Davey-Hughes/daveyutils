@@ -135,6 +135,36 @@ jobs:
       - run: cargo clippy --manifest-path nudge-rs/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path nudge-rs/Cargo.toml
 
+  # The nudge-rs job's three commands, for the other crate. Nothing to install:
+  # the tests read MKV fixtures committed under subcheck-rs/tests/fixtures/, so
+  # neither mkvtoolnix nor ffmpeg is needed. Only dev/make-subcheck-fixtures.sh
+  # wants them, and only when a fixture changes.
+  subcheck-rs:
+    name: subcheck-rs
+    runs-on: docker
+    container:
+      image: rust:1-bookworm
+    steps:
+      - name: Checkout
+        env:
+          TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          host="${FORGEJO_SERVER_URL#http://}"; host="${host#https://}"
+          scheme="${FORGEJO_SERVER_URL%%://*}"
+          git init -q .
+          git remote add origin "${scheme}://x-access-token:${TOKEN}@${host}/${FORGEJO_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "$FORGEJO_REF"
+          git checkout -q FETCH_HEAD
+
+      # See the same step in the nudge-rs job: the image's minimal rustup
+      # profile has neither component.
+      - name: Install rustfmt and clippy
+        run: rustup component add rustfmt clippy
+
+      - run: cargo fmt --manifest-path subcheck-rs/Cargo.toml --all --check
+      - run: cargo clippy --manifest-path subcheck-rs/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path subcheck-rs/Cargo.toml
+
   # The Makefile is how every utility here gets onto a PATH, and a `make` that
   # exits 0 while installing a non-functional bin/ ships green -- which is
   # exactly how the CARGO_TARGET_DIR dangling-symlink bug got out, caught only by
@@ -196,6 +226,7 @@ jobs:
       - name: Installed utilities resolve
         run: |
           test -x bin/nudge
+          test -x bin/subcheck
           test -L bin/bisect_img
           test -x bin/bisect_img
           ./bin/nudge --version
