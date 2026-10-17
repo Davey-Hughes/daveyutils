@@ -15,15 +15,19 @@ env:
 # This file is the Forgejo half of a two-forge CI, and the half that gates.
 # .github/workflows/ lives on because this instance has docker runners only, so
 # the macOS legs -- the bash suite against Apple's BSD userland, and nudge-rs
-# against macOS -- exist there and nowhere here. Deleting those files would
-# silently drop the BSD `date`/`sed`/`grep`/`awk` code paths tests/README.md
-# says are covered.
+# and subcheck-rs against macOS -- exist there and nowhere here. Deleting those
+# files would silently drop the BSD `date`/`sed`/`grep`/`awk` code paths
+# tests/README.md says are covered.
 #
 # They are NOT a pre-merge gate, though, and it is worth being precise about
-# why. Nothing pushes to GitHub by hand; the forge mirrors main there after a
-# merge. A Forgejo pull request never reaches GitHub, so the macOS jobs run on
-# already-merged code. Treat a macOS failure as "main is broken, fix forward",
-# not as something a review would have caught.
+# why. Nothing pushes to GitHub by hand: the forge push-mirrors every branch
+# there, so the macOS jobs do run on a pull request's branch, as `push` events,
+# shortly after each push. But their results never reach the Forgejo pull
+# request, so nothing stops a merge on a red macOS run. Before merging, look:
+#
+#   gh run list -R Davey-Hughes/daveyutils --branch <branch>
+#
+# A macOS failure found only after the merge means main is broken: fix forward.
 #
 # Every job clones with git rather than with actions/checkout, and the reason is
 # worth stating because the failure it avoids is silent. checkout is a
