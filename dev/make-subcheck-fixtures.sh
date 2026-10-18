@@ -129,6 +129,59 @@ mux -o "$out/multi.mkv" "$src/video.mkv" \
 grep -v '^Comment:' "$src/a.ass" | grep -v '^Dialogue:' >"$src/empty.ass"
 mux -o "$out/empty.mkv" "$src/video.mkv" --language 0:eng --track-name '0:English Full' "$src/empty.ass"
 
+# What `subcheck timing` is tested on: a 2 fps video with a keyframe every 7 s (14 frames), and three
+# tracks against it. Dialogue that starts on every keyframe and ends on the next, half the lines on
+# the cut's own time and half half a frame before it (Aegisub's way), with lines between them that
+# end 2 frames before a cut; the same script muxed one frame (500 ms) late; and karaoke and effects
+# only, with no style timed to the cuts.
+ass_time() { printf '%d:%02d:%02d.%02d' $(($1 / 360000)) $(($1 / 6000 % 60)) $(($1 / 100 % 60)) $(($1 % 100)); }
+timing_header() {
+  cat <<'EOF'
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+Style: OP,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+Style: FX,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+EOF
+}
+{
+  timing_header
+  for i in $(seq 0 33); do
+    start=$((i * 700))
+    if ((i % 2)); then end=$(((i + 1) * 700)); else end=$(((i + 1) * 700 - 25)); fi
+    printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,Line %d on the cut.\n' "$(ass_time $start)" "$(ass_time $end)" "$i"
+    if ((i % 2)); then
+      printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,Line %d between cuts.\n' "$(ass_time $((start + 300)))" "$(ass_time $((start + 600)))" "$i"
+    fi
+  done
+} >"$src/timing.ass"
+{
+  timing_header
+  # Karaoke a frame after every keyframe: were it not left out, it would read as a late track.
+  for i in $(seq 0 33); do
+    printf 'Dialogue: 0,%s,%s,OP,,0,0,0,,{\\k50}Ka{\\k50}ra{\\k50}o{\\k50}ke\n' "$(ass_time $((i * 700 + 50)))" "$(ass_time $(((i + 1) * 700 + 50)))"
+  done
+  # Effects starting 3 frames before a keyframe to 3 after, three of each, and ending between cuts.
+  for k in $(seq 0 20); do
+    printf 'Dialogue: 0,%s,%s,FX,,0,0,0,,Effect %d\n' "$(ass_time $(((k + 5) * 700 + (k % 7 - 3) * 50)))" "$(ass_time $(((k + 5) * 700 + 300)))" "$k"
+  done
+} >"$src/timing-karaoke.ass"
+ffmpeg -nostdin -loglevel error -y -f lavfi -i color=c=black:s=64x36:r=2:d=240 \
+  -c:v libx264 -preset ultrafast -crf 51 -g 14 -sc_threshold 0 -threads 1 \
+  -fflags +bitexact -flags:v +bitexact "$src/video-2fps.mkv"
+mux -o "$out/timing.mkv" "$src/video-2fps.mkv" \
+  --language 0:eng --track-name '0:Dialogue in sync' "$src/timing.ass" \
+  --language 0:eng --track-name '0:Dialogue a frame late' --default-track-flag 0:no --sync 0:500 "$src/timing.ass" \
+  --language 0:eng --track-name '0:Karaoke and effects' --default-track-flag 0:no "$src/timing-karaoke.ass"
+
 # The oracle: mkvextract's output for every text subtitle track, named the way `subcheck extract`
 # names its default output (<stem>.track<ID>.<ext>).
 for mkv in "$out"/*.mkv; do

@@ -11,7 +11,7 @@ Random command-line utilities. Each one has a `--help`; run it for usage.
 | `batch_makemkvcon` | Rip every Blu-ray/DVD disc image under a directory to MKV | `makemkvcon` |
 | `mkvpropedit_set_name` | Set each MKV's title tag from its filename | `mkvpropedit` |
 | `nudge` | Rate-limit auto-resumer for AI CLIs in tmux (Rust — see `nudge-rs/`) | `tmux` |
-| `subcheck` | Proofread the text subtitles in MKVs with an LLM and review the fixes; extract a track without reading the whole file (Rust — see `subcheck-rs/`) | `claude`, `codex` or `ollama` (for `scan`); `mpv` (for `review`) |
+| `subcheck` | Proofread the text subtitles in MKVs with an LLM and review the fixes; find tracks shifted by whole frames; extract a track without reading the whole file (Rust — see `subcheck-rs/`) | `claude`, `codex` or `ollama` (for `scan`); `mpv` (for `review`) |
 
 ## Install
 
@@ -55,6 +55,10 @@ make help     # list targets
   `subcheck review` steps through a run's fixes to accept, reject or reword each (a fix repeated
   across episodes is one row), and `o` opens the moment in mpv, reusing one window.
   `subcheck list` prints the same as text, and `--mpv` adds a command that opens each one.
+  `subcheck timing` reports subtitle tracks shifted by whole frames against the video (every line
+  a frame late, or part of a track), with the `mkvmerge --sync` that fixes a whole-track shift. It
+  reads only the index and the subtitles: seconds per file when the subtitles have Cues, as
+  mkvmerge writes them by default. No LLM, nothing recorded.
 - `tests/` — bash test-suite (`bash tests/run.sh`); Rust tests live in each crate.
 - `dev/` — tooling for working on this repo, deliberately NOT in `scripts/`: the Makefile
   links every `scripts/*` onto your PATH, so a dev script placed there would ship as a

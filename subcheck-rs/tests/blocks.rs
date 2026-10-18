@@ -130,3 +130,29 @@ fn cues_read_less_than_the_whole_file() {
         r.file_size()
     );
 }
+
+#[test]
+fn read_each_gives_one_result_per_number_even_a_repeated_one() {
+    // Two tracks of a malformed file can share a number; each still needs its row.
+    let (r, layout) = mkv::open(&fixture("multi.mkv")).unwrap();
+    let reads = blocks::read_each(&r, &layout, &[2, 2]);
+    let counts: Vec<usize> = reads
+        .iter()
+        .map(|b| b.as_ref().unwrap().blocks.len())
+        .collect();
+    assert_eq!(counts, [5, 5]);
+}
+
+#[test]
+fn read_each_reads_a_repeated_number_in_the_one_pass() {
+    // ass-nocues has no Cues, so each read is a walk of every Cluster: asking for the track twice
+    // must cost no more than asking once.
+    let bytes = |numbers: &[u64]| {
+        let (r, layout) = mkv::open(&fixture("ass-nocues.mkv")).unwrap();
+        let before = r.bytes_read();
+        let reads = blocks::read_each(&r, &layout, numbers);
+        assert!(reads.iter().all(Result::is_ok));
+        r.bytes_read() - before
+    };
+    assert_eq!(bytes(&[1, 1]), bytes(&[1]));
+}

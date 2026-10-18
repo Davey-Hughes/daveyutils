@@ -6,7 +6,8 @@ use std::process::ExitCode;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use subcheck::blocks::ReadPath;
+use subcheck::blocks::{self, ReadPath};
+use subcheck::ebml;
 use subcheck::list::{self, Filter};
 use subcheck::llm::Backend;
 use subcheck::mkv::{self, Track};
@@ -14,6 +15,8 @@ use subcheck::review;
 use subcheck::scan;
 use subcheck::store::{self, State};
 use subcheck::subs::{self, Kind};
+use subcheck::text;
+use subcheck::timing::{self, TrackReport};
 
 #[derive(Parser)]
 #[command(
@@ -87,6 +90,24 @@ enum Command {
     Review {
         /// A run name (as `scan` prints it) or a run file. Default: the newest.
         run: Option<String>,
+    },
+    /// Report subtitle tracks shifted by whole frames against the video. Reads only the index
+    /// and the subtitles; no LLM, nothing recorded.
+    ///
+    /// Counts the frames between each line's start or end and the nearest video keyframe, which
+    /// is where most cuts are: a track whose timed lines pile up at +1 is a frame late. Directories
+    /// are walked recursively.
+    Timing {
+        /// MKV files, or directories to search for them.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Only tracks in these languages, as ISO 639-2 codes; repeat for more. Default: every text
+        /// subtitle track.
+        #[arg(long = "lang")]
+        langs: Vec<String>,
+        /// Add each style's offset counts, and whether its times were used.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Show a run's findings as text: the newest run, or the one named.
     List {
@@ -193,6 +214,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             review::run(&path, &state)?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Timing {
+            paths,
+            langs,
+            verbose,
+        } => Ok(timing(&paths, &langs, verbose)),
         Command::List {
             run,
             accepted,
@@ -268,6 +294,137 @@ fn extract(
         );
     }
     Ok(())
+}
+
+/// A block per file on stdout. A path or file that cannot be read is reported on stderr, a track
+/// that cannot be read in its row, and the rest are still checked; any of them makes the exit status
+/// 1. A shifted or unsupported track is a result, not a failure.
+fn timing(paths: &[PathBuf], langs: &[String], verbose: bool) -> ExitCode {
+    let mut failed = false;
+    let mut files = Vec::new();
+    for p in paths {
+        match scan::mkv_files(std::slice::from_ref(p)) {
+            Ok((found, warnings)) => {
+                for w in warnings {
+                    eprintln!("warning: {w}");
+                }
+                let root = std::path::absolute(p).ok().filter(|r| r.is_dir());
+                files.extend(found.into_iter().map(|f| {
+                    let (short, long) = timing_labels(p, root.as_deref(), &f);
+                    (f, short, long)
+                }));
+            }
+            Err(e) => {
+                eprintln!("subcheck: {e}");
+                failed = true;
+            }
+        }
+    }
+    // By path; a file reached through two arguments keeps the same label whatever their order.
+    files.sort();
+    files.dedup_by(|a, b| a.0 == b.0);
+    if files.is_empty() && !failed {
+        eprintln!("Nothing to check: no MKV files found");
+    }
+    for (file, short, long) in &files {
+        let alike = files.iter().filter(|(_, s, _)| s == short).count() > 1;
+        let name = if alike { long } else { short };
+        match timing_file(file, langs) {
+            Ok((tracks, unread)) => {
+                print!("{}", timing::render(name, &tracks, verbose));
+                failed |= unread;
+            }
+            Err(e) => {
+                eprintln!("subcheck: {}: {e:#}", file.display());
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// How a file's block is headed: its path below the directory argument it was found under (`root`),
+/// so two seasons' `01.mkv` can be told apart, or its name when the argument named the file. Second,
+/// its path as given, for when two files in the run would share that.
+fn timing_labels(arg: &Path, root: Option<&Path>, file: &Path) -> (String, String) {
+    let below = root.and_then(|r| file.strip_prefix(r).ok());
+    let short = below.map_or_else(
+        || PathBuf::from(file.file_name().unwrap_or(file.as_os_str())),
+        Path::to_path_buf,
+    );
+    let long = below.map_or_else(|| arg.to_path_buf(), |b| arg.join(b));
+    (
+        short.to_string_lossy().into_owned(),
+        long.to_string_lossy().into_owned(),
+    )
+}
+
+/// Every chosen text track of one file against its video, and whether a track could not be read.
+fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)> {
+    let (r, layout) = mkv::open(file)?;
+    if let Some(t) = layout.truncated {
+        eprintln!("{}", t.warning(file));
+    }
+    let chosen: Vec<(&Track, Kind)> = layout
+        .tracks
+        .iter()
+        .filter(|t| t.is_text_subtitle())
+        .filter_map(|t| Some((t, Kind::of(t)?)))
+        .filter(|(t, _)| langs.is_empty() || scan::wanted_language(t, langs))
+        .collect();
+    let name = |t: &Track| {
+        t.name
+            .clone()
+            .unwrap_or_else(|| format!("({})", t.language))
+    };
+    let video = match timing::video(&layout) {
+        Ok(v) => v,
+        Err(reason) => {
+            let tracks = chosen
+                .iter()
+                .map(|(t, _)| TrackReport {
+                    id: t.id,
+                    name: name(t),
+                    result: Err(format!("unsupported: {reason}")),
+                })
+                .collect();
+            return Ok((tracks, false));
+        }
+    };
+    let numbers: Vec<u64> = chosen.iter().map(|(t, _)| t.number).collect();
+    let reads = blocks::read_each(&r, &layout, &numbers);
+    let mut unread = false;
+    let tracks = chosen
+        .into_iter()
+        .zip(reads)
+        .map(|((t, kind), read)| TrackReport {
+            id: t.id,
+            name: name(t),
+            result: match read {
+                Ok(b) => {
+                    let events = text::events(
+                        t.id,
+                        kind,
+                        &b.blocks,
+                        layout.timestamp_scale,
+                        t.default_duration,
+                    );
+                    Ok(timing::analyse(&video, &events))
+                }
+                // Already reads `unsupported: …`.
+                Err(e @ ebml::Error::Unsupported(_)) => Err(e.to_string()),
+                Err(e) => {
+                    unread = true;
+                    Err(format!("cannot read: {e}"))
+                }
+            },
+        })
+        .collect();
+    Ok((tracks, unread))
 }
 
 fn pick_track(tracks: &[Track], id: Option<usize>) -> Result<&Track> {

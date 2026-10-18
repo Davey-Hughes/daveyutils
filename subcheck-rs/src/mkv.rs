@@ -56,6 +56,7 @@ pub const BLOCK_GROUP: u32 = 0xA0;
 pub const BLOCK: u32 = 0xA1;
 pub const BLOCK_DURATION: u32 = 0x9B;
 
+pub const TRACK_TYPE_VIDEO: u64 = 0x01;
 pub const TRACK_TYPE_SUBTITLE: u64 = 0x11;
 
 /// The ContentEncodingScope bit for frame contents; 2 is CodecPrivate.

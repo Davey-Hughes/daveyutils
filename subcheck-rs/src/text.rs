@@ -44,6 +44,8 @@ pub struct Event {
     pub text: String,
     /// The (x, y) of the first `\pos`, if any.
     pub pos: Option<(i64, i64)>,
+    /// Has a karaoke tag (`\k`, `\K`, `\kf`, `\ko`): timed to the music, not the picture.
+    pub karaoke: bool,
 }
 
 /// The track's blocks (one track, mkvmerge ID `track`) as events. `scale` is the TimestampScale;
@@ -82,7 +84,7 @@ pub fn events(
             }
             Kind::Srt => (String::new(), String::new(), payload),
         };
-        let Some((text, pos)) = clean(&raw, kind) else {
+        let Some(Cleaned { text, pos, karaoke }) = clean(&raw, kind) else {
             continue;
         };
         out.push(Event {
@@ -93,6 +95,7 @@ pub fn events(
             style,
             text,
             pos,
+            karaoke,
         });
     }
     out
@@ -102,10 +105,19 @@ fn ms(ns: i128) -> i64 {
     i64::try_from(ns / 1_000_000).unwrap_or(i64::MAX)
 }
 
-/// Text without markup, and its first `\pos`; `None` for an ASS drawing.
-fn clean(raw: &str, kind: Kind) -> Option<(String, Option<(i64, i64)>)> {
+/// What [`clean`] makes of an event's text.
+struct Cleaned {
+    text: String,
+    pos: Option<(i64, i64)>,
+    karaoke: bool,
+}
+
+/// Text without markup, its first `\pos`, and whether it has a karaoke tag; `None` for an ASS
+/// drawing.
+fn clean(raw: &str, kind: Kind) -> Option<Cleaned> {
     let mut text = String::new();
     let mut pos = None;
+    let mut karaoke = false;
     let mut rest = raw;
     while !rest.is_empty() {
         let (open, close) = match kind {
@@ -130,6 +142,7 @@ fn clean(raw: &str, kind: Kind) -> Option<(String, Option<(i64, i64)>)> {
                 if pos.is_none() {
                     pos = pos_of(tag);
                 }
+                karaoke |= is_karaoke(tag);
             }
         }
         rest = &rest[i + j + 1..];
@@ -141,7 +154,11 @@ fn clean(raw: &str, kind: Kind) -> Option<(String, Option<(i64, i64)>)> {
             .replace("\\n", " ")
             .replace("\\h", " "),
     };
-    Some((collapse(&text), pos))
+    Some(Cleaned {
+        text: collapse(&text),
+        pos,
+        karaoke,
+    })
 }
 
 /// `\p1` and up turn on drawing mode; `\p0` turns it off. `\pos`, `\pbo` are other tags.
@@ -149,6 +166,13 @@ fn is_drawing(tag: &str) -> bool {
     tag.strip_prefix('p')
         .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
         .is_some_and(|n| !n.trim_start_matches('0').is_empty())
+}
+
+/// `\k`, `\K`, `\kf` and `\ko`, each with a duration in centiseconds.
+fn is_karaoke(tag: &str) -> bool {
+    tag.strip_prefix(['k', 'K'])
+        .map(|rest| rest.strip_prefix(['f', 'o']).unwrap_or(rest))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn pos_of(tag: &str) -> Option<(i64, i64)> {
@@ -470,6 +494,23 @@ mod tests {
         let out = lines(events(3, Kind::Srt, &[block], 1_000_000, None));
         assert_eq!(texts(&out), ["Two rows"]);
         assert_eq!(out[0].style, "");
+    }
+
+    #[test]
+    fn karaoke_tags_mark_an_event() {
+        let blocks = [
+            ass(0, 0, 1000, "OP", r"{\k20}ka{\k15}ra"),
+            ass(1, 0, 1000, "OP", r"{\K20}ka"),
+            ass(2, 0, 1000, "OP", r"{\an8\kf30}ka"),
+            ass(3, 0, 1000, "OP", r"{\ko10}ka"),
+            ass(4, 0, 1000, "D", r"{\pos(10,20)\i1}Not karaoke."),
+            ass(5, 0, 1000, "D", "Plain."),
+        ];
+        let karaoke: Vec<bool> = events(0, Kind::Ass, &blocks, 1_000_000, None)
+            .iter()
+            .map(|e| e.karaoke)
+            .collect();
+        assert_eq!(karaoke, [true, true, true, true, false, false]);
     }
 
     #[test]

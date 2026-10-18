@@ -37,7 +37,7 @@ pub enum ReadPath {
     Empty,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TrackBlocks {
     pub track: u64,
     pub path: ReadPath,
@@ -95,6 +95,37 @@ pub fn read_tracks(
         });
     }
     Ok(out)
+}
+
+/// The blocks of each track numbered `numbers`, in one pass so a file whose tracks have no Cues is
+/// walked once, not once per track. If that fails (one track's encoding unsupported, say), they are
+/// read one at a time so the failure costs only that track. One result per number, in order.
+pub fn read_each(r: &Reader, layout: &Layout, numbers: &[u64]) -> Vec<Result<TrackBlocks>> {
+    // read_tracks gives a number asked for twice one entry: read each once, hand it out per ask.
+    let mut distinct = numbers.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    match read_tracks(r, layout, &distinct, false) {
+        Ok(all) => numbers
+            .iter()
+            .map(|&n| {
+                Ok(all
+                    .iter()
+                    .find(|t| t.track == n)
+                    .expect("read_tracks returns one entry per track asked for")
+                    .clone())
+            })
+            .collect(),
+        Err(_) => numbers
+            .iter()
+            .map(|&n| {
+                read_tracks(r, layout, &[n], false).map(|mut one| {
+                    one.pop()
+                        .expect("read_tracks returns one entry per track asked for")
+                })
+            })
+            .collect(),
+    }
 }
 
 fn find_track(layout: &Layout, number: u64) -> Result<&Track> {

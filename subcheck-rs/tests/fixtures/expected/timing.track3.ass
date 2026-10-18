@@ -1,0 +1,68 @@
+﻿[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+Style: OP,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+Style: FX,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.50,0:00:07.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:00:07.50,0:00:14.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:00:14.50,0:00:21.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:00:21.50,0:00:28.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:00:28.50,0:00:35.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:00:35.50,0:00:42.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:00:42.50,0:00:49.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:00:49.50,0:00:56.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:00:56.50,0:01:03.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:01:03.50,0:01:10.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:01:10.50,0:01:17.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:01:17.50,0:01:24.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:01:24.50,0:01:31.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:01:31.50,0:01:38.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:01:38.50,0:01:45.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:01:45.50,0:01:52.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:01:52.50,0:01:59.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:01:59.50,0:02:06.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:02:06.50,0:02:13.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:02:13.50,0:02:20.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:02:20.50,0:02:27.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:02:27.50,0:02:34.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:02:34.50,0:02:41.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:02:41.50,0:02:48.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:02:48.50,0:02:55.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:02:55.50,0:03:02.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:03:02.50,0:03:09.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:03:09.50,0:03:16.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:03:16.50,0:03:23.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:03:23.50,0:03:30.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:03:30.50,0:03:37.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:03:37.50,0:03:44.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:03:44.50,0:03:51.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:03:51.50,0:03:58.50,OP,,0,0,0,,{\k50}Ka{\k50}ra{\k50}o{\k50}ke
+Dialogue: 0,0:00:33.50,0:00:38.00,FX,,0,0,0,,Effect 0
+Dialogue: 0,0:00:41.00,0:00:45.00,FX,,0,0,0,,Effect 1
+Dialogue: 0,0:00:48.50,0:00:52.00,FX,,0,0,0,,Effect 2
+Dialogue: 0,0:00:56.00,0:00:59.00,FX,,0,0,0,,Effect 3
+Dialogue: 0,0:01:03.50,0:01:06.00,FX,,0,0,0,,Effect 4
+Dialogue: 0,0:01:11.00,0:01:13.00,FX,,0,0,0,,Effect 5
+Dialogue: 0,0:01:18.50,0:01:20.00,FX,,0,0,0,,Effect 6
+Dialogue: 0,0:01:22.50,0:01:27.00,FX,,0,0,0,,Effect 7
+Dialogue: 0,0:01:30.00,0:01:34.00,FX,,0,0,0,,Effect 8
+Dialogue: 0,0:01:37.50,0:01:41.00,FX,,0,0,0,,Effect 9
+Dialogue: 0,0:01:45.00,0:01:48.00,FX,,0,0,0,,Effect 10
+Dialogue: 0,0:01:52.50,0:01:55.00,FX,,0,0,0,,Effect 11
+Dialogue: 0,0:02:00.00,0:02:02.00,FX,,0,0,0,,Effect 12
+Dialogue: 0,0:02:07.50,0:02:09.00,FX,,0,0,0,,Effect 13
+Dialogue: 0,0:02:11.50,0:02:16.00,FX,,0,0,0,,Effect 14
+Dialogue: 0,0:02:19.00,0:02:23.00,FX,,0,0,0,,Effect 15
+Dialogue: 0,0:02:26.50,0:02:30.00,FX,,0,0,0,,Effect 16
+Dialogue: 0,0:02:34.00,0:02:37.00,FX,,0,0,0,,Effect 17
+Dialogue: 0,0:02:41.50,0:02:44.00,FX,,0,0,0,,Effect 18
+Dialogue: 0,0:02:49.00,0:02:51.00,FX,,0,0,0,,Effect 19
+Dialogue: 0,0:02:56.50,0:02:58.00,FX,,0,0,0,,Effect 20

@@ -198,22 +198,9 @@ fn prepare(path: &Path, langs: &[String]) -> Prepared {
             }
         }
     }
-    // One read for all of them, so a file whose tracks have no Cues is walked once, not once per
-    // track. If that fails (one track's encoding unsupported, say), read them one at a time so the
-    // failure costs only that track.
     let numbers: Vec<u64> = wanted.iter().map(|(t, _, _)| t.number).collect();
     let before = r.bytes_read();
-    let reads: Vec<Result<blocks::TrackBlocks, String>> =
-        match blocks::read_tracks(&r, &layout, &numbers, false) {
-            Ok(all) => all.into_iter().map(Ok).collect(),
-            Err(_) => numbers
-                .iter()
-                .map(|&n| match blocks::read_tracks(&r, &layout, &[n], false) {
-                    Ok(mut one) => one.pop().ok_or_else(|| "no blocks".to_string()),
-                    Err(e) => Err(e.to_string()),
-                })
-                .collect(),
-        };
+    let reads = blocks::read_each(&r, &layout, &numbers);
     let mut events = Vec::new();
     for ((track, kind, sid), read) in wanted.into_iter().zip(reads) {
         let read = match read {

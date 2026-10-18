@@ -16,3 +16,4 @@ pub mod scan;
 pub mod store;
 pub mod subs;
 pub mod text;
+pub mod timing;
