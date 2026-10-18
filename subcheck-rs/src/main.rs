@@ -156,6 +156,10 @@ struct ApplyArgs {
     /// originals. Nothing is swapped.
     #[arg(long)]
     check: bool,
+    /// Fix per-letter karaoke too: change the row's letters and re-space it by each letter's
+    /// width, measured from the style's other rows. Look at each one afterwards (review, o).
+    #[arg(long)]
+    karaoke: bool,
     /// The mkvmerge program.
     #[arg(long, default_value = "mkvmerge", hide = true)]
     mkvmerge: PathBuf,
@@ -293,6 +297,7 @@ fn apply_run(a: ApplyArgs) -> Result<ExitCode> {
         &path,
         &state,
         &mode,
+        a.karaoke,
         a.mkvmerge.as_os_str(),
         &mut std::io::stdout().lock(),
     )?;

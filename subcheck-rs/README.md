@@ -97,11 +97,21 @@ chapter, an edition), or an element mkvmerge's tags XML cannot hold.
 `--no-backup` keeps no original. `--dry-run` shows each changed event before and after, and writes
 nothing. Running apply again is safe: a fix already in its file is reported and left alone.
 
-Some fixes are left for a hand fix, with the reason: per-letter karaoke (one event per letter),
-signs set letter by letter (a tag before nearly every letter), a change across a tag or a line
-break, two fixes on one line, and a line that is not there any more.
+Some fixes are left for a hand fix, with the reason: per-letter karaoke (one event per letter)
+without `--karaoke`, signs set letter by letter (a tag before nearly every letter), a change
+across a tag or a line break, two fixes on one line, and a line that is not there any more.
+
+`--karaoke` makes per-letter karaoke fixes too. Each changed letter keeps its event (tags,
+colours, animation), and a new one is a copy of the letter beside it. The row is then re-spaced
+by each letter's width, measured from where the style's other rows put their letters, and stays
+anchored as the style aligns it: a centred row grows both ways. A letter the style never shows
+gets a typical width, and the output says so. Look at each one afterwards (`subcheck review`,
+then `o`). It leaves for a hand fix a row whose letters are timed one by one (`\k` or `\t`
+times that differ from letter to letter; the same `\k` on every letter is fine), drawn at
+different sizes, or not centred on their `\pos`.
 
 A file in a directory you cannot write to (a library share, say) can be remuxed elsewhere:
 `--tracks-only DIR` writes its fixed tracks to DIR and prints the mkvmerge command that remuxes
 it to `.<name>.mkv.subcheck` beside the original; `--check` then checks that remux against the
-original. The swap is yours. Afterwards `subcheck apply` finds the fixes in place and records them.
+original (with `--karaoke` too when the tracks were written with it; `--tracks-only` prints the
+command). The swap is yours. Afterwards `subcheck apply` finds the fixes in place and records them.

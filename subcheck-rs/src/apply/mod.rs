@@ -2,6 +2,7 @@
 //! events, write the fixed tracks, remux with mkvmerge beside the original, check the remux, and
 //! swap it in, keeping the original as `.orig` unless told not to.
 
+pub mod karaoke;
 pub mod patch;
 pub mod remux;
 pub mod verify;
@@ -64,10 +65,12 @@ pub fn backup_path(file: &Path) -> PathBuf {
 }
 
 /// Apply the run in `run_path`'s accepted fixes, as `mode` says; `state` is the state directory.
+/// `karaoke`: re-space per-letter karaoke rows rather than leave them for a hand fix.
 pub fn run(
     run_path: &Path,
     state: &Path,
     mode: &Mode,
+    karaoke: bool,
     mkvmerge: &OsStr,
     out: &mut impl Write,
 ) -> anyhow::Result<Summary> {
@@ -102,6 +105,7 @@ pub fn run(
             name,
             fixes: &mine,
             mode,
+            karaoke,
             state,
             mkvmerge,
         };
@@ -109,7 +113,7 @@ pub fn run(
             Ok(done) => {
                 for (_, o) in &done.outcomes {
                     match o {
-                        Outcome::Patched => summary.fixed += 1,
+                        Outcome::Patched | Outcome::Respaced { .. } => summary.fixed += 1,
                         Outcome::AlreadyApplied => summary.already += 1,
                         Outcome::ByHand(_) => summary.by_hand += 1,
                         Outcome::NotFound => summary.not_found += 1,
@@ -121,7 +125,14 @@ pub fn run(
                     let records: Vec<Record> = done
                         .outcomes
                         .iter()
-                        .filter(|(_, o)| matches!(o, Outcome::AlreadyApplied | Outcome::Patched))
+                        .filter(|(_, o)| {
+                            matches!(
+                                o,
+                                Outcome::AlreadyApplied
+                                    | Outcome::Patched
+                                    | Outcome::Respaced { .. }
+                            )
+                        })
                         .map(|&(finding, _)| Record::Applied(Applied { finding, at }))
                         .collect();
                     w.append(&records)?;
@@ -144,6 +155,21 @@ pub fn run(
         "{verb} {}, already applied {}, by hand {}, not found {}; {} remuxed, {} failed",
         s.fixed, s.already, s.by_hand, s.not_found, s.remuxed, s.failed
     )?;
+    // The check plans the fixes again, and must plan them as these tracks were. A run outside the
+    // state directory is found by its path, not its name.
+    if matches!(mode, Mode::TracksOnly(_)) && s.fixed > 0 {
+        let flag = if karaoke { " --karaoke" } else { "" };
+        let in_state = run_path.parent() == Some(state.join("runs").as_path());
+        let shown = if in_state {
+            run.name.clone()
+        } else {
+            shell_quote(&run_path.to_string_lossy())
+        };
+        writeln!(
+            out,
+            "Once they are remuxed, check them with: subcheck apply {shown} --check{flag}"
+        )?;
+    }
     Ok(summary)
 }
 
@@ -187,6 +213,7 @@ struct Job<'a> {
     name: String,
     fixes: &'a [Fix<'a>],
     mode: &'a Mode,
+    karaoke: bool,
     state: &'a Path,
     mkvmerge: &'a OsStr,
 }
@@ -272,7 +299,7 @@ impl Job<'_> {
                 default_duration: t.default_duration,
             })
             .collect();
-        let plan = patch::plan(&views, self.fixes);
+        let plan = patch::plan(&views, self.fixes, self.karaoke);
         self.report(&plan, &views, out).map_err(|e| e.to_string())?;
         note_tags(&r, &layout, &chosen, &plan, out)?;
         let fixed: Vec<Fixed> = chosen
@@ -374,6 +401,7 @@ impl Job<'_> {
             let what = format!("{} → {}", &f.original[a], &fix.text[b]);
             let status = match outcome {
                 Outcome::Patched => "ok".to_string(),
+                Outcome::Respaced { px, guessed } => respaced(*px, guessed),
                 Outcome::AlreadyApplied => "already applied".into(),
                 Outcome::ByHand(why) => format!("by hand: {why}"),
                 Outcome::NotFound => "not found: the file changed since the scan".into(),
@@ -386,13 +414,26 @@ impl Job<'_> {
                     .iter()
                     .find(|v| v.id == *id)
                     .expect("an edited track was read");
-                for (i, new) in edits {
+                let rows: Vec<&patch::KaraokeRow> =
+                    plan.rows.iter().filter(|r| r.track == *id).collect();
+                // A karaoke row's events are shown as the row, below.
+                let in_row = |i: &usize| rows.iter().any(|r| r.blocks.contains(i));
+                for (i, new) in edits.changed.iter().filter(|(i, _)| !in_row(i)) {
                     let old = subs::c_string(&view.blocks[*i].payload);
                     writeln!(out, "    track {id}: {}", text_of(view.kind, &old))?;
                     writeln!(
                         out,
                         "         now: {}",
                         text_of(view.kind, &subs::c_string(new))
+                    )?;
+                }
+                for r in rows {
+                    writeln!(out, "    track {id}: {}", r.was)?;
+                    writeln!(
+                        out,
+                        "         now: {} (karaoke letters: {})",
+                        r.now,
+                        letter_counts(r)
                     )?;
                 }
             }
@@ -687,6 +728,33 @@ fn say(out: &mut impl Write, line: &str) -> Result<(), String> {
     writeln!(out, "  {line}").map_err(|e| e.to_string())
 }
 
+/// What a re-spaced karaoke row's letters did, the counts that are not zero.
+fn letter_counts(r: &patch::KaraokeRow) -> String {
+    let counts = [
+        (r.changed, "changed"),
+        (r.added, "added"),
+        (r.removed, "removed"),
+        (r.moved, "moved"),
+    ];
+    let said: Vec<String> = counts
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, done)| format!("{n} {done}"))
+        .collect();
+    said.join(", ")
+}
+
+/// A karaoke fix's status: how much its rows grew, and which widths were guesses.
+fn respaced(px: i64, guessed: &str) -> String {
+    let guess = if guessed.is_empty() {
+        String::new()
+    } else {
+        let quoted: Vec<String> = guessed.chars().map(|c| format!("\"{c}\"")).collect();
+        format!(" (no {} in this style to measure)", quoted.join(", "))
+    };
+    format!("karaoke re-spaced by {px:+} px{guess}: check it (review, o)")
+}
+
 fn quick_or_full(full: bool) -> &'static str {
     if full {
         "full"
@@ -725,6 +793,38 @@ fn free_space(dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_karaoke_rows_counts_leave_out_the_zeros() {
+        let row = |changed, added, removed, moved| patch::KaraokeRow {
+            track: 3,
+            blocks: vec![],
+            was: String::new(),
+            now: String::new(),
+            changed,
+            added,
+            removed,
+            moved,
+        };
+        assert_eq!(letter_counts(&row(1, 0, 0, 0)), "1 changed");
+        assert_eq!(letter_counts(&row(0, 1, 0, 12)), "1 added, 12 moved");
+        assert_eq!(
+            letter_counts(&row(2, 0, 1, 3)),
+            "2 changed, 1 removed, 3 moved"
+        );
+    }
+
+    #[test]
+    fn a_karaoke_fix_says_how_much_its_row_grew_and_what_was_guessed() {
+        assert_eq!(
+            respaced(29, ""),
+            "karaoke re-spaced by +29 px: check it (review, o)"
+        );
+        assert_eq!(
+            respaced(-24, "qz"),
+            "karaoke re-spaced by -24 px (no \"q\", \"z\" in this style to measure): check it (review, o)"
+        );
+    }
 
     #[test]
     fn files_of_one_name_get_names_no_other_file_has() {

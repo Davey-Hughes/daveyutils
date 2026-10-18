@@ -91,7 +91,11 @@ fn a_track_is_written_with_edited_payloads_in_place_of_theirs() {
     let write = |edits: &std::collections::BTreeMap<usize, Vec<u8>>| {
         let mut out = Vec::new();
         let kind = subs::Kind::of(track).unwrap();
-        let blocks = subcheck::apply::patch::edited(&read.blocks, edits);
+        let edits = subcheck::apply::patch::Edits {
+            changed: edits.clone(),
+            ..Default::default()
+        };
+        let blocks = subcheck::apply::patch::edited(&read.blocks, &edits);
         subs::write_track(track, kind, &blocks, layout.timestamp_scale, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     };

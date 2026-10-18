@@ -39,7 +39,13 @@ fn fixed(dir: &Path) -> (Fixed, Vec<Replacement>) {
             })
             .collect();
         assert!(!edits.is_empty());
-        let patched = patch::edited(&read.blocks, &edits);
+        let patched = patch::edited(
+            &read.blocks,
+            &patch::Edits {
+                changed: edits,
+                ..Default::default()
+            },
+        );
         let kind = subs::Kind::of(track).unwrap();
         let file = dir.join(format!("apply.track{id}.{}", kind.extension()));
         let mut out = Vec::new();

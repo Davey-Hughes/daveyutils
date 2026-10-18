@@ -193,7 +193,9 @@ fn a_dry_run_says_what_would_change_and_writes_nothing() {
         "{text}"
     );
     assert!(
-        text.contains("  0:00:05.00  trough → through  by hand: per-letter karaoke\n"),
+        text.contains(
+            "  0:00:05.00  trough → through  by hand: per-letter karaoke (try --karaoke)\n"
+        ),
         "{text}"
     );
     assert!(
@@ -291,6 +293,89 @@ fn apply_remuxes_checks_and_swaps_keeping_the_original() {
         text.ends_with(
             "applied 0, already applied 7, by hand 1, not found 1; 0 remuxed, 0 failed\n"
         ),
+        "{text}"
+    );
+}
+
+/// The apply fixture's per-letter OP row ("go trough it", letters 20 px apart from x 200 in track
+/// 3) as `--karaoke` leaves it: an h after the t, the row spread 10 px each way about its centre.
+fn karaoke_row() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (i, c) in "go through it".chars().enumerate() {
+        let x = 190 + 20 * i;
+        let c = c.to_string().replace(' ', "");
+        writeln!(
+            out,
+            "Dialogue: 0,0:00:05.00,0:00:07.00,OP,,0,0,0,fx,{{\\an5\\pos({x},40)}}{c}"
+        )
+        .unwrap();
+    }
+    out
+}
+
+#[test]
+fn karaoke_is_re_spaced_with_the_flag() {
+    if !have_mkvmerge() {
+        return;
+    }
+    let s = Setup::new();
+    let dry = stdout(&s.apply(&["--dry-run", "--karaoke"]));
+    assert!(
+        dry.contains(
+            "  0:00:05.00  trough → through  karaoke re-spaced by +20 px: check it (review, o)\n"
+        ),
+        "{dry}"
+    );
+    assert!(
+        dry.contains(
+            "    track 3: go trough it\n         now: go through it (karaoke letters: 1 added, 12 moved)\n"
+        ),
+        "{dry}"
+    );
+    // Remuxed elsewhere from the tracks it writes: the check needs --karaoke too, and says so.
+    let out = s.root.join("tracks");
+    let text = stdout(&s.apply(&["--tracks-only", out.to_str().unwrap(), "--karaoke"]));
+    assert!(text.ends_with(" --check --karaoke\n"), "{text}");
+    let command = text.lines().find(|l| l.starts_with("  mkvmerge ")).unwrap();
+    let ran = Command::new("sh")
+        .arg("-c")
+        .arg(command.trim())
+        .output()
+        .unwrap();
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stdout)
+    );
+    let o = s.apply(&["--check", "--karaoke"]);
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert_eq!(s.apply(&["--check"]).status.code(), Some(1));
+    std::fs::remove_file(subcheck::apply::remux_path(&s.file)).unwrap();
+    let o = s.apply(&["--karaoke"]);
+    let text = stdout(&o);
+    assert!(
+        o.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        text.ends_with(
+            "applied 8, already applied 0, by hand 0, not found 1; 1 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+    let before = expected(3, "ass");
+    let start = before.find("Dialogue: 0,0:00:05.00").unwrap();
+    let end = before.rfind("}t\n").unwrap() + 3;
+    let after = format!("{}{}{}", &before[..start], karaoke_row(), &before[end..])
+        .replace("Libary", "Library")
+        .replace("happen share", "happen to share");
+    assert_eq!(track(&s.file, 3), after);
+    // In now: a second run finds it so, karaoke or not.
+    let text = stdout(&s.apply(&[]));
+    assert!(
+        text.contains("  0:00:05.00  trough → through  already applied\n"),
         "{text}"
     );
 }
@@ -439,6 +524,34 @@ fn tracks_only_then_a_remux_elsewhere_then_check_then_apply_records() {
     assert_eq!(
         std::fs::read(&s.file).unwrap(),
         std::fs::read(fixture("apply.mkv")).unwrap()
+    );
+    let name = s
+        .run_file()
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        text.ends_with(&format!(
+            "\nOnce they are remuxed, check them with: subcheck apply {name} --check\n"
+        )),
+        "{text}"
+    );
+    // A run given as a file elsewhere is named by its path, quoted for the shell.
+    let elsewhere = s.root.join("a run.jsonl");
+    std::fs::copy(s.run_file(), &elsewhere).unwrap();
+    let other = s.root.join("other tracks");
+    let text = stdout(&s.apply(&[
+        elsewhere.to_str().unwrap(),
+        "--tracks-only",
+        other.to_str().unwrap(),
+    ]));
+    assert!(
+        text.ends_with(&format!(
+            "check them with: subcheck apply '{}' --check\n",
+            elsewhere.display()
+        )),
+        "{text}"
     );
     // Nothing built yet.
     let o = s.apply(&["--check"]);

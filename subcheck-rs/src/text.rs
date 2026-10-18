@@ -242,10 +242,15 @@ pub fn cleaned(raw: &str, kind: Kind) -> Mapped {
     Mapped { text, spans }
 }
 
+/// Whether a tag's argument is a whole number: one or more ASCII digits.
+pub fn is_number(n: &str) -> bool {
+    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// `\p1` and up turn on drawing mode; `\p0` turns it off. `\pos`, `\pbo` are other tags.
 fn is_drawing(tag: &str) -> bool {
     tag.strip_prefix('p')
-        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .filter(|n| is_number(n))
         .is_some_and(|n| !n.trim_start_matches('0').is_empty())
 }
 
@@ -253,7 +258,45 @@ fn is_drawing(tag: &str) -> bool {
 fn is_karaoke(tag: &str) -> bool {
     tag.strip_prefix(['k', 'K'])
         .map(|rest| rest.strip_prefix(['f', 'o']).unwrap_or(rest))
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .is_some_and(is_number)
+}
+
+/// The first `\pos` in `raw` (an event's text): where its x is, as bytes of `raw`, and its value.
+/// `None` for SRT, or when the first `\pos` has no x that parses.
+pub fn pos_x(raw: &str, kind: Kind) -> Option<(Range<usize>, f64)> {
+    if kind == Kind::Srt {
+        return None;
+    }
+    let block = tag_blocks(raw, kind)
+        .into_iter()
+        .find(|b| raw[b.clone()].contains("\\pos("))?;
+    let start = block.start + raw[block.clone()].find("\\pos(")? + "\\pos(".len();
+    let end = start + raw[start..block.end].find(',')?;
+    let x = raw[start..end].trim().parse().ok()?;
+    Some((start..end, x))
+}
+
+/// Every override tag in `raw` (an event's text), in order, each without its backslash: a `\t`'s
+/// inner tags come apart from it, and text before a block's first backslash (a comment) is none.
+/// Empty for SRT.
+pub fn tags(raw: &str, kind: Kind) -> Vec<&str> {
+    if kind == Kind::Srt {
+        return Vec::new();
+    }
+    tag_blocks(raw, kind)
+        .into_iter()
+        .flat_map(|b| raw[b].split('\\').skip(1))
+        .filter(|tag| !tag.is_empty())
+        .collect()
+}
+
+/// The tags in `raw` (an event's text) that time its effects: `\t` with its times, `\k` and its
+/// kin, `\fad` and `\fade`, each as written (a `\t`'s inner tags left out). Empty for SRT.
+pub fn timing(raw: &str, kind: Kind) -> Vec<&str> {
+    tags(raw, kind)
+        .into_iter()
+        .filter(|tag| tag.starts_with("t(") || tag.starts_with("fad") || is_karaoke(tag))
+        .collect()
 }
 
 fn pos_of(tag: &str) -> Option<(i64, i64)> {
@@ -284,19 +327,13 @@ const FRAGMENT_STYLE_MIN_LINES: usize = 10;
 /// Measured on K-On!! E02: the four romaji/kanji styles are 100% single tokens, dialogue 11%, the
 /// English lyrics 0–6%; a one-line sign style survives on the minimum.
 pub fn lines(events: Vec<Event>) -> Vec<Line> {
-    // Karaoke: events of one track sharing style, layer, start, end and row (the \pos y), so
-    // two lyric rows, or signs at different heights, shown at once stay separate lines.
+    // Karaoke: events of one track in one row (see `row_of`), so two lyric rows, or signs at
+    // different heights, shown at once stay separate lines.
     type Key = (usize, i64, i64, String, String, Option<i64>);
     let mut groups: BTreeMap<Key, Vec<Event>> = BTreeMap::new();
     for e in events {
-        let key = (
-            e.track,
-            e.start_ms,
-            e.end_ms,
-            e.style.clone(),
-            e.layer.clone(),
-            e.pos.map(|(_, y)| y),
-        );
+        let (start, end, style, layer, y) = row_of(&e);
+        let key = (e.track, start, end, style.to_string(), layer.to_string(), y);
         groups.entry(key).or_default().push(e);
     }
     let mut merged: Vec<(String, String, Occurrence)> = Vec::new();
@@ -352,6 +389,21 @@ pub fn lines(events: Vec<Event>) -> Vec<Line> {
     out.retain(|l| !fragments.contains(&l.style));
     out.sort_by(|a, b| (a.start_ms(), &a.style, &a.text).cmp(&(b.start_ms(), &b.style, &b.text)));
     out
+}
+
+/// A row of per-letter karaoke: start and end, style, layer, and the y of the `\pos`.
+pub type RowKey<'e> = (i64, i64, &'e str, &'e str, Option<i64>);
+
+/// Which row of per-letter karaoke an event belongs to. Apply's karaoke fixes group by the same key
+/// as the lines read.
+pub fn row_of(e: &Event) -> RowKey<'_> {
+    (
+        e.start_ms,
+        e.end_ms,
+        e.style.as_str(),
+        e.layer.as_str(),
+        e.pos.map(|(_, y)| y),
+    )
 }
 
 /// The line of a per-letter karaoke group: three or more events of one track that share times,
@@ -587,6 +639,37 @@ mod tests {
         let out = lines(events(3, Kind::Srt, &[block], 1_000_000, None));
         assert_eq!(texts(&out), ["Two rows"]);
         assert_eq!(out[0].style, "");
+    }
+
+    #[test]
+    fn the_first_pos_x_is_found_where_it_is_written() {
+        let raw = r"{\an5\bord3}{\pos(315.5, 1013)\pos(1,2)}T";
+        let (at, x) = pos_x(raw, Kind::Ass).unwrap();
+        assert_eq!((&raw[at], x), ("315.5", 315.5));
+        assert_eq!(pos_x(r"{\an5}T", Kind::Ass), None);
+        assert_eq!(pos_x(r"{\pos(left,2)}T", Kind::Ass), None);
+        assert_eq!(pos_x(r"<\pos(1,2)>T", Kind::Srt), None);
+    }
+
+    #[test]
+    fn tags_are_every_override_in_order() {
+        let raw = r"{\an5\t(0,200,\alpha&H00&)}x{\pos(1,2)}";
+        assert_eq!(
+            tags(raw, Kind::Ass),
+            ["an5", "t(0,200,", "alpha&H00&)", "pos(1,2)"]
+        );
+        assert_eq!(tags("<i>x</i>", Kind::Srt), Vec::<&str>::new());
+        // Text before a block's first backslash is a comment, not a tag.
+        assert_eq!(tags(r"{rough\an5}x", Kind::Ass), ["an5"]);
+    }
+
+    #[test]
+    fn timing_tags_are_the_ones_that_time_effects() {
+        let raw = r"{\an5\t(0,200,\alpha&H00&)\t(\c&H3557FF&)\k20\fad(100,0)\pos(1,2)}x";
+        assert_eq!(
+            timing(raw, Kind::Ass),
+            ["t(0,200,", "t(", "k20", "fad(100,0)"]
+        );
     }
 
     #[test]
