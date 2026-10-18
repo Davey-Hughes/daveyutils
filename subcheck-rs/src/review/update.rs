@@ -2,11 +2,14 @@
 //! are touched only by the effects, so every rule here is tested without a terminal.
 
 use crossterm::event::KeyCode;
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
+use ratatui::layout::{Position, Rect};
 
+use super::layout::{self, EDIT_KEYS, KEYS, PLAYBACK};
 use super::model::{Editor, Entry, FileNote, Model, UndoStep};
+use super::view;
 use crate::list::{self, label, Filter};
-use crate::player::Moment;
+use crate::player::{Moment, PlayState, Playback};
 use crate::store::{Decision, State};
 use crate::text::timestamp;
 
@@ -24,6 +27,19 @@ pub enum Msg {
     },
     /// An `Open` effect finished.
     Opened(Result<(), String>),
+    /// A `Playback` effect finished: where mpv is now.
+    Played(Result<PlayState, String>),
+    /// The terminal's new size.
+    Resize(u16, u16),
+    /// A mouse action at a column and row of the screen.
+    Mouse(Mouse, u16, u16),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mouse {
+    Click,
+    WheelUp,
+    WheelDown,
 }
 
 /// What a write was for, so its result can be applied.
@@ -41,12 +57,41 @@ pub enum Effect {
         decisions: Vec<Decision>,
     },
     Open(Moment),
+    /// Pause or seek the open mpv.
+    Playback(Playback),
 }
 
 /// Rows a PgUp or PgDn moves.
 const PAGE: usize = 10;
 
+/// Two clicks on one entry within this long are a double-click.
+const DOUBLE_CLICK: SignedDuration = SignedDuration::from_millis(500);
+
+/// Lines the detail pane scrolls per notch of the wheel.
+const WHEEL_LINES: u16 = 3;
+
 pub fn update(m: &mut Model, msg: Msg, now: Timestamp) -> Vec<Effect> {
+    let before = m.selected_entry();
+    // A double-click is two clicks in a row: anything in between starts over.
+    let last_click = m.last_click.take();
+    let effects = apply(m, msg, last_click, now);
+    if m.selected_entry() != before {
+        m.detail_scroll = 0;
+    }
+    // No further than the detail's last line, however that moved: the wheel, a wider screen, a
+    // decision or a filter that shortened the text.
+    m.detail_scroll = m.detail_scroll.min(detail_last(m));
+    // The list scrolls no further than it takes to keep the selection in view.
+    m.scroll = m.list_scroll(m.area);
+    effects
+}
+
+fn apply(
+    m: &mut Model,
+    msg: Msg,
+    last_click: Option<(Entry, Timestamp)>,
+    now: Timestamp,
+) -> Vec<Effect> {
     match msg {
         Msg::Quit => {
             m.should_quit = true;
@@ -79,7 +124,103 @@ pub fn update(m: &mut Model, msg: Msg, now: Timestamp) -> Vec<Effect> {
             });
             Vec::new()
         }
+        Msg::Played(result) => {
+            m.status = Some(match result {
+                Ok(p) => format!(
+                    "{} {}",
+                    if p.paused { "⏸" } else { "▶" },
+                    timestamp(p.at_ms)
+                ),
+                Err(e) => e,
+            });
+            Vec::new()
+        }
+        Msg::Resize(width, height) => {
+            m.area = Rect::new(0, 0, width, height);
+            Vec::new()
+        }
+        Msg::Mouse(action, x, y) => mouse(m, action, Position::new(x, y), last_click, now),
     }
+}
+
+/// The furthest the detail pane scrolls: its last line, wrapped as drawn, on top.
+fn detail_last(m: &Model) -> u16 {
+    // Inside the border, where the lines wrap.
+    let width = layout::panes(m.area).detail.width.saturating_sub(2);
+    let lines = view::detail_height(m, width);
+    u16::try_from(lines.saturating_sub(1)).unwrap_or(u16::MAX)
+}
+
+/// A click does what its key does; the wheel moves the selection over the list and scrolls the
+/// detail pane. While the editor is open only its own buttons work, so a stray click cannot lose
+/// the edit.
+fn mouse(
+    m: &mut Model,
+    action: Mouse,
+    at: Position,
+    last_click: Option<(Entry, Timestamp)>,
+    now: Timestamp,
+) -> Vec<Effect> {
+    let p = layout::panes(m.area);
+    let press = |m: &mut Model, key: Option<KeyCode>| match key {
+        Some(key) => apply(m, Msg::Key(key), None, now),
+        None => Vec::new(),
+    };
+    if m.editor.is_some() {
+        return match action {
+            Mouse::Click => press(m, layout::bar_click(EDIT_KEYS, p.keys, at)),
+            _ => Vec::new(),
+        };
+    }
+    match action {
+        Mouse::WheelUp if p.list.contains(at) => press(m, Some(KeyCode::Up)),
+        Mouse::WheelDown if p.list.contains(at) => press(m, Some(KeyCode::Down)),
+        Mouse::WheelUp if p.detail.contains(at) => {
+            m.detail_scroll = m.detail_scroll.saturating_sub(WHEEL_LINES);
+            Vec::new()
+        }
+        Mouse::WheelDown if p.detail.contains(at) => {
+            // `update` stops it at the last line.
+            m.detail_scroll = m.detail_scroll.saturating_add(WHEEL_LINES);
+            Vec::new()
+        }
+        Mouse::Click if layout::list_rows(&p).contains(at) => {
+            let row = usize::from(at.y - layout::list_rows(&p).y);
+            click_row(m, m.scroll + row, last_click, now)
+        }
+        Mouse::Click if p.keys.contains(at) => press(m, layout::bar_click(KEYS, p.keys, at)),
+        // Only while they show: a long message takes the line from them.
+        Mouse::Click
+            if p.status.contains(at) && layout::playback_shown(p.status, m.status.as_deref()) =>
+        {
+            let left = layout::playback_left(p.status);
+            press(m, layout::bar_hit(PLAYBACK, left, at.x))
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// A click on the list's `index`th entry selects it; the second click of a double-click opens it.
+fn click_row(
+    m: &mut Model,
+    index: usize,
+    last_click: Option<(Entry, Timestamp)>,
+    now: Timestamp,
+) -> Vec<Effect> {
+    let Some(&entry) = m.entries().get(index) else {
+        return Vec::new();
+    };
+    m.status = None;
+    m.selected = index;
+    // The wall clock can step back between two clicks: a negative gap is not a short one.
+    let double = last_click.is_some_and(|(e, at)| {
+        e == entry && (SignedDuration::ZERO..=DOUBLE_CLICK).contains(&now.duration_since(at))
+    });
+    if double {
+        return open(m);
+    }
+    m.last_click = Some((entry, now));
+    Vec::new()
 }
 
 fn key_press(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
@@ -119,6 +260,11 @@ fn key_press(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
         }
         KeyCode::Char('u') => return undo(m, now),
         KeyCode::Char('o') => return open(m),
+        KeyCode::Char(' ') => return vec![Effect::Playback(Playback::Pause)],
+        KeyCode::Left => return vec![Effect::Playback(Playback::Seek(-5))],
+        KeyCode::Right => return vec![Effect::Playback(Playback::Seek(5))],
+        KeyCode::Char(',') => return vec![Effect::Playback(Playback::Seek(-1))],
+        KeyCode::Char('.') => return vec![Effect::Playback(Playback::Seek(1))],
         _ => {}
     }
     Vec::new()
@@ -756,6 +902,210 @@ mod tests {
         assert_eq!(
             m.status.as_deref(),
             Some(format!("file missing: {}", path(1)).as_str())
+        );
+    }
+
+    #[test]
+    fn playback_keys_ask_mpv_and_show_where_it_is() {
+        let mut m = sample();
+        let playback = |p| vec![Effect::Playback(p)];
+        assert_eq!(press(&mut m, ' '), playback(Playback::Pause));
+        assert_eq!(key(&mut m, KeyCode::Left), playback(Playback::Seek(-5)));
+        assert_eq!(key(&mut m, KeyCode::Right), playback(Playback::Seek(5)));
+        assert_eq!(press(&mut m, ','), playback(Playback::Seek(-1)));
+        assert_eq!(press(&mut m, '.'), playback(Playback::Seek(1)));
+        let at = |paused| {
+            Msg::Played(Ok(PlayState {
+                paused,
+                at_ms: 171_060,
+            }))
+        };
+        update(&mut m, at(true), now());
+        assert_eq!(m.status.as_deref(), Some("⏸ 0:02:51.06"));
+        update(&mut m, at(false), now());
+        assert_eq!(m.status.as_deref(), Some("▶ 0:02:51.06"));
+        update(
+            &mut m,
+            Msg::Played(Err("mpv is not open (o opens it)".into())),
+            now(),
+        );
+        assert_eq!(m.status.as_deref(), Some("mpv is not open (o opens it)"));
+    }
+
+    #[test]
+    fn in_the_editor_playback_keys_edit() {
+        let mut m = sample();
+        m.selected = 1;
+        press(&mut m, 'e');
+        assert_eq!(key(&mut m, KeyCode::Left), []);
+        assert_eq!(press(&mut m, ' '), []);
+        assert_eq!(press(&mut m, '.'), []);
+        assert_eq!(
+            m.editor.as_ref().map(|e| e.text.as_str()),
+            Some("Let's have snacks together every day ..")
+        );
+    }
+
+    /// `sample()` on a 110×20 screen: the list's rows are y 1 to 16 from x 1, the detail pane is
+    /// x 55 on, the status line y 18 and the key bar, on one row, y 19.
+    fn on_screen() -> Model {
+        let mut m = sample();
+        update(&mut m, Msg::Resize(110, 20), now());
+        m
+    }
+
+    /// A click at `x`, `y`, `ms` milliseconds after `now()`.
+    fn click(m: &mut Model, x: u16, y: u16, ms: i64) -> Vec<Effect> {
+        let at = now() + SignedDuration::from_millis(ms);
+        update(m, Msg::Mouse(Mouse::Click, x, y), at)
+    }
+
+    fn wheel(m: &mut Model, action: Mouse, x: u16, y: u16) {
+        assert_eq!(update(m, Msg::Mouse(action, x, y), now()), []);
+    }
+
+    #[test]
+    fn a_click_selects_the_entry_under_it() {
+        let mut m = on_screen();
+        key(&mut m, KeyCode::Enter);
+        // Row 0, its members E01 E02 E03, then row 1: y 3 is E02's member.
+        assert_eq!(click(&mut m, 5, 3, 0), []);
+        assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)));
+        // The border, the title, below the last entry, the detail pane: nothing.
+        for (x, y) in [(0, 2), (5, 0), (5, 9), (70, 2)] {
+            click(&mut m, x, y, 1000);
+            assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)), "{x},{y}");
+        }
+    }
+
+    #[test]
+    fn a_click_lands_on_the_entry_drawn_there_when_the_list_is_scrolled() {
+        let mut m = crate::review::model::tests_support::many(30);
+        update(&mut m, Msg::Resize(110, 20), now());
+        key(&mut m, KeyCode::End);
+        // 16 rows, ending at entry 29: entry 14 is on the first row.
+        assert_eq!(m.scroll, 14);
+        click(&mut m, 5, 1, 0);
+        assert_eq!(m.selected, 14);
+        click(&mut m, 5, 16, 1000);
+        assert_eq!(m.selected, 29);
+    }
+
+    #[test]
+    fn a_double_click_opens_and_a_slow_or_moved_one_does_not() {
+        let mut m = on_screen();
+        let opens = |effects: Vec<Effect>| matches!(effects[..], [Effect::Open(_)]);
+        assert_eq!(click(&mut m, 5, 2, 0), []);
+        assert!(opens(click(&mut m, 5, 2, 500)), "within 500 ms");
+        assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
+        // A third click starts over.
+        assert_eq!(click(&mut m, 5, 2, 600), []);
+        // Too slow.
+        assert_eq!(click(&mut m, 5, 2, 2000), []);
+        assert_eq!(click(&mut m, 5, 2, 2501), []);
+        // Two rows.
+        assert_eq!(click(&mut m, 5, 1, 4000), []);
+        assert_eq!(click(&mut m, 5, 2, 4100), []);
+        // Something in between.
+        assert_eq!(click(&mut m, 5, 2, 6000), []);
+        key(&mut m, KeyCode::Char('f'));
+        assert_eq!(click(&mut m, 5, 2, 6100), []);
+        // The clock stepped back between them (NTP, a resume): not a double-click.
+        assert_eq!(click(&mut m, 5, 2, 8000), []);
+        assert_eq!(click(&mut m, 5, 2, 7000), []);
+    }
+
+    #[test]
+    fn the_wheel_moves_the_selection_over_the_list_and_scrolls_the_detail() {
+        let mut m = on_screen();
+        wheel(&mut m, Mouse::WheelDown, 10, 5);
+        assert_eq!(m.selected, 1);
+        wheel(&mut m, Mouse::WheelUp, 10, 5);
+        assert_eq!(m.selected, 0);
+        // The ×3 row's detail is 11 lines: the wheel stops with the last one on top.
+        for _ in 0..5 {
+            wheel(&mut m, Mouse::WheelDown, 70, 5);
+        }
+        assert_eq!(m.detail_scroll, 10);
+        wheel(&mut m, Mouse::WheelUp, 70, 5);
+        assert_eq!(m.detail_scroll, 7);
+        // A new selection starts at the top.
+        key(&mut m, KeyCode::Down);
+        assert_eq!(m.detail_scroll, 0);
+    }
+
+    #[test]
+    fn a_detail_that_got_shorter_is_scrolled_back_to_its_last_line() {
+        let mut m = on_screen();
+        // Scrolled for a longer text: a decision or a filter can shorten it while the same entry
+        // stays selected.
+        m.detail_scroll = 100;
+        update(&mut m, Msg::Played(Err("mpv is not open".into())), now());
+        assert_eq!(
+            m.detail_scroll, 10,
+            "the ×3 row's 11 lines, the last on top"
+        );
+    }
+
+    #[test]
+    fn buttons_press_their_keys() {
+        let mut m = on_screen();
+        // "j/k move · o mpv · a accept …" and, at x 71, "␣ pause · ← −5s …".
+        assert_eq!(click(&mut m, 2, 19, 0), [], "j/k move is not a button");
+        assert!(matches!(click(&mut m, 12, 19, 1000)[..], [Effect::Open(_)]));
+        assert_eq!(
+            decided(&click(&mut m, 20, 19, 2000)),
+            [
+                (1, State::Accepted, None),
+                (2, State::Accepted, None),
+                (4, State::Accepted, None)
+            ]
+        );
+        assert_eq!(
+            click(&mut m, 71, 18, 3000),
+            [Effect::Playback(Playback::Pause)]
+        );
+        assert_eq!(
+            click(&mut m, 82, 18, 4000),
+            [Effect::Playback(Playback::Seek(-5))]
+        );
+        assert_eq!(click(&mut m, 30, 18, 5000), [], "the status text");
+    }
+
+    #[test]
+    fn on_a_narrow_screen_every_button_still_works() {
+        let mut m = sample();
+        update(&mut m, Msg::Resize(80, 20), now());
+        // The status line is y 17 with "␣ pause · …" from x 41; the key bar's second row, y 19,
+        // is "n next · p prev · q quit".
+        assert_eq!(
+            click(&mut m, 45, 17, 0),
+            [Effect::Playback(Playback::Pause)]
+        );
+        m.status = Some("x".repeat(70));
+        assert_eq!(click(&mut m, 45, 17, 1000), [], "they gave way to it");
+        click(&mut m, 18, 19, 2000);
+        assert!(m.should_quit);
+    }
+
+    #[test]
+    fn while_editing_only_the_editors_buttons_work() {
+        let mut m = on_screen();
+        m.selected = 1;
+        press(&mut m, 'e');
+        assert_eq!(click(&mut m, 5, 1, 0), []);
+        wheel(&mut m, Mouse::WheelUp, 5, 1);
+        assert_eq!(click(&mut m, 71, 18, 1000), [], "no playback buttons");
+        assert_eq!(click(&mut m, 9, 19, 1500), [], "the separator");
+        assert_eq!(m.selected, 1);
+        assert!(m.editor.is_some());
+        // "⏎ accept · Esc cancel": Esc from x 11.
+        click(&mut m, 11, 19, 2000);
+        assert!(m.editor.is_none());
+        press(&mut m, 'e');
+        assert_eq!(
+            decided(&click(&mut m, 0, 19, 3000)),
+            [(3, State::Accepted, None)]
         );
     }
 

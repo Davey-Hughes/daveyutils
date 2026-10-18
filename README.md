@@ -55,6 +55,8 @@ make help     # list targets
   `subcheck review` steps through a run's fixes to accept, reject or reword each (a fix repeated
   across episodes is one row), and `o` opens the moment in mpv, reusing one window.
   `subcheck list` prints the same as text, and `--mpv` adds a command that opens each one.
+  Review's keys and mouse, and a KDE window rule that keeps focus in the terminal:
+  `subcheck-rs/README.md`.
   `subcheck timing` reports subtitle tracks shifted by whole frames against the video (every line
   a frame late, or part of a track), with the `mkvmerge --sync` that fixes a whole-track shift. It
   reads only the index and the subtitles: seconds per file when the subtitles have Cues, as

@@ -3,32 +3,29 @@
 use std::fmt::Write;
 use std::ops::Range;
 
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
+use super::layout::{self, EDIT_KEYS, KEYS, PLAYBACK};
 use super::model::{changed, Entry, FileNote, Model};
 use crate::list::{self, label, Filter};
 use crate::store::State;
 use crate::text::timestamp;
 
-const KEYS: &str =
-    "o mpv · a accept · r reject · e edit · u undo · ⏎ expand · f filter · n/p file · q quit";
-
 pub fn view(m: &Model, f: &mut Frame) {
-    let [body, footer] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .areas(f.area());
-    let [left, right] = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .areas(body);
-    list_pane(m, f, left);
-    detail_pane(m, f, right);
-    footer_line(m, f, footer);
+    let p = layout::panes(f.area());
+    list_pane(m, f, p.list);
+    detail_pane(m, f, p.detail);
+    status_line(m, f, p.status);
+    let keys = if m.editor.is_some() { EDIT_KEYS } else { KEYS };
+    let rows: Vec<Line> = layout::bar_rows(keys, p.keys.width)
+        .into_iter()
+        .map(|row| Line::raw(layout::bar_text(row)))
+        .collect();
+    f.render_widget(Paragraph::new(rows), p.keys);
 }
 
 fn list_pane(m: &Model, f: &mut Frame, area: Rect) {
@@ -57,7 +54,9 @@ fn list_pane(m: &Model, f: &mut Frame, area: Rect) {
         .block(block)
         .highlight_symbol("▶ ")
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default().with_selected(Some(m.selected));
+    let mut state = ListState::default()
+        .with_selected(Some(m.selected))
+        .with_offset(m.list_scroll(f.area()));
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -113,6 +112,29 @@ fn detail_pane(m: &Model, f: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {name} "));
+    f.render_widget(
+        Paragraph::new(detail_lines(m))
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((m.detail_scroll, 0)),
+        area,
+    );
+}
+
+/// The detail pane's lines on screen at `width` columns, wrapped as drawn: `update` stops the
+/// wheel at the last of them.
+pub fn detail_height(m: &Model, width: u16) -> usize {
+    Paragraph::new(detail_lines(m))
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+}
+
+/// What the detail pane says about the selection; nothing when there is none.
+pub fn detail_lines(m: &Model) -> Vec<Line<'static>> {
+    let Some(i) = m.focus() else {
+        return Vec::new();
+    };
+    let finding = m.finding(i);
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines: Vec<Line> = Vec::new();
 
@@ -188,13 +210,7 @@ fn detail_pane(m: &Model, f: &mut Frame, area: Rect) {
         Style::default().add_modifier(Modifier::BOLD),
     ));
     lines.extend(finding.after.iter().map(|l| Line::styled(l.clone(), dim)));
-
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    lines
 }
 
 fn warn(text: &str) -> Line<'static> {
@@ -221,9 +237,11 @@ fn marked(prefix: &'static str, text: &str, span: Range<usize>, color: Color) ->
     ])
 }
 
-fn footer_line(m: &Model, f: &mut Frame, area: Rect) {
+/// The status line with the playback buttons on its right, or the editor while it is open (the
+/// key bar under it says how to leave).
+fn status_line(m: &Model, f: &mut Frame, area: Rect) {
     if let Some(ed) = &m.editor {
-        let prompt = "wording (⏎ accept · Esc cancel): ";
+        let prompt = "wording: ";
         let prompt_len = prompt.chars().count();
         // Scrolled so the cursor stays in view, with a column left for it after the text.
         let room = usize::from(area.width).saturating_sub(prompt_len).max(1);
@@ -234,15 +252,41 @@ fn footer_line(m: &Model, f: &mut Frame, area: Rect) {
         f.set_cursor_position(Position::new(x.min(area.right().saturating_sub(1)), area.y));
         return;
     }
-    let text = m.status.clone().unwrap_or_else(|| KEYS.to_string());
-    f.render_widget(Paragraph::new(text), area);
+    if !layout::playback_shown(area, m.status.as_deref()) {
+        if let Some(status) = &m.status {
+            f.render_widget(Paragraph::new(status.as_str()), area);
+        }
+        return;
+    }
+    let left = layout::playback_left(area);
+    let buttons = Rect {
+        x: left,
+        width: area.right() - left,
+        ..area
+    };
+    if let Some(status) = &m.status {
+        // A column clear of the buttons, so a message does not run into them.
+        let text = Rect {
+            width: (left - area.x).saturating_sub(1),
+            ..area
+        };
+        f.render_widget(Paragraph::new(status.as_str()), text);
+    }
+    f.render_widget(Paragraph::new(layout::bar_text(PLAYBACK)), buttons);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyCode;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    use crate::review::update::{self, Msg};
+
+    fn now() -> jiff::Timestamp {
+        "2026-10-17T12:00:00Z".parse().unwrap()
+    }
 
     use crate::review::model::tests_support::sample;
 
@@ -303,21 +347,142 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_file_and_a_status_show() {
+    fn a_changed_file_and_a_status_show_above_the_key_bar() {
         let mut m = sample();
         m.notes
             .insert(m.run.findings[0].file.clone(), FileNote::Changed);
         m.status = Some("not saved: disk full".into());
         let screen = render(&m, 160, 20);
         assert!(screen.contains("⚠ file changed since scan"), "{screen}");
+        let lines: Vec<&str> = screen.lines().collect();
+        assert!(lines[18].starts_with("not saved: disk full"), "{screen}");
         assert!(
-            screen
-                .lines()
-                .last()
-                .unwrap()
-                .starts_with("not saved: disk full"),
+            lines[19].starts_with("j/k move · o mpv · a accept · r reject · e edit · u undo"),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn the_detail_pane_scrolls() {
+        let mut m = sample();
+        m.detail_scroll = 2;
+        let screen = render(&m, 160, 20);
+        assert!(!screen.contains("3 files:"), "{screen}");
+        assert!(
+            screen.lines().nth(1).unwrap().contains("│state: pending"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_wheel_reaches_the_end_of_a_wrapped_detail() {
+        let mut m = sample();
+        // 8 lines leave the detail pane 4 rows of 28 columns, so its lines wrap.
+        update::update(&mut m, Msg::Resize(60, 8), now());
+        for _ in 0..20 {
+            update::update(&mut m, Msg::Mouse(update::Mouse::WheelDown, 40, 2), now());
+        }
+        let screen = render(&m, 60, 8);
+        // It stops with the last line on top.
+        assert!(
+            screen.lines().nth(1).unwrap().contains("│The line after."),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_wider_screen_scrolls_a_detail_back_from_past_its_end() {
+        let mut m = sample();
+        update::update(&mut m, Msg::Resize(60, 8), now());
+        for _ in 0..20 {
+            update::update(&mut m, Msg::Mouse(update::Mouse::WheelDown, 40, 2), now());
+        }
+        // Wider, the lines wrap less: the last one is on top again, not off the end.
+        update::update(&mut m, Msg::Resize(160, 8), now());
+        let screen = render(&m, 160, 8);
+        assert!(
+            screen.lines().nth(1).unwrap().contains("│The line after."),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_playback_buttons_share_the_status_line() {
+        let mut m = sample();
+        m.status = Some("⏸ 0:02:51.06".into());
+        let screen = render(&m, 110, 20);
+        let line = screen.lines().nth(18).unwrap();
+        assert!(line.starts_with("⏸ 0:02:51.06 "), "{screen}");
+        assert!(
+            line.ends_with(" ␣ pause · ← −5s · → +5s · , −1s · . +1s"),
+            "{screen}"
+        );
+        // A message that fits stops a column short of the buttons.
+        m.status = Some("x".repeat(70));
+        let screen = render(&m, 110, 20);
+        let line = screen.lines().nth(18).unwrap();
+        assert!(
+            line.starts_with(&format!("{} ␣ pause", "x".repeat(70))),
+            "{screen}"
+        );
+        // One too long for that takes the whole line, and the buttons give way.
+        m.status = Some(format!("{}y", "x".repeat(109)));
+        let screen = render(&m, 110, 20);
+        assert_eq!(
+            screen.lines().nth(18).unwrap(),
+            format!("{}y", "x".repeat(109))
+        );
+    }
+
+    #[test]
+    fn a_narrow_screen_wraps_the_key_bar() {
+        let screen = render(&sample(), 80, 20);
+        let lines: Vec<&str> = screen.lines().collect();
+        assert!(
+            lines[17].ends_with(" ␣ pause · ← −5s · → +5s · , −1s · . +1s"),
+            "{screen}"
+        );
+        assert!(lines[18].starts_with("j/k move · o mpv"), "{screen}");
+        assert!(lines[18].trim_end().ends_with("· f filter"), "{screen}");
+        assert!(
+            lines[19].starts_with("n next · p prev · q quit"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_list_stays_put_while_the_selection_moves_inside_it() {
+        let mut m = crate::review::model::tests_support::many(12);
+        // 10 lines: 2 for the footer and 2 for the border leave 6 rows.
+        update::update(&mut m, Msg::Resize(110, 10), now());
+        for _ in 0..8 {
+            update::update(&mut m, Msg::Key(KeyCode::Char('j')), now());
+        }
+        for _ in 0..2 {
+            update::update(&mut m, Msg::Key(KeyCode::Char('k')), now());
+        }
+        assert_eq!((m.selected, m.scroll), (6, 3));
+        let screen = render(&m, 110, 10);
+        let lines: Vec<&str> = screen.lines().collect();
+        // Entries 3 to 8 show, E04 to E09, and the selection is on E07 in the middle.
+        assert!(lines[1].contains("E04 "), "{screen}");
+        assert!(lines[4].contains("▶ · E07 "), "{screen}");
+        assert!(lines[6].contains("E09 "), "{screen}");
+    }
+
+    #[test]
+    fn a_taller_screen_shows_the_entries_above_instead_of_blank_rows() {
+        let mut m = crate::review::model::tests_support::many(12);
+        update::update(&mut m, Msg::Resize(110, 10), now());
+        update::update(&mut m, Msg::Key(KeyCode::End), now());
+        assert_eq!(m.scroll, 6);
+        // 20 lines leave 16 rows: all 12 entries fit, from the top.
+        update::update(&mut m, Msg::Resize(110, 20), now());
+        assert_eq!(m.scroll, 0);
+        let screen = render(&m, 110, 20);
+        let lines: Vec<&str> = screen.lines().collect();
+        assert!(lines[1].contains("E01 "), "{screen}");
+        assert!(lines[12].contains("▶ · E12 "), "{screen}");
     }
 
     #[test]
@@ -351,14 +516,16 @@ mod tests {
             text: "0123456789".repeat(4),
             cursor: 40,
         });
-        let mut term = Terminal::new(TestBackend::new(50, 10)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(30, 10)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();
-        let footer: String = (0..50)
-            .map(|x| term.backend().buffer()[(x, 9)].symbol().to_string())
+        // 30 columns fit the key bar in 4 rows, and it keeps them while editing, so that the
+        // panes stay put: the status line is y 5.
+        let status: String = (0..30)
+            .map(|x| term.backend().buffer()[(x, 5)].symbol().to_string())
             .collect();
-        // The 33-column prompt leaves 17: the text's last 16 characters, then the cursor.
-        assert!(footer.ends_with("4567890123456789 "), "{footer}");
-        assert_eq!(term.get_cursor_position().unwrap(), Position::new(49, 9));
+        // The 9-column prompt leaves 21: the text's last 20 characters, then the cursor.
+        assert_eq!(status, "wording: 01234567890123456789 ");
+        assert_eq!(term.get_cursor_position().unwrap(), Position::new(29, 5));
     }
 
     #[test]
@@ -373,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn the_editor_takes_the_footer_and_the_cursor() {
+    fn the_editor_takes_the_status_line_and_its_keys_the_bar() {
         let mut m = sample();
         m.editor = Some(super::super::model::Editor {
             entry: Entry::Row(0),
@@ -383,7 +550,20 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();
         let pos = term.get_cursor_position().unwrap();
-        // The prompt is 33 characters, then one character of text before the cursor.
-        assert_eq!((pos.x, pos.y), (34, 19));
+        // The prompt is 9 characters, then one character of text before the cursor.
+        assert_eq!((pos.x, pos.y), (10, 18));
+        let screen = render(&m, 160, 20);
+        assert!(
+            screen.lines().nth(18).unwrap().starts_with("wording: abc"),
+            "{screen}"
+        );
+        assert!(
+            screen
+                .lines()
+                .nth(19)
+                .unwrap()
+                .starts_with("⏎ accept · Esc cancel "),
+            "{screen}"
+        );
     }
 }

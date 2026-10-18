@@ -4,6 +4,10 @@ use std::collections::hash_map::Entry as Slot;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
+use jiff::Timestamp;
+use ratatui::layout::Rect;
+
+use super::layout;
 use crate::list::{self, Filter};
 use crate::store::{Decision, Finding, Run, State};
 
@@ -66,6 +70,14 @@ pub struct Model {
     pub should_quit: bool,
     /// The name each file goes by in the list.
     pub labels: HashMap<String, String>,
+    /// The screen, as the terminal last reported it: where a click lands depends on it.
+    pub area: Rect,
+    /// The list's first shown entry.
+    pub scroll: usize,
+    /// How far the wheel has scrolled the detail pane, in lines; back to 0 on a new selection.
+    pub detail_scroll: u16,
+    /// The last click on the list, while it could still be the first of a double-click.
+    pub last_click: Option<(Entry, Timestamp)>,
 }
 
 impl Model {
@@ -84,7 +96,19 @@ impl Model {
             notes,
             status: None,
             should_quit: false,
+            area: Rect::default(),
+            scroll: 0,
+            detail_scroll: 0,
+            last_click: None,
         }
+    }
+
+    /// The list's scroll offset on a screen of `area`: `scroll`, moved just enough to show the
+    /// selection. The view draws with it and `update` keeps it.
+    pub fn list_scroll(&self, area: Rect) -> usize {
+        let rows = layout::list_rows(&layout::panes(area)).height;
+        let len = self.entries().len();
+        layout::keep_in_view(self.scroll, self.selected, usize::from(rows), len)
     }
 
     /// The name a file goes by in the list (see [`labels`]).
@@ -443,6 +467,23 @@ pub mod tests_support {
             ],
             ..Run::default()
         }
+    }
+
+    /// `n` findings, one per episode, no two alike: `n` rows.
+    pub fn many(n: u32) -> Model {
+        let run = Run {
+            name: "many".into(),
+            files: (1..=n).map(file).collect(),
+            findings: (1..=n)
+                .map(|ep| {
+                    let original = format!("Line {ep} has a typo.");
+                    let fixed = format!("Line {ep} has no typo.");
+                    finding(ep.into(), ep, &original, &fixed, 1000)
+                })
+                .collect(),
+            ..Run::default()
+        };
+        Model::new(run, std::collections::HashMap::new())
     }
 
     pub fn sample() -> Model {
