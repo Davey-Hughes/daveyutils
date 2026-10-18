@@ -1,10 +1,10 @@
 //! Pure render of `Model` into a ratatui frame.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs, Wrap};
-use ratatui::Frame;
 
 use super::model::{FormField, MessageField, Model, Tab, VimMode, WhenMode};
 use crate::app::human_countdown;
@@ -99,7 +99,9 @@ fn minimal_hint(model: &Model) -> &'static str {
 /// The full keybind reference, shown only while help is toggled on (`?`).
 fn full_keys(model: &Model) -> &'static str {
     match model.tab {
-        Tab::Jobs => "[↑↓] select  [c] cancel  [e] edit  [r] refresh  [Tab] new  [q] quit  ·  [?] hide",
+        Tab::Jobs => {
+            "[↑↓] select  [c] cancel  [e] edit  [r] refresh  [Tab] new  [q] quit  ·  [?] hide"
+        }
         Tab::NewNudge => match &model.form.picker {
             Some(p) if p.mode == VimMode::Normal => {
                 "NORMAL · [j/k] move  [i] insert  [enter] pick  [esc/q] cancel"
@@ -288,30 +290,30 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     // Normal mode draws a block cursor (reverse video on the char under it) by
     // rebuilding that row's spans. No cursor-style escape is emitted, so the
     // terminal's own cursor shape/blink is untouched (Insert uses it below).
-    if form.nav_mode == VimMode::Normal {
-        if let Some((idx, value_len)) = editable {
-            let rchars: Vec<char> = rows_txt[idx].chars().collect();
-            let vstart = rchars.len() - value_len;
-            let col = vstart
-                + if value_len == 0 {
-                    0
-                } else {
-                    form.cursor.min(value_len - 1)
-                };
-            let before: String = rchars[..col.min(rchars.len())].iter().collect();
-            let under = rchars.get(col).copied().unwrap_or(' ');
-            let after: String = rchars
-                .get(col + 1..)
-                .map_or(String::new(), |c| c.iter().collect());
-            lines[idx] = Line::from(vec![
-                Span::raw(before),
-                Span::styled(
-                    under.to_string(),
-                    Style::default().add_modifier(Modifier::REVERSED),
-                ),
-                Span::raw(after),
-            ]);
-        }
+    if form.nav_mode == VimMode::Normal
+        && let Some((idx, value_len)) = editable
+    {
+        let rchars: Vec<char> = rows_txt[idx].chars().collect();
+        let vstart = rchars.len() - value_len;
+        let col = vstart
+            + if value_len == 0 {
+                0
+            } else {
+                form.cursor.min(value_len - 1)
+            };
+        let before: String = rchars[..col.min(rchars.len())].iter().collect();
+        let under = rchars.get(col).copied().unwrap_or(' ');
+        let after: String = rchars
+            .get(col + 1..)
+            .map_or(String::new(), |c| c.iter().collect());
+        lines[idx] = Line::from(vec![
+            Span::raw(before),
+            Span::styled(
+                under.to_string(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ),
+            Span::raw(after),
+        ]);
     }
 
     let form_block = Block::default().borders(Borders::ALL).title(title);
@@ -340,14 +342,14 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
 
     // Insert mode places the terminal's own cursor (a bar) at the edit position —
     // position+show only, so it keeps the terminal's shape and blink setting.
-    if form.nav_mode == VimMode::Insert {
-        if let Some((idx, value_len)) = editable {
-            let vstart = rows_txt[idx].chars().count() - value_len;
-            let cursor_x = (inner.x + cols(vstart) + cols(form.cursor.min(value_len)))
-                .min(inner.right().saturating_sub(1));
-            let cursor_y = (inner.y + cols(idx)).min(inner.bottom().saturating_sub(1));
-            f.set_cursor_position((cursor_x, cursor_y));
-        }
+    if form.nav_mode == VimMode::Insert
+        && let Some((idx, value_len)) = editable
+    {
+        let vstart = rows_txt[idx].chars().count() - value_len;
+        let cursor_x = (inner.x + cols(vstart) + cols(form.cursor.min(value_len)))
+            .min(inner.right().saturating_sub(1));
+        let cursor_y = (inner.y + cols(idx)).min(inner.bottom().saturating_sub(1));
+        f.set_cursor_position((cursor_x, cursor_y));
     }
 }
 
@@ -477,8 +479,8 @@ fn picker_view(model: &Model, f: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     use super::super::model::{Model, ScheduleDefaults, VimMode, WhenMode};
 

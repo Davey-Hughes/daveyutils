@@ -1,6 +1,6 @@
 //! A tmux pane as an injection `Target`, via `tmux capture-pane` / `send-keys`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::process::{Command, Output};
 use std::time::Duration;
 

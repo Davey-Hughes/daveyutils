@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::group;
-use crate::text::{timestamp, Line};
+use crate::text::{Line, timestamp};
 
 /// Stored in every run file, so findings can be traced to the prompt that produced them.
 pub const PROMPT_VERSION: u32 = 1;
@@ -223,15 +223,13 @@ fn is_none(line: &str) -> bool {
 /// The corrected text without an echoed `[0:02:45.06] (OP en) ` prefix.
 fn strip_echo<'a>(s: &'a str, line: &Line) -> &'a str {
     let mut s = s;
-    if let Some(rest) = s.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            if rest[..end]
-                .bytes()
-                .all(|b| b.is_ascii_digit() || b == b':' || b == b'.')
-            {
-                s = rest[end + 1..].trim_start();
-            }
-        }
+    if let Some(rest) = s.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+        && rest[..end]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b':' || b == b'.')
+    {
+        s = rest[end + 1..].trim_start();
     }
     let style = format!("({})", line.style);
     s.strip_prefix(style.as_str()).map_or(s, str::trim_start)

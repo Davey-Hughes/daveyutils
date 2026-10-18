@@ -562,7 +562,7 @@ pub fn sync_ms(frames: i64, frame_ns: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mkv::{Cue, Track, TRACK_TYPE_SUBTITLE};
+    use crate::mkv::{Cue, TRACK_TYPE_SUBTITLE, Track};
 
     /// 23.976 fps, as mkvmerge stores it.
     const FRAME_NS: u64 = 41_708_333;
@@ -680,7 +680,7 @@ mod tests {
         // 16 times or more: the top two offsets need 45%.
         assert!(is_timed(&[2, 2, 2, 5, 4, 3, 2])); // 20 times, 9 in the top two
         assert!(!is_timed(&[3, 2, 2, 4, 4, 3, 2])); // 20, 8
-                                                    // Shaped like E09: dialogue piled on +1, and an effects style flat at 279-314 each.
+        // Shaped like E09: dialogue piled on +1, and an effects style flat at 279-314 each.
         assert!(is_timed(&[30, 24, 38, 29, 143, 31, 28]));
         assert!(!is_timed(&[279, 300, 314, 290, 285, 301, 296]));
         // Under 16: the top offset needs half.

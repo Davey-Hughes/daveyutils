@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{handle_request, read_msg, write_msg, Request, Response, IO_TIMEOUT};
+use super::{IO_TIMEOUT, Request, Response, handle_request, read_msg, write_msg};
 use crate::queue::Queue;
 
 /// Ceiling on IPC worker threads in flight at once.

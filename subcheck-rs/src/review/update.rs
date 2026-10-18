@@ -8,7 +8,7 @@ use ratatui::layout::{Position, Rect};
 use super::layout::{self, EDIT_KEYS, KEYS, PLAYBACK};
 use super::model::{Editor, Entry, FileNote, Model, UndoStep};
 use super::view;
-use crate::list::{self, label, Filter};
+use crate::list::{self, Filter, label};
 use crate::player::{Moment, PlayState, Playback};
 use crate::store::{Decision, State};
 use crate::text::timestamp;

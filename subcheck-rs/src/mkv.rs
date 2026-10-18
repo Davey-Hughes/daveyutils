@@ -376,13 +376,13 @@ fn parse_seek_head(data: &[u8], base: u64, segment_data: u64) -> Result<Vec<u64>
                 _ => {}
             }
         }
-        if let (Some(target), Some(position)) = (target, position) {
-            if matches!(
+        if let (Some(target), Some(position)) = (target, position)
+            && matches!(
                 target,
                 SEEK_HEAD | INFO | TRACKS | CUES | TAGS | CHAPTERS | ATTACHMENTS
-            ) {
-                out.push(segment_data + position);
-            }
+            )
+        {
+            out.push(segment_data + position);
         }
     }
     Ok(out)

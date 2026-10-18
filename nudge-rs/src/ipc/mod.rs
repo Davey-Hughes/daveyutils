@@ -7,7 +7,7 @@ pub mod server;
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::job::{Job, JobSpec};
 use crate::queue::Queue;

@@ -10,7 +10,7 @@
 
 mod common;
 
-use nudge::paths::{resolve_from, Os};
+use nudge::paths::{Os, resolve_from};
 
 #[test]
 fn short_tempdir_leaves_room_for_the_macos_socket_path() {

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use nudge::ipc::{client, server, Request, Response, IO_TIMEOUT};
+use nudge::ipc::{IO_TIMEOUT, Request, Response, client, server};
 use nudge::queue::Queue;
 
 /// Generous next to `IO_TIMEOUT` (the stuck peer must time out first, and the

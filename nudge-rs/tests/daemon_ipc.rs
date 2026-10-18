@@ -7,7 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nudge::ipc::{client, server, Request, Response};
+use nudge::ipc::{Request, Response, client, server};
 use nudge::queue::Queue;
 
 fn wait_for_socket(path: &std::path::Path) {

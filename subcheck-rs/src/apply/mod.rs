@@ -536,13 +536,13 @@ impl Job<'_> {
         }
         let size = fs::metadata(self.path).map_err(|e| e.to_string())?.len();
         let dir = self.path.parent().unwrap_or(Path::new("."));
-        if let Some(free) = free_space(dir) {
-            if free < size {
-                return Err(format!(
-                    "not enough space in {}: the remux needs {size} bytes, {free} are free",
-                    dir.display()
-                ));
-            }
+        if let Some(free) = free_space(dir)
+            && free < size
+        {
+            return Err(format!(
+                "not enough space in {}: the remux needs {size} bytes, {free} are free",
+                dir.display()
+            ));
         }
         let remuxed = remux_path(self.path);
         // Created here first: an unwritable directory says so before any work.
@@ -756,11 +756,7 @@ fn respaced(px: i64, guessed: &str) -> String {
 }
 
 fn quick_or_full(full: bool) -> &'static str {
-    if full {
-        "full"
-    } else {
-        "quick"
-    }
+    if full { "full" } else { "quick" }
 }
 
 fn differs(remuxed: &Path, diffs: &[String]) -> String {

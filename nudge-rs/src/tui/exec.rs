@@ -6,7 +6,7 @@ use std::path::Path;
 
 use super::update::{Effect, Msg};
 use crate::detect::detect_reset;
-use crate::ipc::{client, Request, Response};
+use crate::ipc::{Request, Response, client};
 use crate::target::tmux::TmuxTarget;
 
 pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
@@ -90,11 +90,11 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
 /// fails the schedule: a pane that will not snapshot arms no gate and fails open
 /// at fire time, exactly as `app::snapshot_pane` does for the CLI.
 fn attach_baseline(spec: &mut crate::job::JobSpec, snapshot_pane: Option<String>) {
-    if let Some(pane) = snapshot_pane {
-        if let Some(b) = crate::verify::capture_baseline(&TmuxTarget::new(&pane)) {
-            spec.verify_fingerprint = Some(b.fingerprint);
-            spec.verify_dims = Some(b.dims);
-        }
+    if let Some(pane) = snapshot_pane
+        && let Some(b) = crate::verify::capture_baseline(&TmuxTarget::new(&pane))
+    {
+        spec.verify_fingerprint = Some(b.fingerprint);
+        spec.verify_dims = Some(b.dims);
     }
 }
 

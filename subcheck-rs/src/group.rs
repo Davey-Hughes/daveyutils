@@ -2,11 +2,11 @@
 //! apply's mkvmerge), and the files to remove, so that a signal that ends subcheck ends those
 //! groups too and leaves no half-written file behind.
 
-use std::ffi::{c_char, CString};
+use std::ffi::{CString, c_char};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 use std::sync::Once;
+use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 
 /// More than `-j` will ever want; a command that finds no free slot just is not forwarded to.
 const SLOTS: usize = 64;

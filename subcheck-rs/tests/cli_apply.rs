@@ -466,10 +466,12 @@ fn a_bad_remux_leaves_the_original_and_no_remux_behind() {
     );
     assert!(!subcheck::apply::remux_path(&s.file).exists());
     assert!(!subcheck::apply::backup_path(&s.file).exists());
-    assert!(subcheck::store::read_run(&s.run_file())
-        .unwrap()
-        .applied
-        .is_empty());
+    assert!(
+        subcheck::store::read_run(&s.run_file())
+            .unwrap()
+            .applied
+            .is_empty()
+    );
 }
 
 #[test]

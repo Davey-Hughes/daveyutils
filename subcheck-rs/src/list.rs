@@ -5,7 +5,7 @@ use std::fmt::Write;
 
 use crate::mkv::Truncated;
 use crate::store::{FileRecord, Finding, Run, State, TrackRecord};
-use crate::text::{timestamp, Occurrence};
+use crate::text::{Occurrence, timestamp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {

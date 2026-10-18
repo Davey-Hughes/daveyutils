@@ -6,17 +6,17 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::CommandFactory;
 use jiff::Zoned;
 
-use crate::cli::{resolve_options, tri, Cli};
+use crate::cli::{Cli, resolve_options, tri};
 use crate::config::Toggles;
 use crate::detect::detect_reset;
-use crate::ipc::{client, Request, Response};
+use crate::ipc::{Request, Response, client};
 use crate::job::{Job, JobSpec, TargetSpec};
 use crate::paths;
-use crate::target::{tmux::TmuxTarget, PaneDims, Target};
+use crate::target::{PaneDims, Target, tmux::TmuxTarget};
 use crate::timespec::parse_timespec;
 
 /// The mode `dispatch` resolves a parsed CLI + TTY state into.
@@ -920,10 +920,12 @@ mod tests {
 
     #[test]
     fn a_pong_from_this_build_is_accepted_and_any_other_is_not() {
-        assert!(check_handshake(Response::Pong {
-            version: crate::VERSION.to_string()
-        })
-        .is_ok());
+        assert!(
+            check_handshake(Response::Pong {
+                version: crate::VERSION.to_string()
+            })
+            .is_ok()
+        );
 
         let err = check_handshake(Response::Pong {
             version: "0.0.1-ancient".to_string(),

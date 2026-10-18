@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use nudge::app::build_spec;
-use nudge::cli::{resolve_options, Cli};
-use nudge::ipc::{client, server, Request, Response};
+use nudge::cli::{Cli, resolve_options};
+use nudge::ipc::{Request, Response, client, server};
 use nudge::job::TargetSpec;
 use nudge::queue::Queue;
 use nudge::target::PaneDims;

@@ -4,7 +4,7 @@
 use jiff::{ToSpan, Zoned};
 use regex::Regex;
 
-use crate::timespec::{parse_timespec, DayWords};
+use crate::timespec::{DayWords, parse_timespec};
 
 /// Padding added to every detected reset time to absorb scheduler latency.
 const PADDING_MINUTES: i64 = 3;
@@ -82,10 +82,10 @@ pub fn validate_patterns(
         ("NUDGE_WEEKLY_PATTERN", WEEKLY_BASE, weekly_ext),
     ] {
         // Unset and empty both mean "no extension", which is the common case.
-        if let Some(e) = ext.filter(|e| !e.is_empty()) {
-            if let Err(err) = compile(base, e) {
-                anyhow::bail!("invalid {var}={e:?}: {err}");
-            }
+        if let Some(e) = ext.filter(|e| !e.is_empty())
+            && let Err(err) = compile(base, e)
+        {
+            anyhow::bail!("invalid {var}={e:?}: {err}");
         }
     }
     Ok(())
@@ -312,12 +312,11 @@ pub fn detect_reset(
             Shape::Clock => find_clock_token(rest),
             Shape::Weekly | Shape::Codex => unreachable!("handled above"),
         };
-        if let Some(token) = token {
-            if let Ok(z) = parse_timespec(&token, now) {
-                if let Ok(padded) = z.checked_add(PADDING_MINUTES.minutes()) {
-                    return Detection::Reset(padded);
-                }
-            }
+        if let Some(token) = token
+            && let Ok(z) = parse_timespec(&token, now)
+            && let Ok(padded) = z.checked_add(PADDING_MINUTES.minutes())
+        {
+            return Detection::Reset(padded);
         }
         // This banner carried no parseable countdown (a bare "quota reached"
         // with the time on a line the capture cut off). Fall back to the next
@@ -1159,8 +1158,7 @@ mod tests {
     /// so the banner carries its date -- and the wrap falls inside it.
     #[test]
     fn detects_the_captured_dated_codex_banner() {
-        let pane =
-            "■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), \
+        let pane = "■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), \
             visit https://chatgpt.com/settings/usage to purchase more credits or try again at Oct\n\
             13th, 2026 1:40 AM.\n\n\n\
             › Ask Codex to do anything";

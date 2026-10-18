@@ -11,9 +11,9 @@ use std::{
 };
 
 use jiff::{civil::date, tz::TimeZone};
-use nudge::inject::{run_injection, InjectOutcome};
+use nudge::inject::{InjectOutcome, run_injection};
 use nudge::job::{Job, TargetSpec};
-use nudge::target::{tmux::TmuxTarget, Target};
+use nudge::target::{Target, tmux::TmuxTarget};
 
 fn tmux_available() -> bool {
     Command::new("tmux")

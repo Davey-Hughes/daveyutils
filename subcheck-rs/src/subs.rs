@@ -233,11 +233,11 @@ pub fn write_srt(
     let mut pending: Option<(i128, String)> = None;
     for b in blocks {
         let start = ns(b.timestamp, scale);
-        if let Some((at, text)) = pending.take() {
-            if !text.is_empty() {
-                count += 1;
-                srt_entry(out, count, at, (start - at).abs(), &text)?;
-            }
+        if let Some((at, text)) = pending.take()
+            && !text.is_empty()
+        {
+            count += 1;
+            srt_entry(out, count, at, (start - at).abs(), &text)?;
         }
         let duration = duration_ns(b, scale, default_duration);
         let text = c_string(&b.payload).replace('\r', "");
@@ -398,9 +398,10 @@ mod tests {
     #[test]
     fn dialogue_skips_a_non_numeric_read_order() {
         let w = AssWriter::new(HEADER.as_bytes(), false);
-        assert!(w
-            .dialogue(&block(0, Some(1), "x,0,S,,0,0,0,,t"), 1_000_000, None)
-            .is_none());
+        assert!(
+            w.dialogue(&block(0, Some(1), "x,0,S,,0,0,0,,t"), 1_000_000, None)
+                .is_none()
+        );
     }
 
     #[test]

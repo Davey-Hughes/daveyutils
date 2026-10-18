@@ -8,14 +8,14 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use jiff::Timestamp;
 
 use crate::blocks::{self, ReadPath};
 use crate::llm::{self, Backend, Suggestion};
-use crate::mkv::{self, Track, Truncated, TRACK_TYPE_SUBTITLE};
+use crate::mkv::{self, TRACK_TYPE_SUBTITLE, Track, Truncated};
 use crate::store::{
     Cache, CacheEntry, CheckedWith, FileRecord, Finding, Record, RunHeader, RunWriter, TrackRecord,
 };
@@ -192,10 +192,10 @@ fn prepare(path: &Path, langs: &[String]) -> Prepared {
         if track.kind == TRACK_TYPE_SUBTITLE {
             sid += 1;
         }
-        if let Some(kind) = Kind::of(track) {
-            if wanted_language(track, langs) {
-                wanted.push((track, kind, sid));
-            }
+        if let Some(kind) = Kind::of(track)
+            && wanted_language(track, langs)
+        {
+            wanted.push((track, kind, sid));
         }
     }
     let numbers: Vec<u64> = wanted.iter().map(|(t, _, _)| t.number).collect();

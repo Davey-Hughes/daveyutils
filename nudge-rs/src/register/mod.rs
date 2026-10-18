@@ -300,10 +300,11 @@ mod tests {
             1000,
         );
         assert!(plan.files[0].0.ends_with("systemd/user/nudged.service"));
-        assert!(plan
-            .commands
-            .iter()
-            .any(|c| c.contains(&"enable".to_string())));
+        assert!(
+            plan.commands
+                .iter()
+                .any(|c| c.contains(&"enable".to_string()))
+        );
     }
 
     #[test]
@@ -315,12 +316,15 @@ mod tests {
             None,
             501,
         );
-        assert!(plan.files[0]
-            .0
-            .ends_with("Library/LaunchAgents/com.nudge.daemon.plist"));
-        assert!(plan
-            .commands
-            .iter()
-            .any(|c| c.contains(&"bootstrap".to_string())));
+        assert!(
+            plan.files[0]
+                .0
+                .ends_with("Library/LaunchAgents/com.nudge.daemon.plist")
+        );
+        assert!(
+            plan.commands
+                .iter()
+                .any(|c| c.contains(&"bootstrap".to_string()))
+        );
     }
 }

@@ -98,10 +98,11 @@ fn scan_records_the_planted_typos() {
         ["We should leave befor it rains.", "Nothing wrong here."]
     );
     assert_eq!(karaoke.after, ["The last line."]);
-    assert!(run
-        .findings
-        .iter()
-        .all(|f| run.state_of(f.id) == State::Pending));
+    assert!(
+        run.findings
+            .iter()
+            .all(|f| run.state_of(f.id) == State::Pending)
+    );
 
     let file = &run.files[0];
     assert_eq!((file.error.as_deref(), file.lines), (None, 4));
@@ -126,10 +127,11 @@ fn an_empty_track_costs_no_llm_call() {
 #[test]
 fn an_unchanged_file_is_skipped_until_forced() {
     let env = Env::new();
-    assert!(env
-        .subcheck(&["scan", &path("typos.mkv")], &[])
-        .status
-        .success());
+    assert!(
+        env.subcheck(&["scan", &path("typos.mkv")], &[])
+            .status
+            .success()
+    );
     assert_eq!(env.calls().len(), 1);
 
     let out = env.subcheck(&["scan", &path("typos.mkv")], &[]);
@@ -184,14 +186,16 @@ fn a_truncated_file_is_warned_about_on_every_scan() {
 #[test]
 fn a_scan_with_nothing_to_check_records_no_run() {
     let env = Env::new();
-    assert!(env
-        .subcheck(&["scan", &path("typos.mkv")], &[])
-        .status
-        .success());
-    assert!(env
-        .subcheck(&["scan", &path("typos.mkv")], &[])
-        .status
-        .success());
+    assert!(
+        env.subcheck(&["scan", &path("typos.mkv")], &[])
+            .status
+            .success()
+    );
+    assert!(
+        env.subcheck(&["scan", &path("typos.mkv")], &[])
+            .status
+            .success()
+    );
     let runs = std::fs::read_dir(env.state.path().join("subcheck/runs"))
         .unwrap()
         .count();
@@ -205,10 +209,11 @@ fn a_scan_with_nothing_to_check_records_no_run() {
 #[test]
 fn changing_the_languages_checks_a_file_again() {
     let env = Env::new();
-    assert!(env
-        .subcheck(&["scan", &path("typos.mkv")], &[])
-        .status
-        .success());
+    assert!(
+        env.subcheck(&["scan", &path("typos.mkv")], &[])
+            .status
+            .success()
+    );
     let out = env.subcheck(
         &["scan", &path("typos.mkv"), "--lang", "eng", "--lang", "und"],
         &[],
@@ -220,10 +225,11 @@ fn changing_the_languages_checks_a_file_again() {
 #[test]
 fn dry_run_leaves_out_files_a_scan_would_skip() {
     let env = Env::new();
-    assert!(env
-        .subcheck(&["scan", &path("typos.mkv")], &[])
-        .status
-        .success());
+    assert!(
+        env.subcheck(&["scan", &path("typos.mkv")], &[])
+            .status
+            .success()
+    );
     let out = env.subcheck(&["scan", &path("typos.mkv"), "--dry-run"], &[]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.contains("(chunk"), "{stdout}");
@@ -332,10 +338,11 @@ fn dry_run_prints_prompts_and_records_nothing() {
 #[test]
 fn list_shows_the_newest_run_with_mpv_commands() {
     let env = Env::new();
-    assert!(env
-        .subcheck(&["scan", &path("typos.mkv")], &[])
-        .status
-        .success());
+    assert!(
+        env.subcheck(&["scan", &path("typos.mkv")], &[])
+            .status
+            .success()
+    );
     let out = env.subcheck(&["list", "--mpv"], &[]);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = String::from_utf8_lossy(&out.stdout);

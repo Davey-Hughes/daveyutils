@@ -31,7 +31,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use nudge::job::{JobSpec, TargetSpec};
-use nudge::paths::{resolve_from, Os, Paths};
+use nudge::paths::{Os, Paths, resolve_from};
 use nudge::queue::Queue;
 
 fn tmux_available() -> bool {
@@ -127,11 +127,17 @@ fn a_verify_skip_lands_in_the_daemon_log() {
 
     // Set before anything is spawned: the daemon inherits all of it, resolves
     // its own state dir from it, and runs its tmux calls under it.
-    std::env::set_var("HOME", &home);
-    std::env::set_var("XDG_STATE_HOME", home.join("state"));
-    std::env::set_var("XDG_RUNTIME_DIR", home.join("run"));
-    std::env::set_var("TMUX_TMPDIR", &tmux_tmpdir);
-    std::env::remove_var("TMUX");
+    //
+    // SAFETY: nothing else reads the environment while it changes. This is the
+    // only test in its binary (see the module doc), and it has started no
+    // thread of its own yet.
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_STATE_HOME", home.join("state"));
+        std::env::set_var("XDG_RUNTIME_DIR", home.join("run"));
+        std::env::set_var("TMUX_TMPDIR", &tmux_tmpdir);
+        std::env::remove_var("TMUX");
+    }
 
     let session = format!("nudgelog_{}", std::process::id());
     let server = Server::start(&tmux_tmpdir, &session);

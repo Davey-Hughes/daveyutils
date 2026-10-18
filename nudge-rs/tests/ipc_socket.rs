@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use nudge::ipc::{client, server, Request, Response};
+use nudge::ipc::{Request, Response, client, server};
 use nudge::job::{JobSpec, TargetSpec};
 use nudge::queue::Queue;
 

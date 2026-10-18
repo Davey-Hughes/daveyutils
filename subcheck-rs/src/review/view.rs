@@ -3,15 +3,15 @@
 use std::fmt::Write;
 use std::ops::Range;
 
+use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
-use ratatui::Frame;
 
 use super::layout::{self, EDIT_KEYS, KEYS, PLAYBACK};
-use super::model::{changed, Entry, FileNote, Model};
-use crate::list::{self, label, Filter};
+use super::model::{Entry, FileNote, Model, changed};
+use crate::list::{self, Filter, label};
 use crate::store::State;
 use crate::text::timestamp;
 
@@ -279,8 +279,8 @@ fn status_line(m: &Model, f: &mut Frame, area: Rect) {
 mod tests {
     use super::*;
     use crossterm::event::KeyCode;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     use crate::review::update::{self, Msg};
 

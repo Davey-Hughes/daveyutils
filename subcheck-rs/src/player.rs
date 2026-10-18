@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::group;
 use crate::scan::file_stamp;
@@ -235,18 +235,18 @@ impl Player {
             if let Ok(conn) = Conn::connect(&self.socket) {
                 return Ok(conn);
             }
-            if let Some((child, _)) = self.children.last_mut() {
-                if let Ok(Some(status)) = child.try_wait() {
-                    self.children.pop();
-                    let e = format!("mpv exited before opening its socket ({status})");
-                    // 1 is mpv's exit on an option it does not know; a launcher that exits 0 or a
-                    // crash is no reason to drop a flag.
-                    return Err(if status.code() == Some(1) {
-                        Start::Exited(e)
-                    } else {
-                        Start::Failed(e)
-                    });
-                }
+            if let Some((child, _)) = self.children.last_mut()
+                && let Ok(Some(status)) = child.try_wait()
+            {
+                self.children.pop();
+                let e = format!("mpv exited before opening its socket ({status})");
+                // 1 is mpv's exit on an option it does not know; a launcher that exits 0 or a
+                // crash is no reason to drop a flag.
+                return Err(if status.code() == Some(1) {
+                    Start::Exited(e)
+                } else {
+                    Start::Failed(e)
+                });
             }
             if Instant::now() >= deadline {
                 return Err(Start::Failed(format!(
@@ -474,7 +474,7 @@ mod tests {
     }
 
     /// An mpv with `file` open; `seek` is its answer to a seek.
-    fn has_open(file: &str, seek: Value) -> impl Fn(&Value) -> Value + Send + 'static {
+    fn has_open(file: &str, seek: Value) -> impl Fn(&Value) -> Value + Send + 'static + use<> {
         let file = file.to_string();
         move |c| match (c[0].as_str(), c[1].as_str()) {
             (_, Some("path")) => ok(file.clone()),

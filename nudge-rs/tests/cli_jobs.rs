@@ -7,7 +7,7 @@ use std::thread;
 
 use nudge::app::format_jobs;
 use nudge::config::Toggles;
-use nudge::ipc::{client, server, Request, Response};
+use nudge::ipc::{Request, Response, client, server};
 use nudge::job::{JobSpec, TargetSpec};
 use nudge::queue::Queue;
 use nudge::target::PaneDims;

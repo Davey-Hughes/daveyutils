@@ -5,7 +5,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use super::{read_msg, write_msg, Request, Response, IO_TIMEOUT};
+use super::{IO_TIMEOUT, Request, Response, read_msg, write_msg};
 
 /// Connect to the daemon socket, send `req`, and return its `Response`.
 pub fn request(socket: &Path, req: &Request) -> std::io::Result<Response> {

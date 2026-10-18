@@ -623,10 +623,10 @@ fn picker_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
     // Keys shared by both modes: pick, and arrow navigation.
     match code {
         KeyCode::Enter => {
-            if let Some(p) = &model.form.picker {
-                if let Some(&idx) = p.matches.get(p.highlight) {
-                    model.form.pane_idx = idx;
-                }
+            if let Some(p) = &model.form.picker
+                && let Some(&idx) = p.matches.get(p.highlight)
+            {
+                model.form.pane_idx = idx;
             }
             model.form.picker = None;
             return capture_selected(&mut model.form, model.now);
@@ -679,10 +679,10 @@ fn picker_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
 /// list, re-capturing the preview only when the highlighted pane actually changes.
 fn picker_move(model: &mut Model, delta: i32) -> Vec<Effect> {
     let before = model.form.active_pane().map(|p| p.target.clone());
-    if let Some(picker) = model.form.picker.as_mut() {
-        if !picker.matches.is_empty() {
-            picker.highlight = wrap_index(picker.highlight, delta, picker.matches.len());
-        }
+    if let Some(picker) = model.form.picker.as_mut()
+        && !picker.matches.is_empty()
+    {
+        picker.highlight = wrap_index(picker.highlight, delta, picker.matches.len());
     }
     if model.form.active_pane().map(|p| p.target.clone()) == before {
         vec![]
@@ -1667,10 +1667,12 @@ mod tests {
         m.form.focus = FormField::Submit;
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
         match fx.as_slice() {
-            [Effect::Schedule {
-                spec,
-                snapshot_pane,
-            }] => {
+            [
+                Effect::Schedule {
+                    spec,
+                    snapshot_pane,
+                },
+            ] => {
                 assert_eq!(spec.messages, vec!["please continue".to_string()]);
                 assert!(spec.verify);
                 assert_eq!(spec.fire_at.to_string(), "2026-07-16T15:00:00Z");
@@ -1931,12 +1933,13 @@ mod tests {
     fn action_failed_lands_in_the_status_line_and_does_not_quit() {
         let mut m = with_jobs(1);
         update(&mut m, Msg::ActionFailed("daemon is not this build".into()));
-        assert!(m
-            .status
-            .0
-            .as_ref()
-            .unwrap()
-            .contains("daemon is not this build"));
+        assert!(
+            m.status
+                .0
+                .as_ref()
+                .unwrap()
+                .contains("daemon is not this build")
+        );
         assert!(!m.should_quit);
     }
 
@@ -2317,11 +2320,12 @@ mod tests {
             },
         ];
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/'))); // open; highlight = s:0.1
-                                                                        // Typing 'v' filters to [vim] -> highlighted pane changes to s:0.2 -> capture.
+        // Typing 'v' filters to [vim] -> highlighted pane changes to s:0.2 -> capture.
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('v')));
-        assert!(fx
-            .iter()
-            .any(|e| matches!(e, Effect::CapturePane { pane } if pane == "s:0.2")));
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::CapturePane { pane } if pane == "s:0.2"))
+        );
         // Typing 'i' keeps the match [vim] -> highlighted pane unchanged -> no capture.
         let fx2 = update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('i')));
         assert!(

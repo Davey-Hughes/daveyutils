@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use nudge::ipc::server;
 use nudge::job::{JobSpec, TargetSpec};
-use nudge::paths::{resolve_from, Os, Paths};
+use nudge::paths::{Os, Paths, resolve_from};
 use nudge::queue::Queue;
 
 /// How long the stand-in daemon waits before binding. Long enough that the CLI

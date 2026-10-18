@@ -18,7 +18,7 @@ mod common;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use nudge::paths::{resolve_from, Os, Paths};
+use nudge::paths::{Os, Paths, resolve_from};
 
 fn os() -> Os {
     if cfg!(target_os = "macos") {

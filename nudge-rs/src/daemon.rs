@@ -9,7 +9,7 @@ use jiff::{Span, Zoned};
 use crate::inject::run_injection;
 use crate::paths::Paths;
 use crate::queue::Queue;
-use crate::scheduler::{apply_outcome, next_wake, plan, MAX_POLL};
+use crate::scheduler::{MAX_POLL, apply_outcome, next_wake, plan};
 
 /// A retry never lands sooner than this, so a sub-second `settle_secs` can't
 /// create a fire-storm (esp. with infinite retries).
@@ -377,9 +377,11 @@ mod tests {
 
     #[test]
     fn notifies_on_sent_when_opted_in_and_never_when_not() {
-        assert!(notification(&job(true), &Ok(InjectOutcome::Sent(1)))
-            .unwrap()
-            .contains("fired"));
+        assert!(
+            notification(&job(true), &Ok(InjectOutcome::Sent(1)))
+                .unwrap()
+                .contains("fired")
+        );
         assert_eq!(notification(&job(false), &Ok(InjectOutcome::Sent(1))), None);
         assert_eq!(
             notification(&job(false), &Ok(InjectOutcome::SkippedResumed)),

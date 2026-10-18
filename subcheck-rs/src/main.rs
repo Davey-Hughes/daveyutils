@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use subcheck::apply::{self, Mode};

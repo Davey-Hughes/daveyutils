@@ -166,10 +166,10 @@ fn via_cues(r: &Reader, layout: &Layout, track: &Track) -> Result<Option<Vec<Blo
     }
     cues.sort_by_key(|c| (c.cluster, c.relative));
     cues.dedup_by_key(|c| (c.cluster, c.relative));
-    if let Some(&frames) = layout.frame_counts.get(&track.uid) {
-        if (cues.len() as u64) < frames {
-            return Ok(None);
-        }
+    if let Some(&frames) = layout.frame_counts.get(&track.uid)
+        && (cues.len() as u64) < frames
+    {
+        return Ok(None);
     }
     // Every Cluster head and block this loop will read. A block sits at Cluster start + header
     // (at most 12 bytes) + relative position, so starting at Cluster start + relative covers it.

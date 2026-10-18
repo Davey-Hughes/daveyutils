@@ -84,9 +84,11 @@ mod tests {
             plan.files[0].0,
             Path::new("/home/d/.config/systemd/user/nudged.service")
         );
-        assert!(plan.files[0]
-            .1
-            .contains("ExecStart=\"/usr/bin/nudge\" --daemon"));
+        assert!(
+            plan.files[0]
+                .1
+                .contains("ExecStart=\"/usr/bin/nudge\" --daemon")
+        );
         // daemon-reload then enable --now.
         assert!(plan.commands.contains(&vec![
             "systemctl".into(),

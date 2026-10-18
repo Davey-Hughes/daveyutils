@@ -97,7 +97,7 @@ mod tests {
     use crate::inject::InjectOutcome;
     use crate::job::{Job, JobSpec, TargetSpec};
     use crate::queue::Queue;
-    use jiff::{civil::date, tz::TimeZone, ToSpan};
+    use jiff::{ToSpan, civil::date, tz::TimeZone};
 
     fn now() -> jiff::Zoned {
         date(2026, 7, 13)

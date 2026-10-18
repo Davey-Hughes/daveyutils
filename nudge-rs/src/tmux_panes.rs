@@ -1,6 +1,6 @@
 //! Enumerate tmux panes for the interactive picker.
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 
 /// One selectable tmux pane.
 #[derive(Debug, Clone, PartialEq, Eq)]

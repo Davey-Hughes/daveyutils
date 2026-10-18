@@ -230,11 +230,11 @@ pub fn cleaned(raw: &str, kind: Kind) -> Mapped {
             run = Some(run.map_or(span.clone(), |r| r.start..span.end));
             continue;
         }
-        if let Some(r) = run.take() {
-            if !text.is_empty() {
-                text.push(' ');
-                spans.push(r);
-            }
+        if let Some(r) = run.take()
+            && !text.is_empty()
+        {
+            text.push(' ');
+            spans.push(r);
         }
         text.push(c);
         spans.push(span);
