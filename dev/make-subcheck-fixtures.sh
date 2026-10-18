@@ -182,6 +182,69 @@ mux -o "$out/timing.mkv" "$src/video-2fps.mkv" \
   --language 0:eng --track-name '0:Dialogue a frame late' --default-track-flag 0:no --sync 0:500 "$src/timing.ass" \
   --language 0:eng --track-name '0:Karaoke and effects' --default-track-flag 0:no "$src/timing-karaoke.ass"
 
+# What `subcheck apply` is tested on: everything a remux must keep (a title, chapters, an attachment,
+# an audio track with the commentary flag, a forced zlib track, a hearing-impaired SRT track) and a
+# fix of each kind. In the Full track: a plain typo, one inside italics, one after a \N, and a song
+# line that the Signs/Songs track repeats. In Signs/Songs: a sign on two layers and per-letter karaoke
+# (which apply leaves for a hand fix). In the SRT track: a typo inside <i> and one on a second row.
+apply_header() {
+  cat <<'EOF'
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+Style: Song,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+Style: Sign,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,5,10,10,10,1
+Style: OP,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+EOF
+}
+{
+  apply_header
+  cat <<'EOF'
+Dialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,We should leave befor it rains.
+Dialogue: 0,0:00:03.00,0:00:04.50,Default,,0,0,0,,{\i1}Ihave{\i0} to go.
+Dialogue: 0,0:00:05.00,0:00:06.50,Default,,0,0,0,,Two rows here\Nand teh second.
+Dialogue: 0,0:00:07.00,0:00:08.50,Default,,0,0,0,,Nothing {\b1}wrong{\b0} here.
+Dialogue: 0,0:00:09.00,0:00:10.00,Song,,0,0,0,,{\be2}We happen share the road
+EOF
+} >"$src/apply-full.ass"
+{
+  apply_header
+  cat <<'EOF'
+Dialogue: 0,0:00:02.00,0:00:04.00,Sign,,0,0,0,,{\bord3\pos(320,100)}Libary
+Dialogue: 1,0:00:02.00,0:00:04.00,Sign,,0,0,0,,{\bord0\pos(320,100)}Libary
+Dialogue: 0,0:00:09.00,0:00:10.00,Song,,0,0,0,,{\be2}We happen share the road
+EOF
+  lyric="go trough it"
+  for ((i = 0; i < ${#lyric}; i++)); do
+    c=${lyric:i:1}
+    [ "$c" = " " ] && c=""
+    printf 'Dialogue: 0,0:00:05.00,0:00:07.00,OP,,0,0,0,fx,{\\an5\\pos(%d,40)}%s\n' $((200 + 20 * i)) "$c"
+  done
+} >"$src/apply-signs.ass"
+printf '1\r\n00:00:01,005 --> 00:00:02,500\r\nHello <i>tehre</i>\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\nA line split\r\nacros two rows\r\n\r\n' >"$src/apply.srt"
+printf 'CHAPTER01=00:00:00.000\nCHAPTER01NAME=Part A\nCHAPTER02=00:00:06.000\nCHAPTER02NAME=Part B\n' >"$src/apply-chapters.txt"
+for i in $(seq 1 64); do printf 'not a real font, line %02d\n' "$i"; done >"$src/fake-font.ttf"
+ffmpeg -nostdin -loglevel error -y -f lavfi -i color=c=black:s=64x36:r=1:d=12 \
+  -f lavfi -i anullsrc=r=8000:cl=mono -t 12 -map 0:v -map 1:a \
+  -c:v libx264 -preset ultrafast -crf 51 -g 6 -threads 1 -c:a flac \
+  -fflags +bitexact -flags:v +bitexact -flags:a +bitexact "$src/apply-av.mkv"
+mux -o "$out/apply.mkv" --title 'Apply fixture' --chapters "$src/apply-chapters.txt" \
+  --attachment-mime-type font/ttf --attach-file "$src/fake-font.ttf" \
+  --language 1:jpn --track-name '1:Commentary' --commentary-flag 1:yes "$src/apply-av.mkv" \
+  --language 0:eng --track-name '0:English Full' "$src/apply-full.ass" \
+  --language 0:eng --track-name '0:English Signs/Songs' --default-track-flag 0:no \
+  --forced-display-flag 0:yes --compression 0:zlib "$src/apply-signs.ass" \
+  --language 0:eng --track-name '0:English SDH' --default-track-flag 0:no \
+  --hearing-impaired-flag 0:yes "$src/apply.srt"
+
 # The oracle: mkvextract's output for every text subtitle track, named the way `subcheck extract`
 # names its default output (<stem>.track<ID>.<ext>).
 for mkv in "$out"/*.mkv; do

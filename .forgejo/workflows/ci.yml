@@ -139,10 +139,11 @@ jobs:
       - run: cargo clippy --manifest-path nudge-rs/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path nudge-rs/Cargo.toml
 
-  # The nudge-rs job's three commands, for the other crate. Nothing to install:
-  # the tests read MKV fixtures committed under subcheck-rs/tests/fixtures/, so
-  # neither mkvtoolnix nor ffmpeg is needed. Only dev/make-subcheck-fixtures.sh
-  # wants them, and only when a fixture changes.
+  # The nudge-rs job's three commands, for the other crate, with mkvtoolnix: the
+  # `apply` tests remux with mkvmerge. They skip without it, so the job sets
+  # SUBCHECK_NEED_MKVMERGE to make a missing mkvmerge fail them instead. The other
+  # tests read MKV fixtures committed under subcheck-rs/tests/fixtures/; only
+  # dev/make-subcheck-fixtures.sh wants ffmpeg, and only when a fixture changes.
   subcheck-rs:
     name: subcheck-rs
     runs-on: docker
@@ -165,9 +166,14 @@ jobs:
       - name: Install rustfmt and clippy
         run: rustup component add rustfmt clippy
 
+      - name: Install mkvtoolnix
+        run: apt-get update && apt-get install -y --no-install-recommends mkvtoolnix
+
       - run: cargo fmt --manifest-path subcheck-rs/Cargo.toml --all --check
       - run: cargo clippy --manifest-path subcheck-rs/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path subcheck-rs/Cargo.toml
+        env:
+          SUBCHECK_NEED_MKVMERGE: "1"
 
   # The Makefile is how every utility here gets onto a PATH, and a `make` that
   # exits 0 while installing a non-functional bin/ ships green -- which is

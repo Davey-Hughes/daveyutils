@@ -14,6 +14,8 @@ pub const SEEK_ID: u32 = 0x53AB;
 pub const SEEK_POSITION: u32 = 0x53AC;
 pub const INFO: u32 = 0x1549_A966;
 pub const TIMESTAMP_SCALE: u32 = 0x002A_D7B1;
+pub const SEGMENT_UID: u32 = 0x73A4;
+pub const TITLE: u32 = 0x7BA9;
 pub const TRACKS: u32 = 0x1654_AE6B;
 pub const TRACK_ENTRY: u32 = 0xAE;
 pub const TRACK_NUMBER: u32 = 0xD7;
@@ -21,6 +23,14 @@ pub const TRACK_UID: u32 = 0x73C5;
 pub const TRACK_TYPE: u32 = 0x83;
 pub const FLAG_DEFAULT: u32 = 0x88;
 pub const FLAG_FORCED: u32 = 0x55AA;
+pub const FLAG_ENABLED: u32 = 0xB9;
+pub const FLAG_HEARING_IMPAIRED: u32 = 0x55AB;
+pub const FLAG_VISUAL_IMPAIRED: u32 = 0x55AC;
+pub const FLAG_TEXT_DESCRIPTIONS: u32 = 0x55AD;
+pub const FLAG_ORIGINAL: u32 = 0x55AE;
+pub const FLAG_COMMENTARY: u32 = 0x55AF;
+pub const VIDEO: u32 = 0xE0;
+pub const AUDIO: u32 = 0xE1;
 pub const DEFAULT_DURATION: u32 = 0x0023_E383;
 pub const NAME: u32 = 0x536E;
 pub const LANGUAGE: u32 = 0x0022_B59C;
@@ -42,13 +52,24 @@ pub const CUE_TRACK_POSITIONS: u32 = 0xB7;
 pub const CUE_TRACK: u32 = 0xF7;
 pub const CUE_CLUSTER_POSITION: u32 = 0xF1;
 pub const CUE_RELATIVE_POSITION: u32 = 0xF0;
+pub const CHAPTERS: u32 = 0x1043_A770;
+pub const ATTACHMENTS: u32 = 0x1941_A469;
 pub const TAGS: u32 = 0x1254_C367;
 pub const TAG: u32 = 0x7373;
+/// Elements any master may hold that say nothing of its content.
+pub const CRC32: u32 = 0xBF;
+pub const VOID: u32 = 0xEC;
 pub const TARGETS: u32 = 0x63C0;
 pub const TAG_TRACK_UID: u32 = 0x63C5;
 pub const SIMPLE_TAG: u32 = 0x67C8;
 pub const TAG_NAME: u32 = 0x45A3;
 pub const TAG_STRING: u32 = 0x4487;
+pub const TAG_BINARY: u32 = 0x4485;
+pub const TAG_LANGUAGE: u32 = 0x447A;
+pub const TAG_LANGUAGE_BCP47: u32 = 0x447B;
+pub const TAG_DEFAULT: u32 = 0x4484;
+pub const TARGET_TYPE_VALUE: u32 = 0x68CA;
+pub const TARGET_TYPE: u32 = 0x63CA;
 pub const CLUSTER: u32 = 0x1F43_B675;
 pub const TIMESTAMP: u32 = 0xE7;
 pub const SIMPLE_BLOCK: u32 = 0xA3;
@@ -99,6 +120,22 @@ pub struct Track {
     pub codec_private: Vec<u8>,
     /// Highest ContentEncodingOrder first: the order to undo them in.
     pub encodings: Vec<ContentEncoding>,
+    pub flags: Flags,
+    /// The Video and Audio elements' data, as stored: compared whole, never parsed.
+    pub video: Option<Vec<u8>>,
+    pub audio: Option<Vec<u8>>,
+}
+
+/// The track flags mkvmerge sets with `--<name>-flag`, other than default and forced: `None` when
+/// the file leaves the element out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Flags {
+    pub enabled: Option<bool>,
+    pub hearing_impaired: Option<bool>,
+    pub visual_impaired: Option<bool>,
+    pub text_descriptions: Option<bool>,
+    pub original: Option<bool>,
+    pub commentary: Option<bool>,
 }
 
 impl Track {
@@ -135,6 +172,16 @@ pub struct Layout {
     pub cues: Vec<Cue>,
     /// `NUMBER_OF_FRAMES` statistics tags, by track UID.
     pub frame_counts: HashMap<u64, u64>,
+    /// `NUMBER_OF_BYTES` statistics tags, by track UID.
+    pub byte_counts: HashMap<u64, u64>,
+    pub segment_uid: Option<Vec<u8>>,
+    pub title: Option<String>,
+    /// Absolute offsets of the Chapters, Attachments and Tags elements. Chapters and Attachments
+    /// are read only by the verify after a remux (a file's fonts can be megabytes); Tags are also
+    /// parsed for their statistics.
+    pub chapters_at: Option<u64>,
+    pub attachments_at: Option<u64>,
+    pub tags_at: Option<u64>,
     /// Absolute offset of the first Cluster.
     pub first_cluster: Option<u64>,
     /// Set when the Segment's size says the file should be longer than it is.
@@ -212,6 +259,12 @@ pub fn read_layout(r: &Reader) -> Result<Layout> {
         tracks: Vec::new(),
         cues: Vec::new(),
         frame_counts: HashMap::new(),
+        byte_counts: HashMap::new(),
+        segment_uid: None,
+        title: None,
+        chapters_at: None,
+        attachments_at: None,
+        tags_at: None,
         first_cluster: None,
         truncated,
     };
@@ -293,10 +346,15 @@ fn load(
                 }
             }
         }
-        INFO => layout.timestamp_scale = parse_info(&r.data(h)?, h.data_start)?,
+        INFO => parse_info(&r.data(h)?, h.data_start, layout)?,
         TRACKS => layout.tracks = parse_tracks(&r.data(h)?, h.data_start)?,
         CUES => layout.cues = parse_cues(&r.data(h)?, h.data_start)?,
-        TAGS => layout.frame_counts = parse_tags(&r.data(h)?, h.data_start)?,
+        TAGS => {
+            (layout.frame_counts, layout.byte_counts) = parse_tags(&r.data(h)?, h.data_start)?;
+            layout.tags_at = Some(h.offset);
+        }
+        CHAPTERS => layout.chapters_at = Some(h.offset),
+        ATTACHMENTS => layout.attachments_at = Some(h.offset),
         _ => {}
     }
     Ok(())
@@ -319,7 +377,10 @@ fn parse_seek_head(data: &[u8], base: u64, segment_data: u64) -> Result<Vec<u64>
             }
         }
         if let (Some(target), Some(position)) = (target, position) {
-            if matches!(target, SEEK_HEAD | INFO | TRACKS | CUES | TAGS) {
+            if matches!(
+                target,
+                SEEK_HEAD | INFO | TRACKS | CUES | TAGS | CHAPTERS | ATTACHMENTS
+            ) {
                 out.push(segment_data + position);
             }
         }
@@ -327,17 +388,21 @@ fn parse_seek_head(data: &[u8], base: u64, segment_data: u64) -> Result<Vec<u64>
     Ok(out)
 }
 
-fn parse_info(data: &[u8], base: u64) -> Result<u64> {
+fn parse_info(data: &[u8], base: u64, layout: &mut Layout) -> Result<()> {
     let mut scale = 1_000_000;
     for (id, _, v) in ebml::children(data, base)? {
-        if id == TIMESTAMP_SCALE {
-            scale = ebml::uint(v);
+        match id {
+            TIMESTAMP_SCALE => scale = ebml::uint(v),
+            SEGMENT_UID => layout.segment_uid = Some(v.to_vec()),
+            TITLE => layout.title = Some(ebml::string(v)),
+            _ => {}
         }
     }
     if scale == 0 {
         return ebml::parse_err(base, "TimestampScale is 0");
     }
-    Ok(scale)
+    layout.timestamp_scale = scale;
+    Ok(())
 }
 
 fn parse_tracks(data: &[u8], base: u64) -> Result<Vec<Track>> {
@@ -365,7 +430,11 @@ fn parse_track(id: usize, data: &[u8], base: u64) -> Result<Track> {
         default_duration: None,
         codec_private: Vec::new(),
         encodings: Vec::new(),
+        flags: Flags::default(),
+        video: None,
+        audio: None,
     };
+    let flag = |v: &[u8]| Some(ebml::uint(v) != 0);
     for (cid, at, v) in ebml::children(data, base)? {
         match cid {
             TRACK_NUMBER => t.number = ebml::uint(v),
@@ -380,6 +449,14 @@ fn parse_track(id: usize, data: &[u8], base: u64) -> Result<Track> {
             CODEC_ID => t.codec = ebml::string(v),
             CODEC_PRIVATE => t.codec_private = v.to_vec(),
             CONTENT_ENCODINGS => t.encodings = parse_encodings(v, at)?,
+            FLAG_ENABLED => t.flags.enabled = flag(v),
+            FLAG_HEARING_IMPAIRED => t.flags.hearing_impaired = flag(v),
+            FLAG_VISUAL_IMPAIRED => t.flags.visual_impaired = flag(v),
+            FLAG_TEXT_DESCRIPTIONS => t.flags.text_descriptions = flag(v),
+            FLAG_ORIGINAL => t.flags.original = flag(v),
+            FLAG_COMMENTARY => t.flags.commentary = flag(v),
+            VIDEO => t.video = Some(v.to_vec()),
+            AUDIO => t.audio = Some(v.to_vec()),
             _ => {}
         }
     }
@@ -471,14 +548,15 @@ fn parse_cues(data: &[u8], base: u64) -> Result<Vec<Cue>> {
     Ok(out)
 }
 
-fn parse_tags(data: &[u8], base: u64) -> Result<HashMap<u64, u64>> {
-    let mut out = HashMap::new();
+/// The statistics tags: `NUMBER_OF_FRAMES` and `NUMBER_OF_BYTES`, each by track UID.
+fn parse_tags(data: &[u8], base: u64) -> Result<(HashMap<u64, u64>, HashMap<u64, u64>)> {
+    let (mut frame_counts, mut byte_counts) = (HashMap::new(), HashMap::new());
     for (id, at, tag) in ebml::children(data, base)? {
         if id != TAG {
             continue;
         }
         let mut uids = Vec::new();
-        let mut frames = None;
+        let (mut frames, mut bytes) = (None, None);
         for (cid, cat, v) in ebml::children(tag, at)? {
             match cid {
                 TARGETS => {
@@ -497,20 +575,25 @@ fn parse_tags(data: &[u8], base: u64) -> Result<HashMap<u64, u64>> {
                             _ => {}
                         }
                     }
-                    if name == "NUMBER_OF_FRAMES" {
-                        frames = value.trim().parse::<u64>().ok();
+                    match name.as_str() {
+                        "NUMBER_OF_FRAMES" => frames = value.trim().parse::<u64>().ok(),
+                        "NUMBER_OF_BYTES" => bytes = value.trim().parse::<u64>().ok(),
+                        _ => {}
                     }
                 }
                 _ => {}
             }
         }
-        if let Some(frames) = frames {
-            for uid in uids {
-                out.insert(uid, frames);
+        for uid in uids {
+            if let Some(frames) = frames {
+                frame_counts.insert(uid, frames);
+            }
+            if let Some(bytes) = bytes {
+                byte_counts.insert(uid, bytes);
             }
         }
     }
-    Ok(out)
+    Ok((frame_counts, byte_counts))
 }
 
 #[cfg(test)]

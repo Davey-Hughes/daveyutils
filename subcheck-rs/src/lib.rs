@@ -5,6 +5,7 @@
 //! where each one is; `blocks` reads just those, and walks the Clusters only when the index does
 //! not cover a track.
 
+pub mod apply;
 pub mod blocks;
 pub mod ebml;
 pub mod group;

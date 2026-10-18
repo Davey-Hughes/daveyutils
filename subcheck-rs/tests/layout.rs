@@ -200,3 +200,54 @@ fn an_unknown_size_index_element_fails_whether_the_file_is_cut_or_not() {
     let err = mkv::open(&path).unwrap_err().to_string();
     assert!(err.contains("unknown-size element"), "{err}");
 }
+
+#[test]
+fn layout_has_what_a_remux_must_keep() {
+    let (r, layout) = mkv::open(&fixture("apply.mkv")).unwrap();
+    assert_eq!(layout.title.as_deref(), Some("Apply fixture"));
+    assert_eq!(layout.segment_uid.as_ref().map(Vec::len), Some(16));
+    let tracks: Vec<String> = layout
+        .tracks
+        .iter()
+        .map(|t| {
+            format!(
+                "{} {:?} default={} forced={} {:?} video={} audio={}",
+                t.id,
+                t.name,
+                t.default,
+                t.forced,
+                t.flags,
+                t.video.is_some(),
+                t.audio.is_some()
+            )
+        })
+        .collect();
+    let none = "enabled: None, hearing_impaired: None, visual_impaired: None, \
+                text_descriptions: None, original: None";
+    assert_eq!(
+        tracks,
+        [
+            format!("0 None default=false forced=false Flags {{ {none}, commentary: None }} video=true audio=false"),
+            format!("1 Some(\"Commentary\") default=false forced=false Flags {{ {none}, commentary: Some(true) }} video=false audio=true"),
+            format!("2 Some(\"English Full\") default=true forced=false Flags {{ {none}, commentary: None }} video=false audio=false"),
+            format!("3 Some(\"English Signs/Songs\") default=false forced=true Flags {{ {none}, commentary: None }} video=false audio=false"),
+            "4 Some(\"English SDH\") default=false forced=false Flags { enabled: None, hearing_impaired: Some(true), visual_impaired: None, text_descriptions: None, original: None, commentary: None } video=false audio=false".to_string(),
+        ]
+    );
+    // The statistics: frames and bytes, by track UID.
+    let full = &layout.tracks[2];
+    assert_eq!(layout.frame_counts.get(&full.uid), Some(&5));
+    assert!(layout.byte_counts.get(&full.uid).is_some_and(|&b| b > 0));
+    // Chapters and Attachments are found, not read.
+    for at in [layout.chapters_at, layout.attachments_at] {
+        let h = r.header_at(at.unwrap()).unwrap();
+        assert!(h.id == mkv::CHAPTERS || h.id == mkv::ATTACHMENTS, "{h:?}");
+    }
+}
+
+#[test]
+fn a_file_without_chapters_or_attachments_has_none() {
+    let (_, layout) = mkv::open(&fixture("multi.mkv")).unwrap();
+    assert_eq!((layout.chapters_at, layout.attachments_at), (None, None));
+    assert_eq!(layout.title, None);
+}

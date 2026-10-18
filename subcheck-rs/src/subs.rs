@@ -63,8 +63,24 @@ pub fn extract(
     let read = blocks::read_tracks(r, layout, &[track.number], force_walk)?
         .pop()
         .expect("read_tracks returns one entry per track asked for");
-    let scale = layout.timestamp_scale;
-    let events = match kind {
+    let events = write_track(track, kind, &read.blocks, layout.timestamp_scale, out)?;
+    Ok(Extracted {
+        kind,
+        path: read.path,
+        events,
+    })
+}
+
+/// A track written as `extract` writes it, from its blocks: all of them, in file order, payloads
+/// decoded. The number of events written.
+pub fn write_track(
+    track: &Track,
+    kind: Kind,
+    blocks: &[Block],
+    scale: u64,
+    out: &mut impl Write,
+) -> Result<usize> {
+    Ok(match kind {
         Kind::Ass | Kind::Ssa => {
             let private = blocks::decode(
                 track.codec_private.clone(),
@@ -72,8 +88,7 @@ pub fn extract(
                 mkv::SCOPE_CODEC_PRIVATE,
             )?;
             let writer = AssWriter::new(&private, kind == Kind::Ssa);
-            let lines: Vec<(i64, String)> = read
-                .blocks
+            let lines: Vec<(i64, String)> = blocks
                 .iter()
                 .filter_map(|b| writer.dialogue(b, scale, track.default_duration))
                 .collect();
@@ -81,12 +96,7 @@ pub fn extract(
             writer.write(lines, out)?;
             written
         }
-        Kind::Srt => write_srt(&read.blocks, scale, track.default_duration, out)?,
-    };
-    Ok(Extracted {
-        kind,
-        path: read.path,
-        events,
+        Kind::Srt => write_srt(blocks, scale, track.default_duration, out)?,
     })
 }
 
@@ -295,8 +305,13 @@ fn srt_time(ms: i128) -> String {
 
 /// Bytes up to the first NUL, as text: mkvextract handles these as C strings.
 pub(crate) fn c_string(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(c_bytes(bytes)).into_owned()
+}
+
+/// Bytes up to the first NUL.
+pub(crate) fn c_bytes(bytes: &[u8]) -> &[u8] {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
+    &bytes[..end]
 }
 
 /// mkvtoolnix's `split`: at most `max` parts, the last holding the rest, and no empty part after a

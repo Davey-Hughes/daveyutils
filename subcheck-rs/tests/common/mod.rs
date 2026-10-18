@@ -42,6 +42,26 @@ pub fn cut(path: &Path, len: u64) {
         .unwrap();
 }
 
+/// Whether mkvmerge can be run. The tests that need it pass without checking anything when it
+/// cannot (macOS CI has none), and say so; with SUBCHECK_NEED_MKVMERGE set (CI on Linux, and
+/// dev/check-all.sh) they fail instead, so a broken install cannot pass unseen.
+#[allow(dead_code)] // only the apply tests run mkvmerge
+pub fn have_mkvmerge() -> bool {
+    let ok = std::process::Command::new("mkvmerge")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    let needed = std::env::var_os("SUBCHECK_NEED_MKVMERGE").is_some_and(|v| !v.is_empty());
+    assert!(
+        ok || !needed,
+        "mkvmerge not found, and SUBCHECK_NEED_MKVMERGE is set"
+    );
+    if !ok {
+        eprintln!("skipped: mkvmerge not found");
+    }
+    ok
+}
+
 /// A file under tests/fixtures/, built by dev/make-subcheck-fixtures.sh.
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

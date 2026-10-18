@@ -23,6 +23,9 @@ const ORACLE: &[(&str, usize, &str)] = &[
     ("timing.mkv", 1, "timing.track1.ass"),
     ("timing.mkv", 2, "timing.track2.ass"),
     ("timing.mkv", 3, "timing.track3.ass"),
+    ("apply.mkv", 2, "apply.track2.ass"),
+    ("apply.mkv", 3, "apply.track3.ass"),
+    ("apply.mkv", 4, "apply.track4.srt"),
 ];
 
 #[test]
@@ -74,4 +77,31 @@ fn every_text_track_in_the_fixtures_is_in_the_oracle() {
             );
         }
     }
+}
+
+/// write_track of the blocks read is extract; with one payload edited, only that event changes.
+#[test]
+fn a_track_is_written_with_edited_payloads_in_place_of_theirs() {
+    let (r, layout) = mkv::open(&fixture("apply.mkv")).unwrap();
+    let track = &layout.tracks[2];
+    let read = subcheck::blocks::read_tracks(&r, &layout, &[track.number], false)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let write = |edits: &std::collections::BTreeMap<usize, Vec<u8>>| {
+        let mut out = Vec::new();
+        let kind = subs::Kind::of(track).unwrap();
+        let blocks = subcheck::apply::patch::edited(&read.blocks, edits);
+        subs::write_track(track, kind, &blocks, layout.timestamp_scale, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    };
+    let expected = std::fs::read_to_string(fixture("expected/apply.track2.ass")).unwrap();
+    assert_eq!(write(&std::collections::BTreeMap::new()), expected);
+    let first = String::from_utf8(read.blocks[0].payload.clone()).unwrap();
+    assert!(first.ends_with("befor it rains."), "{first}");
+    let edits = [(0, first.replace("befor", "before").into_bytes())].into();
+    assert_eq!(
+        write(&edits),
+        expected.replace("leave befor it", "leave before it")
+    );
 }

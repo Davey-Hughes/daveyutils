@@ -4,7 +4,7 @@
 //! `~/.local/state/subcheck/` (`~/Library/Application Support/subcheck/` on macOS):
 //! `runs/<run>.jsonl`, one append-only file per scan, and `cache.jsonl`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -49,6 +49,7 @@ pub enum Record {
     File(FileRecord),
     Finding(Finding),
     Decision(Decision),
+    Applied(Applied),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -120,6 +121,13 @@ pub struct Decision {
     pub state: State,
     /// The reviewer's own wording, when it replaces the suggestion.
     pub edited: Option<String>,
+    pub at: Timestamp,
+}
+
+/// A finding's fix, made in its file by `apply` (or found there already).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Applied {
+    pub finding: u64,
     pub at: Timestamp,
 }
 
@@ -198,6 +206,8 @@ pub struct Run {
     pub findings: Vec<Finding>,
     /// The latest decision per finding ID; a finding with none is pending.
     pub decisions: HashMap<u64, Decision>,
+    /// Findings whose fix is in their file.
+    pub applied: HashSet<u64>,
     /// Lines that did not parse (a run cut off mid-write leaves at most one).
     pub bad_lines: usize,
 }
@@ -229,6 +239,9 @@ pub fn read_run(path: &Path) -> io::Result<Run> {
             Ok(Record::Finding(f)) => run.findings.push(f),
             Ok(Record::Decision(d)) => {
                 run.decisions.insert(d.finding, d);
+            }
+            Ok(Record::Applied(a)) => {
+                run.applied.insert(a.finding);
             }
             Err(_) => run.bad_lines += 1,
         }
@@ -502,6 +515,29 @@ mod tests {
         assert_eq!(run.findings.len(), 1);
         assert_eq!(run.state_of(1), State::Accepted);
         assert!(RunWriter::open(&dir.path().join("runs/none.jsonl")).is_err());
+    }
+
+    #[test]
+    fn applied_records_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = RunWriter::create(dir.path()).unwrap();
+        w.append(&[
+            Record::Finding(finding(1)),
+            Record::Finding(finding(2)),
+            Record::Applied(Applied {
+                finding: 2,
+                at: Timestamp::UNIX_EPOCH,
+            }),
+        ])
+        .unwrap();
+        let text = std::fs::read_to_string(&w.path).unwrap();
+        assert!(
+            text.ends_with(
+                "{\"type\":\"applied\",\"finding\":2,\"at\":\"1970-01-01T00:00:00Z\"}\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(read_run(&w.path).unwrap().applied, [2].into());
     }
 
     #[test]

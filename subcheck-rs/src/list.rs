@@ -50,9 +50,14 @@ pub fn render(run: &Run, filter: Filter, mpv: bool) -> String {
             n => format!(" (+{} more)", n - 1),
         };
         let state = run.state_of(f.id);
+        let applied = if run.applied.contains(&f.id) {
+            ", applied"
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
-            "  #{}  {when}{more}  {}  [{}]",
+            "  #{}  {when}{more}  {}  [{}{applied}]",
             f.id,
             f.style,
             label(state)
@@ -142,8 +147,9 @@ pub fn mpv_command(run: &Run, f: &Finding) -> String {
     )
 }
 
-/// Single-quoted for a POSIX shell (fish reads it the same way unless the path holds a `\`).
-fn shell_quote(s: &str) -> String {
+/// Single-quoted for a POSIX shell (fish reads it the same way unless it holds a `\`). Always
+/// quoted: even a `!` in a word with nothing else special is history to an interactive bash.
+pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
@@ -230,6 +236,21 @@ mod tests {
     }
 
     #[test]
+    fn an_applied_fix_says_so() {
+        let mut r = run();
+        r.applied.insert(2);
+        let text = render(&r, Filter::All, false);
+        assert!(
+            text.contains("  #2  0:12:59.08  OP en  [accepted, applied]\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  #1  0:02:45.06 (+1 more)  OP en  [pending]\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn filters_by_decision_state() {
         let text = render(&run(), Filter::Only(State::Pending), false);
         assert!(text.contains("#1 ") && !text.contains("#2 "), "{text}");
@@ -265,5 +286,12 @@ mod tests {
     #[test]
     fn quotes_survive_shell_quoting() {
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn a_history_bang_is_quoted() {
+        // `!3,4` bare would be history entry 3 in an interactive bash.
+        assert_eq!(shell_quote("!3,4"), "'!3,4'");
+        assert_eq!(shell_quote("/m/K-On!!/E01.mkv"), "'/m/K-On!!/E01.mkv'");
     }
 }

@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
+use subcheck::apply::{self, Mode};
 use subcheck::blocks::{self, ReadPath};
 use subcheck::ebml;
 use subcheck::list::{self, Filter};
@@ -109,6 +110,11 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Make a run's accepted fixes in its MKV files: the newest run, or the one named.
+    ///
+    /// Each file is remuxed with mkvmerge beside the original, checked against it, and swapped
+    /// in; the original is kept as <name>.mkv.orig.
+    Apply(ApplyArgs),
     /// Show a run's findings as text: the newest run, or the one named.
     List {
         /// A run name (as `scan` prints it) or a run file. Default: the newest.
@@ -128,6 +134,33 @@ enum Command {
     },
 }
 
+#[derive(Args)]
+#[allow(clippy::struct_excessive_bools)] // command-line flags
+struct ApplyArgs {
+    /// A run name (as `scan` prints it) or a run file. Default: the newest.
+    run: Option<String>,
+    /// Show what would change, event by event; write nothing.
+    #[arg(long, conflicts_with_all = ["no_backup", "full", "tracks_only", "check"])]
+    dry_run: bool,
+    /// Keep no copy of the original. The check before the swap is then the full one.
+    #[arg(long, conflicts_with_all = ["tracks_only", "check"])]
+    no_backup: bool,
+    /// Check every frame of every track too, reading both files whole.
+    #[arg(long, conflicts_with = "tracks_only")]
+    full: bool,
+    /// Write each file's fixed tracks to DIR and print the mkvmerge command that would remux it,
+    /// for a remux done elsewhere. No MKV is touched.
+    #[arg(long, value_name = "DIR", conflicts_with = "check")]
+    tracks_only: Option<PathBuf>,
+    /// Check remuxes built elsewhere (.<name>.mkv.subcheck beside each original) against their
+    /// originals. Nothing is swapped.
+    #[arg(long)]
+    check: bool,
+    /// The mkvmerge program.
+    #[arg(long, default_value = "mkvmerge", hide = true)]
+    mkvmerge: PathBuf,
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(code) => code,
@@ -138,6 +171,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one arm per subcommand
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Extract {
@@ -219,6 +253,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             langs,
             verbose,
         } => Ok(timing(&paths, &langs, verbose)),
+        Command::Apply(args) => apply_run(args),
         Command::List {
             run,
             accepted,
@@ -239,6 +274,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// `subcheck apply`: exit status 1 when a file failed (or, with --check, differs or is missing).
+fn apply_run(a: ApplyArgs) -> Result<ExitCode> {
+    let mode = match (a.dry_run, a.tracks_only, a.check) {
+        (true, _, _) => Mode::DryRun,
+        (_, Some(dir), _) => Mode::TracksOnly(dir),
+        (_, _, true) => Mode::Check { full: a.full },
+        _ => Mode::Apply {
+            backup: !a.no_backup,
+            full: a.full,
+        },
+    };
+    let state = store::state_dir()?;
+    let path = store::find_run(&state, a.run.as_deref())?;
+    let s = apply::run(
+        &path,
+        &state,
+        &mode,
+        a.mkvmerge.as_os_str(),
+        &mut std::io::stdout().lock(),
+    )?;
+    Ok(if s.failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn extract(

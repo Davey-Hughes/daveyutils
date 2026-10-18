@@ -26,11 +26,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # Nothing to install: the tests read MKV fixtures committed under
-      # tests/fixtures/, so neither mkvtoolnix nor ffmpeg is needed here.
+      # The `apply` tests remux with mkvmerge: installed on Linux and required
+      # there (SUBCHECK_NEED_MKVMERGE), left out on macOS, where they skip. The
+      # other tests read MKV fixtures committed under tests/fixtures/.
+      - name: Install mkvtoolnix
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mkvtoolnix
       #
       # Keep these three in step with the subcheck-rs job in
       # .forgejo/workflows/ci.yml, which runs them with --manifest-path.
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+        env:
+          SUBCHECK_NEED_MKVMERGE: ${{ runner.os == 'Linux' && '1' || '' }}

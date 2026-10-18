@@ -1028,6 +1028,9 @@ mod tests {
             default_duration,
             codec_private: Vec::new(),
             encodings: Vec::new(),
+            flags: crate::mkv::Flags::default(),
+            video: None,
+            audio: None,
         }
     }
 
@@ -1047,6 +1050,12 @@ mod tests {
                 })
                 .collect(),
             frame_counts: std::collections::HashMap::new(),
+            byte_counts: std::collections::HashMap::new(),
+            segment_uid: None,
+            title: None,
+            chapters_at: None,
+            attachments_at: None,
+            tags_at: None,
             first_cluster: None,
             truncated: None,
         }

@@ -735,6 +735,9 @@ mod tests {
             default_duration: None,
             codec_private: Vec::new(),
             encodings: Vec::new(),
+            flags: crate::mkv::Flags::default(),
+            video: None,
+            audio: None,
         }
     }
 

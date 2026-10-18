@@ -8,6 +8,8 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
   under `~/.local/state/subcheck/`.
 - `subcheck review` steps through a run's fixes to accept, reject or reword each one.
 - `subcheck list` prints a run's fixes as text; `--mpv` adds a command that opens each one.
+- `subcheck apply` makes a run's accepted fixes in the MKV files, keeping each original as
+  `<name>.mkv.orig`. Needs mkvtoolnix.
 - `subcheck timing` reports subtitle tracks shifted by whole frames against the video, with the
   `mkvmerge --sync` that fixes a whole-track shift. No LLM, nothing recorded.
 
@@ -70,3 +72,36 @@ window and leave focus alone. The ways below rest on two mpv options, `--focus-o
   window when a window opens.) It also turns Keep Above on when the window opens, because a
   window that is refused focus opens behind the active one, so a maximized terminal would hide
   it. Alt+F3 → More Actions → Keep Above turns that off.
+
+## Apply
+
+`subcheck apply` takes the newest run's accepted fixes (or those of the run named), with your
+wording where you reworded one, and makes them in each file:
+
+1. It finds the events each fix was made from and changes just the words that differ, keeping the
+   tags around them (`{\i1}Ihave{\i0}` becomes `{\i1}I have{\i0}`).
+2. mkvmerge writes `.<name>.mkv.subcheck` beside the file: the same file with the fixed tracks
+   replaced, each in its place, with its name, language, flags and compression.
+3. That remux is checked against the original: titles, chapters, attachments, every track's
+   header, frame counts, and every subtitle event. With `--full` (or `--no-backup`), every frame of
+   every track too, which reads both files end to end.
+4. The original becomes `<name>.mkv.orig` and the remux takes its name. The original is linked to
+   that name first, so the file is never missing on the way; a filesystem without hard links
+   needs `--no-backup`.
+
+A fixed track's own tags (a `Source` note, say) are carried over to its replacement. The check does
+not compare tags. Any that may not come over exactly are noted in the output, the dry run's too:
+a value that is not plain UTF-8 text, a tag that also targets something else (another track, a
+chapter, an edition), or an element mkvmerge's tags XML cannot hold.
+
+`--no-backup` keeps no original. `--dry-run` shows each changed event before and after, and writes
+nothing. Running apply again is safe: a fix already in its file is reported and left alone.
+
+Some fixes are left for a hand fix, with the reason: per-letter karaoke (one event per letter),
+signs set letter by letter (a tag before nearly every letter), a change across a tag or a line
+break, two fixes on one line, and a line that is not there any more.
+
+A file in a directory you cannot write to (a library share, say) can be remuxed elsewhere:
+`--tracks-only DIR` writes its fixed tracks to DIR and prints the mkvmerge command that remuxes
+it to `.<name>.mkv.subcheck` beside the original; `--check` then checks that remux against the
+original. The swap is yours. Afterwards `subcheck apply` finds the fixes in place and records them.

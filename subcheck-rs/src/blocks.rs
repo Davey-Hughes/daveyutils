@@ -510,10 +510,208 @@ fn bytes_at<'a>(
     }
 }
 
+/// The largest Cluster read whole by [`each_frame`]: real ones are a few MB.
+const MAX_CLUSTER: u64 = 512 << 20;
+
+/// Every frame of every track, in file order, as `(track number, frame)`: lacing and content
+/// encodings undone. Reads the whole file, a Cluster at a time: for checking a remux frame by frame.
+pub fn each_frame(r: &Reader, layout: &Layout, mut f: impl FnMut(u64, &[u8])) -> Result<()> {
+    let encodings: HashMap<u64, &[ContentEncoding]> = layout
+        .tracks
+        .iter()
+        .map(|t| (t.number, t.encodings.as_slice()))
+        .collect();
+    let Some(mut pos) = layout.first_cluster else {
+        return Ok(());
+    };
+    while pos < layout.segment_end {
+        let h = r.header_at(pos)?;
+        let Some(end) = h.end() else {
+            return Err(Error::Unsupported(format!(
+                "unknown-size element {:#X} at byte {pos}",
+                h.id
+            )));
+        };
+        if h.id == mkv::CLUSTER {
+            let size = end - h.data_start;
+            if size > MAX_CLUSTER || end > r.file_size() {
+                return ebml::parse_err(pos, format!("Cluster of {size} bytes"));
+            }
+            let data = r.read_exact(h.data_start, usize::try_from(size).unwrap_or(usize::MAX))?;
+            for (id, at, child) in ebml::children(&data, h.data_start)? {
+                let body = match id {
+                    mkv::SIMPLE_BLOCK => Some((at, child)),
+                    mkv::BLOCK_GROUP => ebml::children(child, at)?
+                        .into_iter()
+                        .find(|(cid, _, _)| *cid == mkv::BLOCK)
+                        .map(|(_, bat, b)| (bat, b)),
+                    _ => None,
+                };
+                let Some((at, body)) = body else {
+                    continue;
+                };
+                let (track, frames) = frames(body, at)?;
+                let enc = encodings.get(&track).copied().unwrap_or_default();
+                for frame in frames {
+                    f(track, &decode(frame.to_vec(), enc, mkv::SCOPE_FRAMES)?);
+                }
+            }
+        }
+        pos = end;
+    }
+    Ok(())
+}
+
+/// A Block or SimpleBlock body's track number and frames, its lacing (Xiph, EBML or fixed-size)
+/// undone. `at` is the body's offset, for errors.
+fn frames(body: &[u8], at: u64) -> Result<(u64, Vec<&[u8]>)> {
+    let Some((track, n, _)) = ebml::read_vint(body) else {
+        return ebml::parse_err(at, "bad block track number");
+    };
+    let Some((&flags, data)) = body.get(n + 2..).and_then(<[u8]>::split_first) else {
+        return ebml::parse_err(at, "block too short");
+    };
+    let lacing = (flags >> 1) & 3;
+    if lacing == 0 {
+        return Ok((track, vec![data]));
+    }
+    let bad = || ebml::parse_err(at, "bad lacing");
+    let Some((&last, mut rest)) = data.split_first() else {
+        return bad();
+    };
+    let count = usize::from(last) + 1;
+    let mut sizes: Vec<usize> = Vec::with_capacity(count);
+    match lacing {
+        // Xiph: each size but the last as a run of 255s and a final byte below 255.
+        1 => {
+            for _ in 1..count {
+                let mut size = 0;
+                loop {
+                    let Some((&b, r)) = rest.split_first() else {
+                        return bad();
+                    };
+                    rest = r;
+                    size += usize::from(b);
+                    if b != 255 {
+                        break;
+                    }
+                }
+                sizes.push(size);
+            }
+        }
+        // Fixed: every frame the same size.
+        2 => {
+            if rest.len() % count != 0 {
+                return bad();
+            }
+            sizes = vec![rest.len() / count; count - 1];
+        }
+        // EBML: the first size, then each next one as a signed difference from the one before.
+        _ => {
+            let Some((first, len, _)) = ebml::read_vint(rest) else {
+                return bad();
+            };
+            rest = &rest[len..];
+            sizes.push(usize::try_from(first).unwrap_or(usize::MAX));
+            for _ in 2..count {
+                let Some((raw, len, _)) = ebml::read_vint(rest) else {
+                    return bad();
+                };
+                rest = &rest[len..];
+                let bias = (1i64 << (7 * len - 1)) - 1;
+                let prev = i64::try_from(*sizes.last().unwrap_or(&0)).unwrap_or(i64::MAX);
+                let Ok(size) = usize::try_from(prev + i64::try_from(raw).unwrap_or(0) - bias)
+                else {
+                    return bad();
+                };
+                sizes.push(size);
+            }
+        }
+    }
+    let laced: usize = sizes.iter().sum();
+    if laced > rest.len() {
+        return bad();
+    }
+    sizes.push(rest.len() - laced);
+    let mut out = Vec::with_capacity(count);
+    for size in sizes {
+        let (frame, r) = rest.split_at(size);
+        out.push(frame);
+        rest = r;
+    }
+    Ok((track, out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A block body for track 1: timestamp 0, `flags`, then `data`.
+    fn body(flags: u8, data: &[u8]) -> Vec<u8> {
+        [&[0x81, 0, 0, flags][..], data].concat()
+    }
+
+    #[test]
+    fn lacing_is_undone_in_all_three_kinds() {
+        // Frames "ab", "c", "def".
+        let xiph = body(0x02, &[2, 2, 1, b'a', b'b', b'c', b'd', b'e', b'f']);
+        let fixed = body(0x04, &[2, b'a', b'b', b'c', b'd', b'e', b'f']);
+        // EBML: first size 2 (0x82), then 1 - 2 = -1 as a 1-byte signed vint: 0x80 | (0x3F - 1).
+        let ebml = body(
+            0x06,
+            &[2, 0x82, 0x80 | 0x3E, b'a', b'b', b'c', b'd', b'e', b'f'],
+        );
+        let none = body(0x80, b"abc");
+        let got = |b: &[u8]| frames(b, 0).unwrap().1.concat_with_bars();
+        assert_eq!(got(&xiph), "ab|c|def");
+        assert_eq!(got(&fixed), "ab|cd|ef");
+        assert_eq!(got(&ebml), "ab|c|def");
+        assert_eq!(got(&none), "abc");
+        assert!(
+            frames(&body(0x02, &[2, 9, 9]), 0).is_err(),
+            "sizes past the end"
+        );
+        assert!(
+            frames(&body(0x04, &[1, b'a', b'b', b'c']), 0).is_err(),
+            "3 bytes in 2"
+        );
+    }
+
+    trait Bars {
+        fn concat_with_bars(&self) -> String;
+    }
+
+    impl Bars for Vec<&[u8]> {
+        fn concat_with_bars(&self) -> String {
+            self.iter()
+                .map(|f| String::from_utf8_lossy(f).into_owned())
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+    }
+
+    #[test]
+    fn every_frame_of_a_file_comes_out_once() {
+        let (r, layout) = mkv::open(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/apply.mkv"
+        )))
+        .unwrap();
+        let mut count: HashMap<u64, u64> = HashMap::new();
+        each_frame(&r, &layout, |track, _| {
+            *count.entry(track).or_default() += 1;
+        })
+        .unwrap();
+        for t in &layout.tracks {
+            assert_eq!(
+                count.get(&t.number),
+                layout.frame_counts.get(&t.uid),
+                "track {}",
+                t.id
+            );
+        }
+    }
 
     #[test]
     fn decode_undoes_zlib_then_header_strip_in_order() {
