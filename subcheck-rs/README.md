@@ -27,7 +27,7 @@ A fix repeated across episodes (an OP lyric, say) is one row; `⏎` expands it i
 | Space | pause or resume mpv |
 | ← → | mpv back or forward 5 s |
 | `,` `.` | mpv back or forward 1 s |
-| `q` | quit |
+| `q` | quit, closing the mpv window review started |
 
 The mouse works too. Click a row to select it, and double-click to open it in mpv. The wheel moves
 the selection over the list and scrolls the detail pane. The key bar and the playback buttons are
@@ -64,7 +64,8 @@ window and leave focus alone. The ways below rest on two mpv options, `--focus-o
   `count=`, and reconfigure.
 
   The rule stops this one window from ever taking keyboard focus. Review's playback keys control
-  it; mpv's own keys (`f`, `q`, …) do not reach it, and you close it from its title bar.
+  it; mpv's own keys (`f`, `q`, …) do not reach it. The window closes when the review that started
+  it quits or its terminal closes; close one left by any other way from its title bar.
   (KWin's focus stealing prevention would be gentler, but KWin 6.8 on Wayland ignores it per
   window when a window opens.) It also turns Keep Above on when the window opens, because a
   window that is refused focus opens behind the active one, so a maximized terminal would hide

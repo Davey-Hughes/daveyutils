@@ -7,6 +7,7 @@
 
 pub mod blocks;
 pub mod ebml;
+pub mod group;
 pub mod list;
 pub mod llm;
 pub mod mkv;

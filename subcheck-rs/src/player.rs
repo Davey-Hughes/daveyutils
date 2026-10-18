@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use jiff::Timestamp;
 use serde_json::{json, Value};
 
+use crate::group;
 use crate::scan::file_stamp;
 use crate::text::timestamp;
 
@@ -79,8 +80,11 @@ pub fn loadfile_command(m: &Moment) -> Value {
 pub struct Player {
     program: OsString,
     socket: PathBuf,
-    /// The mpv this review started, until it exits.
-    child: Option<Child>,
+    /// The mpvs this review started that are still up, newest last, each registered so that a
+    /// signal that ends the review ends it too. More than one only when `o` found none answering
+    /// while an earlier one was still up (slow to open its socket, say): it starts another, and
+    /// either may end up with the socket.
+    children: Vec<(Child, group::Registered)>,
     /// The file this review last loaded into mpv, with its size and mtime then.
     loaded: Option<(String, (u64, Timestamp))>,
     /// How many of [`focus_flags`] this mpv takes: all, until one that exited on them started with
@@ -93,7 +97,7 @@ impl Player {
         Player {
             program: program.into(),
             socket,
-            child: None,
+            children: Vec::new(),
             loaded: None,
             focus: focus_flags().len(),
         }
@@ -172,13 +176,10 @@ impl Player {
         })
     }
 
-    /// Forget a started mpv that has exited (and collect its exit status).
+    /// Forget the started mpvs that have exited (and collect their exit status).
     fn reap(&mut self) {
-        if let Some(child) = &mut self.child {
-            if !matches!(child.try_wait(), Ok(None)) {
-                self.child = None;
-            }
-        }
+        self.children
+            .retain_mut(|(child, _)| matches!(child.try_wait(), Ok(None)));
     }
 
     /// Start an idle mpv on the socket and connect to it. A stale socket file left by an mpv that
@@ -215,8 +216,8 @@ impl Player {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            // Its own process group: the terminal's signals stay with the review, and the window
-            // outlives it.
+            // Its own process group: the terminal's signals stay with the review, which closes the
+            // window itself.
             .process_group(0)
             .spawn()
             .map_err(|e| {
@@ -227,15 +228,16 @@ impl Player {
                     format!("starting {program}: {e}")
                 })
             })?;
-        self.child = Some(child);
+        let pgid = i32::try_from(child.id()).unwrap_or(0);
+        self.children.push((child, group::register(pgid)));
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
             if let Ok(conn) = Conn::connect(&self.socket) {
                 return Ok(conn);
             }
-            if let Some(child) = &mut self.child {
+            if let Some((child, _)) = self.children.last_mut() {
                 if let Ok(Some(status)) = child.try_wait() {
-                    self.child = None;
+                    self.children.pop();
                     let e = format!("mpv exited before opening its socket ({status})");
                     // 1 is mpv's exit on an option it does not know; a launcher that exits 0 or a
                     // crash is no reason to drop a flag.
@@ -254,6 +256,19 @@ impl Player {
                 )));
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Every mpv this review started that is still up closes with it: the window takes no keys, so it
+/// has no `q` of its own. Killed, as `group` does when a signal ends the review (the terminal
+/// closed): mpv without a terminal has no handler for SIGTERM either. One the review found open on
+/// the socket is left alone.
+impl Drop for Player {
+    fn drop(&mut self) {
+        self.reap();
+        for (child, _) in &self.children {
+            group::kill(i32::try_from(child.id()).unwrap_or(0));
         }
     }
 }
@@ -380,14 +395,14 @@ mod tests {
     }
 
     /// A script standing in for the mpv program: it writes its arguments to `argv` and stays
-    /// up for a while, as mpv would.
+    /// up, as mpv would, until the Player that started it is dropped.
     fn fake_program(dir: &Path) -> (PathBuf, PathBuf) {
         let argv = dir.join("argv");
         let program = script(
             dir,
             "fake-mpv",
             &format!(
-                "printf '%s\\n' \"$@\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nsleep 2\n",
+                "printf '%s\\n' \"$@\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nsleep 60\n",
                 argv.display()
             ),
         );
@@ -524,7 +539,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("mpv.sock");
         let m = on_disk(dir.path());
-        // mpv's window kept from an earlier review: whatever it opened then may be stale.
+        // mpv's window from another review: whatever it opened then may be stale.
         let mpv = fake_mpv(
             UnixListener::bind(&socket).unwrap(),
             has_open(&m.file, ok(Value::Null)),
@@ -618,7 +633,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&argv).unwrap(), base_args(&socket));
         let count = || std::fs::read_to_string(&starts).unwrap().lines().count();
         assert_eq!(count(), 3, "both flags, the app id, neither");
-        // That mpv gone, socket and all, the next o starts another straight away without them.
+        // Its socket gone (as if that mpv had quit), the next o starts another straight away
+        // without them.
         std::fs::remove_file(&socket).unwrap();
         std::fs::remove_file(&argv).unwrap();
         let server = mpv_once_started(&socket, &argv);
@@ -686,6 +702,69 @@ mod tests {
                 socket.display()
             )
         );
+    }
+
+    /// The pid of the newest mpv `player` started.
+    fn newest(player: &Player) -> u32 {
+        player.children.last().expect("an mpv started").0.id()
+    }
+
+    /// Whether the started mpv `pid` was killed, waiting up to 2 s for it to end. A dropped Player
+    /// never waits for one it killed, so it is still there to wait for; one still up is killed
+    /// here, so that no test leaves it behind.
+    fn killed(pid: u32) -> bool {
+        let pid = i32::try_from(pid).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut status = 0;
+        // SAFETY: waitpid writes only to `status`, and kill only reads its integer arguments.
+        unsafe {
+            while libc::waitpid(pid, &raw mut status, libc::WNOHANG) == 0 {
+                if Instant::now() >= deadline {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::waitpid(pid, &raw mut status, 0);
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL
+    }
+
+    #[test]
+    fn the_mpv_a_review_started_closes_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        let (program, argv) = fake_program(dir.path());
+        let server = mpv_once_started(&socket, &argv);
+        let mut player = Player::new(&program, socket);
+        assert_eq!(player.open(&moment()), Ok(()));
+        server.join().unwrap();
+        let pid = newest(&player);
+        drop(player);
+        assert!(killed(pid));
+    }
+
+    #[test]
+    fn an_mpv_out_of_reach_closes_with_the_review_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        let (program, argv) = fake_program(dir.path());
+        let server = mpv_once_started(&socket, &argv);
+        let mut player = Player::new(&program, socket.clone());
+        assert_eq!(player.open(&moment()), Ok(()));
+        server.join().unwrap();
+        let first = newest(&player);
+        // Its socket file gone, the next o cannot reach it and starts another.
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::remove_file(&argv).unwrap();
+        let server = mpv_once_started(&socket, &argv);
+        assert_eq!(player.open(&moment()), Ok(()));
+        server.join().unwrap();
+        let second = newest(&player);
+        assert_ne!(second, first);
+        drop(player);
+        assert!(killed(first));
+        assert!(killed(second));
     }
 
     #[test]
