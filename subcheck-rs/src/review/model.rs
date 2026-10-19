@@ -7,7 +7,7 @@ use std::ops::Range;
 use jiff::Timestamp;
 use ratatui::layout::Rect;
 
-use super::layout;
+use super::layout::{self, EDIT_KEYS, HELP, Item};
 use crate::list::{self, Filter};
 use crate::store::{Decision, Finding, Run, State, TrackRecord};
 use crate::timing::frame_count;
@@ -63,6 +63,8 @@ pub struct Model {
     track_names: Vec<String>,
     pub expanded: HashSet<usize>,
     pub filter: Filter,
+    /// Whether the box of keys `?` opens is showing.
+    pub help: bool,
     /// Index into `entries()`.
     pub selected: usize,
     pub editor: Option<Editor>,
@@ -85,16 +87,19 @@ pub struct Model {
 }
 
 impl Model {
+    /// Every finding, decided or not, with the first row that has a pending one selected: a
+    /// half-reviewed run opens where the work is.
     pub fn new(run: Run, notes: HashMap<String, FileNote>) -> Model {
         let (rows, track_names) = group(&run);
         let labels = labels(&run);
-        Model {
+        let mut m = Model {
             run,
             rows,
             track_names,
             labels,
             expanded: HashSet::new(),
-            filter: Filter::Only(State::Pending),
+            filter: Filter::All,
+            help: false,
             selected: 0,
             editor: None,
             undo: Vec::new(),
@@ -105,7 +110,27 @@ impl Model {
             scroll: 0,
             detail_scroll: 0,
             last_click: None,
-        }
+        };
+        m.selected = m
+            .entries()
+            .iter()
+            .position(|&e| m.has_pending(e))
+            .unwrap_or(0);
+        m
+    }
+
+    /// Whether any finding an entry stands for is pending.
+    pub fn has_pending(&self, e: Entry) -> bool {
+        self.targets(e)
+            .iter()
+            .any(|&i| self.state(i) == State::Pending)
+    }
+
+    /// A screen of `area`, scrolled to show the selection as the view will draw it: a click maps
+    /// rows with `scroll` before any message has moved it.
+    pub fn set_area(&mut self, area: Rect) {
+        self.area = area;
+        self.scroll = self.list_scroll(area);
     }
 
     /// The list's scroll offset on a screen of `area`: `scroll`, moved just enough to show the
@@ -114,6 +139,20 @@ impl Model {
         let rows = layout::list_rows(&layout::panes(area)).height;
         let len = self.entries().len();
         layout::keep_in_view(self.scroll, self.selected, usize::from(rows), len)
+    }
+
+    /// The buttons at the end of the status line `status`, when they show there: the editor's while
+    /// it is open, beside its prompt and [`layout::EDIT_FIELD`] columns of text; else `? help`,
+    /// beside the message.
+    pub fn buttons(&self, status: Rect) -> Option<&'static [Item]> {
+        let (items, left) = match &self.editor {
+            Some(_) => (
+                EDIT_KEYS,
+                layout::width(layout::PROMPT) + layout::EDIT_FIELD,
+            ),
+            None => (HELP, self.status.as_deref().map_or(0, layout::width)),
+        };
+        layout::right_shown(status, items, left).then_some(items)
     }
 
     /// The name a file goes by in the list (see [`labels`]).
@@ -182,6 +221,19 @@ impl Model {
             Entry::Row(r) => self.shown_members(r),
             Entry::Member(_, i) => vec![i],
         }
+    }
+
+    /// What `a` `r` `e` on an entry decide: of its targets, the pending ones; all of them when none
+    /// is, so that a decided group still flips as a whole. A member decided on its own keeps its
+    /// decision when its row is decided later.
+    pub fn to_decide(&self, e: Entry) -> Vec<usize> {
+        let targets = self.targets(e);
+        let pending: Vec<usize> = targets
+            .iter()
+            .copied()
+            .filter(|&i| self.state(i) == State::Pending)
+            .collect();
+        if pending.is_empty() { targets } else { pending }
     }
 
     pub fn selected_entry(&self) -> Option<Entry> {

@@ -172,7 +172,7 @@ pub fn run(path: &Path, state: &Path) -> anyhow::Result<()> {
     let guard = TerminalGuard::enter().context("entering the alternate screen")?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let size = terminal.size()?;
-    model.area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+    model.set_area(ratatui::layout::Rect::new(0, 0, size.width, size.height));
     while !model.should_quit {
         terminal.draw(|f| view::view(&model, f))?;
         let msg = next_msg(event::read)?;

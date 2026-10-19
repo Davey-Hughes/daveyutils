@@ -5,7 +5,7 @@ use crossterm::event::KeyCode;
 use jiff::{SignedDuration, Timestamp};
 use ratatui::layout::{Position, Rect};
 
-use super::layout::{self, EDIT_KEYS, KEYS, PLAYBACK};
+use super::layout;
 use super::model::{Editor, Entry, FileNote, Model, UndoStep};
 use super::view;
 use crate::list::{self, Filter, label};
@@ -45,7 +45,11 @@ pub enum Mouse {
 /// What a write was for, so its result can be applied.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    Decide { entry: Entry, before: UndoStep },
+    /// `a` `r` `e`, and `x`, which puts findings back to pending.
+    Decide {
+        entry: Entry,
+        before: UndoStep,
+    },
     Undo,
 }
 
@@ -105,6 +109,12 @@ fn apply(
             Vec::new()
         }
         Msg::Key(key) if m.editor.is_some() => edit_key(m, key, now),
+        // Any key closes the box of keys and does nothing else; but `q` quits, as the box says.
+        Msg::Key(key) if m.help => {
+            m.help = false;
+            m.should_quit = key == KeyCode::Char('q');
+            Vec::new()
+        }
         Msg::Key(key) => {
             m.status = None;
             key_press(m, key, now)
@@ -136,7 +146,7 @@ fn apply(
             Vec::new()
         }
         Msg::Resize(width, height) => {
-            m.area = Rect::new(0, 0, width, height);
+            m.set_area(Rect::new(0, 0, width, height));
             Vec::new()
         }
         Msg::Mouse(action, x, y) => mouse(m, action, Position::new(x, y), last_click, now),
@@ -153,7 +163,7 @@ fn detail_last(m: &Model) -> u16 {
 
 /// A click does what its key does; the wheel moves the selection over the list and scrolls the
 /// detail pane. While the editor is open only its own buttons work, so a stray click cannot lose
-/// the edit.
+/// the edit; while the box of keys shows, a click closes it and the wheel does nothing.
 fn mouse(
     m: &mut Model,
     action: Mouse,
@@ -166,9 +176,13 @@ fn mouse(
         Some(key) => apply(m, Msg::Key(key), None, now),
         None => Vec::new(),
     };
+    if m.help {
+        m.help = !matches!(action, Mouse::Click);
+        return Vec::new();
+    }
     if m.editor.is_some() {
         return match action {
-            Mouse::Click => press(m, layout::bar_click(EDIT_KEYS, p.keys, at)),
+            Mouse::Click => press(m, status_button(m, p.status, at)),
             _ => Vec::new(),
         };
     }
@@ -188,16 +202,15 @@ fn mouse(
             let row = usize::from(at.y - layout::list_rows(&p).y);
             click_row(m, m.scroll + row, last_click, now)
         }
-        Mouse::Click if p.keys.contains(at) => press(m, layout::bar_click(KEYS, p.keys, at)),
-        // Only while they show: a long message takes the line from them.
-        Mouse::Click
-            if p.status.contains(at) && layout::playback_shown(p.status, m.status.as_deref()) =>
-        {
-            let left = layout::playback_left(p.status);
-            press(m, layout::bar_hit(PLAYBACK, left, at.x))
-        }
+        Mouse::Click => press(m, status_button(m, p.status, at)),
         _ => Vec::new(),
     }
+}
+
+/// The key the button at `at` on the status line `status` presses, while the buttons show.
+fn status_button(m: &Model, status: Rect, at: Position) -> Option<KeyCode> {
+    let items = m.buttons(status).filter(|_| status.contains(at))?;
+    layout::bar_hit(items, layout::bar_left(status, items), at.x)
 }
 
 /// A click on the list's `index`th entry selects it; the second click of a double-click opens it.
@@ -227,6 +240,7 @@ fn key_press(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
     let last = m.entries().len().saturating_sub(1);
     match key {
         KeyCode::Char('q') => m.should_quit = true,
+        KeyCode::Char('?') => m.help = true,
         KeyCode::Down | KeyCode::Char('j') => m.selected = (m.selected + 1).min(last),
         KeyCode::Up | KeyCode::Char('k') => m.selected = m.selected.saturating_sub(1),
         KeyCode::PageDown => m.selected = (m.selected + PAGE).min(last),
@@ -249,20 +263,23 @@ fn key_press(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
         }
         KeyCode::Char('e') => {
             if let Some(entry) = m.selected_entry() {
-                if m.targets(entry)
-                    .iter()
-                    .any(|&i| m.finding(i).timing.is_some())
-                {
+                let targets = m.to_decide(entry);
+                if targets.iter().any(|&i| m.finding(i).timing.is_some()) {
                     m.status = Some("a timing fix is accepted or rejected, not edited".into());
                     return Vec::new();
                 }
-                let text = m.wording(m.targets(entry)[0]).to_string();
+                let text = m.wording(targets[0]).to_string();
                 let cursor = text.chars().count();
                 m.editor = Some(Editor {
                     entry,
                     text,
                     cursor,
                 });
+            }
+        }
+        KeyCode::Char('x') => {
+            if let Some(entry) = m.selected_entry() {
+                return clear(m, entry, now);
             }
         }
         KeyCode::Char('u') => return undo(m, now),
@@ -297,7 +314,7 @@ fn edit_key(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
                 m.editor = Some(ed);
                 return Vec::new();
             }
-            let reworded = ed.text != m.finding(m.targets(ed.entry)[0]).suggestion;
+            let reworded = ed.text != m.finding(m.to_decide(ed.entry)[0]).suggestion;
             let edited = reworded.then_some(ed.text.as_str());
             return decide(m, ed.entry, State::Accepted, edited, now);
         }
@@ -324,17 +341,18 @@ fn edit_key(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
     Vec::new()
 }
 
-/// Decisions for each finding `entry` stands for that is not already `state` with that wording.
-fn decide(
-    m: &mut Model,
-    entry: Entry,
+/// Decisions putting each of `findings` at `state` with that wording, but those that already are;
+/// and what each had before, for `u`.
+fn changes(
+    m: &Model,
+    findings: Vec<usize>,
     state: State,
     edited: Option<&str>,
     now: Timestamp,
-) -> Vec<Effect> {
+) -> (UndoStep, Vec<Decision>) {
     let mut before = Vec::new();
     let mut decisions = Vec::new();
-    for i in m.targets(entry) {
+    for i in findings {
         let id = m.finding(i).id;
         let current = m.run.decisions.get(&id);
         if current.is_some_and(|d| d.state == state && d.edited.as_deref() == edited) {
@@ -348,8 +366,38 @@ fn decide(
             at: now,
         });
     }
+    (before, decisions)
+}
+
+/// `a` `r` `e`: the findings `entry` decides ([`Model::to_decide`]) at `state`, with that wording.
+fn decide(
+    m: &mut Model,
+    entry: Entry,
+    state: State,
+    edited: Option<&str>,
+    now: Timestamp,
+) -> Vec<Effect> {
+    let (before, decisions) = changes(m, m.to_decide(entry), state, edited, now);
     if decisions.is_empty() {
         m.status = Some(format!("already {}", label(state)));
+        return Vec::new();
+    }
+    vec![Effect::Write {
+        action: Action::Decide { entry, before },
+        decisions,
+    }]
+}
+
+/// `x`: each finding `entry` stands for back to pending, but those that are.
+fn clear(m: &mut Model, entry: Entry, now: Timestamp) -> Vec<Effect> {
+    let decided: Vec<usize> = m
+        .targets(entry)
+        .into_iter()
+        .filter(|&i| m.state(i) != State::Pending)
+        .collect();
+    let (before, decisions) = changes(m, decided, State::Pending, None, now);
+    if decisions.is_empty() {
+        m.status = Some("nothing to clear".into());
         return Vec::new();
     }
     vec![Effect::Write {
@@ -398,23 +446,39 @@ fn written(m: &mut Model, action: Action, decisions: &[Decision], result: Result
     };
     match action {
         Action::Decide { entry, before } => {
-            // `a` means the suggestion as written, so it replaces a rewording; say so, since `u`
-            // can bring it back.
-            let replaced = before
-                .iter()
-                .zip(decisions)
-                .filter(|((_, was), now)| {
-                    now.state == State::Accepted
-                        && now.edited.is_none()
-                        && was.as_ref().is_some_and(|d| d.edited.is_some())
-                })
-                .count();
-            let replacing = if replaced > 0 {
-                format!(", replacing your wording on {replaced} (u undoes)")
+            let state = decisions[0].state;
+            m.status = Some(if state == State::Pending {
+                format!("cleared {what}")
             } else {
-                String::new()
-            };
-            m.status = Some(format!("{} {what}{replacing}", label(decisions[0].state)));
+                // `a` means the suggestion as written, so it replaces a rewording; say so, since
+                // `u` can bring it back.
+                let replaced = before
+                    .iter()
+                    .zip(decisions)
+                    .filter(|((_, was), now)| {
+                        now.state == State::Accepted
+                            && now.edited.is_none()
+                            && was.as_ref().is_some_and(|d| d.edited.is_some())
+                    })
+                    .count();
+                let replacing = if replaced > 0 {
+                    format!(", replacing your wording on {replaced} (u undoes)")
+                } else {
+                    String::new()
+                };
+                // The members a row's key left alone, decided the other way on their own.
+                let kept: Vec<State> = m
+                    .targets(entry)
+                    .into_iter()
+                    .map(|i| m.state(i))
+                    .filter(|&s| s != state)
+                    .collect();
+                let kept = match kept.first() {
+                    Some(&other) => format!(", {} kept as {}", kept.len(), label(other)),
+                    None => String::new(),
+                };
+                format!("{} {what}{replacing}{kept}", label(state))
+            });
             m.undo.push(before);
             advance(m, entry, old, &shown);
         }
@@ -440,11 +504,13 @@ fn written(m: &mut Model, action: Action, decisions: &[Decision], result: Result
 }
 
 /// After a decision on `decided`, which was at `old` in `shown` (the list before it): select the
-/// first entry after it that is still shown, passing over a decided row's members. The decided
-/// entry may be gone, and with it more than itself: the last shown member of a group takes the
-/// group's row along.
+/// first entry after it that is still shown and has a pending finding, passing over a decided
+/// row's members. Under a filter of accepted or rejected findings, where nothing shown is
+/// pending, the first one still shown. The decided entry may be gone, and with it more than
+/// itself: the last shown member of a group takes the group's row along.
 fn advance(m: &mut Model, decided: Entry, old: usize, shown: &[Entry]) {
     let now = m.entries();
+    let to_do = matches!(m.filter, Filter::All | Filter::Only(State::Pending));
     let next = shown
         .iter()
         .skip(old + 1)
@@ -452,6 +518,7 @@ fn advance(m: &mut Model, decided: Entry, old: usize, shown: &[Entry]) {
             !(matches!(decided, Entry::Row(_))
                 && matches!(e, Entry::Member(r, _) if *r == decided.row()))
         })
+        .filter(|&&e| !to_do || m.has_pending(e))
         .find_map(|e| now.iter().position(|n| n == e));
     m.selected = match next {
         Some(i) => i,
@@ -466,10 +533,10 @@ fn advance(m: &mut Model, decided: Entry, old: usize, shown: &[Entry]) {
 fn cycle_filter(m: &mut Model) {
     let focus = m.focus();
     m.filter = match m.filter {
-        Filter::Only(State::Pending) => Filter::All,
-        Filter::All => Filter::Only(State::Accepted),
+        Filter::All => Filter::Only(State::Pending),
+        Filter::Only(State::Pending) => Filter::Only(State::Accepted),
         Filter::Only(State::Accepted) => Filter::Only(State::Rejected),
-        Filter::Only(State::Rejected) => Filter::Only(State::Pending),
+        Filter::Only(State::Rejected) => Filter::All,
     };
     // Stay on the same finding's row when it is still shown.
     let entries = m.entries();
@@ -646,7 +713,8 @@ mod tests {
             ]
         );
         assert_eq!(m.status.as_deref(), Some("accepted 3 findings"));
-        // Under the pending filter the decided row is gone; the next one took its place.
+        // The decided row stays in the list; the selection moved on to the next.
+        assert_eq!(m.entries(), [Entry::Row(0), Entry::Row(1)]);
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
     }
 
@@ -661,6 +729,46 @@ mod tests {
         m.selected = 0;
         assert_eq!(press(&mut m, 'r'), []);
         assert_eq!(m.status.as_deref(), Some("already rejected"));
+    }
+
+    #[test]
+    fn after_a_decision_the_selection_skips_rows_already_decided() {
+        let mut m = crate::review::model::tests_support::many(4);
+        m.selected = 1;
+        let effects = press(&mut m, 'r');
+        written(&mut m, effects);
+        assert_eq!(m.selected, 2, "E03, the next row");
+        m.selected = 0;
+        let effects = press(&mut m, 'a');
+        written(&mut m, effects);
+        assert_eq!(m.selected, 2, "past E02, decided");
+        // Nothing pending below the last row: the selection stays on it.
+        m.selected = 3;
+        let effects = press(&mut m, 'a');
+        written(&mut m, effects);
+        assert_eq!(m.selected, 3);
+    }
+
+    #[test]
+    fn under_a_decided_filter_a_decision_moves_to_the_row_that_takes_its_place() {
+        let mut m = crate::review::model::tests_support::many(4);
+        for id in 1..=4 {
+            m.run.decisions.insert(
+                id,
+                Decision {
+                    finding: id,
+                    state: State::Rejected,
+                    edited: None,
+                    at: now(),
+                },
+            );
+        }
+        m.filter = Filter::Only(State::Rejected);
+        m.selected = 1;
+        let effects = press(&mut m, 'a');
+        written(&mut m, effects);
+        // Nothing here is pending: E02 left, and E03 took its place.
+        assert_eq!(m.selected_entry(), Some(Entry::Row(2)));
     }
 
     #[test]
@@ -754,6 +862,61 @@ mod tests {
     }
 
     #[test]
+    fn x_clears_an_entry_back_to_pending_and_u_puts_it_back() {
+        let mut m = sample();
+        let effects = press(&mut m, 'a');
+        written(&mut m, effects);
+        m.selected = 0;
+        let effects = press(&mut m, 'x');
+        assert_eq!(
+            decided(&effects),
+            [
+                (1, State::Pending, None),
+                (2, State::Pending, None),
+                (4, State::Pending, None)
+            ]
+        );
+        written(&mut m, effects);
+        assert_eq!(states(&m), [State::Pending; 4]);
+        assert_eq!(m.status.as_deref(), Some("cleared 3 findings"));
+        assert_eq!(
+            m.selected_entry(),
+            Some(Entry::Row(1)),
+            "on to the next pending row, as after a and r"
+        );
+        assert_eq!(press(&mut m, 'x'), []);
+        assert_eq!(m.status.as_deref(), Some("nothing to clear"));
+        let effects = press(&mut m, 'u');
+        assert_eq!(
+            decided(&effects),
+            [
+                (1, State::Accepted, None),
+                (2, State::Accepted, None),
+                (4, State::Accepted, None)
+            ]
+        );
+    }
+
+    #[test]
+    fn x_on_a_member_clears_it_alone_and_on_a_row_only_the_decided() {
+        let mut m = sample();
+        let effects = press(&mut m, 'a');
+        written(&mut m, effects);
+        m.selected = 0;
+        key(&mut m, KeyCode::Enter);
+        m.selected = 2;
+        assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)));
+        let effects = press(&mut m, 'x');
+        assert_eq!(decided(&effects), [(2, State::Pending, None)]);
+        written(&mut m, effects);
+        m.selected = 0;
+        assert_eq!(
+            decided(&press(&mut m, 'x')),
+            [(1, State::Pending, None), (4, State::Pending, None)]
+        );
+    }
+
+    #[test]
     fn undo_restores_an_earlier_wording() {
         let mut m = sample();
         m.selected = 1;
@@ -778,6 +941,7 @@ mod tests {
     #[test]
     fn a_member_is_decided_alone_and_the_row_decides_the_rest() {
         let mut m = sample();
+        m.filter = Filter::Only(State::Pending);
         key(&mut m, KeyCode::Enter);
         assert_eq!(
             m.entries(),
@@ -802,6 +966,71 @@ mod tests {
             decided(&effects),
             [(1, State::Accepted, None), (4, State::Accepted, None)],
             "only the members the filter shows"
+        );
+    }
+
+    #[test]
+    fn a_row_decision_keeps_a_member_decided_alone() {
+        let mut m = sample();
+        m.filter = Filter::All;
+        key(&mut m, KeyCode::Enter);
+        m.selected = 2;
+        let effects = press(&mut m, 'r');
+        written(&mut m, effects);
+        // The row shows E02's rejection too, but its key decides only the pending members.
+        m.selected = 0;
+        let effects = press(&mut m, 'a');
+        assert_eq!(
+            decided(&effects),
+            [(1, State::Accepted, None), (4, State::Accepted, None)]
+        );
+        written(&mut m, effects);
+        assert_eq!(
+            m.status.as_deref(),
+            Some("accepted 2 findings, 1 kept as rejected")
+        );
+        // None pending: the row flips as a whole.
+        m.selected = 0;
+        let effects = press(&mut m, 'r');
+        assert_eq!(
+            decided(&effects),
+            [(1, State::Rejected, None), (4, State::Rejected, None)]
+        );
+        written(&mut m, effects);
+        assert_eq!(m.status.as_deref(), Some("rejected 2 findings"));
+    }
+
+    #[test]
+    fn editing_a_row_rewords_its_pending_members() {
+        let mut run = crate::review::model::tests_support::run();
+        run.findings[1].original = "Let's have snacks together everyday.".into();
+        run.findings[1].suggestion = "Let's have snacks together every day.".into();
+        run.findings[1].occurrences[0].start_ms = 894_190;
+        let mut m = Model::new(run, std::collections::HashMap::new());
+        m.filter = Filter::All;
+        // E02's two "everyday" findings are one row; reject the first alone.
+        let row = m.rows.iter().position(|r| r.members == [1, 2]).unwrap();
+        m.expanded.insert(row);
+        m.selected = m
+            .entries()
+            .iter()
+            .position(|&e| e == Entry::Member(row, 1))
+            .unwrap();
+        let effects = press(&mut m, 'r');
+        written(&mut m, effects);
+        m.selected = m
+            .entries()
+            .iter()
+            .position(|&e| e == Entry::Row(row))
+            .unwrap();
+        press(&mut m, 'e');
+        update(&mut m, Msg::KillLine, now());
+        for c in "Snacks every day!".chars() {
+            press(&mut m, c);
+        }
+        assert_eq!(
+            decided(&key(&mut m, KeyCode::Enter)),
+            [(3, State::Accepted, Some("Snacks every day!"))]
         );
     }
 
@@ -881,16 +1110,39 @@ mod tests {
     #[test]
     fn the_filter_cycles_and_keeps_the_selected_row() {
         let mut m = sample();
+        assert_eq!(m.filter, Filter::All);
         m.selected = 1;
         press(&mut m, 'f');
-        assert_eq!(m.filter, Filter::All);
+        assert_eq!(m.filter, Filter::Only(State::Pending));
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
         press(&mut m, 'f');
         assert_eq!(m.filter, Filter::Only(State::Accepted));
         assert_eq!(m.entries(), []);
         press(&mut m, 'f');
         press(&mut m, 'f');
-        assert_eq!(m.filter, Filter::Only(State::Pending));
+        assert_eq!(m.filter, Filter::All);
+    }
+
+    #[test]
+    fn review_opens_on_every_finding_at_the_first_pending_row() {
+        let accepted = |id| Decision {
+            finding: id,
+            state: State::Accepted,
+            edited: None,
+            at: now(),
+        };
+        let opened = |ids: &[u64]| {
+            let mut run = crate::review::model::tests_support::run();
+            for &id in ids {
+                run.decisions.insert(id, accepted(id));
+            }
+            Model::new(run, std::collections::HashMap::new())
+        };
+        let m = opened(&[1, 2, 4]);
+        assert_eq!(m.entries(), [Entry::Row(0), Entry::Row(1)]);
+        assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
+        // Nothing pending: the top.
+        assert_eq!(opened(&[1, 2, 3, 4]).selected, 0);
     }
 
     #[test]
@@ -1033,8 +1285,8 @@ mod tests {
         );
     }
 
-    /// `sample()` on a 110×20 screen: the list's rows are y 1 to 16 from x 1, the detail pane is
-    /// x 55 on, the status line y 18 and the key bar, on one row, y 19.
+    /// `sample()` on a 110×20 screen: the list's rows are y 1 to 17 from x 1, the detail pane is
+    /// x 55 on, and the status line y 19, with `? help` from x 104.
     fn on_screen() -> Model {
         let mut m = sample();
         update(&mut m, Msg::Resize(110, 20), now());
@@ -1070,12 +1322,24 @@ mod tests {
         let mut m = crate::review::model::tests_support::many(30);
         update(&mut m, Msg::Resize(110, 20), now());
         key(&mut m, KeyCode::End);
-        // 16 rows, ending at entry 29: entry 14 is on the first row.
-        assert_eq!(m.scroll, 14);
+        // 17 rows, ending at entry 29: entry 13 is on the first row.
+        assert_eq!(m.scroll, 13);
         click(&mut m, 5, 1, 0);
-        assert_eq!(m.selected, 14);
-        click(&mut m, 5, 16, 1000);
+        assert_eq!(m.selected, 13);
+        click(&mut m, 5, 17, 1000);
         assert_eq!(m.selected, 29);
+    }
+
+    #[test]
+    fn the_first_click_lands_on_the_row_drawn_there_when_review_opens_scrolled() {
+        // Review opened on the first pending row, entry 25, before any message: the screen it
+        // first draws is scrolled to show it.
+        let mut m = crate::review::model::tests_support::many(30);
+        m.selected = 25;
+        m.set_area(Rect::new(0, 0, 110, 20));
+        assert_eq!(m.scroll, 9);
+        click(&mut m, 5, 1, 0);
+        assert_eq!(m.selected, 9);
     }
 
     #[test]
@@ -1135,52 +1399,32 @@ mod tests {
     }
 
     #[test]
-    fn buttons_press_their_keys() {
+    fn question_mark_shows_the_keys_and_any_key_closes_them() {
         let mut m = on_screen();
-        // "j/k move · o mpv · a accept …" and, at x 55, "␣ pause · ← −5s … [ −1f · ] +1f".
-        assert_eq!(click(&mut m, 2, 19, 0), [], "j/k move is not a button");
-        assert!(matches!(click(&mut m, 12, 19, 1000)[..], [Effect::Open(_)]));
-        assert_eq!(
-            decided(&click(&mut m, 20, 19, 2000)),
-            [
-                (1, State::Accepted, None),
-                (2, State::Accepted, None),
-                (4, State::Accepted, None)
-            ]
-        );
-        assert_eq!(
-            click(&mut m, 55, 18, 3000),
-            [Effect::Playback(Playback::Pause)]
-        );
-        assert_eq!(
-            click(&mut m, 66, 18, 4000),
-            [Effect::Playback(Playback::Seek(-5))]
-        );
-        assert_eq!(
-            click(&mut m, 98, 18, 4500),
-            [Effect::Playback(Playback::PreviousFrame)]
-        );
-        assert_eq!(
-            click(&mut m, 106, 18, 4800),
-            [Effect::Playback(Playback::NextFrame)]
-        );
-        assert_eq!(click(&mut m, 30, 18, 5000), [], "the status text");
-    }
-
-    #[test]
-    fn on_a_narrow_screen_every_button_still_works() {
-        let mut m = sample();
-        update(&mut m, Msg::Resize(80, 20), now());
-        // The status line is y 17 with "␣ pause · …" from x 25; the key bar's second row, y 19,
-        // is "n next · p prev · q quit".
-        assert_eq!(
-            click(&mut m, 29, 17, 0),
-            [Effect::Playback(Playback::Pause)]
-        );
-        m.status = Some("x".repeat(70));
-        assert_eq!(click(&mut m, 29, 17, 1000), [], "they gave way to it");
-        click(&mut m, 18, 19, 2000);
+        assert!(!m.help);
+        press(&mut m, '?');
+        assert!(m.help);
+        // Closing is all the key does: no decision.
+        assert_eq!(press(&mut m, 'a'), []);
+        assert!(!m.help);
+        assert_eq!(states(&m), [State::Pending; 4]);
+        press(&mut m, '?');
+        key(&mut m, KeyCode::Esc);
+        assert!(!m.help);
+        // But `q` quits, as the box says.
+        press(&mut m, '?');
+        press(&mut m, 'q');
         assert!(m.should_quit);
+        m.should_quit = false;
+        // `? help` at the end of the status line opens them; a click anywhere closes them, and the
+        // wheel does nothing under them.
+        click(&mut m, 105, 19, 0);
+        assert!(m.help);
+        wheel(&mut m, Mouse::WheelDown, 10, 5);
+        assert_eq!(m.selected, 0);
+        click(&mut m, 5, 2, 1000);
+        assert!(!m.help);
+        assert_eq!(m.selected, 0, "the click only closed them");
     }
 
     #[test]
@@ -1190,16 +1434,16 @@ mod tests {
         press(&mut m, 'e');
         assert_eq!(click(&mut m, 5, 1, 0), []);
         wheel(&mut m, Mouse::WheelUp, 5, 1);
-        assert_eq!(click(&mut m, 71, 18, 1000), [], "no playback buttons");
-        assert_eq!(click(&mut m, 9, 19, 1500), [], "the separator");
+        assert_eq!(click(&mut m, 50, 19, 1000), [], "the text");
+        assert_eq!(click(&mut m, 98, 19, 1500), [], "the separator");
         assert_eq!(m.selected, 1);
         assert!(m.editor.is_some());
-        // "⏎ accept · Esc cancel": Esc from x 11.
-        click(&mut m, 11, 19, 2000);
+        // "⏎ accept · Esc cancel" at the end of the status line: Esc from x 100.
+        click(&mut m, 100, 19, 2000);
         assert!(m.editor.is_none());
         press(&mut m, 'e');
         assert_eq!(
-            decided(&click(&mut m, 0, 19, 3000)),
+            decided(&click(&mut m, 89, 19, 3000)),
             [(3, State::Accepted, None)]
         );
     }

@@ -2,57 +2,34 @@
 //! with the same numbers that `update` maps a click with.
 
 use crossterm::event::KeyCode;
-use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::text::Span;
 
-/// One item of a bar: its text, and for a button the key a click presses.
+/// One button of a bar: its text, and the key a click presses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Item {
     pub text: &'static str,
-    pub key: Option<KeyCode>,
+    pub key: KeyCode,
 }
 
 const fn button(text: &'static str, key: KeyCode) -> Item {
-    Item {
-        text,
-        key: Some(key),
-    }
+    Item { text, key }
 }
 
-/// The key bar. `j/k move` is only a reminder: the wheel moves the selection.
-pub const KEYS: &[Item] = &[
-    Item {
-        text: "j/k move",
-        key: None,
-    },
-    button("o mpv", KeyCode::Char('o')),
-    button("a accept", KeyCode::Char('a')),
-    button("r reject", KeyCode::Char('r')),
-    button("e edit", KeyCode::Char('e')),
-    button("u undo", KeyCode::Char('u')),
-    button("⏎ expand", KeyCode::Enter),
-    button("f filter", KeyCode::Char('f')),
-    button("n next", KeyCode::Char('n')),
-    button("p prev", KeyCode::Char('p')),
-    button("q quit", KeyCode::Char('q')),
-];
+/// At the end of the status line: what `?` shows, every key.
+pub const HELP: &[Item] = &[button("? help", KeyCode::Char('?'))];
 
-/// The key bar while the editor is open.
+/// At the end of the status line while the editor is open.
 pub const EDIT_KEYS: &[Item] = &[
     button("⏎ accept", KeyCode::Enter),
     button("Esc cancel", KeyCode::Esc),
 ];
 
-/// The playback buttons, on the right of the status line.
-pub const PLAYBACK: &[Item] = &[
-    button("␣ pause", KeyCode::Char(' ')),
-    button("← −5s", KeyCode::Left),
-    button("→ +5s", KeyCode::Right),
-    button(", −1s", KeyCode::Char(',')),
-    button(". +1s", KeyCode::Char('.')),
-    button("[ −1f", KeyCode::Char('[')),
-    button("] +1f", KeyCode::Char(']')),
-];
+/// The editor's prompt, on the status line.
+pub const PROMPT: &str = "wording: ";
+
+/// Columns of text the editor keeps beside its prompt before its buttons show.
+pub const EDIT_FIELD: u16 = 20;
 
 const SEP: &str = " · ";
 
@@ -61,21 +38,14 @@ const SEP: &str = " · ";
 pub struct Panes {
     pub list: Rect,
     pub detail: Rect,
-    /// The status line, which the editor takes while it is open.
+    /// The last line: messages, or the editor while it is open, with its buttons at the end.
     pub status: Rect,
-    pub keys: Rect,
 }
 
 pub fn panes(area: Rect) -> Panes {
-    // The key bar takes as many rows as it needs to show every button.
-    let bar = u16::try_from(bar_rows(KEYS, area.width).len()).unwrap_or(u16::MAX);
-    let [body, status, keys] = Layout::default()
+    let [body, status] = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(bar),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .areas(area);
     let [list, detail] = Layout::default()
         .direction(Direction::Horizontal)
@@ -85,7 +55,6 @@ pub fn panes(area: Rect) -> Panes {
         list,
         detail,
         status,
-        keys,
     }
 }
 
@@ -99,34 +68,6 @@ pub fn bar_text(items: &[Item]) -> String {
     items.iter().map(|i| i.text).collect::<Vec<_>>().join(SEP)
 }
 
-/// A bar's items in rows of at most `columns`, broken only between items; an item wider than that
-/// gets a row to itself.
-pub fn bar_rows(items: &[Item], columns: u16) -> Vec<&[Item]> {
-    let mut rows = Vec::new();
-    let (mut start, mut used) = (0, 0);
-    for (n, item) in items.iter().enumerate() {
-        let w = width(item.text);
-        if n > start && used + width(SEP) + w > columns {
-            rows.push(&items[start..n]);
-            (start, used) = (n, 0);
-        }
-        used += if n > start { width(SEP) + w } else { w };
-    }
-    if start < items.len() {
-        rows.push(&items[start..]);
-    }
-    rows
-}
-
-/// The key a click at `at` presses, on a bar flowed into `area` as [`bar_rows`] does.
-pub fn bar_click(items: &[Item], area: Rect, at: Position) -> Option<KeyCode> {
-    if !area.contains(at) {
-        return None;
-    }
-    let rows = bar_rows(items, area.width);
-    bar_hit(rows.get(usize::from(at.y - area.y))?, area.x, at.x)
-}
-
 /// The key a click at column `x` presses, on a bar drawn from column `left`.
 pub fn bar_hit(items: &[Item], left: u16, x: u16) -> Option<KeyCode> {
     let mut at = left;
@@ -136,26 +77,27 @@ pub fn bar_hit(items: &[Item], left: u16, x: u16) -> Option<KeyCode> {
         }
         let end = at.saturating_add(width(item.text));
         if (at..end).contains(&x) {
-            return item.key;
+            return Some(item.key);
         }
         at = end;
     }
     None
 }
 
-/// Where the playback buttons start on the status line `status`: flush right.
-pub fn playback_left(status: Rect) -> u16 {
+/// Where `items` start at the end of the status line `status`: flush right.
+pub fn bar_left(status: Rect, items: &[Item]) -> u16 {
     status
         .right()
-        .saturating_sub(width(&bar_text(PLAYBACK)))
+        .saturating_sub(width(&bar_text(items)))
         .max(status.x)
 }
 
-/// Whether the playback buttons show on the status line `status` beside the message `text`. They
-/// need 56 columns, and give way to a message too long to fit to their left with a column clear.
-pub fn playback_shown(status: Rect, text: Option<&str>) -> bool {
-    let room = (playback_left(status) - status.x).saturating_sub(1);
-    status.width > width(&bar_text(PLAYBACK)) && text.map_or(0, width) <= room
+/// Whether `items` show at the end of the status line `status` beside `left` columns of text:
+/// they give way to text too long to fit to their left with a column clear, and to a screen no
+/// wider than they are.
+pub fn right_shown(status: Rect, items: &[Item], left: u16) -> bool {
+    let room = (bar_left(status, items) - status.x).saturating_sub(1);
+    status.width > width(&bar_text(items)) && left <= room
 }
 
 /// Columns `s` takes on screen.
@@ -187,91 +129,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_footer_is_two_lines_under_the_panes() {
-        // Wide enough for the key bar's 105 columns on one row.
+    fn the_footer_is_one_line_under_the_panes() {
         let p = panes(Rect::new(0, 0, 110, 20));
-        assert_eq!(p.list, Rect::new(0, 0, 55, 18));
-        assert_eq!(p.detail, Rect::new(55, 0, 55, 18));
-        assert_eq!(p.status, Rect::new(0, 18, 110, 1));
-        assert_eq!(p.keys, Rect::new(0, 19, 110, 1));
-        assert_eq!(list_rows(&p), Rect::new(1, 1, 53, 16));
+        assert_eq!(p.list, Rect::new(0, 0, 55, 19));
+        assert_eq!(p.detail, Rect::new(55, 0, 55, 19));
+        assert_eq!(p.status, Rect::new(0, 19, 110, 1));
+        assert_eq!(list_rows(&p), Rect::new(1, 1, 53, 17));
     }
 
     #[test]
-    fn a_click_on_a_bar_presses_the_button_under_it() {
-        // "j/k move · o mpv · a accept …": `o mpv` is columns 11 to 15.
-        assert_eq!(bar_hit(KEYS, 0, 0), None, "a reminder, not a button");
-        assert_eq!(bar_hit(KEYS, 0, 9), None, "the separator");
-        assert_eq!(bar_hit(KEYS, 0, 11), Some(KeyCode::Char('o')));
-        assert_eq!(bar_hit(KEYS, 0, 15), Some(KeyCode::Char('o')));
-        assert_eq!(bar_hit(KEYS, 0, 16), None);
-        assert_eq!(bar_hit(KEYS, 0, 19), Some(KeyCode::Char('a')));
-        // `⏎` is one column wide, as drawn.
-        let text = bar_text(KEYS);
-        let expand = u16::try_from(text[..text.find("⏎").unwrap()].chars().count()).unwrap();
-        assert_eq!(bar_hit(KEYS, 0, expand), Some(KeyCode::Enter));
-        assert_eq!(bar_hit(KEYS, 0, expand + 9), None);
-        assert_eq!(bar_hit(KEYS, 0, width(&text) - 1), Some(KeyCode::Char('q')));
-        assert_eq!(bar_hit(KEYS, 0, width(&text)), None);
-        // Drawn from column 4, everything moves 4 to the right.
-        assert_eq!(bar_hit(EDIT_KEYS, 4, 3), None);
-        assert_eq!(bar_hit(EDIT_KEYS, 4, 4), Some(KeyCode::Enter));
-        assert_eq!(bar_hit(EDIT_KEYS, 4, 15), Some(KeyCode::Esc));
+    fn buttons_sit_at_the_right_end_of_the_status_line() {
+        let status = panes(Rect::new(0, 0, 110, 20)).status;
+        // `? help` is the last 6 columns.
+        let left = bar_left(status, HELP);
+        assert_eq!(left, 104);
+        assert_eq!(bar_hit(HELP, left, 103), None);
+        assert_eq!(bar_hit(HELP, left, 104), Some(KeyCode::Char('?')));
+        assert_eq!(bar_hit(HELP, left, 109), Some(KeyCode::Char('?')));
+        // "⏎ accept · Esc cancel" is the last 21: `⏎` is one column wide, as drawn.
+        let left = bar_left(status, EDIT_KEYS);
+        assert_eq!(left, 89);
+        assert_eq!(bar_hit(EDIT_KEYS, left, 89), Some(KeyCode::Enter));
+        assert_eq!(bar_hit(EDIT_KEYS, left, 97), None, "the separator");
+        assert_eq!(bar_hit(EDIT_KEYS, left, 100), Some(KeyCode::Esc));
+        assert_eq!(bar_hit(EDIT_KEYS, left, 109), Some(KeyCode::Esc));
     }
 
     #[test]
-    fn the_playback_buttons_sit_at_the_right_of_the_status_line() {
-        let status = panes(Rect::new(0, 0, 100, 20)).status;
-        // "␣ pause · ← −5s · → +5s · , −1s · . +1s · [ −1f · ] +1f" is 55 columns.
-        let left = playback_left(status);
-        assert_eq!(left, 45);
-        assert_eq!(bar_hit(PLAYBACK, left, 45), Some(KeyCode::Char(' ')));
-        assert_eq!(bar_hit(PLAYBACK, left, 55), Some(KeyCode::Left));
-        assert_eq!(bar_hit(PLAYBACK, left, 87), Some(KeyCode::Char('[')));
-        assert_eq!(bar_hit(PLAYBACK, left, 99), Some(KeyCode::Char(']')));
-    }
-
-    #[test]
-    fn the_playback_buttons_give_way_to_a_long_message_and_a_narrow_screen() {
-        // 80 - 55 leaves 25 columns, one of them clear of the buttons.
-        let status = Rect::new(0, 18, 80, 1);
-        assert!(playback_shown(status, None));
-        assert!(playback_shown(status, Some(&"x".repeat(24))));
-        assert!(!playback_shown(status, Some(&"x".repeat(25))));
-        assert!(playback_shown(Rect::new(0, 18, 56, 1), None));
-        assert!(!playback_shown(Rect::new(0, 18, 55, 1), None));
-    }
-
-    #[test]
-    fn a_narrow_key_bar_wraps_between_items() {
-        let rows = |w| {
-            bar_rows(KEYS, w)
-                .into_iter()
-                .map(bar_text)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(rows(105), [bar_text(KEYS)]);
-        assert_eq!(rows(104).len(), 2);
-        assert_eq!(
-            rows(80),
-            [
-                "j/k move · o mpv · a accept · r reject · e edit · u undo · ⏎ expand · f filter",
-                "n next · p prev · q quit"
-            ]
-        );
-        assert_eq!(rows(3).len(), KEYS.len(), "an item to a row");
-        // The panes give up a row to it.
-        let p = panes(Rect::new(0, 0, 80, 20));
-        assert_eq!(p.list.height, 17);
-        assert_eq!(p.status, Rect::new(0, 17, 80, 1));
-        assert_eq!(p.keys, Rect::new(0, 18, 80, 2));
-        // A click presses the button drawn under it, on either row.
-        let at = |x, y| bar_click(KEYS, p.keys, Position::new(x, y));
-        assert_eq!(at(11, 18), Some(KeyCode::Char('o')));
-        assert_eq!(at(79, 18), None, "past the first row's end");
-        assert_eq!(at(0, 19), Some(KeyCode::Char('n')));
-        assert_eq!(at(18, 19), Some(KeyCode::Char('q')));
-        assert_eq!(at(0, 17), None, "the status line");
+    fn buttons_give_way_to_a_long_message_and_a_narrow_screen() {
+        // 110 - 6 leaves 104 columns, one of them clear of `? help`.
+        let status = Rect::new(0, 19, 110, 1);
+        assert!(right_shown(status, HELP, 0));
+        assert!(right_shown(status, HELP, 103));
+        assert!(!right_shown(status, HELP, 104));
+        assert!(right_shown(Rect::new(0, 19, 7, 1), HELP, 0));
+        assert!(!right_shown(Rect::new(0, 19, 6, 1), HELP, 0));
     }
 
     #[test]

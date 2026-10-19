@@ -7,9 +7,11 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+};
 
-use super::layout::{self, EDIT_KEYS, KEYS, PLAYBACK};
+use super::layout;
 use super::model::{Entry, FileNote, Model, changed, fix_label};
 use crate::list::{self, Filter, label};
 use crate::store::{State, TimingFix};
@@ -21,12 +23,136 @@ pub fn view(m: &Model, f: &mut Frame) {
     list_pane(m, f, p.list);
     detail_pane(m, f, p.detail);
     status_line(m, f, p.status);
-    let keys = if m.editor.is_some() { EDIT_KEYS } else { KEYS };
-    let rows: Vec<Line> = layout::bar_rows(keys, p.keys.width)
-        .into_iter()
-        .map(|row| Line::raw(layout::bar_text(row)))
+    if m.help {
+        keys_box(f, f.area());
+    }
+}
+
+/// What `?` shows, a column to each group: each key and what it does.
+const KEY_GROUPS: [(&str, &[(&str, &str)]); 3] = [
+    (
+        "decide",
+        &[
+            ("a", "accept"),
+            ("r", "reject"),
+            ("x", "clear: back to pending"),
+            ("e", "reword, then accept"),
+            ("u", "undo"),
+        ],
+    ),
+    (
+        "move",
+        &[
+            ("j k ↑ ↓", "move"),
+            ("g G", "top, bottom"),
+            ("PgUp PgDn", "page"),
+            ("n p", "next, previous file"),
+            ("⏎", "expand a group"),
+            ("f", "filter"),
+        ],
+    ),
+    (
+        "mpv",
+        &[
+            ("o", "open the line"),
+            ("␣", "pause"),
+            ("← →", "5 s back, on"),
+            (", .", "1 s back, on"),
+            ("[ ]", "a frame back, on"),
+        ],
+    ),
+];
+
+/// [`KEY_GROUPS`] as lines: as many groups side by side as fit in `columns`, the rest under them.
+fn keys_lines(columns: usize) -> Vec<Line<'static>> {
+    const GAP: usize = 4;
+    let w = |s: &str| usize::from(layout::width(s));
+    let pad = |s: &str, to: usize| format!("{s}{}", " ".repeat(to.saturating_sub(w(s))));
+    // Each group: its heading, its rows, and the width of the widest.
+    let groups: Vec<(&str, Vec<String>, usize)> = KEY_GROUPS
+        .iter()
+        .map(|&(name, keys)| {
+            let key_width = keys.iter().map(|&(k, _)| w(k)).max().unwrap_or(0);
+            let rows: Vec<String> = keys
+                .iter()
+                .map(|&(k, what)| format!("{}  {what}", pad(k, key_width)))
+                .collect();
+            let width = rows
+                .iter()
+                .map(|r| w(r))
+                .chain([w(name)])
+                .max()
+                .unwrap_or(0);
+            (name, rows, width)
+        })
         .collect();
-    f.render_widget(Paragraph::new(rows), p.keys);
+    let mut bands: Vec<Vec<&(&str, Vec<String>, usize)>> = Vec::new();
+    let mut used = 0;
+    for g in &groups {
+        match bands.last_mut() {
+            Some(band) if used + GAP + g.2 <= columns => {
+                band.push(g);
+                used += GAP + g.2;
+            }
+            _ => {
+                bands.push(vec![g]);
+                used = g.2;
+            }
+        }
+    }
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let mut lines = Vec::new();
+    for band in bands {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        let mut heading = Vec::new();
+        for (n, g) in band.iter().enumerate() {
+            if n > 0 {
+                heading.push(Span::raw(" ".repeat(GAP)));
+            }
+            heading.push(Span::styled(pad(g.0, g.2), bold));
+        }
+        lines.push(Line::from(heading));
+        let height = band.iter().map(|g| g.1.len()).max().unwrap_or(0);
+        for r in 0..height {
+            let row: Vec<String> = band
+                .iter()
+                .map(|g| pad(g.1.get(r).map_or("", String::as_str), g.2))
+                .collect();
+            lines.push(Line::raw(row.join(&" ".repeat(GAP)).trim_end().to_string()));
+        }
+    }
+    lines
+}
+
+/// The box of keys `?` opens, over the middle of `area`, with how to leave it in its bottom
+/// border: on a screen too short for every key that still shows.
+fn keys_box(f: &mut Frame, area: Rect) {
+    const LEAVE: &str = " q quits · any other key closes this ";
+    // Inside a border and a column of padding each side.
+    let lines = keys_lines(usize::from(area.width.saturating_sub(4)));
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+    let widest = widest.max(usize::from(layout::width(LEAVE)));
+    let width = u16::try_from(widest + 4)
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let height = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let at = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" keys ")
+        .title_bottom(LEAVE)
+        .padding(Padding::horizontal(1));
+    f.render_widget(Clear, at);
+    f.render_widget(Paragraph::new(lines).block(block), at);
 }
 
 fn list_pane(m: &Model, f: &mut Frame, area: Rect) {
@@ -61,6 +187,18 @@ fn list_pane(m: &Model, f: &mut Frame, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// A list line's colour by its state: accepted green, rejected red, mixed yellow, pending the
+/// terminal's own.
+fn colour(state: Option<State>) -> Style {
+    let fg = match state {
+        Some(State::Pending) => return Style::default(),
+        Some(State::Accepted) => Color::Green,
+        Some(State::Rejected) => Color::Red,
+        None => Color::Yellow,
+    };
+    Style::default().fg(fg)
+}
+
 fn mark(state: Option<State>) -> &'static str {
     match state {
         Some(State::Pending) => "·",
@@ -71,6 +209,16 @@ fn mark(state: Option<State>) -> &'static str {
 }
 
 fn entry_line(m: &Model, e: Entry) -> Line<'static> {
+    // A row with anything pending is still to do, however its decided members differ.
+    let state = match e {
+        Entry::Row(_) if m.has_pending(e) => Some(State::Pending),
+        Entry::Row(r) => m.shown_state(r),
+        Entry::Member(_, i) => Some(m.state(i)),
+    };
+    entry_text(m, e).style(colour(state))
+}
+
+fn entry_text(m: &Model, e: Entry) -> Line<'static> {
     match e {
         Entry::Row(r) => {
             // What the row's keys act on: the members the filter shows.
@@ -335,42 +483,41 @@ fn marked(prefix: &'static str, text: &str, span: Range<usize>, color: Color) ->
     ])
 }
 
-/// The status line with the playback buttons on its right, or the editor while it is open (the
-/// key bar under it says how to leave).
+/// The status line: the message, or the editor while it is open, with its buttons at the end
+/// while there is room (`? help`, or the editor's).
 fn status_line(m: &Model, f: &mut Frame, area: Rect) {
-    if let Some(ed) = &m.editor {
-        let prompt = "wording: ";
-        let prompt_len = prompt.chars().count();
-        // Scrolled so the cursor stays in view, with a column left for it after the text.
-        let room = usize::from(area.width).saturating_sub(prompt_len).max(1);
-        let start = ed.cursor.saturating_sub(room - 1);
-        let shown: String = ed.text.chars().skip(start).take(room).collect();
-        f.render_widget(Paragraph::new(format!("{prompt}{shown}")), area);
-        let x = area.x + u16::try_from(prompt_len + ed.cursor - start).unwrap_or(u16::MAX);
-        f.set_cursor_position(Position::new(x.min(area.right().saturating_sub(1)), area.y));
-        return;
-    }
-    if !layout::playback_shown(area, m.status.as_deref()) {
-        if let Some(status) = &m.status {
-            f.render_widget(Paragraph::new(status.as_str()), area);
-        }
-        return;
-    }
-    let left = layout::playback_left(area);
-    let buttons = Rect {
-        x: left,
-        width: area.right() - left,
-        ..area
+    let buttons = m.buttons(area);
+    // The text stops a column short of the buttons.
+    let text = match buttons {
+        Some(items) => Rect {
+            width: (layout::bar_left(area, items) - area.x).saturating_sub(1),
+            ..area
+        },
+        None => area,
     };
-    if let Some(status) = &m.status {
-        // A column clear of the buttons, so a message does not run into them.
-        let text = Rect {
-            width: (left - area.x).saturating_sub(1),
+    if let Some(items) = buttons {
+        let left = layout::bar_left(area, items);
+        let at = Rect {
+            x: left,
+            width: area.right() - left,
             ..area
         };
+        f.render_widget(Paragraph::new(layout::bar_text(items)), at);
+    }
+    if let Some(ed) = &m.editor {
+        let prompt_len = layout::PROMPT.chars().count();
+        // Scrolled so the cursor stays in view, with a column left for it after the text.
+        let room = usize::from(text.width).saturating_sub(prompt_len).max(1);
+        let start = ed.cursor.saturating_sub(room - 1);
+        let shown: String = ed.text.chars().skip(start).take(room).collect();
+        f.render_widget(Paragraph::new(format!("{}{shown}", layout::PROMPT)), text);
+        let x = text.x + u16::try_from(prompt_len + ed.cursor - start).unwrap_or(u16::MAX);
+        f.set_cursor_position(Position::new(x.min(text.right().saturating_sub(1)), text.y));
+        return;
+    }
+    if let Some(status) = &m.status {
         f.render_widget(Paragraph::new(status.as_str()), text);
     }
-    f.render_widget(Paragraph::new(layout::bar_text(PLAYBACK)), buttons);
 }
 
 #[cfg(test)]
@@ -407,7 +554,7 @@ mod tests {
         let m = sample();
         let screen = render(&m, 160, 20);
         assert!(
-            screen.contains("findings (4 pending · 0 accepted · 0 rejected) · showing pending"),
+            screen.contains("findings (4 pending · 0 accepted · 0 rejected) · showing all"),
             "{screen}"
         );
         assert!(
@@ -502,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_file_and_a_status_show_above_the_key_bar() {
+    fn a_changed_file_and_a_status_show_on_the_last_line() {
         let mut m = sample();
         m.notes
             .insert(m.run.findings[0].file.clone(), FileNote::Changed);
@@ -510,11 +657,8 @@ mod tests {
         let screen = render(&m, 160, 20);
         assert!(screen.contains("⚠ file changed since scan"), "{screen}");
         let lines: Vec<&str> = screen.lines().collect();
-        assert!(lines[18].starts_with("not saved: disk full"), "{screen}");
-        assert!(
-            lines[19].starts_with("j/k move · o mpv · a accept · r reject · e edit · u undo"),
-            "{screen}"
-        );
+        assert!(lines[19].starts_with("not saved: disk full"), "{screen}");
+        assert!(lines[19].ends_with(" ? help"), "{screen}");
     }
 
     #[test]
@@ -532,7 +676,7 @@ mod tests {
     #[test]
     fn the_wheel_reaches_the_end_of_a_wrapped_detail() {
         let mut m = sample();
-        // 8 lines leave the detail pane 4 rows of 28 columns, so its lines wrap.
+        // 8 lines leave the detail pane 5 rows of 28 columns, so its lines wrap.
         update::update(&mut m, Msg::Resize(60, 8), now());
         for _ in 0..20 {
             update::update(&mut m, Msg::Mouse(update::Mouse::WheelDown, 40, 2), now());
@@ -562,45 +706,66 @@ mod tests {
     }
 
     #[test]
-    fn the_playback_buttons_share_the_status_line() {
+    fn the_status_line_ends_with_the_help_hint() {
         let mut m = sample();
         m.status = Some("⏸ 0:02:51.06".into());
         let screen = render(&m, 110, 20);
-        let line = screen.lines().nth(18).unwrap();
+        let line = screen.lines().nth(19).unwrap();
         assert!(line.starts_with("⏸ 0:02:51.06 "), "{screen}");
-        assert!(
-            line.ends_with(" ␣ pause · ← −5s · → +5s · , −1s · . +1s · [ −1f · ] +1f"),
-            "{screen}"
-        );
-        // A message that fits stops a column short of the buttons.
-        m.status = Some("x".repeat(54));
+        assert!(line.ends_with(" ? help"), "{screen}");
+        // In the terminal's own colour, as the message is.
+        let mut term = Terminal::new(TestBackend::new(110, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        assert_eq!(term.backend().buffer()[(104, 19)].fg, Color::Reset);
+        // A message that fits stops a column short of it.
+        m.status = Some("x".repeat(103));
         let screen = render(&m, 110, 20);
-        let line = screen.lines().nth(18).unwrap();
-        assert!(
-            line.starts_with(&format!("{} ␣ pause", "x".repeat(54))),
-            "{screen}"
+        assert_eq!(
+            screen.lines().nth(19).unwrap(),
+            format!("{} ? help", "x".repeat(103))
         );
-        // One too long for that takes the whole line, and the buttons give way.
+        // One too long for that takes the whole line.
         m.status = Some(format!("{}y", "x".repeat(109)));
         let screen = render(&m, 110, 20);
         assert_eq!(
-            screen.lines().nth(18).unwrap(),
+            screen.lines().nth(19).unwrap(),
             format!("{}y", "x".repeat(109))
         );
     }
 
     #[test]
-    fn a_narrow_screen_wraps_the_key_bar() {
-        let screen = render(&sample(), 80, 20);
-        let lines: Vec<&str> = screen.lines().collect();
+    fn question_mark_shows_every_key_in_a_box_over_the_panes() {
+        let mut m = sample();
+        m.help = true;
+        let screen = render(&m, 120, 24);
+        for text in [
+            "┌ keys ",
+            "decide",
+            "a  accept",
+            "x  clear: back to pending",
+            "PgUp PgDn  page",
+            "␣    pause",
+            "[ ]  a frame back, on",
+            "└ q quits · any other key closes this ",
+        ] {
+            assert!(screen.contains(text), "{text}\n{screen}");
+        }
+        // The three groups side by side on 120 columns: one heading line holds them all.
         assert!(
-            lines[17].ends_with(" ␣ pause · ← −5s · → +5s · , −1s · . +1s · [ −1f · ] +1f"),
+            screen
+                .lines()
+                .any(|l| l.contains("decide") && l.contains("move") && l.contains("mpv")),
             "{screen}"
         );
-        assert!(lines[18].starts_with("j/k move · o mpv"), "{screen}");
-        assert!(lines[18].trim_end().ends_with("· f filter"), "{screen}");
+        // On 70 the last group goes under the others.
+        let screen = render(&m, 70, 24);
+        let heading = |name: &str| screen.lines().position(|l| l.contains(name)).unwrap();
+        assert_eq!(heading("decide"), heading("move"), "{screen}");
+        assert!(heading("mpv") > heading("decide"), "{screen}");
+        // Too short for every key, it still says how to leave.
+        let screen = render(&m, 50, 20);
         assert!(
-            lines[19].starts_with("n next · p prev · q quit"),
+            screen.contains("q quits · any other key closes"),
             "{screen}"
         );
     }
@@ -608,7 +773,7 @@ mod tests {
     #[test]
     fn the_list_stays_put_while_the_selection_moves_inside_it() {
         let mut m = crate::review::model::tests_support::many(12);
-        // 10 lines: 2 for the footer and 2 for the border leave 6 rows.
+        // 10 lines: 1 for the footer and 2 for the border leave 7 rows.
         update::update(&mut m, Msg::Resize(110, 10), now());
         for _ in 0..8 {
             update::update(&mut m, Msg::Key(KeyCode::Char('j')), now());
@@ -616,13 +781,13 @@ mod tests {
         for _ in 0..2 {
             update::update(&mut m, Msg::Key(KeyCode::Char('k')), now());
         }
-        assert_eq!((m.selected, m.scroll), (6, 3));
+        assert_eq!((m.selected, m.scroll), (6, 2));
         let screen = render(&m, 110, 10);
         let lines: Vec<&str> = screen.lines().collect();
-        // Entries 3 to 8 show, E04 to E09, and the selection is on E07 in the middle.
-        assert!(lines[1].contains("E04 "), "{screen}");
-        assert!(lines[4].contains("▶ · E07 "), "{screen}");
-        assert!(lines[6].contains("E09 "), "{screen}");
+        // Entries 2 to 8 show, E03 to E09, and the selection is on E07 inside them.
+        assert!(lines[1].contains("E03 "), "{screen}");
+        assert!(lines[5].contains("▶ · E07 "), "{screen}");
+        assert!(lines[7].contains("E09 "), "{screen}");
     }
 
     #[test]
@@ -630,8 +795,8 @@ mod tests {
         let mut m = crate::review::model::tests_support::many(12);
         update::update(&mut m, Msg::Resize(110, 10), now());
         update::update(&mut m, Msg::Key(KeyCode::End), now());
-        assert_eq!(m.scroll, 6);
-        // 20 lines leave 16 rows: all 12 entries fit, from the top.
+        assert_eq!(m.scroll, 5);
+        // 20 lines leave 17 rows: all 12 entries fit, from the top.
         update::update(&mut m, Msg::Resize(110, 20), now());
         assert_eq!(m.scroll, 0);
         let screen = render(&m, 110, 20);
@@ -643,6 +808,7 @@ mod tests {
     #[test]
     fn a_partly_decided_group_shows_what_its_keys_act_on() {
         let mut m = sample();
+        m.filter = Filter::Only(State::Pending);
         m.run.decisions.insert(
             1,
             crate::store::Decision {
@@ -663,6 +829,50 @@ mod tests {
         );
     }
 
+    /// The colour of the list line holding `text`, on a 160×20 screen.
+    fn colour_of(m: &Model, text: &str) -> Color {
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| view(m, f)).unwrap();
+        let screen = render(m, 160, 20);
+        let y = screen.lines().position(|l| l.contains(text)).expect(text);
+        let line = screen.lines().nth(y).unwrap();
+        let x = line[..line.find(text).unwrap()].chars().count();
+        term.backend().buffer()[(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())].fg
+    }
+
+    #[test]
+    fn decided_rows_stay_in_the_list_coloured_by_their_state() {
+        let mut m = sample();
+        let decide = |m: &mut Model, id, state| {
+            m.run.decisions.insert(
+                id,
+                crate::store::Decision {
+                    finding: id,
+                    state,
+                    edited: None,
+                    at: jiff::Timestamp::UNIX_EPOCH,
+                },
+            );
+        };
+        assert_eq!(colour_of(&m, "everyday."), Color::Reset, "pending");
+        decide(&mut m, 3, State::Rejected);
+        assert_eq!(colour_of(&m, "everyday."), Color::Red);
+        // Partly decided, partly pending: still to do, so not yellow.
+        decide(&mut m, 1, State::Accepted);
+        assert_eq!(colour_of(&m, "×3 0:02:45.06"), Color::Reset);
+        for id in [1, 2, 4] {
+            decide(&mut m, id, State::Accepted);
+        }
+        // The selected row too: its highlight reverses the colour.
+        assert_eq!(colour_of(&m, "×3 0:02:45.06"), Color::Green);
+        decide(&mut m, 2, State::Rejected);
+        assert_eq!(colour_of(&m, "×3 0:02:45.06"), Color::Yellow, "mixed");
+        // Each member in its own colour.
+        m.expanded.insert(0);
+        assert_eq!(colour_of(&m, "E01 0:02:45.06"), Color::Green);
+        assert_eq!(colour_of(&m, "E02 0:02:45.06"), Color::Red);
+    }
+
     #[test]
     fn a_long_edit_scrolls_to_keep_the_cursor_in_view() {
         let mut m = sample();
@@ -673,14 +883,27 @@ mod tests {
         });
         let mut term = Terminal::new(TestBackend::new(30, 10)).unwrap();
         term.draw(|f| view(&m, f)).unwrap();
-        // 30 columns fit the key bar in 4 rows, and it keeps them while editing, so that the
-        // panes stay put: the status line is y 5.
+        // The status line is the last, y 9; 30 columns leave no room for the editor's buttons.
         let status: String = (0..30)
-            .map(|x| term.backend().buffer()[(x, 5)].symbol().to_string())
+            .map(|x| term.backend().buffer()[(x, 9)].symbol().to_string())
             .collect();
         // The 9-column prompt leaves 21: the text's last 20 characters, then the cursor.
         assert_eq!(status, "wording: 01234567890123456789 ");
-        assert_eq!(term.get_cursor_position().unwrap(), Position::new(29, 5));
+        assert_eq!(term.get_cursor_position().unwrap(), Position::new(29, 9));
+    }
+
+    #[test]
+    fn the_editors_buttons_show_on_a_60_column_screen() {
+        let mut m = sample();
+        m.editor = Some(super::super::model::Editor {
+            entry: Entry::Row(0),
+            text: "abc".into(),
+            cursor: 3,
+        });
+        let screen = render(&m, 60, 20);
+        let line = screen.lines().nth(19).unwrap();
+        assert!(line.starts_with("wording: abc "), "{screen}");
+        assert!(line.ends_with(" ⏎ accept · Esc cancel"), "{screen}");
     }
 
     #[test]
@@ -695,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn the_editor_takes_the_status_line_and_its_keys_the_bar() {
+    fn the_editor_takes_the_status_line_with_its_buttons() {
         let mut m = sample();
         m.editor = Some(super::super::model::Editor {
             entry: Entry::Row(0),
@@ -706,19 +929,10 @@ mod tests {
         term.draw(|f| view(&m, f)).unwrap();
         let pos = term.get_cursor_position().unwrap();
         // The prompt is 9 characters, then one character of text before the cursor.
-        assert_eq!((pos.x, pos.y), (10, 18));
+        assert_eq!((pos.x, pos.y), (10, 19));
         let screen = render(&m, 160, 20);
-        assert!(
-            screen.lines().nth(18).unwrap().starts_with("wording: abc"),
-            "{screen}"
-        );
-        assert!(
-            screen
-                .lines()
-                .nth(19)
-                .unwrap()
-                .starts_with("⏎ accept · Esc cancel "),
-            "{screen}"
-        );
+        let line = screen.lines().nth(19).unwrap();
+        assert!(line.starts_with("wording: abc "), "{screen}");
+        assert!(line.ends_with(" ⏎ accept · Esc cancel"), "{screen}");
     }
 }

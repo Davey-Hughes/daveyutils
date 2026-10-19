@@ -24,24 +24,33 @@ season's timing findings on one track are one row too, whatever each episode's f
 partial ×1`): `o` opens one paused on the frame that shows the error, `[` `]` step from there, and
 `e` does not apply (a timing fix is accepted or rejected).
 
+Decided rows stay in the list: green when accepted, red when rejected, yellow when a group's
+episodes are all decided, differently. A row with anything still pending keeps the terminal's
+colour (its mark `±` when some episodes are decided). Review opens on the first row with anything
+pending, and after `a`, `r`, `e` or `x` moves to the next one below (under the accepted or rejected
+filter, to the next row).
+
 | Key | Does |
 |---|---|
 | `j` `k` ↑ ↓ `g` `G` PgUp PgDn | move |
 | `n` `p` | first row of the next or previous file |
-| `a` `r` | accept or reject (a row: every episode the filter shows) |
+| `a` `r` | accept or reject (a row: the pending episodes the filter shows, or all it shows when none is pending; an episode decided on its own keeps its decision) |
+| `x` | clear: back to pending (a row: every episode the filter shows) |
 | `e` | reword, then accept |
-| `u` | undo this session's last decision |
-| `f` | filter: pending, all, accepted, rejected |
+| `u` | undo this session's last decision or clear |
+| `f` | filter: all, pending, accepted, rejected |
 | `o` | open the line in mpv, 2 s early, with its subtitle track; again on the same line replays it |
 | Space | pause or resume mpv |
 | ← → | mpv back or forward 5 s |
 | `,` `.` | mpv back or forward 1 s |
 | `[` `]` | mpv back or forward one frame (it stays paused) |
+| `?` | show every key, in a box over the list; `q` quits from it, any other key closes it |
 | `q` | quit, closing the mpv window review started |
 
 The mouse works too. Click a row to select it, and double-click to open it in mpv. The wheel moves
-the selection over the list and scrolls the detail pane. The key bar and the playback buttons are
-clickable. Since review takes the mouse, select text in the terminal with Shift+drag.
+the selection over the list and scrolls the detail pane. `? help` at the end of the status line, and
+the editor's `⏎ accept · Esc cancel` there, are clickable. Since review takes the mouse, select text
+in the terminal with Shift+drag.
 
 ## Keeping focus in the terminal
 
