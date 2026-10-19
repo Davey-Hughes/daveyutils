@@ -436,6 +436,20 @@ pub fn karaoke_line(group: &[&Event]) -> Option<String> {
     Some(collapse(&joined))
 }
 
+/// `H:MM:SS.mmm`: a time to the millisecond, as mpv's `--start` and `seek` take it. A frame's time
+/// needs it: mpv shows the frame nearest the time it is given, and at 60 fps a centisecond is more
+/// than half a frame.
+pub fn timestamp_ms(ms: i64) -> String {
+    let ms = ms.max(0);
+    format!(
+        "{}:{:02}:{:02}.{:03}",
+        ms / 3_600_000,
+        ms / 60_000 % 60,
+        ms / 1000 % 60,
+        ms % 1000
+    )
+}
+
 /// `H:MM:SS.cc`, the way ASS writes times.
 pub fn timestamp(ms: i64) -> String {
     let ms = ms.max(0);

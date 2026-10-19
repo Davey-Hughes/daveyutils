@@ -528,7 +528,7 @@ fn relation(gap: i64, source: usize) -> String {
 }
 
 /// "in sync", "1 frame late", "2 frames early".
-fn shift_label(frames: i64) -> String {
+pub fn shift_label(frames: i64) -> String {
     if frames == 0 {
         return "in sync".into();
     }
@@ -538,10 +538,15 @@ fn shift_label(frames: i64) -> String {
 /// "1 frame late", "2 frames early": `frames` one way or the other, in the words given for more
 /// (positive) and fewer (negative).
 fn frames_way(frames: i64, more: &str, fewer: &str) -> String {
+    let way = if frames > 0 { more } else { fewer };
+    format!("{} {way}", frame_count(frames))
+}
+
+/// "1 frame", "2 frames": how many, whichever way.
+pub fn frame_count(frames: i64) -> String {
     let n = frames.abs();
     let unit = if n == 1 { "frame" } else { "frames" };
-    let way = if frames > 0 { more } else { fewer };
-    format!("{n} {unit} {way}")
+    format!("{n} {unit}")
 }
 
 fn verdict_label(v: &Verdict) -> String {

@@ -205,7 +205,13 @@ fn follow(
                 })
                 .collect();
             let m = lines::moves(&blocks, &of, mine.len(), &moved);
-            (Verdict::Partial(m.stretches), m.each, m.unshifted)
+            // None of this track's lines in a stretch that moves: the track is in sync.
+            let shifts = |k: usize| m.stretches[k].frames != 0;
+            if m.each.iter().flatten().any(|&k| shifts(k)) {
+                (Verdict::Partial(m.stretches), m.each, m.unshifted)
+            } else {
+                (Verdict::InSync, vec![Some(0); mine.len()], Vec::new())
+            }
         }
         Verdict::TooFew | Verdict::Unclear => return None,
     };
@@ -357,6 +363,37 @@ mod tests {
             panic!("{out:?}")
         };
         assert_eq!((f.gap, f.verdict.clone()), (1, Verdict::Shifted(2)));
+    }
+
+    #[test]
+    fn off_a_partial_source_a_track_with_no_line_in_a_stretch_that_moves_is_in_sync() {
+        let v = video();
+        // The source: late to 0:40, in sync after. This track's signs are all after 0:40.
+        let full = signs(20, 0);
+        let mut each: Vec<Option<usize>> = vec![Some(0); 4];
+        each.extend(vec![Some(1); 16]);
+        let partial = analysis(
+            Verdict::Partial(vec![
+                Stretch {
+                    from_ms: None,
+                    to_ms: Some(33_500),
+                    frames: 1,
+                },
+                Stretch {
+                    from_ms: Some(40_500),
+                    to_ms: None,
+                    frames: 0,
+                },
+            ]),
+            each,
+        );
+        let thin: Vec<Event> = full[4..].to_vec();
+        let unclear = analysis(Verdict::Unclear, vec![None; 16]);
+        let out = lines_of(&v, &[(5, &full, &partial), (6, &thin, &unclear)]);
+        let Some(Lines::Follows(f)) = &out[1] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(f.verdict, Verdict::InSync);
     }
 
     #[test]

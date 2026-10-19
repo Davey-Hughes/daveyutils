@@ -18,7 +18,10 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
 
 ## Review
 
-A fix repeated across episodes (an OP lyric, say) is one row; `⏎` expands it into its episodes.
+A fix repeated across episodes (an OP lyric, say) is one row; `⏎` expands it into its episodes. A
+season's timing findings on one track are one row too, whatever each episode's fix (`−1 frame ×23 ·
+partial ×1`): `o` opens one paused on the frame that shows the error, `[` `]` step from there, and
+`e` does not apply (a timing fix is accepted or rejected).
 
 | Key | Does |
 |---|---|
@@ -32,6 +35,7 @@ A fix repeated across episodes (an OP lyric, say) is one row; `⏎` expands it i
 | Space | pause or resume mpv |
 | ← → | mpv back or forward 5 s |
 | `,` `.` | mpv back or forward 1 s |
+| `[` `]` | mpv back or forward one frame (it stays paused) |
 | `q` | quit, closing the mpv window review started |
 
 The mouse works too. Click a row to select it, and double-click to open it in mpv. The wheel moves

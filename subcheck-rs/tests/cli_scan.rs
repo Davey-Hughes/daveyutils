@@ -305,7 +305,7 @@ fn scan_run_refuses_another_llm_or_languages_and_leaves_out_a_changed_file() {
         stderr(&out)
     );
 
-    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    let later = std::time::SystemTime::now() + std::time::Duration::from_mins(1);
     std::fs::File::options()
         .write(true)
         .open(&file)

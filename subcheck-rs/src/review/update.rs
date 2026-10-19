@@ -11,7 +11,7 @@ use super::view;
 use crate::list::{self, Filter, label};
 use crate::player::{Moment, PlayState, Playback};
 use crate::store::{Decision, State};
-use crate::text::timestamp;
+use crate::text::{timestamp, timestamp_ms};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
@@ -129,7 +129,7 @@ fn apply(
                 Ok(p) => format!(
                     "{} {}",
                     if p.paused { "⏸" } else { "▶" },
-                    timestamp(p.at_ms)
+                    timestamp_ms(p.at_ms)
                 ),
                 Err(e) => e,
             });
@@ -249,6 +249,13 @@ fn key_press(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
         }
         KeyCode::Char('e') => {
             if let Some(entry) = m.selected_entry() {
+                if m.targets(entry)
+                    .iter()
+                    .any(|&i| m.finding(i).timing.is_some())
+                {
+                    m.status = Some("a timing fix is accepted or rejected, not edited".into());
+                    return Vec::new();
+                }
                 let text = m.wording(m.targets(entry)[0]).to_string();
                 let cursor = text.chars().count();
                 m.editor = Some(Editor {
@@ -265,6 +272,8 @@ fn key_press(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
         KeyCode::Right => return vec![Effect::Playback(Playback::Seek(5))],
         KeyCode::Char(',') => return vec![Effect::Playback(Playback::Seek(-1))],
         KeyCode::Char('.') => return vec![Effect::Playback(Playback::Seek(1))],
+        KeyCode::Char('[') => return vec![Effect::Playback(Playback::PreviousFrame)],
+        KeyCode::Char(']') => return vec![Effect::Playback(Playback::NextFrame)],
         _ => {}
     }
     Vec::new()
@@ -529,17 +538,36 @@ fn open(m: &mut Model) -> Vec<Effect> {
         m.status = Some(format!("file missing: {}", f.file));
         return Vec::new();
     }
-    let (start_ms, sid) = list::mpv_moment(&m.run, f);
+    // A timing finding opens on the frame that shows its error, paused; a line two seconds early,
+    // playing.
+    let (start_ms, sid, paused) = if let Some(at) = list::timing_moment(&m.run, f) {
+        (at.at_ms, at.sid, true)
+    } else if f.timing.is_some() {
+        m.status = Some("nothing to open: no line of this track moves".into());
+        return Vec::new();
+    } else {
+        let (at, sid) = list::mpv_moment(&m.run, f);
+        (at, sid, false)
+    };
     let moment = Moment {
         file: f.file.clone(),
         start_ms,
         sid,
+        paused,
     };
-    m.status = Some(format!(
-        "opening {} at {}",
-        m.label(&moment.file),
-        timestamp(start_ms)
-    ));
+    m.status = Some(if paused {
+        format!(
+            "opening {} at {}, paused",
+            m.label(&moment.file),
+            timestamp_ms(start_ms)
+        )
+    } else {
+        format!(
+            "opening {} at {}",
+            m.label(&moment.file),
+            timestamp(start_ms)
+        )
+    });
     vec![Effect::Open(moment)]
 }
 
@@ -657,6 +685,27 @@ mod tests {
         }
         // The last member took its row with it; the row after the group is next, not skipped.
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
+    }
+
+    #[test]
+    fn a_timing_fix_is_accepted_or_rejected_not_edited() {
+        let mut m = crate::review::model::tests_support::with_timing();
+        m.selected = 1;
+        assert_eq!(press(&mut m, 'e'), []);
+        assert_eq!(m.editor, None);
+        assert_eq!(
+            m.status.as_deref(),
+            Some("a timing fix is accepted or rejected, not edited")
+        );
+        // Accepting the row accepts each member's own fix.
+        assert_eq!(
+            decided(&press(&mut m, 'a')),
+            [
+                (11, State::Accepted, None),
+                (12, State::Accepted, None),
+                (13, State::Accepted, None)
+            ]
+        );
     }
 
     #[test]
@@ -887,11 +936,49 @@ mod tests {
                 file: path(1),
                 start_ms: 163_060,
                 sid: Some(1),
+                paused: false,
             })]
         );
         assert_eq!(m.status.as_deref(), Some("opening E01 at 0:02:43.06"));
         update(&mut m, Msg::Opened(Err("mpv not found".into())), now());
         assert_eq!(m.status.as_deref(), Some("mpv not found"));
+    }
+
+    #[test]
+    fn o_opens_a_timing_finding_paused_on_the_frame_that_shows_it() {
+        let mut m = crate::review::model::tests_support::with_timing();
+        m.selected = 1;
+        assert_eq!(
+            press(&mut m, 'o'),
+            [Effect::Open(Moment {
+                file: path(1),
+                start_ms: 763_763,
+                sid: Some(1),
+                paused: true,
+            })]
+        );
+        assert_eq!(
+            m.status.as_deref(),
+            Some("opening E01 at 0:12:43.763, paused")
+        );
+    }
+
+    #[test]
+    fn a_timing_finding_with_no_line_of_its_track_to_open_says_so() {
+        let mut m = crate::review::model::tests_support::with_timing();
+        for f in &mut m.run.findings {
+            if let Some(t) = &mut f.timing {
+                for s in &mut t.stretches {
+                    (s.first, s.last, s.frame_ms) = (None, None, None);
+                }
+            }
+        }
+        m.selected = 1;
+        assert_eq!(press(&mut m, 'o'), []);
+        assert_eq!(
+            m.status.as_deref(),
+            Some("nothing to open: no line of this track moves")
+        );
     }
 
     #[test]
@@ -921,9 +1008,9 @@ mod tests {
             }))
         };
         update(&mut m, at(true), now());
-        assert_eq!(m.status.as_deref(), Some("⏸ 0:02:51.06"));
+        assert_eq!(m.status.as_deref(), Some("⏸ 0:02:51.060"));
         update(&mut m, at(false), now());
-        assert_eq!(m.status.as_deref(), Some("▶ 0:02:51.06"));
+        assert_eq!(m.status.as_deref(), Some("▶ 0:02:51.060"));
         update(
             &mut m,
             Msg::Played(Err("mpv is not open (o opens it)".into())),
@@ -1050,7 +1137,7 @@ mod tests {
     #[test]
     fn buttons_press_their_keys() {
         let mut m = on_screen();
-        // "j/k move · o mpv · a accept …" and, at x 71, "␣ pause · ← −5s …".
+        // "j/k move · o mpv · a accept …" and, at x 55, "␣ pause · ← −5s … [ −1f · ] +1f".
         assert_eq!(click(&mut m, 2, 19, 0), [], "j/k move is not a button");
         assert!(matches!(click(&mut m, 12, 19, 1000)[..], [Effect::Open(_)]));
         assert_eq!(
@@ -1062,12 +1149,20 @@ mod tests {
             ]
         );
         assert_eq!(
-            click(&mut m, 71, 18, 3000),
+            click(&mut m, 55, 18, 3000),
             [Effect::Playback(Playback::Pause)]
         );
         assert_eq!(
-            click(&mut m, 82, 18, 4000),
+            click(&mut m, 66, 18, 4000),
             [Effect::Playback(Playback::Seek(-5))]
+        );
+        assert_eq!(
+            click(&mut m, 98, 18, 4500),
+            [Effect::Playback(Playback::PreviousFrame)]
+        );
+        assert_eq!(
+            click(&mut m, 106, 18, 4800),
+            [Effect::Playback(Playback::NextFrame)]
         );
         assert_eq!(click(&mut m, 30, 18, 5000), [], "the status text");
     }
@@ -1076,14 +1171,14 @@ mod tests {
     fn on_a_narrow_screen_every_button_still_works() {
         let mut m = sample();
         update(&mut m, Msg::Resize(80, 20), now());
-        // The status line is y 17 with "␣ pause · …" from x 41; the key bar's second row, y 19,
+        // The status line is y 17 with "␣ pause · …" from x 25; the key bar's second row, y 19,
         // is "n next · p prev · q quit".
         assert_eq!(
-            click(&mut m, 45, 17, 0),
+            click(&mut m, 29, 17, 0),
             [Effect::Playback(Playback::Pause)]
         );
         m.status = Some("x".repeat(70));
-        assert_eq!(click(&mut m, 45, 17, 1000), [], "they gave way to it");
+        assert_eq!(click(&mut m, 29, 17, 1000), [], "they gave way to it");
         click(&mut m, 18, 19, 2000);
         assert!(m.should_quit);
     }

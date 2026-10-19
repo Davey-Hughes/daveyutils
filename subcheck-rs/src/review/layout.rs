@@ -50,6 +50,8 @@ pub const PLAYBACK: &[Item] = &[
     button("→ +5s", KeyCode::Right),
     button(", −1s", KeyCode::Char(',')),
     button(". +1s", KeyCode::Char('.')),
+    button("[ −1f", KeyCode::Char('[')),
+    button("] +1f", KeyCode::Char(']')),
 ];
 
 const SEP: &str = " · ";
@@ -150,7 +152,7 @@ pub fn playback_left(status: Rect) -> u16 {
 }
 
 /// Whether the playback buttons show on the status line `status` beside the message `text`. They
-/// need 40 columns, and give way to a message too long to fit to their left with a column clear.
+/// need 56 columns, and give way to a message too long to fit to their left with a column clear.
 pub fn playback_shown(status: Rect, text: Option<&str>) -> bool {
     let room = (playback_left(status) - status.x).saturating_sub(1);
     status.width > width(&bar_text(PLAYBACK)) && text.map_or(0, width) <= room
@@ -220,23 +222,24 @@ mod tests {
     #[test]
     fn the_playback_buttons_sit_at_the_right_of_the_status_line() {
         let status = panes(Rect::new(0, 0, 100, 20)).status;
-        // "␣ pause · ← −5s · → +5s · , −1s · . +1s" is 39 columns.
+        // "␣ pause · ← −5s · → +5s · , −1s · . +1s · [ −1f · ] +1f" is 55 columns.
         let left = playback_left(status);
-        assert_eq!(left, 61);
-        assert_eq!(bar_hit(PLAYBACK, left, 61), Some(KeyCode::Char(' ')));
-        assert_eq!(bar_hit(PLAYBACK, left, 71), Some(KeyCode::Left));
-        assert_eq!(bar_hit(PLAYBACK, left, 99), Some(KeyCode::Char('.')));
+        assert_eq!(left, 45);
+        assert_eq!(bar_hit(PLAYBACK, left, 45), Some(KeyCode::Char(' ')));
+        assert_eq!(bar_hit(PLAYBACK, left, 55), Some(KeyCode::Left));
+        assert_eq!(bar_hit(PLAYBACK, left, 87), Some(KeyCode::Char('[')));
+        assert_eq!(bar_hit(PLAYBACK, left, 99), Some(KeyCode::Char(']')));
     }
 
     #[test]
     fn the_playback_buttons_give_way_to_a_long_message_and_a_narrow_screen() {
-        // 80 - 39 leaves 41 columns, one of them clear of the buttons.
+        // 80 - 55 leaves 25 columns, one of them clear of the buttons.
         let status = Rect::new(0, 18, 80, 1);
         assert!(playback_shown(status, None));
-        assert!(playback_shown(status, Some(&"x".repeat(40))));
-        assert!(!playback_shown(status, Some(&"x".repeat(41))));
-        assert!(playback_shown(Rect::new(0, 18, 40, 1), None));
-        assert!(!playback_shown(Rect::new(0, 18, 39, 1), None));
+        assert!(playback_shown(status, Some(&"x".repeat(24))));
+        assert!(!playback_shown(status, Some(&"x".repeat(25))));
+        assert!(playback_shown(Rect::new(0, 18, 56, 1), None));
+        assert!(!playback_shown(Rect::new(0, 18, 55, 1), None));
     }
 
     #[test]

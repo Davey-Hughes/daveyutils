@@ -10,10 +10,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::layout::{self, EDIT_KEYS, KEYS, PLAYBACK};
-use super::model::{Entry, FileNote, Model, changed};
+use super::model::{Entry, FileNote, Model, changed, fix_label};
 use crate::list::{self, Filter, label};
-use crate::store::State;
-use crate::text::timestamp;
+use crate::store::{State, TimingFix};
+use crate::text::{timestamp, timestamp_ms};
+use crate::timing::shift_label;
 
 pub fn view(m: &Model, f: &mut Frame) {
     let p = layout::panes(f.area());
@@ -82,6 +83,14 @@ fn entry_line(m: &Model, e: Entry) -> Line<'static> {
                 (all, n) => format!("×{n}/{all}"),
             };
             let f = m.finding(first);
+            if f.timing.is_some() {
+                return Line::from(format!(
+                    "{} {who} {}  {}",
+                    mark(m.shown_state(r)),
+                    m.track_name(first),
+                    m.fix_summary(&shown)
+                ));
+            }
             let wording = m.wording(first);
             let (ra, rb) = changed(&f.original, wording);
             Line::from(format!(
@@ -93,12 +102,19 @@ fn entry_line(m: &Model, e: Entry) -> Line<'static> {
                 f.style
             ))
         }
-        Entry::Member(_, i) => Line::from(format!(
-            "    {} {} {}",
-            mark(Some(m.state(i))),
-            m.label(&m.finding(i).file),
-            timestamp(m.start_ms(i))
-        )),
+        Entry::Member(_, i) => {
+            // A timing finding's members differ in their fix, not in a time.
+            let what = if m.finding(i).timing.is_some() {
+                fix_label(m.finding(i))
+            } else {
+                timestamp(m.start_ms(i))
+            };
+            Line::from(format!(
+                "    {} {} {what}",
+                mark(Some(m.state(i))),
+                m.label(&m.finding(i).file)
+            ))
+        }
     }
 }
 
@@ -138,24 +154,12 @@ pub fn detail_lines(m: &Model) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines: Vec<Line> = Vec::new();
 
-    if let Some(Entry::Row(r)) = m.selected_entry() {
-        let all = m.rows[r].members.len();
-        let shown = m.shown_members(r);
-        if all > 1 {
-            let episodes: Vec<String> =
-                shown.iter().map(|&j| m.label(&m.finding(j).file)).collect();
-            let hidden = match all - shown.len() {
-                0 => String::new(),
-                n => format!(" (+{n} hidden by the filter)"),
-            };
-            lines.push(Line::from(format!(
-                "{} files: {}{hidden}",
-                shown.len(),
-                episodes.join(" ")
-            )));
-        }
-    }
-    let (occurrence, track) = list::shown_at(&m.run, finding);
+    lines.extend(group_line(m));
+    let (occurrence, track) = match &finding.timing {
+        // The whole track, not one line of it.
+        Some(t) => (None, list::track_of(&m.run, finding, t.track)),
+        None => list::shown_at(&m.run, finding),
+    };
     let mut at = occurrence.map_or_else(String::new, |o| timestamp(o.start_ms));
     if let Some(t) = track {
         let _ = write!(
@@ -166,10 +170,10 @@ pub fn detail_lines(m: &Model) -> Vec<Line<'static>> {
             t.sid
         );
     }
-    if finding.occurrences.len() > 1 {
+    if finding.occurrences.len() > 1 && finding.timing.is_none() {
         let _ = write!(at, "  (+{} more)", finding.occurrences.len() - 1);
     }
-    lines.push(Line::from(at));
+    lines.push(Line::from(at.trim_start().to_string()));
     match m.notes.get(&finding.file) {
         Some(FileNote::Changed) => lines.push(warn("file changed since scan")),
         Some(FileNote::Missing) => lines.push(warn("file missing")),
@@ -197,19 +201,113 @@ pub fn detail_lines(m: &Model) -> Vec<Line<'static>> {
     lines.push(Line::default());
 
     let wording = m.wording(i);
-    let (ra, rb) = changed(&finding.original, wording);
+    let (ra, rb) = match finding.timing {
+        Some(_) => (0..finding.original.len(), 0..wording.len()),
+        None => changed(&finding.original, wording),
+    };
     lines.push(marked("- ", &finding.original, ra, Color::Red));
     lines.push(marked("+ ", wording, rb, Color::Green));
     if !finding.reason.is_empty() {
         lines.push(Line::from(format!("why: {}", finding.reason)));
     }
     lines.push(Line::default());
+    if let Some(t) = &finding.timing {
+        lines.extend(stretch_lines(t));
+        lines.extend(opens_line(m, i));
+        return lines;
+    }
     lines.extend(finding.before.iter().map(|l| Line::styled(l.clone(), dim)));
     lines.push(Line::styled(
         finding.original.clone(),
         Style::default().add_modifier(Modifier::BOLD),
     ));
     lines.extend(finding.after.iter().map(|l| Line::styled(l.clone(), dim)));
+    lines
+}
+
+/// For a row of several findings, what they are: a typo's files, a timing row's members' fixes.
+fn group_line(m: &Model) -> Option<Line<'static>> {
+    let Some(Entry::Row(r)) = m.selected_entry() else {
+        return None;
+    };
+    let all = m.rows[r].members.len();
+    let shown = m.shown_members(r);
+    if all < 2 {
+        return None;
+    }
+    let hidden = match all - shown.len() {
+        0 => String::new(),
+        n => format!(" (+{n} hidden by the filter)"),
+    };
+    let each = |j: usize| m.label(&m.finding(j).file);
+    let files = if m.finding(shown[0]).timing.is_some() {
+        let fixes: Vec<String> = shown
+            .iter()
+            .map(|&j| format!("{} {}", each(j), fix_label(m.finding(j))))
+            .collect();
+        fixes.join(" · ")
+    } else {
+        let episodes: Vec<String> = shown.iter().map(|&j| each(j)).collect();
+        format!("{} files: {}", shown.len(), episodes.join(" "))
+    };
+    Some(Line::from(format!("{files}{hidden}")))
+}
+
+/// Where `o` opens timing finding `i`.
+fn opens_line(m: &Model, i: usize) -> Vec<Line<'static>> {
+    let Some(at) = list::timing_moment(&m.run, m.finding(i)) else {
+        return Vec::new();
+    };
+    let on = if at.on_frame {
+        "the frame that shows the error"
+    } else {
+        "its first moved line (no line of it ends or starts on a cut)"
+    };
+    vec![
+        Line::default(),
+        Line::styled(
+            format!("o opens {}, paused on {on}", timestamp_ms(at.at_ms)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]
+}
+
+/// A timing fix's stretches, each from its first line's start to its last line's end with its
+/// shift, then the lines it leaves where they are.
+fn stretch_lines(t: &TimingFix) -> Vec<Line<'static>> {
+    let mut rows: Vec<(String, String, String)> = t
+        .stretches
+        .iter()
+        .map(|s| {
+            let from = s.from_ms.or(s.first.as_ref().map(|l| l.start_ms));
+            let to = s.to_ms.or(s.last.as_ref().map(|l| l.end_ms));
+            (
+                shift_label(s.frames),
+                from.map_or_else(|| "start".into(), timestamp),
+                to.map_or_else(|| "end".into(), timestamp),
+            )
+        })
+        .collect();
+    rows.extend(t.unshifted.iter().map(|l| {
+        (
+            "not shifted".to_string(),
+            timestamp(l.start_ms),
+            timestamp(l.end_ms),
+        )
+    }));
+    let width = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
+    let mut lines: Vec<Line> = rows
+        .into_iter()
+        .map(|(label, from, to)| Line::from(format!("{label:<width$}  {from} – {to}")))
+        .collect();
+    if !t.unshifted.is_empty() {
+        let note = if t.unshifted.len() == 1 {
+            "(the line not shifted: its times point both ways)"
+        } else {
+            "(lines not shifted: their times point both ways)"
+        };
+        lines.push(Line::styled(note, Style::default().fg(Color::DarkGray)));
+    }
     lines
 }
 
@@ -323,6 +421,63 @@ mod tests {
     }
 
     #[test]
+    fn a_timing_row_shows_its_track_and_its_members_fixes() {
+        let mut m = crate::review::model::tests_support::with_timing();
+        let screen = render(&m, 160, 20);
+        assert!(
+            screen.contains("· ×3 English Full  −1 frame ×2 · partial ×1"),
+            "{screen}"
+        );
+        m.selected = 1;
+        update::update(&mut m, Msg::Key(KeyCode::Enter), now());
+        let screen = render(&m, 160, 20);
+        assert!(screen.contains("    · E01 −1 frame"), "{screen}");
+        assert!(screen.contains("    · E02 partial"), "{screen}");
+    }
+
+    #[test]
+    fn the_detail_pane_shows_a_timing_rows_fixes_and_stretches() {
+        let mut m = crate::review::model::tests_support::with_timing();
+        m.selected = 1;
+        let screen = render(&m, 160, 24);
+        assert!(
+            screen.contains("│E01 −1 frame · E02 partial · E03 −1 frame"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("│English Full [track 5 · sid 1]"),
+            "{screen}"
+        );
+        assert!(screen.contains("│- 1 frame late"), "{screen}");
+        assert!(screen.contains("│+ shift 1 frame earlier"), "{screen}");
+        assert!(
+            screen.contains("│why: cuts: 345 times, +1 in 5 of 9 windows"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("│1 frame late  0:00:01.00 – 0:23:22.00"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("│o opens 0:12:43.763, paused on the frame that shows the error"),
+            "{screen}"
+        );
+        // E02, the partial one.
+        update::update(&mut m, Msg::Key(KeyCode::Enter), now());
+        m.selected = 3;
+        let screen = render(&m, 160, 24);
+        for line in [
+            "│1 frame late  0:00:01.00 – 0:07:55.78",
+            "│in sync       0:08:03.51 – 0:15:39.00",
+            "│1 frame late  0:15:40.47 – 0:23:22.00",
+            "│not shifted   0:21:40.00 – 0:21:42.00",
+            "│(the line not shifted: its times point both ways)",
+        ] {
+            assert!(screen.contains(line), "{line}\n{screen}");
+        }
+    }
+
+    #[test]
     fn the_detail_pane_shows_the_group_and_the_line() {
         let m = sample();
         let screen = render(&m, 160, 20);
@@ -414,15 +569,15 @@ mod tests {
         let line = screen.lines().nth(18).unwrap();
         assert!(line.starts_with("⏸ 0:02:51.06 "), "{screen}");
         assert!(
-            line.ends_with(" ␣ pause · ← −5s · → +5s · , −1s · . +1s"),
+            line.ends_with(" ␣ pause · ← −5s · → +5s · , −1s · . +1s · [ −1f · ] +1f"),
             "{screen}"
         );
         // A message that fits stops a column short of the buttons.
-        m.status = Some("x".repeat(70));
+        m.status = Some("x".repeat(54));
         let screen = render(&m, 110, 20);
         let line = screen.lines().nth(18).unwrap();
         assert!(
-            line.starts_with(&format!("{} ␣ pause", "x".repeat(70))),
+            line.starts_with(&format!("{} ␣ pause", "x".repeat(54))),
             "{screen}"
         );
         // One too long for that takes the whole line, and the buttons give way.
@@ -439,7 +594,7 @@ mod tests {
         let screen = render(&sample(), 80, 20);
         let lines: Vec<&str> = screen.lines().collect();
         assert!(
-            lines[17].ends_with(" ␣ pause · ← −5s · → +5s · , −1s · . +1s"),
+            lines[17].ends_with(" ␣ pause · ← −5s · → +5s · , −1s · . +1s · [ −1f · ] +1f"),
             "{screen}"
         );
         assert!(lines[18].starts_with("j/k move · o mpv"), "{screen}");

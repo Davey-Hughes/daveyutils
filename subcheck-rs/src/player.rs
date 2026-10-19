@@ -15,10 +15,14 @@ use serde_json::{Value, json};
 
 use crate::group;
 use crate::scan::file_stamp;
-use crate::text::timestamp;
+use crate::text::timestamp_ms;
 
 /// How long a new mpv gets to open its socket.
 const START_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a frame step gets to land. A step back seeks from the keyframe before it, and until it
+/// has (70 ms on K-On!! E09, read over NFS) mpv still reports the old position.
+const FRAME_WAIT: Duration = Duration::from_secs(1);
 
 /// The app id of mpv's window on Wayland, so that a window rule can match it and no other mpv
 /// (README, "Window focus").
@@ -31,6 +35,8 @@ pub struct Moment {
     pub start_ms: i64,
     /// mpv's `--sid`.
     pub sid: Option<usize>,
+    /// Stay on the frame at `start_ms` (a timing finding's), rather than play from it (a line's).
+    pub paused: bool,
 }
 
 /// What a playback key asks of mpv.
@@ -40,6 +46,9 @@ pub enum Playback {
     Pause,
     /// Seek this many seconds; back when negative.
     Seek(i32),
+    /// One frame on, or back; mpv pauses there.
+    NextFrame,
+    PreviousFrame,
 }
 
 /// Where playback is, as mpv reports it.
@@ -69,11 +78,13 @@ pub fn socket_path(state: &Path) -> PathBuf {
 /// escaping (both checked against mpv 0.41).
 pub fn loadfile_command(m: &Moment) -> Value {
     let mut options = serde_json::Map::new();
-    options.insert("start".into(), timestamp(m.start_ms).into());
+    options.insert("start".into(), timestamp_ms(m.start_ms).into());
     if let Some(sid) = m.sid {
         options.insert("sid".into(), sid.to_string().into());
     }
     options.insert("sub-visibility".into(), "yes".into());
+    // Not `pause`: mpv puts a per-file option back when its file ends, which can be after the
+    // next file was loaded and unpaused (measured, mpv 0.41); `open` sets it before loading.
     json!({"name": "loadfile", "url": m.file, "flags": "replace", "options": options})
 }
 
@@ -103,14 +114,18 @@ impl Player {
         }
     }
 
-    /// Show `m` in the mpv listening on the socket, or start one and show it there. Playing: `o`
-    /// is there to show the line.
+    /// Show `m` in the mpv listening on the socket, or start one and show it there. Playing, as
+    /// `o` is there to show the line, unless the moment is a frame to stay on.
     pub fn open(&mut self, m: &Moment) -> Result<(), String> {
         self.reap();
         let mut conn = match Conn::connect(&self.socket) {
             Ok(conn) => conn,
             Err(_) => self.start()?,
         };
+        // A frame to stay on: paused before mpv gets there, or a playing mpv goes on past it.
+        if m.paused {
+            conn.request(&json!(["set_property", "pause", true]))?;
+        }
         // The file mpv has open already is sought, not reopened (6 GB over NFS), if this review
         // loaded it and it is unchanged on disk since: a remux in place keeps the path, and after
         // a fix of one letter even the size. One still loading cannot seek yet, so it is loaded
@@ -124,7 +139,7 @@ impl Player {
         let sought = open.as_ref().and_then(Value::as_str) == Some(m.file.as_str())
             && unchanged
             && conn
-                .request(&json!(["seek", timestamp(m.start_ms), "absolute+exact"]))
+                .request(&json!(["seek", timestamp_ms(m.start_ms), "absolute+exact"]))
                 .is_ok();
         if sought {
             if let Some(sid) = m.sid {
@@ -135,7 +150,7 @@ impl Player {
             conn.request(&loadfile_command(m))?;
             self.loaded = stamp.map(|s| (m.file.clone(), s));
         }
-        conn.request(&json!(["set_property", "pause", false]))?;
+        conn.request(&json!(["set_property", "pause", m.paused]))?;
         Ok(())
     }
 
@@ -146,7 +161,7 @@ impl Player {
             Conn::connect(&self.socket).map_err(|_| "mpv is not open (o opens it)".to_string())?;
         // No position: no file open, or one still opening (seconds, from a disk that has to spin
         // up), which has its path already and refuses seeks.
-        match conn.request(&json!(["get_property", "time-pos"])) {
+        let before = match conn.request(&json!(["get_property", "time-pos"])) {
             Err(e) if e == "mpv: property unavailable" => {
                 return Err(match conn.request(&json!(["get_property", "path"])) {
                     Ok(_) => "mpv is still opening the file".into(),
@@ -157,17 +172,26 @@ impl Player {
                 });
             }
             Err(e) => return Err(e),
-            Ok(_) => {}
-        }
+            Ok(at) => at,
+        };
         conn.request(&match p {
             Playback::Pause => json!(["cycle", "pause"]),
             // Exact: a plain relative seek lands on a keyframe, up to seconds away.
             Playback::Seek(s) => json!(["seek", s, "relative+exact"]),
+            Playback::NextFrame => json!(["frame-step"]),
+            Playback::PreviousFrame => json!(["frame-back-step"]),
         })?;
         let paused = conn.request(&json!(["get_property", "pause"]))?;
-        // Read straight after an exact seek, this is already the new position (checked against
-        // mpv 0.41).
-        let secs = conn.request(&json!(["get_property", "time-pos"]))?;
+        // Read straight after an exact seek or a step on, this is already the new position
+        // (checked against mpv 0.41); after a step back, only once mpv has sought.
+        let mut secs = conn.request(&json!(["get_property", "time-pos"]))?;
+        if p == Playback::PreviousFrame {
+            let deadline = Instant::now() + FRAME_WAIT;
+            while secs == before && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+                secs = conn.request(&json!(["get_property", "time-pos"]))?;
+            }
+        }
         #[allow(clippy::cast_possible_truncation)]
         let at_ms = (secs.as_f64().unwrap_or(0.0) * 1000.0).round() as i64;
         Ok(PlayState {
@@ -351,6 +375,7 @@ mod tests {
             file: "/m/K-On! - E02.mkv".into(),
             start_ms: 163_060,
             sid: Some(2),
+            paused: false,
         }
     }
 
@@ -435,7 +460,7 @@ mod tests {
                 "name": "loadfile",
                 "url": "/m/K-On! - E02.mkv",
                 "flags": "replace",
-                "options": {"start": "0:02:43.06", "sid": "2", "sub-visibility": "yes"}
+                "options": {"start": "0:02:43.060", "sid": "2", "sub-visibility": "yes"}
             })
         );
         let no_sid = Moment {
@@ -443,6 +468,59 @@ mod tests {
             ..moment()
         };
         assert!(loadfile_command(&no_sid)["options"].get("sid").is_none());
+    }
+
+    #[test]
+    fn a_frame_to_stay_on_is_opened_paused_to_the_millisecond() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        let mpv = fake_mpv(UnixListener::bind(&socket).unwrap(), idle);
+        let frame = Moment {
+            start_ms: 763_763,
+            paused: true,
+            ..moment()
+        };
+        let mut player = Player::new(dir.path().join("no-such-mpv"), socket);
+        assert_eq!(player.open(&frame), Ok(()));
+        let pause = json!(["set_property", "pause", true]);
+        assert_eq!(
+            mpv.join().unwrap(),
+            [
+                pause.clone(),
+                json!(["get_property", "path"]),
+                loadfile_command(&frame),
+                pause
+            ]
+        );
+        assert_eq!(loadfile_command(&frame)["options"]["start"], "0:12:43.763");
+        assert!(loadfile_command(&frame)["options"].get("pause").is_none());
+    }
+
+    #[test]
+    fn a_frame_in_the_file_mpv_has_open_is_sought_once_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let m = Moment {
+            paused: true,
+            ..on_disk(dir.path())
+        };
+        let mut player = Player::new("mpv", socket);
+        load(&mut player, &listener, &m);
+        let mpv = fake_mpv(listener, has_open(&m.file, ok(Value::Null)));
+        assert_eq!(player.open(&m), Ok(()));
+        let pause = json!(["set_property", "pause", true]);
+        assert_eq!(
+            mpv.join().unwrap(),
+            [
+                pause.clone(),
+                json!(["get_property", "path"]),
+                json!(["seek", "0:02:43.060", "absolute+exact"]),
+                json!(["set_property", "sid", 2]),
+                json!(["set_property", "sub-visibility", true]),
+                pause
+            ]
+        );
     }
 
     #[test]
@@ -487,7 +565,13 @@ mod tests {
     fn load(player: &mut Player, listener: &UnixListener, m: &Moment) {
         let mpv = fake_mpv(listener.try_clone().unwrap(), idle);
         assert_eq!(player.open(m), Ok(()));
-        assert_eq!(mpv.join().unwrap()[1], loadfile_command(m));
+        let pause = json!(["set_property", "pause", m.paused]);
+        let mut want = Vec::new();
+        if m.paused {
+            want.push(pause.clone());
+        }
+        want.extend([json!(["get_property", "path"]), loadfile_command(m), pause]);
+        assert_eq!(mpv.join().unwrap(), want);
     }
 
     #[test]
@@ -504,7 +588,7 @@ mod tests {
             mpv.join().unwrap(),
             [
                 json!(["get_property", "path"]),
-                json!(["seek", "0:02:43.06", "absolute+exact"]),
+                json!(["seek", "0:02:43.060", "absolute+exact"]),
                 json!(["set_property", "sid", 2]),
                 json!(["set_property", "sub-visibility", true]),
                 unpause()
@@ -835,6 +919,35 @@ mod tests {
             mpv.join().unwrap()[1],
             json!(["seek", -5, "relative+exact"])
         );
+    }
+
+    #[test]
+    fn a_step_back_a_frame_reads_the_position_once_mpv_has_sought() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        // The old position twice more after the step, as mpv seeks from the keyframe before.
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let mpv = fake_mpv(UnixListener::bind(&socket).unwrap(), move |c| {
+            match c[1].as_str() {
+                Some("time-pos") => {
+                    let n = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ok(if n < 3 { 763.763 } else { 763.721 })
+                }
+                Some("pause") if c[0] == "get_property" => ok(true),
+                _ => ok(Value::Null),
+            }
+        });
+        let mut player = Player::new("mpv", socket);
+        assert_eq!(
+            player.playback(Playback::PreviousFrame),
+            Ok(PlayState {
+                paused: true,
+                at_ms: 763_721
+            })
+        );
+        let sent = mpv.join().unwrap();
+        assert_eq!(sent[1], json!(["frame-back-step"]));
+        assert_eq!(sent.len(), 6, "{sent:?}");
     }
 
     #[test]

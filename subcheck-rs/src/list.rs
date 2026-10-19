@@ -6,7 +6,7 @@ use std::fmt::Write;
 
 use crate::mkv::Truncated;
 use crate::store::{FileRecord, Finding, Run, State, TrackRecord};
-use crate::text::{Occurrence, timestamp};
+use crate::text::{Occurrence, timestamp, timestamp_ms};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {
@@ -169,20 +169,68 @@ pub fn mpv_command(run: &Run, f: &Finding) -> String {
 /// The track a timing finding is on: "track 5 English Full [Semisu]", or "track 5 (eng)" when it
 /// has no name.
 fn track_label(run: &Run, f: &Finding, id: usize) -> String {
-    match track_of(run, f, id) {
-        Some(TrackRecord {
-            name: Some(name), ..
-        }) => format!("track {id} {name}"),
-        Some(t) => format!("track {id} ({})", t.language),
+    match track_name_in(tracks_of(run, &f.file), id) {
+        Some((name, _)) => format!("track {id} {name}"),
         None => format!("track {id}"),
     }
 }
 
-fn track_of<'a>(run: &'a Run, f: &Finding, id: usize) -> Option<&'a TrackRecord> {
+/// Track `id` among a file record's `tracks` by name: its name, else its language, `(eng)`; and
+/// whether that tells it apart, being a name no other track of the file has. `None` when it is
+/// not among them.
+pub fn track_name_in(tracks: &[TrackRecord], id: usize) -> Option<(String, bool)> {
+    let t = tracks.iter().find(|t| t.id == id)?;
+    Some(match own_name(t) {
+        Some(own) => {
+            let alike = tracks.iter().filter(|x| own_name(x) == Some(own));
+            (own.to_string(), alike.count() == 1)
+        }
+        None => (format!("({})", t.language), false),
+    })
+}
+
+/// A track's name, if it has one: an empty TrackName names nothing.
+fn own_name(t: &TrackRecord) -> Option<&str> {
+    t.name.as_deref().filter(|n| !n.trim().is_empty())
+}
+
+/// The tracks the run's record of file `path` lists; none when it has no record of it.
+fn tracks_of<'a>(run: &'a Run, path: &str) -> &'a [TrackRecord] {
     run.files
         .iter()
-        .find(|r| r.path == f.file)
-        .and_then(|r| r.tracks.iter().find(|t| t.id == id))
+        .find(|r| r.path == path)
+        .map_or(&[], |r| r.tracks.as_slice())
+}
+
+/// Track `id` of a finding's file, as the run's record of the file has it.
+pub fn track_of<'a>(run: &'a Run, f: &Finding, id: usize) -> Option<&'a TrackRecord> {
+    tracks_of(run, &f.file).iter().find(|t| t.id == id)
+}
+
+/// Where review's `o` opens a timing finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimingMoment {
+    pub at_ms: i64,
+    /// mpv's sid for its track.
+    pub sid: Option<usize>,
+    /// On the frame that shows the error, not only a line of a shifted stretch.
+    pub on_frame: bool,
+}
+
+/// Where review's `o` opens a timing finding: the first frame that shows a shifted stretch's
+/// error, else the first shifted stretch's first line. `None` for other findings.
+pub fn timing_moment(run: &Run, f: &Finding) -> Option<TimingMoment> {
+    let t = f.timing.as_ref()?;
+    let shifted = || t.stretches.iter().filter(|s| s.frames != 0);
+    let (at_ms, on_frame) = match shifted().find_map(|s| s.frame_ms) {
+        Some(at) => (at, true),
+        None => (shifted().find_map(|s| s.first.as_ref())?.start_ms, false),
+    };
+    Some(TimingMoment {
+        at_ms,
+        sid: track_of(run, f, t.track).map(|r| r.sid),
+        on_frame,
+    })
 }
 
 /// For a timing finding, an mpv command per shifted stretch that opens the file paused on the
@@ -200,22 +248,11 @@ pub fn timing_mpv_commands(run: &Run, f: &Finding) -> Vec<String> {
         .map(|ms| {
             format!(
                 "mpv --start={} --pause{sid} {}",
-                to_the_ms(ms),
+                timestamp_ms(ms),
                 shell_quote(&f.file)
             )
         })
         .collect()
-}
-
-/// `H:MM:SS.mmm`: a frame's time to the millisecond, as mpv's `--start` takes it.
-fn to_the_ms(ms: i64) -> String {
-    format!(
-        "{}:{:02}:{:02}.{:03}",
-        ms / 3_600_000,
-        ms / 60_000 % 60,
-        ms / 1000 % 60,
-        ms % 1000
-    )
 }
 
 /// Single-quoted for a POSIX shell (fish reads it the same way unless it holds a `\`). Always
@@ -437,6 +474,53 @@ mod tests {
             .map(|l| &l[..1])
             .collect();
         assert_eq!(ids, ["1", "4", "3"]);
+    }
+
+    #[test]
+    fn a_timing_finding_opens_on_its_frame_else_its_first_moved_line() {
+        let r = run();
+        let mut f = crate::review::model::tests_support::timing(9, 2, true);
+        f.file.clone_from(&r.files[0].path);
+        let moment = |at_ms, on_frame| {
+            Some(TimingMoment {
+                at_ms,
+                sid: Some(1),
+                on_frame,
+            })
+        };
+        // The first shifted stretch's frame, on track 5 (sid 1).
+        assert_eq!(timing_moment(&r, &f), moment(246_788, true));
+        // Without it, the next shifted stretch's frame.
+        if let Some(t) = &mut f.timing {
+            t.stretches[0].frame_ms = None;
+        }
+        assert_eq!(timing_moment(&r, &f), moment(1_196_153, true));
+        // With no frame at all, the first shifted stretch's first line.
+        if let Some(t) = &mut f.timing {
+            t.stretches[2].frame_ms = None;
+        }
+        assert_eq!(timing_moment(&r, &f), moment(1000, false));
+        assert_eq!(timing_moment(&r, &r.findings[0]), None);
+    }
+
+    #[test]
+    fn an_empty_track_name_names_nothing() {
+        let track = |id, name: Option<&str>| TrackRecord {
+            id,
+            name: name.map(Into::into),
+            language: "eng".into(),
+            sid: id,
+            default: false,
+            read: "cues".into(),
+        };
+        let tracks = [
+            track(5, Some("")),
+            track(6, Some("  ")),
+            track(7, Some("Signs")),
+        ];
+        assert_eq!(track_name_in(&tracks, 5), Some(("(eng)".into(), false)));
+        assert_eq!(track_name_in(&tracks, 6), Some(("(eng)".into(), false)));
+        assert_eq!(track_name_in(&tracks, 7), Some(("Signs".into(), true)));
     }
 
     #[test]

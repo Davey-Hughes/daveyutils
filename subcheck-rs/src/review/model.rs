@@ -9,10 +9,12 @@ use ratatui::layout::Rect;
 
 use super::layout;
 use crate::list::{self, Filter};
-use crate::store::{Decision, Finding, Run, State};
+use crate::store::{Decision, Finding, Run, State, TrackRecord};
+use crate::timing::frame_count;
 
-/// Findings with the same original and suggestion: one row, decided together. Repeats are common:
-/// an OP lyric is a finding in every episode.
+/// Findings decided together, as one row. Repeats are common: typos with the same original and
+/// suggestion (an OP lyric is a finding in every episode), and timing findings on the same-named
+/// track of one folder (a season's track), whatever each member's shift.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     /// Indexes into `run.findings`, in file order, then time order.
@@ -57,6 +59,8 @@ pub type UndoStep = Vec<(u64, Option<Decision>)>;
 pub struct Model {
     pub run: Run,
     pub rows: Vec<Row>,
+    /// Each finding's [`track_name`], by index; the list draws them on every redraw.
+    track_names: Vec<String>,
     pub expanded: HashSet<usize>,
     pub filter: Filter,
     /// Index into `entries()`.
@@ -82,11 +86,12 @@ pub struct Model {
 
 impl Model {
     pub fn new(run: Run, notes: HashMap<String, FileNote>) -> Model {
-        let rows = group(&run);
+        let (rows, track_names) = group(&run);
         let labels = labels(&run);
         Model {
             run,
             rows,
+            track_names,
             labels,
             expanded: HashSet::new(),
             filter: Filter::Only(State::Pending),
@@ -234,11 +239,87 @@ impl Model {
             .0
             .map_or(0, |o| o.start_ms)
     }
+
+    /// A timing finding's track (see [`track_name`]).
+    pub fn track_name(&self, i: usize) -> &str {
+        &self.track_names[i]
+    }
+
+    /// The fixes of timing findings `members` in short, the most common first: `−1 frame ×23 ·
+    /// partial ×1`, or one `−1 frame` when they all agree.
+    pub fn fix_summary(&self, members: &[usize]) -> String {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for &i in members {
+            let label = fix_label(self.finding(i));
+            match counts.iter_mut().find(|(l, _)| *l == label) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((label, 1)),
+            }
+        }
+        if let [(only, _)] = counts.as_slice() {
+            return only.clone();
+        }
+        // Stable: equal counts keep the order they came in.
+        counts.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        let parts: Vec<String> = counts.iter().map(|(l, n)| format!("{l} ×{n}")).collect();
+        parts.join(" · ")
+    }
 }
 
-/// The run's findings as rows: identical original and suggestion share one, which sits where its
-/// first member does.
-pub fn group(run: &Run) -> Vec<Row> {
+/// A timing finding's track among its file record's `tracks`: its name, `English Full`; with its ID
+/// before it when the name is not its own (no name, `track 6 (eng)`, or one another track of the
+/// file shares, `track 6 English`), so that it is told apart in the list as in its row; else its
+/// ID alone. Empty for other findings.
+pub fn track_name(tracks: &[TrackRecord], f: &Finding) -> String {
+    let Some(t) = &f.timing else {
+        return String::new();
+    };
+    let id = t.track;
+    match list::track_name_in(tracks, id) {
+        Some((name, true)) => name,
+        Some((name, false)) => format!("track {id} {name}"),
+        None => format!("track {id}"),
+    }
+}
+
+/// Each finding's [`track_name`], by index, through one look-up of the files by path.
+fn track_names(run: &Run) -> Vec<String> {
+    let by_path: HashMap<&str, &[TrackRecord]> = run
+        .files
+        .iter()
+        .map(|r| (r.path.as_str(), r.tracks.as_slice()))
+        .collect();
+    run.findings
+        .iter()
+        .map(|f| track_name(by_path.get(f.file.as_str()).copied().unwrap_or(&[]), f))
+        .collect()
+}
+
+/// A timing finding's fix in a word: `−1 frame` (its lines moved a frame earlier), `+2 frames`,
+/// `partial`. Empty for other findings.
+pub fn fix_label(f: &Finding) -> String {
+    match f.timing.as_ref().map(|t| t.stretches.as_slice()) {
+        Some([whole]) => {
+            let sign = if whole.frames > 0 { '−' } else { '+' };
+            format!("{sign}{}", frame_count(whole.frames))
+        }
+        Some(_) => "partial".into(),
+        None => String::new(),
+    }
+}
+
+/// What puts findings in one row (see [`Row`]).
+#[derive(PartialEq, Eq, Hash)]
+enum Key<'a> {
+    Text(&'a str, &'a str),
+    /// A folder and a [`track_name`], which carries the ID where the name alone is not the track's.
+    Track(&'a str, &'a str),
+}
+
+/// The run's findings as rows (see [`Row`]), each where its first member is; and each finding's
+/// [`track_name`], by index, which timing findings are grouped by.
+pub fn group(run: &Run) -> (Vec<Row>, Vec<String>) {
+    let names = track_names(run);
     let mut order: Vec<usize> = (0..run.findings.len()).collect();
     order.sort_by_cached_key(|&i| {
         let f = &run.findings[i];
@@ -246,10 +327,16 @@ pub fn group(run: &Run) -> Vec<Row> {
         (f.file.clone(), start, f.id)
     });
     let mut rows: Vec<Row> = Vec::new();
-    let mut by_text: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut by_key: HashMap<Key, usize> = HashMap::new();
     for i in order {
         let f = &run.findings[i];
-        match by_text.entry((f.original.as_str(), f.suggestion.as_str())) {
+        let key = if f.timing.is_some() {
+            let folder = f.file.rsplit_once('/').map_or("", |(folder, _)| folder);
+            Key::Track(folder, names[i].as_str())
+        } else {
+            Key::Text(f.original.as_str(), f.suggestion.as_str())
+        };
+        match by_key.entry(key) {
             Slot::Occupied(slot) => rows[*slot.get()].members.push(i),
             Slot::Vacant(slot) => {
                 slot.insert(rows.len());
@@ -257,7 +344,7 @@ pub fn group(run: &Run) -> Vec<Row> {
             }
         }
     }
-    rows
+    (rows, names)
 }
 
 /// The `E02` in a file's stem: `E` and digits, as in `- E02 -` or `S01E02`.
@@ -390,7 +477,9 @@ fn words(s: &str) -> Vec<Range<usize>> {
 #[cfg(test)]
 pub mod tests_support {
     use super::{Model, Row};
-    use crate::store::{Check, FileRecord, Finding, Run, TrackRecord};
+    use crate::store::{
+        Basis, Check, FileRecord, Finding, FixStretch, LineRef, Run, TimingFix, TrackRecord,
+    };
     use crate::text::Occurrence;
 
     pub fn path(ep: u32) -> String {
@@ -471,6 +560,101 @@ pub mod tests_support {
         }
     }
 
+    /// A timing finding on episode `ep`'s English Full track (track 5): a frame late, or partial
+    /// (late, in sync, late) as K-On!! E16 is.
+    pub fn timing(id: u64, ep: u32, partial: bool) -> Finding {
+        let line = |start_ms: i64| LineRef {
+            raw: format!("0,Dialogue,,0,0,0,,Line at {start_ms}."),
+            start_ms,
+            end_ms: start_ms + 2000,
+        };
+        let stretch = |from_ms, to_ms, frames, lines: Option<(i64, i64)>, frame_ms| FixStretch {
+            from_ms,
+            to_ms,
+            frames,
+            first: lines.map(|(first, _)| line(first)),
+            last: lines.map(|(_, last)| line(last)),
+            frame_ms,
+        };
+        let (original, suggestion, stretches, evidence) = if partial {
+            (
+                "partial: 1 frame late, in sync, 1 frame late",
+                "shift 1 frame earlier: start – 0:07:55.78, 0:15:40.47 – end",
+                vec![
+                    stretch(None, Some(475_780), 1, Some((1000, 473_780)), Some(246_788)),
+                    stretch(Some(483_510), Some(939_000), 0, None, None),
+                    stretch(
+                        Some(940_470),
+                        None,
+                        1,
+                        Some((940_470, 1_400_000)),
+                        Some(1_196_153),
+                    ),
+                ],
+                vec![245_000, 1_195_000],
+            )
+        } else {
+            (
+                "1 frame late",
+                "shift 1 frame earlier",
+                vec![stretch(
+                    None,
+                    None,
+                    1,
+                    Some((1000, 1_400_000)),
+                    Some(763_763),
+                )],
+                vec![762_000],
+            )
+        };
+        Finding {
+            id,
+            file: path(ep),
+            style: String::new(),
+            original: original.into(),
+            suggestion: suggestion.into(),
+            reason: "cuts: 345 times, +1 in 5 of 9 windows".into(),
+            source: "timing".into(),
+            occurrences: evidence
+                .into_iter()
+                .map(|start_ms| Occurrence {
+                    track: 5,
+                    start_ms,
+                    end_ms: start_ms + 1800,
+                })
+                .collect(),
+            before: vec![],
+            after: vec![],
+            timing: Some(TimingFix {
+                track: 5,
+                frame_ns: 41_708_333,
+                stretches,
+                unshifted: if partial {
+                    vec![line(1_300_000)]
+                } else {
+                    vec![]
+                },
+                basis: Basis::Cuts {
+                    times: 345,
+                    agreeing: 5,
+                    windows: 9,
+                },
+            }),
+        }
+    }
+
+    /// The sample run and timing findings on its English Full track: a frame late in E01 and E03,
+    /// partial in E02.
+    pub fn with_timing() -> Model {
+        let mut run = run();
+        run.findings.extend([
+            timing(11, 1, false),
+            timing(12, 2, true),
+            timing(13, 3, false),
+        ]);
+        Model::new(run, std::collections::HashMap::new())
+    }
+
     /// `n` findings, one per episode, no two alike: `n` rows.
     pub fn many(n: u32) -> Model {
         let run = Run {
@@ -506,6 +690,7 @@ pub mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::FileRecord;
 
     fn label(a: &str, b: &str) -> String {
         let (ra, rb) = changed(a, b);
@@ -547,6 +732,79 @@ mod tests {
         assert_eq!(label("a b", "x a b"), "a → x a");
         assert_eq!(changed("same words", "same  words"), (0..0, 0..0));
         assert_eq!(changed("", "new"), (0..0, 0..3));
+    }
+
+    #[test]
+    fn a_seasons_timing_findings_on_one_track_are_one_row_whatever_their_fix() {
+        let m = tests_support::with_timing();
+        // The typo rows as before, and the three episodes' track 5 in one row, at its first member.
+        assert_eq!(
+            m.rows,
+            [
+                Row {
+                    members: vec![0, 1, 3]
+                },
+                Row {
+                    members: vec![4, 5, 6]
+                },
+                Row { members: vec![2] },
+            ]
+        );
+        assert_eq!(m.track_name(4), "English Full");
+        assert_eq!(m.fix_summary(&[4, 5, 6]), "−1 frame ×2 · partial ×1");
+        assert_eq!(m.fix_summary(&[4, 6]), "−1 frame");
+        // Another folder's track of the same name is a row of its own.
+        let mut other = tests_support::with_timing();
+        let path = "/m/K-On!!/K-On!! - E03 - Episode.mkv";
+        other.run.findings[6].file = path.into();
+        other.run.files.push(FileRecord {
+            path: path.into(),
+            ..tests_support::file(3)
+        });
+        assert_eq!(group(&other.run).0.len(), 4);
+    }
+
+    #[test]
+    fn a_files_tracks_that_go_by_one_name_are_rows_apart_with_their_ids() {
+        // Tracks 5 and 6 both unnamed (both `eng`), then both named "English".
+        for name in [None, Some("English")] {
+            let mut m = tests_support::with_timing();
+            for file in &mut m.run.files {
+                for t in &mut file.tracks {
+                    t.name = name.map(Into::into);
+                }
+            }
+            // E01's track 6, a frame late too.
+            let mut signs = tests_support::timing(14, 1, false);
+            if let Some(t) = &mut signs.timing {
+                t.track = 6;
+            }
+            m.run.findings.push(signs);
+            let (rows, names) = group(&m.run);
+            let timing_rows: Vec<Vec<usize>> = rows
+                .into_iter()
+                .map(|r| r.members)
+                .filter(|members| members.iter().all(|&i| m.run.findings[i].timing.is_some()))
+                .collect();
+            assert_eq!(timing_rows, [vec![4, 5, 6], vec![7]], "{name:?}");
+            let labels = [4, 7].map(|i| names[i].as_str());
+            match name {
+                None => assert_eq!(labels, ["track 5 (eng)", "track 6 (eng)"]),
+                Some(_) => assert_eq!(labels, ["track 5 English", "track 6 English"]),
+            }
+        }
+    }
+
+    #[test]
+    fn a_fix_in_a_word_counts_the_frames_its_lines_move() {
+        let mut f = tests_support::timing(1, 1, false);
+        assert_eq!(fix_label(&f), "−1 frame");
+        if let Some(t) = &mut f.timing {
+            t.stretches[0].frames = -2;
+        }
+        assert_eq!(fix_label(&f), "+2 frames");
+        assert_eq!(fix_label(&tests_support::timing(1, 1, true)), "partial");
+        assert_eq!(fix_label(&tests_support::finding(1, 1, "a", "b", 0)), "");
     }
 
     #[test]

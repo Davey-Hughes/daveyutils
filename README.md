@@ -55,7 +55,9 @@ make help     # list targets
   already made of an unchanged file are skipped; `scan --run <run>` adds to that run only the
   checks it lacks.
   `subcheck review` steps through a run's fixes to accept, reject or reword each (a fix repeated
-  across episodes is one row), and `o` opens the moment in mpv, reusing one window.
+  across episodes is one row, as is a season's track's timing), and `o` opens the moment in mpv,
+  reusing one window: a timing finding paused on the frame that shows the error, which `[` `]` step
+  through a frame at a time.
   `subcheck list` prints the same as text, and `--mpv` adds a command that opens each one.
   `subcheck apply` makes the accepted fixes: mkvmerge remuxes each file beside the original, the
   remux is checked against it, and then it takes the original's place (kept as `.orig`).
