@@ -2,6 +2,7 @@
 //! events, write the fixed tracks, remux with mkvmerge beside the original, check the remux, and
 //! swap it in, keeping the original as `.orig` unless told not to.
 
+pub mod exact;
 pub mod karaoke;
 pub mod patch;
 pub mod remux;
@@ -251,7 +252,8 @@ struct Done {
     remuxed: bool,
 }
 
-/// The original file, and the blocks read of its tracks with fixes, by track ID.
+/// The original file, and the blocks read of its `S_TEXT` tracks ([`exact::rewritten`]), by track
+/// ID.
 struct Original<'a> {
     r: &'a crate::ebml::Reader,
     layout: &'a Layout,
@@ -283,19 +285,13 @@ impl Job<'_> {
             .iter()
             .filter(|t| ids.contains(&t.id) && t.is_text_subtitle())
             .collect();
-        // Read once, for the plan and the check alike: the tracks the fixes are on. Where the check
-        // will run and these must be walked anyway (no statistics), every other text track comes
-        // in the same walk; otherwise the check reads them itself, and only if it runs.
-        let checks = matches!(self.mode, Mode::Apply { .. } | Mode::Check { .. });
-        let wanted: Vec<&Track> = if checks && verify::must_walk(&layout, &chosen) {
-            layout
-                .tracks
-                .iter()
-                .filter(|t| t.is_text_subtitle())
-                .collect()
-        } else {
-            chosen.clone()
-        };
+        // Read once, for the plan and the check alike: every track whose lines a remux rewrites
+        // where they are not UTF-8 (any S_TEXT track), so the plan looks at them all.
+        let wanted: Vec<&Track> = layout
+            .tracks
+            .iter()
+            .filter(|t| exact::rewritten(t))
+            .collect();
         let numbers: Vec<u64> = wanted.iter().map(|t| t.number).collect();
         let walk = verify::must_walk(&layout, &wanted);
         let read = blocks::read_tracks(&r, &layout, &numbers, walk).map_err(|e| e.to_string())?;
@@ -304,6 +300,7 @@ impl Job<'_> {
             .zip(&read)
             .map(|(t, b)| (t.id, b.blocks.as_slice()))
             .collect();
+        let file = exact::remuxable(wanted.iter().map(|t| (*t, read[&t.id])));
         let headers: Vec<Vec<u8>> = chosen
             .iter()
             .map(|t| {
@@ -318,17 +315,22 @@ impl Job<'_> {
         let mut views: Vec<patch::Track> = chosen
             .iter()
             .zip(&headers)
-            .map(|(t, header)| patch::Track {
-                id: t.id,
-                kind: Kind::of(t).expect("a text subtitle track"),
-                blocks: read[&t.id],
-                header,
-                scale: layout.timestamp_scale,
-                default_duration: t.default_duration,
-                timing: patch::Timing::AsScanned,
+            .map(|(t, header)| {
+                let mut view = patch::Track {
+                    id: t.id,
+                    kind: Kind::of(t).expect("a text subtitle track"),
+                    blocks: read[&t.id],
+                    header,
+                    scale: layout.timestamp_scale,
+                    default_duration: t.default_duration,
+                    timing: patch::Timing::AsScanned,
+                    writable: Ok(()),
+                };
+                view.writable = exact::writable(&view, &BTreeMap::new(), file);
+                view
             })
             .collect();
-        let (plan, grid) = self.plan(&mut views, &layout);
+        let (plan, grid) = self.plan(&mut views, &layout, file);
         self.report(&plan, &views, grid.as_ref(), out)
             .map_err(|e| e.to_string())?;
         note_tags(&r, &layout, &chosen, &plan, out)?;
@@ -362,16 +364,31 @@ impl Job<'_> {
 
     /// Both kinds of fix: the timing fixes first, as a track remuxed with its timing fix has its
     /// typos at their times shifted. And the file's frame grid, where it has timing fixes and one.
+    /// `file`: whether the file can be remuxed as it is ([`exact::remuxable`]).
     fn plan<'v>(
         &'v self,
         views: &mut [patch::Track<'v>],
         layout: &Layout,
+        file: Result<(), exact::Unwritable>,
     ) -> (patch::Plan, Option<Grid>) {
         if self.timing.is_empty() {
             return (patch::plan(views, self.fixes, self.karaoke), None);
         }
         let grid = crate::timing::video(layout).and_then(|v| Grid::fit(&v, layout.timestamp_scale));
-        let shifted = self.shift(views, &grid);
+        let mut shifted = self.shift(views, &grid);
+        // A track its timing fix moves is written at the new times. One that cannot be written out
+        // exactly so gets neither the shift nor (as its view says) its typo fixes.
+        for (f, p) in self.timing.iter().zip(&mut shifted) {
+            let Some(view) = views.iter_mut().find(|v| v.id == timing_fix(f).track) else {
+                continue;
+            };
+            let moved = p.times.iter().map(|&(i, t, d)| (i, (t, d))).collect();
+            view.writable = exact::writable(view, &moved, file);
+            if let (Err(why), Outcome::Shifted { .. }) = (view.writable, &p.outcome) {
+                p.outcome = Outcome::ByHand(why.to_string());
+                p.times.clear();
+            }
+        }
         // Where each track's typos are, by where its timing fix's lines are.
         for view in views.iter_mut() {
             let mut mine = self.timing.iter().zip(&shifted);

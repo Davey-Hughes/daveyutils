@@ -171,8 +171,7 @@ impl AssWriter {
         scale: u64,
         default_duration: Option<u64>,
     ) -> Option<(i64, String)> {
-        let start = ns(block.timestamp, scale) / 1_000_000;
-        let end = start + duration_ns(block, scale, default_duration) / 1_000_000;
+        let (start, end) = ass_ms(block, scale, default_duration);
         let mut fields = split(&c_string(&block.payload), ",", self.num_fields);
         fields.resize(self.num_fields, String::new());
         let read_order = read_order(&block.payload)?;
@@ -240,8 +239,8 @@ pub fn write_srt(
             srt_entry(out, count, at, (start - at).abs(), &text)?;
         }
         let duration = duration_ns(b, scale, default_duration);
-        let text = c_string(&b.payload).replace('\r', "");
-        if duration != 0 && !text.is_empty() {
+        let text = srt_text(b);
+        if srt_alone(duration, &text) {
             count += 1;
             srt_entry(out, count, start, duration, &text)?;
         } else {
@@ -261,8 +260,7 @@ fn srt_entry(
     duration_ns: i128,
     text: &str,
 ) -> io::Result<()> {
-    let start = start_ns / 1_000_000;
-    let end = (start_ns + duration_ns) / 1_000_000;
+    let (start, end) = srt_ms(start_ns, duration_ns);
     puts(
         out,
         &format!("{n}\n{} --> {}\n{text}\n\n", srt_time(start), srt_time(end)),
@@ -281,6 +279,65 @@ fn duration_ns(block: &Block, scale: u64, default_duration: Option<u64>) -> i128
         .map(|d| i128::from(d) * i128::from(scale))
         .or(default_duration.map(i128::from))
         .unwrap_or(-1)
+}
+
+/// An ASS or SSA line's start and end in whole milliseconds, before the cut to centiseconds:
+/// mkvextract cuts the start and the duration to the millisecond each, then adds them.
+fn ass_ms(block: &Block, scale: u64, default_duration: Option<u64>) -> (i128, i128) {
+    let start = ns(block.timestamp, scale) / 1_000_000;
+    (
+        start,
+        start + duration_ns(block, scale, default_duration) / 1_000_000,
+    )
+}
+
+/// An SRT entry's start and end in whole milliseconds: each cut as a whole.
+fn srt_ms(start_ns: i128, duration_ns: i128) -> (i128, i128) {
+    (start_ns / 1_000_000, (start_ns + duration_ns) / 1_000_000)
+}
+
+/// An SRT block's text as written: up to its first NUL, without CRs.
+fn srt_text(block: &Block) -> String {
+    c_string(&block.payload).replace('\r', "")
+}
+
+/// Whether an SRT block is written as an entry of its own: one of no length waits for the next
+/// block, and one of no text is never written.
+fn srt_alone(duration_ns: i128, text: &str) -> bool {
+    duration_ns != 0 && !text.is_empty()
+}
+
+/// What a block's line, as [`write_track`] writes it, reads back as in mkvmerge: its start and
+/// duration in nanoseconds, at the format's precision (centiseconds for ASS and SSA, milliseconds
+/// for SRT). `None` where it comes back as no line of its own: an ASS or SSA block whose ReadOrder
+/// is no integer, an SRT block of no length or no text (none is written), or a time before 0
+/// (written, by mkvextract's arithmetic, as no time at all).
+pub fn written_times(
+    kind: Kind,
+    block: &Block,
+    scale: u64,
+    default_duration: Option<u64>,
+) -> Option<(i128, i128)> {
+    let (start, end, cut) = match kind {
+        Kind::Ass | Kind::Ssa => {
+            read_order(&block.payload)?;
+            let (start, end) = ass_ms(block, scale, default_duration);
+            (start, end, 10)
+        }
+        Kind::Srt => {
+            let duration = duration_ns(block, scale, default_duration);
+            if !srt_alone(duration, &srt_text(block)) {
+                return None;
+            }
+            let (start, end) = srt_ms(ns(block.timestamp, scale), duration);
+            (start, end, 1)
+        }
+    };
+    if start < 0 || end < 0 {
+        return None;
+    }
+    let (start, end) = (start / cut * cut, end / cut * cut);
+    Some((start * 1_000_000, (end - start) * 1_000_000))
 }
 
 fn ass_time(ms: i128) -> String {
@@ -481,5 +538,83 @@ mod tests {
         assert_eq!(split("a,b,c", ",", 2), ["a", "b,c"]);
         assert_eq!(split("a,b,", ",", 9), ["a", "b"]);
         assert_eq!(split("", ",", 9), [""]);
+    }
+
+    /// A time as the writer prints it, `h:mm:ss.cc` (ASS) or `hh:mm:ss,mmm` (SRT), in ns.
+    fn printed_ns(t: &str) -> i128 {
+        let (hms, frac) = t.split_once(['.', ',']).unwrap();
+        let secs = hms
+            .split(':')
+            .fold(0, |acc, p| acc * 60 + p.parse::<i128>().unwrap());
+        let unit = if frac.len() == 2 {
+            10_000_000
+        } else {
+            1_000_000
+        };
+        secs * 1_000_000_000 + frac.parse::<i128>().unwrap() * unit
+    }
+
+    /// The start and duration (ns) the writer prints for one block on its own; `None` when it
+    /// writes no line for it.
+    fn printed(kind: Kind, b: &Block, scale: u64, dd: Option<u64>) -> Option<(i128, i128)> {
+        let (start, end) = if kind == Kind::Srt {
+            let mut out = Vec::new();
+            write_srt(std::slice::from_ref(b), scale, dd, &mut out).unwrap();
+            let out = String::from_utf8(out).unwrap();
+            let (a, z) = out.lines().nth(1)?.split_once(" --> ").unwrap();
+            (printed_ns(a), printed_ns(z))
+        } else {
+            let (_, line) = AssWriter::new(HEADER.as_bytes(), false).dialogue(b, scale, dd)?;
+            let fields: Vec<&str> = line.split(',').collect();
+            (printed_ns(fields[1]), printed_ns(fields[2]))
+        };
+        Some((start, end - start))
+    }
+
+    #[test]
+    fn written_times_are_the_times_the_writer_prints() {
+        let ms = |n: i128| n * 1_000_000;
+        let frame = Some(41_708_333);
+        let ass = |t, d| (Kind::Ass, block(t, d, "0,0,S,,0,0,0,,a"), 1_000_000);
+        let srt = |t, d, text| (Kind::Srt, block(t, d, text), 1_000_000);
+        let cases = [
+            (ass(1000, Some(1500)), None, Some((ms(1000), ms(1500)))),
+            // Start and end cut to the centisecond each: 1007 ms, and 2506 ms to 2.50.
+            (ass(1007, Some(1499)), None, Some((ms(1000), ms(1500)))),
+            // 41.708333 ms cut to 41, then to 0.04; 40 ms as it is.
+            (ass(0, None), frame, Some((0, ms(40)))),
+            (ass(0, None), Some(40_000_000), Some((0, ms(40)))),
+            // No duration at all: a line that ends where it starts.
+            (ass(3000, None), None, Some((ms(3000), 0))),
+            // A ReadOrder that is no integer: mkvextract leaves the line out.
+            (
+                (Kind::Ass, block(0, Some(1), "x,0,S,,0,0,0,,a"), 1_000_000),
+                None,
+                None,
+            ),
+            (srt(1000, Some(1500), "a"), None, Some((ms(1000), ms(1500)))),
+            (srt(0, None, "a"), Some(2_000_000_000), Some((0, ms(2000)))),
+            (srt(0, None, "a"), frame, Some((0, ms(41)))),
+            // No length: held for the next block. No text: never written.
+            (srt(1000, Some(0), "a"), None, None),
+            (srt(1000, Some(500), ""), None, None),
+            // A TimestampScale of 100 µs: 1000.4 ms cut to 1000, its end 1500.4 to 1500.
+            (
+                (Kind::Srt, block(10_004, Some(5000), "a"), 100_000),
+                None,
+                Some((ms(1000), ms(500))),
+            ),
+        ];
+        for ((kind, b, scale), dd, want) in &cases {
+            assert_eq!(
+                written_times(*kind, b, *scale, *dd),
+                *want,
+                "{kind:?} {b:?}"
+            );
+            assert_eq!(printed(*kind, b, *scale, *dd), *want, "{kind:?} {b:?}");
+        }
+        // A time before 0, which no line can hold.
+        let early = block(-50, Some(1000), "0,0,S,,0,0,0,,a");
+        assert_eq!(written_times(Kind::Ass, &early, 1_000_000, None), None);
     }
 }

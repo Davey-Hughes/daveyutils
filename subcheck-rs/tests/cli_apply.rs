@@ -135,11 +135,17 @@ impl Setup {
     /// A copy of fixture `name` in `media/`, scanned with the fake LLM (which finds nothing in
     /// it), and every finding accepted.
     fn scanned(name: &str) -> Setup {
+        Setup::scanned_with(name, |_| {})
+    }
+
+    /// As [`Setup::scanned`], the copy changed by `change` before the scan.
+    fn scanned_with(name: &str, change: impl FnOnce(&Path)) -> Setup {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::create_dir(root.join("media")).unwrap();
         let file = root.join("media").join(name);
         std::fs::copy(fixture(name), &file).unwrap();
+        change(&file);
         let s = Setup {
             _dir: dir,
             root,
@@ -379,6 +385,79 @@ fn a_file_whose_text_tracks_are_timed_by_their_default_duration_is_fixed() {
         ),
         "{}",
         stdout(&o)
+    );
+}
+
+#[test]
+fn a_fix_on_a_track_whose_times_its_format_cannot_keep_is_left_for_a_hand_fix() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // Track 0's lines last 2 s, which its .srt keeps; track 1's a 23.976 fps frame, which a remux
+    // makes 42 ms and its .ass 40. The file's other fix is still made, in the one remux.
+    let s = Setup::with(
+        "timed.mkv",
+        &[
+            ("", "Over tehre", "Over there", &[(0, 0, 2000)]),
+            ("Default", "Over tehre", "Over there", &[(1, 0, 41)]),
+        ],
+        0,
+    );
+    let o = s.apply(&[]);
+    let text = stdout(&o);
+    assert!(
+        o.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        text.contains(
+            "  0:00:00.00  tehre → there  by hand: track 1's .ass file cannot keep its times (its lines last the DefaultDuration, 41.708333 ms)\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "applied 1, already applied 0, by hand 1, not found 0; 1 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+    let expected = |name| std::fs::read_to_string(fixture(&format!("expected/{name}"))).unwrap();
+    assert_eq!(
+        track(&s.file, 0),
+        expected("timed.track0.srt").replace("tehre", "there")
+    );
+    assert_eq!(track(&s.file, 1), expected("timed.track1.ass"));
+
+    // A track timed to the millisecond: nothing left to make, so no remux, and the file as it was.
+    let s = Setup::with(
+        "ass-sync7.mkv",
+        &[(
+            "Default",
+            "Out of order in the file",
+            "Out of order in this file",
+            &[(0, 30_007, 31_007)],
+        )],
+        0,
+    );
+    let o = s.apply(&[]);
+    let text = stdout(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(
+        text.contains(
+            "  by hand: track 0's .ass file cannot keep its times (0:00:01.007 is finer than centiseconds)\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "applied 0, already applied 0, by hand 1, not found 0; 0 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read(&s.file).unwrap(),
+        std::fs::read(fixture("ass-sync7.mkv")).unwrap()
     );
 }
 
@@ -1133,6 +1212,171 @@ fn a_typo_on_a_line_a_timing_fix_reading_not_found_moves_is_left_for_a_hand_fix(
     );
     assert!(
         text.contains(&format!("  0:00:00.00  0 → nought  {unsure}")),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_timing_fix_landing_a_track_timed_to_the_millisecond_on_centiseconds_is_made() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // Track 2, a frame late, 7 ms later still: no line of it is on a centisecond. Shifted, every
+    // line is, so the track can be written out.
+    let s = Setup::scanned_with("timing.mkv", |file| {
+        let synced = file.with_extension("synced.mkv");
+        let o = Command::new("mkvmerge")
+            .arg("-o")
+            .arg(&synced)
+            .args(["--sync", "2:7"])
+            .arg(file)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+        std::fs::rename(&synced, file).unwrap();
+    });
+    let o = s.apply(&[]);
+    let text = stdout(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(
+        text.contains("  track 2  2 frames late → shift 2 frames earlier  ok (68 events moved)\n"),
+        "{text}"
+    );
+    assert!(text.contains("; 1 remuxed, 0 failed\n"), "{text}");
+    assert!(
+        track(&s.file, 2)
+            .contains("Dialogue: 0,0:00:00.00,0:00:06.26,Default,,0,0,0,,Line 0 on the cut.\n"),
+        "{}",
+        track(&s.file, 2)
+    );
+}
+
+/// Make one line of track `id` of `file` Latin-1: its first block's last byte. The track must be
+/// stored uncompressed.
+fn latin1_line(file: &Path, id: usize) {
+    let (r, layout) = subcheck::mkv::open(file).unwrap();
+    let read = subcheck::blocks::read_tracks(&r, &layout, &[layout.tracks[id].number], false)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let first = &read.blocks[0];
+    let mut bytes = std::fs::read(file).unwrap();
+    // Inside its BlockGroup, which starts at its position.
+    let from = usize::try_from(first.position).unwrap();
+    let at = bytes[from..]
+        .windows(first.payload.len())
+        .position(|w| w == first.payload)
+        .unwrap();
+    bytes[from + at + first.payload.len() - 1] = 0xE9;
+    std::fs::write(file, bytes).unwrap();
+}
+
+#[test]
+fn a_timing_fix_on_a_track_that_is_not_all_utf8_is_left_for_a_hand_fix() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // Written out, the Latin-1 line would come back changed; remuxed at all, too, so track 4's fix
+    // is left as well.
+    let s = Setup::scanned_with("timing.mkv", |file| latin1_line(file, 2));
+    let o = s.apply(&["--dry-run"]);
+    let text = stdout(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(
+        text.contains(
+            "  track 2  1 frame late → shift 1 frame earlier  by hand: track 2 is not all UTF-8, which any remux rewrites\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  track 4  1 frame late → shift 1 frame earlier  by hand: track 2 is not all UTF-8, which any remux rewrites\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "to apply 0, already applied 0, by hand 2, not found 0; 0 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+    // Nothing is written.
+    let out = s.root.join("tracks");
+    let text = stdout(&s.apply(&["--tracks-only", out.to_str().unwrap()]));
+    assert!(!text.contains("  wrote "), "{text}");
+}
+
+#[test]
+fn a_file_with_a_text_track_that_is_not_all_utf8_is_left_for_hand_fixes() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // A Latin-1 line in track 4, which no fix touches: any remux rewrites it, so the fix on track
+    // 2 is left for a hand fix too, and the file as it was.
+    let s = Setup::with(
+        "apply.mkv",
+        &[(
+            "Default",
+            "We should leave befor it rains.",
+            "We should leave before it rains.",
+            &[(2, 1000, 2500)],
+        )],
+        0,
+    );
+    latin1_line(&s.file, 4);
+    let changed = std::fs::read(&s.file).unwrap();
+    let o = s.apply(&[]);
+    let text = stdout(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(
+        text.contains(
+            "  0:00:01.00  befor → before  by hand: track 4 is not all UTF-8, which any remux rewrites\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "applied 0, already applied 0, by hand 1, not found 0; 0 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+    assert_eq!(std::fs::read(&s.file).unwrap(), changed);
+}
+
+#[test]
+fn a_webvtt_track_that_is_not_all_utf8_counts_too() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // Any S_TEXT track: mkvmerge rewrites a WebVTT line that is not UTF-8 as it does an ASS one.
+    let s = Setup::with(
+        "apply.mkv",
+        &[(
+            "Default",
+            "We should leave befor it rains.",
+            "We should leave before it rains.",
+            &[(2, 1000, 2500)],
+        )],
+        0,
+    );
+    let vtt = s.root.join("notes.vtt");
+    std::fs::write(&vtt, "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nA note\n").unwrap();
+    let with_vtt = s.root.join("with-vtt.mkv");
+    let o = Command::new("mkvmerge")
+        .arg("-o")
+        .arg(&with_vtt)
+        .arg(&s.file)
+        .arg(&vtt)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+    std::fs::rename(&with_vtt, &s.file).unwrap();
+    latin1_line(&s.file, 5);
+    let text = stdout(&s.apply(&["--dry-run"]));
+    assert!(
+        text.contains(
+            "  0:00:01.00  befor → before  by hand: track 5 is not all UTF-8, which any remux rewrites\n"
+        ),
         "{text}"
     );
 }

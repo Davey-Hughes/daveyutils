@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
+use super::exact::Unwritable;
 use super::karaoke::{self, Align, Letter, Widths};
 use super::shift::{self, Shifts};
 use crate::blocks::Block;
@@ -68,6 +69,9 @@ pub struct Track<'a> {
     pub default_duration: Option<u64>,
     /// Where its typos are, by its timing fix.
     pub timing: Timing<'a>,
+    /// Whether it can be written out exactly ([`exact::writable`](super::exact::writable)): where
+    /// it cannot, a fix on it is left for a hand fix.
+    pub writable: Result<(), Unwritable>,
 }
 
 /// Where a track's typos are, by its timing fix.
@@ -203,8 +207,6 @@ struct Context<'a> {
     tracks: &'a [Track<'a>],
     /// Each track's blocks as events, by track ID and block index.
     events: HashMap<usize, Vec<Option<Event>>>,
-    /// Whether a track can be rewritten: its header and every event are UTF-8.
-    rewritable: HashMap<usize, bool>,
     /// Re-space per-letter karaoke (`--karaoke`), rather than leave it for a hand fix.
     karaoke: bool,
     /// Each style's alignment, by track ID and style, read when first needed.
@@ -228,22 +230,9 @@ pub fn plan(tracks: &[Track], fixes: &[Fix], karaoke: bool) -> Plan {
             (t.id, events)
         })
         .collect();
-    // A rewrite reads the header and every event as UTF-8 (as extract does): bytes that are not
-    // would come out replaced, in lines nobody fixed.
-    let utf8 = |b: &[u8]| std::str::from_utf8(subs::c_bytes(b)).is_ok();
-    let rewritable = tracks
-        .iter()
-        .map(|t| {
-            (
-                t.id,
-                utf8(t.header) && t.blocks.iter().all(|b| utf8(&b.payload)),
-            )
-        })
-        .collect();
     let mut cx = Context {
         tracks,
         events,
-        rewritable,
         karaoke,
         aligns: HashMap::new(),
         widths: HashMap::new(),
@@ -340,9 +329,7 @@ impl Context<'_> {
                     }
                     return Err(Outcome::NotFound);
                 }
-                if !self.rewritable[&track.id] {
-                    return Err(Outcome::ByHand("the track is not all UTF-8".into()));
-                }
+                writable(track)?;
                 let align = *self
                     .aligns
                     .entry((track.id, f.style.clone()))
@@ -375,9 +362,7 @@ impl Context<'_> {
                 }
                 continue;
             }
-            if !self.rewritable[&track.id] {
-                return Err(Outcome::ByHand("the track is not all UTF-8".into()));
-            }
+            writable(track)?;
             for i in original {
                 let new = patch_event(track, i, &f.original, &fix.text)?;
                 change
@@ -391,6 +376,13 @@ impl Context<'_> {
         }
         Ok(change)
     }
+}
+
+/// Nothing, where `track` can be written out exactly; else its fixes' outcome, a hand fix.
+fn writable(track: &Track) -> Result<(), Outcome> {
+    track
+        .writable
+        .map_err(|why| Outcome::ByHand(why.to_string()))
 }
 
 /// The events of `track` at occurrence `o`'s time, in its fix's style: the line is among them. In a
@@ -990,6 +982,7 @@ mod tests {
             scale: 1_000_000,
             default_duration: None,
             timing: Timing::AsScanned,
+            writable: Ok(()),
         }
     }
 
@@ -1803,56 +1796,92 @@ mod tests {
         );
     }
 
+    /// Track 1's verdict, as its times give it: a line 7 ms off the centisecond.
+    const FINER: Unwritable = Unwritable::Times {
+        track: 1,
+        kind: Kind::Ass,
+        why: super::super::exact::Why::Finer(1_007_000_000),
+    };
+
     #[test]
-    fn a_track_with_bytes_that_are_not_utf8_is_left_for_a_hand_fix() {
-        // Another line of the track, in Latin-1: rewriting the track would mangle it.
-        let mut cafe = block(5000, 0, "D", "caf");
-        cafe.payload.push(0xE9);
-        let blocks = [block(1000, 0, "D", "teh end"), cafe];
-        let f = finding(1, "D", "teh end", &[(0, 1000)]);
+    fn a_fix_on_a_track_that_cannot_be_written_exactly_is_left_for_a_hand_fix() {
+        let blocks = [block(1000, 0, "D", "teh end")];
+        let f = finding(1, "D", "teh end", &[(1, 1000)]);
         let fix = Fix {
             finding: &f,
             text: "the end".into(),
         };
-        let p = plan(&[track(0, &blocks)], &[fix], false);
+        for why in [FINER, Unwritable::NotUtf8 { track: 1 }] {
+            let t = Track {
+                writable: Err(why),
+                ..track(1, &blocks)
+            };
+            let p = plan(&[t], std::slice::from_ref(&fix), false);
+            assert_eq!(p.outcomes, [(1, Outcome::ByHand(why.to_string()))]);
+            assert!(p.edits.is_empty());
+        }
         assert_eq!(
-            p.outcomes,
-            [(1, Outcome::ByHand("the track is not all UTF-8".into()))]
+            FINER.to_string(),
+            "track 1's .ass file cannot keep its times (0:00:01.007 is finer than centiseconds)"
         );
-        assert!(p.edits.is_empty());
     }
 
     #[test]
-    fn a_header_that_is_not_utf8_is_left_for_a_hand_fix_but_a_fix_already_in_is_not() {
-        // A Latin-1 style name in the header: a rewrite would mangle it.
+    fn on_a_track_that_cannot_be_written_a_fix_in_already_or_not_there_says_so() {
         let blocks = [
-            block(1000, 0, "D", "teh end"),
+            block(1000, 0, "D", "the end"),
             block(2000, 0, "D", "the start"),
         ];
-        let latin1 = [b"Style: Caf".as_slice(), &[0xE9]].concat();
         let t = Track {
-            header: &latin1,
-            ..track(0, &blocks)
+            writable: Err(FINER),
+            ..track(1, &blocks)
         };
-        let f1 = finding(1, "D", "teh end", &[(0, 1000)]);
-        let f2 = finding(2, "D", "teh start", &[(0, 2000)]);
+        let in_already = finding(1, "D", "teh end", &[(1, 1000)]);
+        let gone = finding(2, "D", "teh middle", &[(1, 3000)]);
         let fixes = [
             Fix {
-                finding: &f1,
+                finding: &in_already,
                 text: "the end".into(),
             },
             Fix {
-                finding: &f2,
-                text: "the start".into(),
+                finding: &gone,
+                text: "the middle".into(),
             },
         ];
         assert_eq!(
             plan(&[t], &fixes, false).outcomes,
-            [
-                (1, Outcome::ByHand("the track is not all UTF-8".into())),
-                (2, Outcome::AlreadyApplied)
-            ]
+            [(1, Outcome::AlreadyApplied), (2, Outcome::NotFound)]
         );
+    }
+
+    #[test]
+    fn a_fix_on_two_tracks_one_of_them_unwritable_is_left_whole_for_a_hand_fix() {
+        let full = [block(9000, 0, "Song", "We happen share")];
+        let signs = [block(9000, 0, "Song", "We happen share")];
+        let f = finding(1, "Song", "We happen share", &[(2, 9000), (3, 9000)]);
+        let fix = Fix {
+            finding: &f,
+            text: "We happen to share".into(),
+        };
+        let refused = Track {
+            writable: Err(FINER),
+            ..track(3, &signs)
+        };
+        let p = plan(&[track(2, &full), refused], &[fix], false);
+        assert_eq!(p.outcomes, [(1, Outcome::ByHand(FINER.to_string()))]);
+        assert!(p.edits.is_empty());
+    }
+
+    #[test]
+    fn per_letter_karaoke_on_a_track_that_cannot_be_written_is_left_for_a_hand_fix() {
+        let letters = row(5000, 0, "OP", "", "go trough");
+        let t = Track {
+            writable: Err(FINER),
+            ..track(0, &letters)
+        };
+        let p = plan_one(&[t], "OP", "go trough", "go through", true);
+        assert_eq!(p.outcomes, hand(&FINER.to_string()));
+        assert!(p.edits.is_empty());
     }
 
     #[test]

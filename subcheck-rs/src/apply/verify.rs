@@ -384,7 +384,7 @@ pub fn must_walk(layout: &Layout, tracks: &[&Track]) -> bool {
 /// A text track's DefaultDuration, in ns, as a remux at `scale` writes it in a block with no
 /// duration of its own: whole `scale` units, rounded to the nearest (mkvmerge 74, 82, 102 and 103
 /// make 42 ms of 41.708333; 102 makes 42 of 41.5 and 41 of 41.499999).
-fn as_remuxed(default_duration: Option<u64>, scale: u64) -> Option<i128> {
+pub fn as_remuxed(default_duration: Option<u64>, scale: u64) -> Option<i128> {
     let scale = i128::from(scale.max(1));
     default_duration.map(|d| (i128::from(d) + scale / 2) / scale * scale)
 }
@@ -401,7 +401,6 @@ fn events(
     default: Option<i128>,
     rewritten: bool,
 ) -> Vec<(i128, Option<i128>, Vec<u8>)> {
-    let scale = i128::from(scale);
     let mut texts: Vec<Vec<u8>> = blocks
         .iter()
         .map(|b| subs::c_bytes(&b.payload).to_vec())
@@ -429,10 +428,18 @@ fn events(
         .iter()
         .zip(texts)
         .map(|(b, text)| {
-            let duration = b.duration.map(|d| i128::from(d) * scale).or(default);
-            (i128::from(b.timestamp) * scale, duration, text)
+            let (start, duration) = expected(b, scale, default);
+            (start, duration, text)
         })
         .collect()
+}
+
+/// A block's start and duration in ns, as the check compares them: a block with no duration of
+/// its own has `default` (its track's DefaultDuration as a remux writes it: [`as_remuxed`]).
+pub fn expected(b: &Block, scale: u64, default: Option<i128>) -> (i128, Option<i128>) {
+    let scale = i128::from(scale);
+    let duration = b.duration.map(|d| i128::from(d) * scale).or(default);
+    (i128::from(b.timestamp) * scale, duration)
 }
 
 /// Every other track (video, audio, image subtitles): its frame count and byte total, from both

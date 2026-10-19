@@ -104,17 +104,24 @@ chapter, an edition), or an element mkvmerge's tags XML cannot hold.
 
 mkvmerge leaves a text subtitle track's default duration out of any remux and gives each event a
 duration of its own instead, rounded to the millisecond. The check expects that rounding, so a file
-whose events take their duration from the track's header passes, without the header field. A fix
-on such a track itself goes through its text format, which cuts each time down to the millisecond
-(SRT) or the centisecond (ASS), and the check refuses the remux unless that still gives the rounded
-duration: a 23.976 fps frame of 41.708 ms rounds to 42, which SRT writes as 41 and ASS as 40.
+whose events take their duration from the track's header passes, without the header field.
+
+A fixed track goes through its text format, which cuts each time down to the millisecond (SRT) or
+the centisecond (ASS). Where that would change a time, a fix on that track is left for a hand fix
+before any remux, and the output names the first such time: an ASS track timed to the
+millisecond, say, or events that last a 23.976 fps default duration (41.708 ms, which a remux
+rounds to 42, SRT writes as 41 and ASS as 40). A timing fix that moves every such event onto the
+format's precision is made. The file's other fixes are made either way.
 
 `--no-backup` keeps no original. `--dry-run` shows each changed event before and after, and writes
 nothing. Running apply again is safe: a fix already in its file is reported and left alone.
 
 Some fixes are left for a hand fix, with the reason: per-letter karaoke (one event per letter)
 without `--karaoke`, signs set letter by letter (a tag before nearly every letter), a change
-across a tag or a line break, two fixes on one line, and a line that is not there any more.
+across a tag or a line break, two fixes on one line, a track whose times its text format cannot
+keep or whose header is not all UTF-8, every fix in a file with any text track (ASS, SSA, SRT,
+WebVTT, USF, ASCII) whose lines are not all UTF-8 (mkvmerge replaces those bytes in any remux),
+and a line that is not there any more.
 
 `--karaoke` makes per-letter karaoke fixes too. Each changed letter keeps its event (tags,
 colours, animation), and a new one is a copy of the letter beside it. The row is then re-spaced

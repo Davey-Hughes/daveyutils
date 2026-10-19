@@ -30,7 +30,13 @@ pub fn args(
     replaced: &[Replacement],
     output: &Path,
 ) -> Vec<OsString> {
-    let mut out: Vec<OsString> = vec!["--quiet".into(), "-o".into(), output.into()];
+    let mut out: Vec<OsString> = vec![
+        "--quiet".into(),
+        "-o".into(),
+        output.into(),
+        "--timestamp-scale".into(),
+        SCALE.to_string().into(),
+    ];
     if let Some(uid) = &layout.segment_uid {
         out.push("--segment-uid".into());
         out.push(hex(uid).into());
@@ -74,6 +80,10 @@ fn hex(bytes: &[u8]) -> String {
         s
     })
 }
+
+/// The remux's TimestampScale, which [`args`] sets: mkvmerge's default (mkvmerge 102 remuxes a file
+/// at 100 µs to 1 ms without it), so that the plan can count on it. The check reads the remux's own.
+pub const SCALE: u64 = 1_000_000;
 
 /// A replaced track's properties, as mkvmerge options for its file's track 0.
 fn track_options(t: &Track) -> Vec<(&'static str, String)> {
@@ -329,6 +339,8 @@ mod tests {
             "--quiet",
             "-o",
             "/o/.x.mkv.subcheck",
+            "--timestamp-scale",
+            "1000000",
             "--segment-uid",
             &uid,
             "--subtitle-tracks",

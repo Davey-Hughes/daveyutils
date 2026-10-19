@@ -589,6 +589,7 @@ mod tests {
             scale: 1_000_000,
             default_duration: None,
             timing: crate::apply::patch::Timing::AsScanned,
+            writable: Ok(()),
         }
     }
 
