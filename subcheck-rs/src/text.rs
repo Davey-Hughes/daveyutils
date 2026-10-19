@@ -47,6 +47,9 @@ pub struct Event {
     pub pos: Option<(i64, i64)>,
     /// Has a karaoke tag (`\k`, `\K`, `\kf`, `\ko`): timed to the music, not the picture.
     pub karaoke: bool,
+    /// The event as written but for its ReadOrder: Layer to Text for ASS and SSA, the text for
+    /// SRT. Two tracks of one release repeat an event byte for byte.
+    pub raw: String,
 }
 
 /// The track's blocks (one track, mkvmerge ID `track`) as events. `scale` is the TimestampScale;
@@ -90,6 +93,10 @@ pub fn event(
         Kind::Srt => (String::new(), String::new()),
     };
     let Cleaned { text, pos, karaoke } = clean(&payload[at..], kind)?;
+    let raw = match kind {
+        Kind::Ass | Kind::Ssa => payload.split_once(',').map_or("", |(_, rest)| rest),
+        Kind::Srt => &payload,
+    };
     Some(Event {
         track,
         start_ms,
@@ -99,6 +106,7 @@ pub fn event(
         text,
         pos,
         karaoke,
+        raw: raw.to_string(),
     })
 }
 
@@ -755,6 +763,19 @@ mod tests {
             ..ass(0, 0, 1, "D", "")
         };
         assert_eq!(event(0, Kind::Ass, &short, 1_000_000, None), None);
+    }
+
+    #[test]
+    fn an_events_raw_text_is_all_but_its_read_order() {
+        let sign = ass(7, 0, 1, "Sign", r"{\pos(1,2)}Hi");
+        let a = event(0, Kind::Ass, &sign, 1_000_000, None).unwrap();
+        assert_eq!(a.raw, r"0,Sign,,0,0,0,,{\pos(1,2)}Hi");
+        let srt = Block {
+            payload: b"<i>Two</i>\nrows".to_vec(),
+            ..ass(0, 0, 1, "", "")
+        };
+        let b = event(0, Kind::Srt, &srt, 1_000_000, None).unwrap();
+        assert_eq!(b.raw, "<i>Two</i>\nrows");
     }
 
     #[test]

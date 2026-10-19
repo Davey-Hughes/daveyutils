@@ -12,53 +12,70 @@ Style: FX,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:00.50,0:00:07.25,Default,,0,0,0,,Line 0 on the cut.
+Dialogue: 0,0:00:02.50,0:00:04.50,Default,,0,0,0,,Sign 0.
 Dialogue: 0,0:00:07.50,0:00:14.50,Default,,0,0,0,,Line 1 on the cut.
 Dialogue: 0,0:00:10.50,0:00:13.50,Default,,0,0,0,,Line 1 between cuts.
 Dialogue: 0,0:00:14.50,0:00:21.25,Default,,0,0,0,,Line 2 on the cut.
+Dialogue: 0,0:00:16.50,0:00:18.50,Default,,0,0,0,,Sign 2.
 Dialogue: 0,0:00:21.50,0:00:28.50,Default,,0,0,0,,Line 3 on the cut.
 Dialogue: 0,0:00:24.50,0:00:27.50,Default,,0,0,0,,Line 3 between cuts.
 Dialogue: 0,0:00:28.50,0:00:35.25,Default,,0,0,0,,Line 4 on the cut.
+Dialogue: 0,0:00:30.50,0:00:32.50,Default,,0,0,0,,Sign 4.
 Dialogue: 0,0:00:35.50,0:00:42.50,Default,,0,0,0,,Line 5 on the cut.
 Dialogue: 0,0:00:38.50,0:00:41.50,Default,,0,0,0,,Line 5 between cuts.
 Dialogue: 0,0:00:42.50,0:00:49.25,Default,,0,0,0,,Line 6 on the cut.
+Dialogue: 0,0:00:44.50,0:00:46.50,Default,,0,0,0,,Sign 6.
 Dialogue: 0,0:00:49.50,0:00:56.50,Default,,0,0,0,,Line 7 on the cut.
 Dialogue: 0,0:00:52.50,0:00:55.50,Default,,0,0,0,,Line 7 between cuts.
 Dialogue: 0,0:00:56.50,0:01:03.25,Default,,0,0,0,,Line 8 on the cut.
+Dialogue: 0,0:00:58.50,0:01:00.50,Default,,0,0,0,,Sign 8.
 Dialogue: 0,0:01:03.50,0:01:10.50,Default,,0,0,0,,Line 9 on the cut.
 Dialogue: 0,0:01:06.50,0:01:09.50,Default,,0,0,0,,Line 9 between cuts.
 Dialogue: 0,0:01:10.50,0:01:17.25,Default,,0,0,0,,Line 10 on the cut.
+Dialogue: 0,0:01:12.50,0:01:14.50,Default,,0,0,0,,Sign 10.
 Dialogue: 0,0:01:17.50,0:01:24.50,Default,,0,0,0,,Line 11 on the cut.
 Dialogue: 0,0:01:20.50,0:01:23.50,Default,,0,0,0,,Line 11 between cuts.
 Dialogue: 0,0:01:24.50,0:01:31.25,Default,,0,0,0,,Line 12 on the cut.
+Dialogue: 0,0:01:26.50,0:01:28.50,Default,,0,0,0,,Sign 12.
 Dialogue: 0,0:01:31.50,0:01:38.50,Default,,0,0,0,,Line 13 on the cut.
 Dialogue: 0,0:01:34.50,0:01:37.50,Default,,0,0,0,,Line 13 between cuts.
 Dialogue: 0,0:01:38.50,0:01:45.25,Default,,0,0,0,,Line 14 on the cut.
+Dialogue: 0,0:01:40.50,0:01:42.50,Default,,0,0,0,,Sign 14.
 Dialogue: 0,0:01:45.50,0:01:52.50,Default,,0,0,0,,Line 15 on the cut.
 Dialogue: 0,0:01:48.50,0:01:51.50,Default,,0,0,0,,Line 15 between cuts.
 Dialogue: 0,0:01:52.50,0:01:59.25,Default,,0,0,0,,Line 16 on the cut.
+Dialogue: 0,0:01:54.50,0:01:56.50,Default,,0,0,0,,Sign 16.
 Dialogue: 0,0:01:59.50,0:02:06.50,Default,,0,0,0,,Line 17 on the cut.
 Dialogue: 0,0:02:02.50,0:02:05.50,Default,,0,0,0,,Line 17 between cuts.
 Dialogue: 0,0:02:06.50,0:02:13.25,Default,,0,0,0,,Line 18 on the cut.
+Dialogue: 0,0:02:08.50,0:02:10.50,Default,,0,0,0,,Sign 18.
 Dialogue: 0,0:02:13.50,0:02:20.50,Default,,0,0,0,,Line 19 on the cut.
 Dialogue: 0,0:02:16.50,0:02:19.50,Default,,0,0,0,,Line 19 between cuts.
 Dialogue: 0,0:02:20.50,0:02:27.25,Default,,0,0,0,,Line 20 on the cut.
+Dialogue: 0,0:02:22.50,0:02:24.50,Default,,0,0,0,,Sign 20.
 Dialogue: 0,0:02:27.50,0:02:34.50,Default,,0,0,0,,Line 21 on the cut.
 Dialogue: 0,0:02:30.50,0:02:33.50,Default,,0,0,0,,Line 21 between cuts.
 Dialogue: 0,0:02:34.50,0:02:41.25,Default,,0,0,0,,Line 22 on the cut.
+Dialogue: 0,0:02:36.50,0:02:38.50,Default,,0,0,0,,Sign 22.
 Dialogue: 0,0:02:41.50,0:02:48.50,Default,,0,0,0,,Line 23 on the cut.
 Dialogue: 0,0:02:44.50,0:02:47.50,Default,,0,0,0,,Line 23 between cuts.
 Dialogue: 0,0:02:48.50,0:02:55.25,Default,,0,0,0,,Line 24 on the cut.
+Dialogue: 0,0:02:50.50,0:02:52.50,Default,,0,0,0,,Sign 24.
 Dialogue: 0,0:02:55.50,0:03:02.50,Default,,0,0,0,,Line 25 on the cut.
 Dialogue: 0,0:02:58.50,0:03:01.50,Default,,0,0,0,,Line 25 between cuts.
 Dialogue: 0,0:03:02.50,0:03:09.25,Default,,0,0,0,,Line 26 on the cut.
+Dialogue: 0,0:03:04.50,0:03:06.50,Default,,0,0,0,,Sign 26.
 Dialogue: 0,0:03:09.50,0:03:16.50,Default,,0,0,0,,Line 27 on the cut.
 Dialogue: 0,0:03:12.50,0:03:15.50,Default,,0,0,0,,Line 27 between cuts.
 Dialogue: 0,0:03:16.50,0:03:23.25,Default,,0,0,0,,Line 28 on the cut.
+Dialogue: 0,0:03:18.50,0:03:20.50,Default,,0,0,0,,Sign 28.
 Dialogue: 0,0:03:23.50,0:03:30.50,Default,,0,0,0,,Line 29 on the cut.
 Dialogue: 0,0:03:26.50,0:03:29.50,Default,,0,0,0,,Line 29 between cuts.
 Dialogue: 0,0:03:30.50,0:03:37.25,Default,,0,0,0,,Line 30 on the cut.
+Dialogue: 0,0:03:32.50,0:03:34.50,Default,,0,0,0,,Sign 30.
 Dialogue: 0,0:03:37.50,0:03:44.50,Default,,0,0,0,,Line 31 on the cut.
 Dialogue: 0,0:03:40.50,0:03:43.50,Default,,0,0,0,,Line 31 between cuts.
 Dialogue: 0,0:03:44.50,0:03:51.25,Default,,0,0,0,,Line 32 on the cut.
+Dialogue: 0,0:03:46.50,0:03:48.50,Default,,0,0,0,,Sign 32.
 Dialogue: 0,0:03:51.50,0:03:58.50,Default,,0,0,0,,Line 33 on the cut.
 Dialogue: 0,0:03:54.50,0:03:57.50,Default,,0,0,0,,Line 33 between cuts.

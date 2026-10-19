@@ -93,6 +93,7 @@ fn records(path: &Path, lines: &[Line], first: u64, rejected: u64) -> Vec<Record
                 .collect(),
             before: vec![],
             after: vec![],
+            timing: None,
         }));
         out.push(Record::Decision(Decision {
             finding: id,

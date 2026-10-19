@@ -99,6 +99,14 @@ impl Backend {
             chunk_lines: CHUNK_LINES,
         }
     }
+
+    /// The backend a run file records by its label.
+    pub fn from_label(label: &str) -> Result<Backend, String> {
+        match label.strip_prefix("cmd:") {
+            Some(command) => Ok(Backend::shell(command)),
+            None => Backend::preset(label),
+        }
+    }
 }
 
 const INSTRUCTIONS: &str = "\
@@ -427,6 +435,24 @@ mod tests {
             Backend::shell("my-llm --x").argv,
             ["sh", "-c", "my-llm --x"]
         );
+    }
+
+    #[test]
+    fn a_backend_comes_back_from_the_label_a_run_records() {
+        for label in [
+            "claude",
+            "gpt",
+            "ollama:gemma4:12b-it-qat",
+            "cmd:my-llm --x",
+        ] {
+            let b = Backend::from_label(label).unwrap();
+            assert_eq!(b.label, label);
+        }
+        assert_eq!(
+            Backend::from_label("cmd:my-llm --x").unwrap().argv,
+            Backend::shell("my-llm --x").argv
+        );
+        assert!(Backend::from_label("gemini").is_err());
     }
 
     #[test]

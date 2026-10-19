@@ -129,11 +129,13 @@ mux -o "$out/multi.mkv" "$src/video.mkv" \
 grep -v '^Comment:' "$src/a.ass" | grep -v '^Dialogue:' >"$src/empty.ass"
 mux -o "$out/empty.mkv" "$src/video.mkv" --language 0:eng --track-name '0:English Full' "$src/empty.ass"
 
-# What `subcheck timing` is tested on: a 2 fps video with a keyframe every 7 s (14 frames), and three
+# What `subcheck timing` is tested on: a 2 fps video with a keyframe every 7 s (14 frames), and four
 # tracks against it. Dialogue that starts on every keyframe and ends on the next, half the lines on
 # the cut's own time and half half a frame before it (Aegisub's way), with lines between them that
-# end 2 frames before a cut; the same script muxed one frame (500 ms) late; and karaoke and effects
-# only, with no style timed to the cuts.
+# end 2 frames before a cut, and signs in mid-shot, nowhere near a cut; the same script muxed one
+# frame (500 ms) late; karaoke and effects only, with no style timed to the cuts; and the signs on
+# their own, muxed late as well: too far from the cuts for a verdict, which their lines shared with
+# the late track give.
 ass_time() { printf '%d:%02d:%02d.%02d' $(($1 / 360000)) $(($1 / 6000 % 60)) $(($1 / 100 % 60)) $(($1 % 100)); }
 timing_header() {
   cat <<'EOF'
@@ -160,6 +162,8 @@ EOF
     printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,Line %d on the cut.\n' "$(ass_time $start)" "$(ass_time $end)" "$i"
     if ((i % 2)); then
       printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,Line %d between cuts.\n' "$(ass_time $((start + 300)))" "$(ass_time $((start + 600)))" "$i"
+    else
+      printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,Sign %d.\n' "$(ass_time $((start + 200)))" "$(ass_time $((start + 400)))" "$i"
     fi
   done
 } >"$src/timing.ass"
@@ -174,13 +178,18 @@ EOF
     printf 'Dialogue: 0,%s,%s,FX,,0,0,0,,Effect %d\n' "$(ass_time $(((k + 5) * 700 + (k % 7 - 3) * 50)))" "$(ass_time $(((k + 5) * 700 + 300)))" "$k"
   done
 } >"$src/timing-karaoke.ass"
+{
+  timing_header
+  grep ',Sign [0-9]*\.$' "$src/timing.ass"
+} >"$src/timing-signs.ass"
 ffmpeg -nostdin -loglevel error -y -f lavfi -i color=c=black:s=64x36:r=2:d=240 \
   -c:v libx264 -preset ultrafast -crf 51 -g 14 -sc_threshold 0 -threads 1 \
   -fflags +bitexact -flags:v +bitexact "$src/video-2fps.mkv"
 mux -o "$out/timing.mkv" "$src/video-2fps.mkv" \
   --language 0:eng --track-name '0:Dialogue in sync' "$src/timing.ass" \
   --language 0:eng --track-name '0:Dialogue a frame late' --default-track-flag 0:no --sync 0:500 "$src/timing.ass" \
-  --language 0:eng --track-name '0:Karaoke and effects' --default-track-flag 0:no "$src/timing-karaoke.ass"
+  --language 0:eng --track-name '0:Karaoke and effects' --default-track-flag 0:no "$src/timing-karaoke.ass" \
+  --language 0:eng --track-name '0:Signs a frame late' --default-track-flag 0:no --sync 0:500 "$src/timing-signs.ass"
 
 # What `subcheck apply` is tested on: everything a remux must keep (a title, chapters, an attachment,
 # an audio track with the commentary flag, a forced zlib track, a hearing-impaired SRT track) and a

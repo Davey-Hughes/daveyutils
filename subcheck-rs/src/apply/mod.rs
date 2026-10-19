@@ -19,7 +19,7 @@ use crate::group;
 use crate::list::shell_quote;
 use crate::mkv::{self, Layout, Track};
 use crate::review::model::changed;
-use crate::store::{self, Applied, Record, RunWriter};
+use crate::store::{self, Applied, Record, RunWriter, State};
 use crate::subs::{self, Kind};
 use crate::text::timestamp;
 use patch::{Fix, Outcome};
@@ -76,6 +76,7 @@ pub fn run(
 ) -> anyhow::Result<Summary> {
     let run = store::read_run(run_path)?;
     let accepted = patch::fixes(&run);
+    note_timing(&run, out)?;
     let mut summary = Summary::default();
     if accepted.is_empty() {
         writeln!(out, "No accepted fixes in run {}.", run.name)?;
@@ -171,6 +172,23 @@ pub fn run(
         )?;
     }
     Ok(summary)
+}
+
+/// Says how many accepted timing fixes there are, which apply leaves alone: it does not shift
+/// tracks yet.
+fn note_timing(run: &store::Run, out: &mut impl Write) -> std::io::Result<()> {
+    let n = run
+        .findings
+        .iter()
+        .filter(|f| f.timing.is_some() && run.state_of(f.id) == State::Accepted)
+        .count();
+    if n > 0 {
+        writeln!(
+            out,
+            "{n} accepted timing fixes left alone: apply does not shift tracks yet."
+        )?;
+    }
+    Ok(())
 }
 
 /// What each file's fixed tracks are named for: its stem, unless another file in the run has the

@@ -59,6 +59,27 @@ pub struct RunHeader {
     pub command: Vec<String>,
     pub prompt_version: u32,
     pub version: String,
+    /// The languages checked, as given (`scan --lang`). Empty in runs from before it was kept.
+    #[serde(default)]
+    pub langs: Vec<String>,
+}
+
+/// One of the checks `scan` makes of a file.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Check {
+    /// Proofreading by the LLM.
+    #[default]
+    Llm,
+    /// Tracks shifted by whole frames (`timing`).
+    Timing,
+}
+
+/// The checks of a file record from before they were kept: the LLM's only.
+fn llm_only() -> Vec<Check> {
+    vec![Check::Llm]
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -75,6 +96,10 @@ pub struct FileRecord {
     /// Left out of the JSON otherwise, so run files from before it read the same.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<Truncated>,
+    /// The checks made of it. A later record for the same path replaces this one (a check added
+    /// by `scan --run`, or a failed file checked again).
+    #[serde(default = "llm_only")]
+    pub checks: Vec<Check>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -105,6 +130,71 @@ pub struct Finding {
     /// Up to two lines on either side, in time order, for context.
     pub before: Vec<String>,
     pub after: Vec<String>,
+    /// A timing finding's fix (source `timing`). Left out of other findings' JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<TimingFix>,
+}
+
+/// A track shifted by whole frames, and how to put it back: every stretch moved by its frames.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimingFix {
+    /// mkvmerge track ID.
+    pub track: usize,
+    /// The video's frame duration.
+    pub frame_ns: u64,
+    /// One for a whole-track shift; a partial track's in time order, in-sync ones included.
+    pub stretches: Vec<FixStretch>,
+    /// Lines of a partial track left where they are: their times point both ways.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unshifted: Vec<LineRef>,
+    pub basis: Basis,
+}
+
+/// Part of a track at one offset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixStretch {
+    /// The first line's start; `None` from the start of the track.
+    pub from_ms: Option<i64>,
+    /// The last line's end; `None` to the end of the track.
+    pub to_ms: Option<i64>,
+    /// How late (positive) or early its lines are; 0 for a stretch in sync.
+    pub frames: i64,
+    /// The first and last lines it moves, as the scan read them; `None` in a stretch in sync or
+    /// one with no lines of this track.
+    pub first: Option<LineRef>,
+    pub last: Option<LineRef>,
+    /// The time of the frame that shows the error, for `o`: a cut's first frame for a late
+    /// stretch, the frame before the cut for an early one.
+    pub frame_ms: Option<i64>,
+}
+
+/// One event, by its raw text (all but its ReadOrder) and times.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineRef {
+    pub raw: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// What a timing finding rests on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Basis {
+    /// The track's own times against the cuts.
+    Cuts {
+        times: usize,
+        /// Windows at the offset (0 when the whole track decided it), of `windows`.
+        agreeing: usize,
+        windows: usize,
+    },
+    /// Its lines shared with another track of the file, `gap` frames after it.
+    Lines {
+        source: usize,
+        /// Distinct shared times, and how many of them sit at `gap`.
+        shared: usize,
+        at_gap: usize,
+        gap: i64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,19 +251,32 @@ impl RunWriter {
         unreachable!("1.. never ends")
     }
 
-    /// An existing run file, to append decisions to.
+    /// An existing run file, to append decisions to. A scan writing to it holds its lock and ends
+    /// its own lines, so a line is ended here only when no one holds the lock.
     pub fn open(path: &Path) -> io::Result<RunWriter> {
-        let mut file = OpenOptions::new().read(true).append(true).open(path)?;
-        // A scan cut off mid-write leaves a last line with no newline. End it, or the first record
-        // appended here would join that broken line and be lost with it.
-        if file.metadata()?.len() > 0 {
-            let mut last = [0u8];
-            file.seek(SeekFrom::End(-1))?;
-            file.read_exact(&mut last)?;
-            if last[0] != b'\n' {
-                file.write_all(b"\n")?;
+        let mut w = RunWriter::open_as_is(path)?;
+        match w.try_lock()? {
+            Lock::Held => {
+                w.end_last_line()?;
+                w.unlock()?;
             }
+            Lock::NoLocks => w.end_last_line()?,
+            Lock::Busy => {}
         }
+        Ok(w)
+    }
+
+    /// An existing run file, taken for this process alone (see [`RunWriter::lock`]) before
+    /// anything is written to it: a scan adding to a run.
+    pub fn open_locked(path: &Path) -> io::Result<RunWriter> {
+        let mut w = RunWriter::open_as_is(path)?;
+        w.lock()?;
+        w.end_last_line()?;
+        Ok(w)
+    }
+
+    fn open_as_is(path: &Path) -> io::Result<RunWriter> {
+        let file = OpenOptions::new().read(true).append(true).open(path)?;
         let name = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -183,6 +286,59 @@ impl RunWriter {
             path: path.to_path_buf(),
             file,
         })
+    }
+
+    /// A scan cut off mid-write leaves a last line with no newline. End it, or the first record
+    /// appended here would join that broken line and be lost with it.
+    fn end_last_line(&mut self) -> io::Result<()> {
+        if self.file.metadata()?.len() > 0 {
+            let mut last = [0u8];
+            self.file.seek(SeekFrom::End(-1))?;
+            self.file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                self.file.write_all(b"\n")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the run for this process alone (an advisory `flock`, let go when the file closes), so
+    /// two scans never number findings in one run at once. Review and apply append without it:
+    /// they number nothing.
+    pub fn lock(&self) -> io::Result<()> {
+        match self.try_lock()? {
+            Lock::Held | Lock::NoLocks => Ok(()),
+            Lock::Busy => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("run {} is being written to by another subcheck", self.name),
+            )),
+        }
+    }
+
+    /// The lock if no one else holds it. On a filesystem with no locks (some network mounts)
+    /// there is none to take, and that is no error.
+    fn try_lock(&self) -> io::Result<Lock> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor this RunWriter owns, open for as long as it lives.
+        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Lock::Held);
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EWOULDBLOCK) => Ok(Lock::Busy),
+            Some(libc::ENOLCK | libc::EOPNOTSUPP) => Ok(Lock::NoLocks),
+            _ => Err(e),
+        }
+    }
+
+    fn unlock(&self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: as in try_lock.
+        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     /// Append records as JSON lines and flush them, so a crash loses nothing already written.
@@ -195,6 +351,15 @@ impl RunWriter {
         self.file.write_all(&buf)?;
         self.file.flush()
     }
+}
+
+/// What asking for a run file's lock got.
+enum Lock {
+    Held,
+    /// Another subcheck holds it.
+    Busy,
+    /// The filesystem has no locks.
+    NoLocks,
 }
 
 /// A run file read back: its findings with the latest decision for each.
@@ -218,6 +383,15 @@ impl Run {
             .get(&finding)
             .map_or(State::Pending, |d| d.state)
     }
+
+    /// The ID for the next finding appended: one past the highest so far.
+    pub fn next_finding_id(&self) -> u64 {
+        self.findings
+            .iter()
+            .map(|f| f.id)
+            .max()
+            .map_or(1, |n| n + 1)
+    }
 }
 
 pub fn read_run(path: &Path) -> io::Result<Run> {
@@ -228,6 +402,8 @@ pub fn read_run(path: &Path) -> io::Result<Run> {
             .unwrap_or_default(),
         ..Run::default()
     };
+    // Where each path's file record is in `run.files`.
+    let mut at: HashMap<String, usize> = HashMap::new();
     for line in BufReader::new(File::open(path)?).lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -235,7 +411,15 @@ pub fn read_run(path: &Path) -> io::Result<Run> {
         }
         match serde_json::from_str::<Record>(&line) {
             Ok(Record::Run(h)) => run.header = Some(h),
-            Ok(Record::File(f)) => run.files.push(f),
+            // The latest record for a path wins, in the place of the first.
+            Ok(Record::File(f)) => {
+                if let Some(&i) = at.get(&f.path) {
+                    run.files[i] = f;
+                } else {
+                    at.insert(f.path.clone(), run.files.len());
+                    run.files.push(f);
+                }
+            }
             Ok(Record::Finding(f)) => run.findings.push(f),
             Ok(Record::Decision(d)) => {
                 run.decisions.insert(d.finding, d);
@@ -305,25 +489,39 @@ fn run_order(path: &Path) -> (String, u32) {
 }
 
 /// What a file was checked with. A change in any of it is a different check, so the file is
-/// checked again: another LLM, other languages, or a new prompt.
+/// checked again: another check, LLM or set of languages, or a new prompt or timing rules.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CheckedWith {
+    /// An entry from before checks were kept is the LLM's.
+    pub check: Check,
+    /// The LLM; empty for the timing check.
     pub backend: String,
     /// Sorted, without repeats: `--lang eng --lang und` and `--lang und --lang eng` are one check.
     pub langs: Vec<String>,
+    /// The LLM's prompt version, or the timing rules' version.
     pub prompt_version: u32,
 }
 
 impl CheckedWith {
+    /// The LLM check.
     pub fn new(backend: &str, langs: &[String], prompt_version: u32) -> CheckedWith {
         let mut langs = langs.to_vec();
         langs.sort();
         langs.dedup();
         CheckedWith {
+            check: Check::Llm,
             backend: backend.to_string(),
             langs,
             prompt_version,
+        }
+    }
+
+    /// The timing check, by the rules of `version`.
+    pub fn timing(langs: &[String], version: u32) -> CheckedWith {
+        CheckedWith {
+            check: Check::Timing,
+            ..CheckedWith::new("", langs, version)
         }
     }
 }
@@ -344,7 +542,8 @@ pub struct CacheEntry {
 /// same [`CheckedWith`].
 #[derive(Debug, Default)]
 pub struct Cache {
-    entries: HashMap<(String, CheckedWith), (u64, Timestamp)>,
+    /// The size, mtime and run of each file checked, by path and what checked it.
+    entries: HashMap<(String, CheckedWith), (u64, Timestamp, String)>,
 }
 
 impl Cache {
@@ -357,14 +556,37 @@ impl Cache {
         };
         for line in BufReader::new(file).lines() {
             if let Ok(e) = serde_json::from_str::<CacheEntry>(&line?) {
-                cache.entries.insert((e.path, e.with), (e.size, e.mtime));
+                cache
+                    .entries
+                    .insert((e.path, e.with), (e.size, e.mtime, e.run));
             }
         }
         Ok(cache)
     }
 
     pub fn is_fresh(&self, path: &str, size: u64, mtime: Timestamp, with: &CheckedWith) -> bool {
-        self.entries.get(&(path.to_string(), with.clone())) == Some(&(size, mtime))
+        self.run_of(path, size, mtime, with).is_some()
+    }
+
+    /// The languages run `run`'s LLM checks were made with, as the cache recorded them: a run from
+    /// before runs kept their languages says so nowhere else.
+    pub fn langs_of(&self, run: &str) -> Option<Vec<String>> {
+        self.entries
+            .iter()
+            .find(|((_, with), (_, _, r))| r == run && with.check == Check::Llm)
+            .map(|((_, with), _)| with.langs.clone())
+    }
+
+    /// The run that checked the file as `with` says, if it is unchanged since.
+    pub fn run_of(
+        &self,
+        path: &str,
+        size: u64,
+        mtime: Timestamp,
+        with: &CheckedWith,
+    ) -> Option<&str> {
+        let (s, m, run) = self.entries.get(&(path.to_string(), with.clone()))?;
+        (*s == size && *m == mtime).then_some(run.as_str())
     }
 
     pub fn append(state: &Path, entry: &CacheEntry) -> io::Result<()> {
@@ -434,6 +656,7 @@ mod tests {
             }],
             before: vec![],
             after: vec!["next".into()],
+            timing: None,
         }
     }
 
@@ -476,6 +699,7 @@ mod tests {
             tracks: vec![],
             lines: 0,
             truncated,
+            checks: vec![Check::Llm],
         };
         // Whole files are written as before, so run files from before the field read the same.
         let whole = serde_json::to_string(&Record::File(file(None))).unwrap();
@@ -494,6 +718,110 @@ mod tests {
             "{line}"
         );
         assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), cut);
+    }
+
+    #[test]
+    fn a_timing_finding_round_trips_and_other_findings_are_written_as_before() {
+        let line = |start_ms| LineRef {
+            raw: "0,D,,0,0,0,,Line.".into(),
+            start_ms,
+            end_ms: start_ms + 1000,
+        };
+        let timing = Finding {
+            style: String::new(),
+            original: "1 frame late".into(),
+            suggestion: "shift 1 frame earlier".into(),
+            reason: "cuts: 289 times, +1 in 7 of 9 windows".into(),
+            source: "timing".into(),
+            after: vec![],
+            timing: Some(TimingFix {
+                track: 5,
+                frame_ns: 41_708_333,
+                stretches: vec![FixStretch {
+                    from_ms: None,
+                    to_ms: None,
+                    frames: 1,
+                    first: Some(line(1000)),
+                    last: Some(line(9000)),
+                    frame_ms: Some(1_091_924),
+                }],
+                unshifted: vec![],
+                basis: Basis::Cuts {
+                    times: 289,
+                    agreeing: 7,
+                    windows: 9,
+                },
+            }),
+            ..finding(1)
+        };
+        let json = serde_json::to_string(&Record::Finding(timing.clone())).unwrap();
+        assert!(
+            json.contains(r#""basis":{"kind":"cuts","times":289,"agreeing":7,"windows":9}"#),
+            "{json}"
+        );
+        assert!(!json.contains("unshifted"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<Record>(&json).unwrap(),
+            Record::Finding(timing)
+        );
+        let plain = serde_json::to_string(&Record::Finding(finding(2))).unwrap();
+        assert!(!plain.contains("timing"), "{plain}");
+    }
+
+    #[test]
+    fn records_from_before_checks_were_kept_read_as_the_llms() {
+        let file = r#"{"type":"file","path":"/m/a.mkv","size":1,"mtime":"1970-01-01T00:00:00Z","error":null,"tracks":[],"lines":0}"#;
+        let Ok(Record::File(f)) = serde_json::from_str::<Record>(file) else {
+            panic!("{file}")
+        };
+        assert_eq!(f.checks, [Check::Llm]);
+        let header = r#"{"type":"run","started":"1970-01-01T00:00:00Z","backend":"claude","command":[],"prompt_version":1,"version":"0.1.0"}"#;
+        let Ok(Record::Run(h)) = serde_json::from_str::<Record>(header) else {
+            panic!("{header}")
+        };
+        assert_eq!(h.langs, Vec::<String>::new());
+        let entry = r#"{"path":"/m/a.mkv","size":1,"mtime":"1970-01-01T00:00:00Z","backend":"claude","langs":["eng"],"prompt_version":1,"run":"r"}"#;
+        let e: CacheEntry = serde_json::from_str(entry).unwrap();
+        assert_eq!(e.with, CheckedWith::new("claude", &["eng".into()], 1));
+    }
+
+    #[test]
+    fn the_latest_file_record_for_a_path_wins_and_ids_continue_past_the_highest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = RunWriter::create(dir.path()).unwrap();
+        let file = |path: &str, checks: Vec<Check>| FileRecord {
+            path: path.into(),
+            size: 1,
+            mtime: Timestamp::UNIX_EPOCH,
+            error: None,
+            tracks: vec![],
+            lines: 0,
+            truncated: None,
+            checks,
+        };
+        w.append(&[
+            Record::File(file("/m/a.mkv", vec![Check::Llm])),
+            Record::File(file("/m/b.mkv", vec![Check::Llm])),
+            Record::Finding(finding(7)),
+            Record::Finding(finding(3)),
+            Record::File(file("/m/a.mkv", vec![Check::Llm, Check::Timing])),
+        ])
+        .unwrap();
+        let run = read_run(&w.path).unwrap();
+        let files: Vec<(&str, &[Check])> = run
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.checks.as_slice()))
+            .collect();
+        assert_eq!(
+            files,
+            [
+                ("/m/a.mkv", [Check::Llm, Check::Timing].as_slice()),
+                ("/m/b.mkv", [Check::Llm].as_slice()),
+            ]
+        );
+        assert_eq!(run.next_finding_id(), 8);
+        assert_eq!(Run::default().next_finding_id(), 1);
     }
 
     #[test]
@@ -582,6 +910,40 @@ mod tests {
     }
 
     #[test]
+    fn a_run_locked_by_one_writer_is_refused_to_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = RunWriter::create(dir.path()).unwrap();
+        first.lock().unwrap();
+        let second = RunWriter::open(&first.path).unwrap();
+        let e = second.lock().unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!("run {} is being written to by another subcheck", first.name)
+        );
+        drop(first);
+        second.lock().unwrap();
+    }
+
+    #[test]
+    fn a_locked_run_is_left_as_it_is_by_another_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = RunWriter::create(dir.path()).unwrap();
+        first.lock().unwrap();
+        // The first scan is part way through a record.
+        OpenOptions::new()
+            .append(true)
+            .open(&first.path)
+            .unwrap()
+            .write_all(b"{\"type\":\"fin")
+            .unwrap();
+        assert!(RunWriter::open_locked(&first.path).is_err());
+        // Nor does review or apply opening it.
+        RunWriter::open(&first.path).unwrap();
+        // Nothing was written: no newline in the middle of the record.
+        assert_eq!(fs::read(&first.path).unwrap(), b"{\"type\":\"fin");
+    }
+
+    #[test]
     fn runs_started_in_the_same_second_get_distinct_names() {
         let dir = tempfile::tempdir().unwrap();
         let a = RunWriter::create(dir.path()).unwrap();
@@ -647,6 +1009,7 @@ mod tests {
         Cache::append(dir.path(), &entry).unwrap();
         let cache = Cache::load(dir.path()).unwrap();
         assert!(cache.is_fresh("/m/a.mkv", 10, t, &with));
+        assert_eq!(cache.run_of("/m/a.mkv", 10, t, &with), Some("r"));
         assert!(!cache.is_fresh("/m/a.mkv", 11, t, &with));
         let later: Timestamp = "2026-10-17T10:00:01Z".parse().unwrap();
         assert!(!cache.is_fresh("/m/a.mkv", 10, later, &with));
@@ -661,5 +1024,7 @@ mod tests {
         // Languages are a set: order and repeats do not matter.
         let same = CheckedWith::new("claude", &["eng".into(), "eng".into()], 1);
         assert!(cache.is_fresh("/m/a.mkv", 10, t, &same));
+        // The timing check of the same file is a check of its own.
+        assert!(!cache.is_fresh("/m/a.mkv", 10, t, &CheckedWith::timing(&["eng".into()], 1)));
     }
 }

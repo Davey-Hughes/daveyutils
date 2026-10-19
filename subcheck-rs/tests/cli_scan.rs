@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use common::fixture;
-use subcheck::store::{self, State};
+use subcheck::store::{self, Check, State};
 
 struct Env {
     state: tempfile::TempDir,
@@ -108,6 +108,361 @@ fn scan_records_the_planted_typos() {
     assert_eq!((file.error.as_deref(), file.lines), (None, 4));
     assert_eq!(file.tracks[0].sid, 1);
     assert_eq!(file.tracks[0].read, "cues");
+}
+
+#[test]
+fn scan_records_timing_findings_beside_the_llms() {
+    let env = Env::new();
+    let out = env.subcheck(&["scan", &path("timing.mkv")], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("unchanged since an earlier scan; 2 findings (2 timing)"),
+        "{}",
+        stderr(&out)
+    );
+    let run = env.newest_run();
+    let found: Vec<(usize, &str, &str, &str)> = run
+        .findings
+        .iter()
+        .map(|f| {
+            (
+                f.timing.as_ref().unwrap().track,
+                f.original.as_str(),
+                f.suggestion.as_str(),
+                f.reason.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                2,
+                "1 frame late",
+                "shift 1 frame earlier",
+                "cuts: 85 times, +1 in 2 of 2 windows"
+            ),
+            (
+                4,
+                "1 frame late",
+                "shift 1 frame earlier",
+                "shares 34 times with track 2, all at the same frame"
+            ),
+        ]
+    );
+    assert!(run.findings.iter().all(|f| f.source == "timing"));
+    assert_eq!(run.files[0].checks, [Check::Llm, Check::Timing]);
+    assert_eq!(run.header.unwrap().langs, ["eng"]);
+}
+
+#[test]
+fn a_file_checked_before_the_timing_check_existed_gets_that_check_alone() {
+    let env = Env::new();
+    assert!(
+        env.subcheck(&["scan", &path("timing.mkv")], &[])
+            .status
+            .success()
+    );
+    // The cache as a scan from before the timing check left it: the LLM's entries only.
+    let cache = env.state.path().join("subcheck/cache.jsonl");
+    let text = std::fs::read_to_string(&cache).unwrap();
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.contains(r#""check":"timing""#))
+        .collect();
+    std::fs::write(&cache, kept.join("\n") + "\n").unwrap();
+    let calls = env.calls().len();
+
+    let out = env.subcheck(&["scan", &path("timing.mkv")], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("timing.mkv: timing only, 2 findings"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.calls().len(), calls, "the LLM check is cached");
+    let run = env.newest_run();
+    assert_eq!(run.files[0].checks, [Check::Timing]);
+    assert_eq!(run.findings.len(), 2);
+
+    let out = env.subcheck(&["scan", &path("timing.mkv")], &[]);
+    assert!(
+        stderr(&out).contains("Nothing to check: 1 file unchanged since an earlier scan"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// The run file's lines as a scan from before the timing check wrote them: no timing findings,
+/// file records without their checks, a run record without its languages.
+fn as_before_timing(run: &Path) {
+    let text = std::fs::read_to_string(run).unwrap();
+    let kept: Vec<String> = text
+        .lines()
+        .filter(|l| !l.contains(r#""source":"timing""#))
+        .map(|l| {
+            l.replace(r#","checks":["llm","timing"]"#, "")
+                .replace(r#","langs":["eng"]"#, "")
+        })
+        .collect();
+    std::fs::write(run, kept.join("\n") + "\n").unwrap();
+}
+
+#[test]
+fn scan_run_adds_only_the_checks_a_run_lacks() {
+    let env = Env::new();
+    let files = [path("timing.mkv"), path("typos.mkv")];
+    let scan = |extra: &[&str]| {
+        let mut args = vec!["scan", files[0].as_str(), files[1].as_str()];
+        args.extend(extra);
+        env.subcheck(&args, &[])
+    };
+    assert!(scan(&[]).status.success());
+    let run_path = store::find_run(&env.state.path().join("subcheck"), None).unwrap();
+    as_before_timing(&run_path);
+    let run = env.newest_run();
+    // Two LLM workers: either file can finish first and take the first IDs.
+    let last_id = run.findings.iter().map(|f| f.id).max().unwrap();
+    assert_eq!(run.findings.len(), 2);
+    let calls = env.calls().len();
+
+    let out = scan(&["--run", &run.name]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(&format!(
+            "run {}: added to 2 files, 0 failed; 2 findings (2 timing)",
+            run.name
+        )),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        env.calls().len(),
+        calls,
+        "no LLM call: the run has that check"
+    );
+    let run = env.newest_run();
+    let added: Vec<(u64, &str)> = run.findings[2..]
+        .iter()
+        .map(|f| (f.id, f.source.as_str()))
+        .collect();
+    assert_eq!(added, [(last_id + 1, "timing"), (last_id + 2, "timing")]);
+    assert!(
+        run.files
+            .iter()
+            .all(|f| f.checks == [Check::Llm, Check::Timing])
+    );
+    // typos.mkv's record keeps the lines its LLM check counted.
+    let typos = run.files.iter().find(|f| f.path.ends_with("typos.mkv"));
+    assert_eq!(typos.unwrap().lines, 4);
+    // The run now says which languages it checked, for the next --run.
+    assert_eq!(run.header.unwrap().langs, ["eng"]);
+
+    let out = scan(&["--run", &run.name]);
+    assert!(
+        stderr(&out).contains(&format!(
+            "Nothing to add to run {}: 2 files with every check already",
+            run.name
+        )),
+        "{}",
+        stderr(&out)
+    );
+    let runs = std::fs::read_dir(env.state.path().join("subcheck/runs"))
+        .unwrap()
+        .count();
+    assert_eq!(runs, 1);
+}
+
+#[test]
+fn scan_run_refuses_another_llm_or_languages_and_leaves_out_a_changed_file() {
+    let env = Env::new();
+    let (_copy, file) = common::copied("timing.mkv");
+    let file = file.to_string_lossy().into_owned();
+    assert!(env.subcheck(&["scan", &file], &[]).status.success());
+    let name = env.newest_run().name;
+
+    let out = env.subcheck(&["scan", &file, "--run", &name, "--force"], &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+
+    // The test harness passes --llm-cmd with the fake LLM's path, so this --llm conflicts with
+    // it; call the binary with --llm alone.
+    let out = Command::new(env!("CARGO_BIN_EXE_subcheck"))
+        .args(["scan", &file, "--run", &name, "--llm", "gpt"])
+        .env("XDG_STATE_HOME", env.state.path())
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&out).contains(&format!("run {name} was scanned with cmd:")),
+        "{}",
+        stderr(&out)
+    );
+    let out = env.subcheck(&["scan", &file, "--run", &name, "--lang", "und"], &[]);
+    assert!(
+        stderr(&out).contains(&format!(
+            "run {name} checked --lang eng; leave out --lang to use it"
+        )),
+        "{}",
+        stderr(&out)
+    );
+
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    let out = env.subcheck(&["scan", &file, "--run", &name], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains(&format!(
+            "{file}: changed since run {name}; scan it into a new run"
+        )),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "Nothing to add to run {name}: 1 file changed since the run"
+        )),
+        "{err}"
+    );
+
+    // A backend this subcheck does not know, with no command recorded, stops a --run only where a
+    // file needs the LLM: here a file new to the run.
+    let run_file = env.state.path().join(format!("subcheck/runs/{name}.jsonl"));
+    let text = std::fs::read_to_string(&run_file).unwrap();
+    let header = text.lines().next().unwrap();
+    let mut gone: serde_json::Value = serde_json::from_str(header).unwrap();
+    gone["backend"] = "gemini".into();
+    gone["command"] = serde_json::json!([]);
+    std::fs::write(&run_file, text.replacen(header, &gone.to_string(), 1)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_subcheck"))
+        .args(["scan", &file, &path("typos.mkv"), "--run", &name])
+        .env("XDG_STATE_HOME", env.state.path())
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&out).contains(&format!(
+            "run {name} was scanned with gemini, which this subcheck does not know"
+        )),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn scan_run_does_not_repeat_an_llm_check_the_cache_has_from_another_run() {
+    let env = Env::new();
+    assert!(
+        env.subcheck(&["scan", &path("typos.mkv")], &[])
+            .status
+            .success()
+    );
+    let first = env.newest_run().name;
+    let runs = env.state.path().join("subcheck/runs");
+    // A run that has the file's timing check but not the LLM's, as a plain scan makes when the
+    // cache has the one and not the other.
+    let text = std::fs::read_to_string(runs.join(format!("{first}.jsonl"))).unwrap();
+    let timing_only: Vec<String> = text
+        .lines()
+        .filter(|l| !l.contains(r#""source":"llm""#))
+        .map(|l| l.replace(r#""checks":["llm","timing"]"#, r#""checks":["timing"]"#))
+        .collect();
+    let other = "2026-01-01T00-00-00";
+    std::fs::write(
+        runs.join(format!("{other}.jsonl")),
+        timing_only.join("\n") + "\n",
+    )
+    .unwrap();
+    let calls = env.calls().len();
+
+    let out = env.subcheck(&["scan", &path("typos.mkv"), "--run", other], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains(&format!(
+            "typos.mkv: its LLM check is in run {first}, unchanged since; not made again"
+        )),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "Nothing to add to run {other}: 1 file with the LLM check in another run"
+        )),
+        "{err}"
+    );
+    assert_eq!(env.calls().len(), calls);
+
+    // A file new to a run: its timing check is added, its LLM check is not, and the file is not
+    // also called left out.
+    let empty = "2026-01-02T00-00-00";
+    let header = timing_only.first().unwrap();
+    std::fs::write(runs.join(format!("{empty}.jsonl")), format!("{header}\n")).unwrap();
+    let out = env.subcheck(&["scan", &path("typos.mkv"), "--run", empty], &[]);
+    let err = stderr(&out);
+    assert!(err.contains("typos.mkv: its LLM check is in run"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "run {empty}: added to 1 file, 0 failed; 0 findings\n"
+        )),
+        "{err}"
+    );
+    assert_eq!(env.calls().len(), calls);
+
+    // Once the run the cache names no longer holds the file's LLM record (its lines lost, or the
+    // run deleted), the LLM check is made.
+    let first_path = runs.join(format!("{first}.jsonl"));
+    let first_text = std::fs::read_to_string(&first_path).unwrap();
+    let first_header = first_text.lines().next().unwrap();
+    std::fs::write(&first_path, format!("{first_header}\n")).unwrap();
+    let out = env.subcheck(&["scan", &path("typos.mkv"), "--run", other], &[]);
+    assert!(
+        stderr(&out).contains(&format!(
+            "run {other}: added to 1 file, 0 failed; 2 findings"
+        )),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.calls().len(), calls + 1);
+}
+
+#[test]
+fn a_failure_adding_a_check_leaves_the_files_record_as_it_was() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root reads a 0o000 file anyway (CI containers run as root)
+    }
+    let env = Env::new();
+    let (_copy, file) = common::copied("timing.mkv");
+    let name = file.to_string_lossy().into_owned();
+    assert!(env.subcheck(&["scan", &name], &[]).status.success());
+    let run_path = store::find_run(&env.state.path().join("subcheck"), None).unwrap();
+    as_before_timing(&run_path);
+    let calls = env.calls().len();
+
+    let mode = |m| std::fs::Permissions::from_mode(m);
+    std::fs::set_permissions(&file, mode(0o000)).unwrap();
+    let run = env.newest_run().name;
+    let out = env.subcheck(&["scan", &name, "--run", &run], &[]);
+    std::fs::set_permissions(&file, mode(0o644)).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("FAILED"), "{}", stderr(&out));
+    let record = &env.newest_run().files[0];
+    assert_eq!(
+        (record.error.as_deref(), record.checks.as_slice()),
+        (None, [Check::Llm].as_slice())
+    );
+
+    // So the next --run adds the timing check alone, and the LLM's is not made again.
+    let out = env.subcheck(&["scan", &name, "--run", &run], &[]);
+    assert!(
+        stderr(&out).contains("added to 1 file, 0 failed; 2 findings (2 timing)"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.calls().len(), calls);
 }
 
 #[test]

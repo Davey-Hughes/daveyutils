@@ -390,7 +390,7 @@ fn words(s: &str) -> Vec<Range<usize>> {
 #[cfg(test)]
 pub mod tests_support {
     use super::{Model, Row};
-    use crate::store::{FileRecord, Finding, Run, TrackRecord};
+    use crate::store::{Check, FileRecord, Finding, Run, TrackRecord};
     use crate::text::Occurrence;
 
     pub fn path(ep: u32) -> String {
@@ -417,6 +417,7 @@ pub mod tests_support {
             ],
             lines: 400,
             truncated: None,
+            checks: vec![Check::Llm],
         }
     }
 
@@ -444,6 +445,7 @@ pub mod tests_support {
             }],
             before: vec!["The line before.".into()],
             after: vec!["The line after.".into()],
+            timing: None,
         }
     }
 

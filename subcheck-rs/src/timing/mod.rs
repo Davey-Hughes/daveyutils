@@ -11,6 +11,14 @@ use std::fmt::Write;
 use crate::mkv::{Layout, TRACK_TYPE_VIDEO};
 use crate::text::{self, Event};
 
+pub mod lines;
+pub mod record;
+pub mod shared;
+
+/// The version of these rules, kept with each file `scan` checks: a file checked by other rules is
+/// checked again. Bump it when a rule or threshold changes what a track's verdict would be.
+pub const RULES_VERSION: u32 = 1;
+
 /// Fewer keyframe Cues than this and there is nothing to measure against.
 const MIN_KEYFRAMES: usize = 10;
 
@@ -111,16 +119,30 @@ pub fn video(layout: &Layout) -> Result<Video, String> {
 /// `start <= frame time < end`, so that frame is the first one at or after the time.
 pub fn frame_offset(video: &Video, time_ms: i64) -> i64 {
     let x = i128::from(time_ms) * 1_000_000;
+    // ceil(d / frame), for a positive frame duration.
+    let d = x - nearest_keyframe(video, time_ms) - SLACK_NS;
+    let frames = -(-d).div_euclid(i128::from(video.frame_ns));
+    i64::try_from(frames).unwrap_or(i64::MAX)
+}
+
+/// The keyframe nearest `time_ms`, in nanoseconds.
+fn nearest_keyframe(video: &Video, time_ms: i64) -> i128 {
+    let x = i128::from(time_ms) * 1_000_000;
     let after = video.keyframes_ns.partition_point(|&k| i128::from(k) < x);
-    let nearest = [after.checked_sub(1), Some(after)]
+    [after.checked_sub(1), Some(after)]
         .into_iter()
         .flatten()
         .filter_map(|i| video.keyframes_ns.get(i))
         .map(|&k| i128::from(k))
         .min_by_key(|k| (k - x).abs())
-        .expect("video() keeps at least MIN_KEYFRAMES keyframes");
-    // ceil(d / frame), for a positive frame duration.
-    let d = x - nearest - SLACK_NS;
+        .expect("video() keeps at least MIN_KEYFRAMES keyframes")
+}
+
+/// The frame on which a line starting or ending at `time_ms` starts or stops showing, counted on
+/// the video's frame grid from its first keyframe. Two times on one frame have the same index.
+pub fn frame_index(video: &Video, time_ms: i64) -> i64 {
+    let first = video.keyframes_ns.first().map_or(0, |&k| i128::from(k));
+    let d = i128::from(time_ms) * 1_000_000 - first - SLACK_NS;
     let frames = -(-d).div_euclid(i128::from(video.frame_ns));
     i64::try_from(frames).unwrap_or(i64::MAX)
 }
@@ -161,6 +183,13 @@ pub struct Analysis {
     pub styles: Vec<StyleCounts>,
     /// The video's, for the fix.
     pub frame_ns: u64,
+    /// Each event's stretch, an index into the verdict's stretches (a shifted or in-sync track is
+    /// one stretch, 0); `None` for an event that stays where it is, and for every event when no
+    /// offset was decided.
+    pub each: Vec<Option<usize>>,
+    /// A partial track's blocks of lines that stay where they are, (start, end) in ms: their times
+    /// point both ways.
+    pub unshifted: Vec<(i64, i64)>,
 }
 
 /// One track's events against the video.
@@ -181,6 +210,14 @@ pub fn analyse(video: &Video, events: &[Event]) -> Analysis {
         [one] => (whole(one.offset), one.windows),
         many => (Verdict::Partial(stretches(&pool, many)), 0),
     };
+    let (verdict, each, unshifted) = match verdict {
+        Verdict::Partial(pooled) => {
+            let m = lines::line_exact(video, events, &pooled);
+            (Verdict::Partial(m.stretches), m.each, m.unshifted)
+        }
+        v @ (Verdict::InSync | Verdict::Shifted(_)) => (v, vec![Some(0); events.len()], Vec::new()),
+        v => (v, vec![None; events.len()], Vec::new()),
+    };
     Analysis {
         verdict,
         times: pool.len(),
@@ -189,6 +226,8 @@ pub fn analyse(video: &Video, events: &[Event]) -> Analysis {
         agreeing,
         styles,
         frame_ns: video.frame_ns,
+        each,
+        unshifted,
     }
 }
 
@@ -398,6 +437,8 @@ pub struct TrackReport {
     pub name: String,
     /// Or what to print in place of a verdict: `unsupported: <reason>`, `cannot read: <error>`.
     pub result: Result<Analysis, String>,
+    /// What its lines shared with another track say.
+    pub lines: Option<shared::Lines>,
 }
 
 /// One file's block: its name, a line per track, the fix or the stretches under a shifted or
@@ -435,13 +476,27 @@ pub fn render(file: &str, tracks: &[TrackReport], verbose: bool) -> String {
         let Ok(a) = &t.result else {
             continue;
         };
-        match &a.verdict {
-            Verdict::Shifted(frames) => {
-                let ms = sync_ms(*frames, a.frame_ns);
-                let _ = writeln!(out, "{indent}fix: mkvmerge --sync {}:{ms}", t.id);
+        out.push_str(&fix(&indent, t.id, &a.verdict, a.frame_ns, &a.unshifted));
+        match &t.lines {
+            Some(shared::Lines::Follows(f)) => {
+                let _ = writeln!(
+                    out,
+                    "{indent}timed {} ({} of {} shared times): {}",
+                    relation(f.gap, f.source),
+                    f.shared.at(f.gap),
+                    f.shared.times,
+                    verdict_label(&f.verdict)
+                );
+                out.push_str(&fix(&indent, t.id, &f.verdict, a.frame_ns, &f.unshifted));
             }
-            Verdict::Partial(stretches) => out.push_str(&ranges(&indent, stretches)),
-            _ => {}
+            Some(shared::Lines::Disagrees { source, says }) => {
+                let _ = writeln!(
+                    out,
+                    "{indent}but its lines shared with track {source} say {}",
+                    verdict_label(says)
+                );
+            }
+            None => {}
         }
         if verbose {
             out.push_str(&style_table(&indent, &a.styles));
@@ -450,14 +505,42 @@ pub fn render(file: &str, tracks: &[TrackReport], verbose: bool) -> String {
     out
 }
 
+/// Under a shifted or partial verdict: the `mkvmerge --sync` fix, or the stretches.
+fn fix(indent: &str, id: usize, v: &Verdict, frame_ns: u64, unshifted: &[(i64, i64)]) -> String {
+    match v {
+        Verdict::Shifted(frames) => {
+            format!(
+                "{indent}fix: mkvmerge --sync {id}:{}\n",
+                sync_ms(*frames, frame_ns)
+            )
+        }
+        Verdict::Partial(stretches) => ranges(indent, stretches, unshifted),
+        _ => String::new(),
+    }
+}
+
+/// "as track 5", "1 frame after track 5", "2 frames before track 5".
+fn relation(gap: i64, source: usize) -> String {
+    if gap == 0 {
+        return format!("as track {source}");
+    }
+    format!("{} track {source}", frames_way(gap, "after", "before"))
+}
+
 /// "in sync", "1 frame late", "2 frames early".
 fn shift_label(frames: i64) -> String {
     if frames == 0 {
         return "in sync".into();
     }
+    frames_way(frames, "late", "early")
+}
+
+/// "1 frame late", "2 frames early": `frames` one way or the other, in the words given for more
+/// (positive) and fewer (negative).
+fn frames_way(frames: i64, more: &str, fewer: &str) -> String {
     let n = frames.abs();
     let unit = if n == 1 { "frame" } else { "frames" };
-    let way = if frames > 0 { "late" } else { "early" };
+    let way = if frames > 0 { more } else { fewer };
     format!("{n} {unit} {way}")
 }
 
@@ -507,14 +590,29 @@ fn detail(a: &Analysis) -> Option<String> {
     })
 }
 
-/// A partial track's stretches, one per line: `1 frame late  start      – 0:07:48.36`.
-fn ranges(indent: &str, stretches: &[Stretch]) -> String {
-    let labels: Vec<String> = stretches.iter().map(|s| shift_label(s.frames)).collect();
-    let width = labels.iter().map(String::len).max().unwrap_or(0);
+/// A partial track's stretches, one per line, `1 frame late  start      – 0:07:55.78`, then the
+/// blocks of lines that stay where they are.
+fn ranges(indent: &str, stretches: &[Stretch], unshifted: &[(i64, i64)]) -> String {
+    let mut rows: Vec<(String, String, String)> = stretches
+        .iter()
+        .map(|s| {
+            (
+                shift_label(s.frames),
+                s.from_ms.map_or_else(|| "start".into(), text::timestamp),
+                s.to_ms.map_or_else(|| "end".into(), text::timestamp),
+            )
+        })
+        .collect();
+    rows.extend(unshifted.iter().map(|&(from, to)| {
+        (
+            "not shifted".to_string(),
+            text::timestamp(from),
+            text::timestamp(to),
+        )
+    }));
+    let width = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
     let mut out = String::new();
-    for (s, label) in stretches.iter().zip(&labels) {
-        let from = s.from_ms.map_or_else(|| "start".into(), text::timestamp);
-        let to = s.to_ms.map_or_else(|| "end".into(), text::timestamp);
+    for (label, from, to) in rows {
         let _ = writeln!(out, "{indent}{label:<width$}  {from:<10} – {to}");
     }
     out
@@ -639,6 +737,7 @@ mod tests {
             text: "Line.".into(),
             pos: None,
             karaoke: false,
+            raw: format!("0,{style},,0,0,0,,Line."),
         }
     }
 
@@ -785,6 +884,9 @@ mod tests {
     #[test]
     fn a_track_late_except_in_the_middle_is_partial_with_its_own_times_as_boundaries() {
         // +1 up to 7:44.04 (the end of the line at 7:42), 0 from 7:48 to 15:32, +1 from 15:42.04.
+        // Between 15:32 and 15:42.04 one background line, 15:40.08 to 15:41, points nowhere: the
+        // silence before it (8 s) is longer than the one after it (1 s), so it moves with the
+        // late stretch.
         let events = [
             dialogue(0, 464, 1),
             dialogue(468, 932, 0),
@@ -807,7 +909,7 @@ mod tests {
                     frames: 0
                 },
                 Stretch {
-                    from_ms: Some(942_040),
+                    from_ms: Some(940_080),
                     to_ms: None,
                     frames: 1
                 },
@@ -892,7 +994,10 @@ mod tests {
                 agreeing,
                 styles: Vec::new(),
                 frame_ns: FRAME_NS,
+                each: Vec::new(),
+                unshifted: Vec::new(),
             }),
+            lines: None,
         }
     }
 
@@ -917,34 +1022,39 @@ mod tests {
         let stretches = vec![
             Stretch {
                 from_ms: None,
-                to_ms: Some(468_360),
+                to_ms: Some(475_780),
                 frames: 1,
             },
             Stretch {
-                from_ms: Some(475_780),
+                from_ms: Some(483_510),
                 to_ms: Some(939_000),
                 frames: 0,
             },
             Stretch {
-                from_ms: Some(942_920),
+                from_ms: Some(940_470),
                 to_ms: None,
                 frames: 1,
             },
         ];
-        let tracks = [report(
+        let mut track = report(
             5,
             "English Full [Semisu]",
             Verdict::Partial(stretches),
             250,
             0,
-        )];
+        );
+        // E16 has none; one here for the layout.
+        if let Ok(a) = &mut track.result {
+            a.unshifted = vec![(1_200_000, 1_203_500)];
+        }
         assert_eq!(
-            render("K-On!! - E16 - Upperclassmen.mkv", &tracks, false),
+            render("K-On!! - E16 - Upperclassmen.mkv", &[track], false),
             "K-On!! - E16 - Upperclassmen.mkv
   track 5  English Full [Semisu]  partial
-           1 frame late  start      – 0:07:48.36
-           in sync       0:07:55.78 – 0:15:39.00
-           1 frame late  0:15:42.92 – end
+           1 frame late  start      – 0:07:55.78
+           in sync       0:08:03.51 – 0:15:39.00
+           1 frame late  0:15:40.47 – end
+           not shifted   0:20:00.00 – 0:20:03.50
 "
         );
     }
@@ -963,6 +1073,7 @@ mod tests {
                 id: 12,
                 name: "(jpn)".into(),
                 result: Err("unsupported: no video track".into()),
+                lines: None,
             },
         ];
         assert_eq!(
@@ -1001,6 +1112,45 @@ mod tests {
            style     -3   -2   -1    0   +1   +2   +3
            Default   24   30   38  143   29   31   28  used
            OP ro    279  300  314  290  285  301  296  ignored
+"
+        );
+    }
+
+    #[test]
+    fn a_track_without_a_verdict_prints_the_one_its_shared_lines_give() {
+        let follow = shared::Follow {
+            source: 5,
+            gap: 0,
+            shared: shared::Shared {
+                times: 11_268,
+                counts: [0, 0, 0, 11_268, 0, 0, 0],
+            },
+            verdict: Verdict::Shifted(1),
+            each: Vec::new(),
+            unshifted: Vec::new(),
+        };
+        let mut signs = report(6, "English Signs/Songs [Semisu]", Verdict::Unclear, 23, 0);
+        signs.lines = Some(shared::Lines::Follows(follow));
+        let mut sdh = report(7, "SDH", Verdict::InSync, 300, 8);
+        sdh.lines = Some(shared::Lines::Disagrees {
+            source: 5,
+            says: Verdict::Shifted(1),
+        });
+        let tracks = [
+            report(5, "English Full [Semisu]", Verdict::Shifted(1), 345, 5),
+            signs,
+            sdh,
+        ];
+        assert_eq!(
+            render("K-On!! - E09 - Finals.mkv", &tracks, false),
+            "K-On!! - E09 - Finals.mkv
+  track 5  English Full [Semisu]         1 frame late     (345 times, +1 in 5 of 9 windows)
+           fix: mkvmerge --sync 5:-42
+  track 6  English Signs/Songs [Semisu]  unclear          (23 times, no offset stands out)
+           timed as track 5 (11268 of 11268 shared times): 1 frame late
+           fix: mkvmerge --sync 6:-42
+  track 7  SDH                           in sync          (300 times, 0 in 8 of 9 windows)
+           but its lines shared with track 5 say 1 frame late
 "
         );
     }

@@ -10,7 +10,7 @@ use subcheck::player::Player;
 use subcheck::review::model::Model;
 use subcheck::review::run_effect;
 use subcheck::review::update::{self, Msg};
-use subcheck::store::{self, FileRecord, Finding, Record, RunWriter, State, TrackRecord};
+use subcheck::store::{self, Check, FileRecord, Finding, Record, RunWriter, State, TrackRecord};
 use subcheck::text::Occurrence;
 
 const FILE: &str = "/m/K-On!/K-On! - E01 - Episode.mkv";
@@ -32,6 +32,7 @@ fn finding(id: u64, file: &str, original: &str, suggestion: &str) -> Record {
         }],
         before: vec![],
         after: vec![],
+        timing: None,
     })
 }
 
@@ -51,6 +52,7 @@ fn file(path: &str) -> Record {
         }],
         lines: 10,
         truncated: None,
+        checks: vec![Check::Llm],
     })
 }
 

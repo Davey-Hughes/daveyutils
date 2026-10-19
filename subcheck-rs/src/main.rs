@@ -17,7 +17,7 @@ use subcheck::scan;
 use subcheck::store::{self, State};
 use subcheck::subs::{self, Kind};
 use subcheck::text;
-use subcheck::timing::{self, TrackReport};
+use subcheck::timing::{self, Analysis, TrackReport};
 
 #[derive(Parser)]
 #[command(
@@ -61,14 +61,19 @@ enum Command {
         /// MKV files, or directories to search for them.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        /// claude, gpt (Codex) or ollama:<model>.
-        #[arg(long, default_value = "claude")]
-        llm: String,
+        /// Add to this run (a name as `scan` prints it, or a run file) instead of starting one:
+        /// only the checks it does not have yet are made, so running it again adds nothing.
+        #[arg(long, conflicts_with_all = ["force", "dry_run"])]
+        run: Option<String>,
+        /// claude, gpt (Codex) or ollama:<model>. Default: claude, or with --run the run's.
+        #[arg(long)]
+        llm: Option<String>,
         /// Any other LLM: a shell command that reads the prompt on stdin and prints the reply.
         #[arg(long, conflicts_with = "llm")]
         llm_cmd: Option<String>,
         /// Subtitle languages to check, as ISO 639-2 codes. Repeat for more (--lang eng --lang und).
-        #[arg(long = "lang", default_value = "eng")]
+        /// Default: eng, or with --run the run's.
+        #[arg(long = "lang")]
         langs: Vec<String>,
         /// LLM calls to run at once.
         #[arg(short, long, default_value_t = 2)]
@@ -188,6 +193,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         } => extract(&file, track, output, force, verbose, walk).map(|()| ExitCode::SUCCESS),
         Command::Scan {
             paths,
+            run,
             llm,
             llm_cmd,
             langs,
@@ -197,9 +203,35 @@ fn run(cli: Cli) -> Result<ExitCode> {
             dry_run,
             verbose,
         } => {
-            let backend = match llm_cmd {
-                Some(cmd) => Backend::shell(&cmd),
-                None => Backend::preset(&llm).map_err(anyhow::Error::msg)?,
+            let state = store::state_dir()?;
+            let into = run
+                .as_deref()
+                .map(|r| store::find_run(&state, Some(r)))
+                .transpose()?;
+            let (backend, langs) = if let Some(path) = &into {
+                let run =
+                    store::read_run(path).with_context(|| format!("reading {}", path.display()))?;
+                // The cache says which languages a run from before runs kept them checked.
+                let old = run.header.as_ref().is_some_and(|h| h.langs.is_empty());
+                let cache = if old {
+                    store::Cache::load(&state)?
+                } else {
+                    store::Cache::default()
+                };
+                scan::resume(&run, &cache, llm.as_deref(), llm_cmd.as_deref(), &langs)
+                    .map_err(anyhow::Error::msg)?
+            } else {
+                let backend = match llm_cmd {
+                    Some(cmd) => Backend::shell(&cmd),
+                    None => Backend::preset(llm.as_deref().unwrap_or("claude"))
+                        .map_err(anyhow::Error::msg)?,
+                };
+                let langs = if langs.is_empty() {
+                    vec![scan::DEFAULT_LANG.to_string()]
+                } else {
+                    langs
+                };
+                (backend, langs)
             };
             let opts = scan::Options {
                 chunk_lines: chunk_lines.unwrap_or(backend.chunk_lines),
@@ -208,8 +240,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 langs,
                 force,
                 verbose,
+                into: into.clone(),
             };
-            let state = store::state_dir()?;
             if dry_run {
                 scan::dry_run(
                     &paths,
@@ -221,6 +253,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
             let s = scan::run(&paths, &opts, &state, &mut std::io::stderr())?;
+            if into.is_some() {
+                return Ok(continued(&s));
+            }
             if s.run.is_empty() {
                 if s.files == 0 {
                     eprintln!("Nothing to check: no MKV files found");
@@ -232,8 +267,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 return Ok(ExitCode::SUCCESS);
             }
+            let of_timing = if s.timing > 0 {
+                format!(" ({} timing)", s.timing)
+            } else {
+                String::new()
+            };
             eprintln!(
-                "run {}: {} files, {} checked, {} failed, {} unchanged since an earlier scan; {} findings",
+                "run {}: {} files, {} checked, {} failed, {} unchanged since an earlier scan; {} findings{of_timing}",
                 s.run, s.files, s.checked, s.failed, s.cached, s.findings
             );
             eprintln!(
@@ -277,6 +317,56 @@ fn run(cli: Cli) -> Result<ExitCode> {
             print!("{}", list::render(&run, filter, mpv));
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// What `scan --run` did: exit status 1 when a file failed.
+fn continued(s: &scan::Summary) -> ExitCode {
+    let mut left = Vec::new();
+    if s.cached > 0 {
+        left.push(format!(
+            "{} with every check already",
+            scan::files(s.cached)
+        ));
+    }
+    if s.changed > 0 {
+        left.push(format!("{} changed since the run", scan::files(s.changed)));
+    }
+    if s.elsewhere > 0 {
+        left.push(format!(
+            "{} with the LLM check in another run",
+            scan::files(s.elsewhere)
+        ));
+    }
+    if s.checked + s.failed == 0 {
+        eprintln!("Nothing to add to run {}: {}", s.run, left.join(", "));
+        return ExitCode::SUCCESS;
+    }
+    let left = if left.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} left out)", left.join(", "))
+    };
+    let of_timing = if s.timing > 0 {
+        format!(" ({} timing)", s.timing)
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "run {}: added to {}{left}, {} failed; {} findings{of_timing}",
+        s.run,
+        scan::files(s.checked + s.failed),
+        s.failed,
+        s.findings
+    );
+    eprintln!(
+        "Review them with: subcheck review {} (or print them: subcheck list {0})",
+        s.run
+    );
+    if s.failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -430,6 +520,9 @@ fn timing_labels(arg: &Path, root: Option<&Path>, file: &Path) -> (String, Strin
     )
 }
 
+/// A track's events and their analysis, or what to print in place of a verdict.
+type Analysed<'a> = (&'a Track, Result<(Vec<text::Event>, Analysis), String>);
+
 /// Every chosen text track of one file against its video, and whether a track could not be read.
 fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)> {
     let (r, layout) = mkv::open(file)?;
@@ -457,6 +550,7 @@ fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)
                     id: t.id,
                     name: name(t),
                     result: Err(format!("unsupported: {reason}")),
+                    lines: None,
                 })
                 .collect();
             return Ok((tracks, false));
@@ -465,13 +559,11 @@ fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)
     let numbers: Vec<u64> = chosen.iter().map(|(t, _)| t.number).collect();
     let reads = blocks::read_each(&r, &layout, &numbers);
     let mut unread = false;
-    let tracks = chosen
+    let read: Vec<Analysed> = chosen
         .into_iter()
         .zip(reads)
-        .map(|((t, kind), read)| TrackReport {
-            id: t.id,
-            name: name(t),
-            result: match read {
+        .map(|((t, kind), read)| {
+            let result = match read {
                 Ok(b) => {
                     let events = text::events(
                         t.id,
@@ -480,7 +572,8 @@ fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)
                         layout.timestamp_scale,
                         t.default_duration,
                     );
-                    Ok(timing::analyse(&video, &events))
+                    let a = timing::analyse(&video, &events);
+                    Ok((events, a))
                 }
                 // Already reads `unsupported: …`.
                 Err(e @ ebml::Error::Unsupported(_)) => Err(e.to_string()),
@@ -488,7 +581,25 @@ fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)
                     unread = true;
                     Err(format!("cannot read: {e}"))
                 }
-            },
+            };
+            (t, result)
+        })
+        .collect();
+    let analysed: Vec<(usize, &[text::Event], &Analysis)> = read
+        .iter()
+        .filter_map(|(t, r)| r.as_ref().ok().map(|(e, a)| (t.id, e.as_slice(), a)))
+        .collect();
+    let mut said = timing::shared::lines_of(&video, &analysed).into_iter();
+    let tracks = read
+        .iter()
+        .map(|(t, result)| TrackReport {
+            id: t.id,
+            name: name(t),
+            result: result
+                .as_ref()
+                .map(|(_, a)| a.clone())
+                .map_err(Clone::clone),
+            lines: result.is_ok().then(|| said.next().flatten()).flatten(),
         })
         .collect();
     Ok((tracks, unread))

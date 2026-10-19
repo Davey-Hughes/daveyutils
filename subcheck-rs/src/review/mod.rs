@@ -308,6 +308,7 @@ mod tests {
                 tracks: vec![],
                 lines: 0,
                 truncated: None,
+                checks: vec![store::Check::Llm],
             }
         };
         let gone = |name: &str| store::FileRecord {

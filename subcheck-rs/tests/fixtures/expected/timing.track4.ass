@@ -1,0 +1,30 @@
+﻿[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+Style: OP,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+Style: FX,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:02.50,0:00:04.50,Default,,0,0,0,,Sign 0.
+Dialogue: 0,0:00:16.50,0:00:18.50,Default,,0,0,0,,Sign 2.
+Dialogue: 0,0:00:30.50,0:00:32.50,Default,,0,0,0,,Sign 4.
+Dialogue: 0,0:00:44.50,0:00:46.50,Default,,0,0,0,,Sign 6.
+Dialogue: 0,0:00:58.50,0:01:00.50,Default,,0,0,0,,Sign 8.
+Dialogue: 0,0:01:12.50,0:01:14.50,Default,,0,0,0,,Sign 10.
+Dialogue: 0,0:01:26.50,0:01:28.50,Default,,0,0,0,,Sign 12.
+Dialogue: 0,0:01:40.50,0:01:42.50,Default,,0,0,0,,Sign 14.
+Dialogue: 0,0:01:54.50,0:01:56.50,Default,,0,0,0,,Sign 16.
+Dialogue: 0,0:02:08.50,0:02:10.50,Default,,0,0,0,,Sign 18.
+Dialogue: 0,0:02:22.50,0:02:24.50,Default,,0,0,0,,Sign 20.
+Dialogue: 0,0:02:36.50,0:02:38.50,Default,,0,0,0,,Sign 22.
+Dialogue: 0,0:02:50.50,0:02:52.50,Default,,0,0,0,,Sign 24.
+Dialogue: 0,0:03:04.50,0:03:06.50,Default,,0,0,0,,Sign 26.
+Dialogue: 0,0:03:18.50,0:03:20.50,Default,,0,0,0,,Sign 28.
+Dialogue: 0,0:03:32.50,0:03:34.50,Default,,0,0,0,,Sign 30.
+Dialogue: 0,0:03:46.50,0:03:48.50,Default,,0,0,0,,Sign 32.

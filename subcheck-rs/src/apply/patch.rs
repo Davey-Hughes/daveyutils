@@ -18,11 +18,12 @@ pub struct Fix<'a> {
 }
 
 /// The run's accepted findings, in run order, each with the reviewer's wording where they reworded
-/// it and else the suggestion, whitespace collapsed as the original was.
+/// it and else the suggestion, whitespace collapsed as the original was. Timing findings are not
+/// among them: apply does not shift tracks yet.
 pub fn fixes(run: &Run) -> Vec<Fix<'_>> {
     run.findings
         .iter()
-        .filter(|f| run.state_of(f.id) == State::Accepted)
+        .filter(|f| run.state_of(f.id) == State::Accepted && f.timing.is_none())
         .map(|f| {
             let edited = run.decisions.get(&f.id).and_then(|d| d.edited.as_deref());
             Fix {
@@ -904,6 +905,7 @@ mod tests {
                 .collect(),
             before: vec![],
             after: vec![],
+            timing: None,
         }
     }
 
@@ -1693,5 +1695,36 @@ mod tests {
             .map(|f| (f.finding.id, f.text))
             .collect();
         assert_eq!(got, [(1, "the".into()), (2, "The".into())]);
+    }
+
+    #[test]
+    fn an_accepted_timing_finding_is_no_fix_yet() {
+        use crate::store::{Basis, Decision, TimingFix};
+        let mut f = finding(1, "", "1 frame late", &[(0, 1000)]);
+        f.timing = Some(TimingFix {
+            track: 0,
+            frame_ns: 41_708_333,
+            stretches: vec![],
+            unshifted: vec![],
+            basis: Basis::Cuts {
+                times: 0,
+                agreeing: 0,
+                windows: 0,
+            },
+        });
+        let mut run = Run {
+            findings: vec![f],
+            ..Run::default()
+        };
+        run.decisions.insert(
+            1,
+            Decision {
+                finding: 1,
+                state: State::Accepted,
+                edited: None,
+                at: jiff::Timestamp::UNIX_EPOCH,
+            },
+        );
+        assert_eq!(fixes(&run), []);
     }
 }

@@ -51,7 +51,9 @@ make help     # list targets
   `dev/make-subcheck-fixtures.sh` and committed, with mkvextract's output for each as the oracle.
   `subcheck scan` sends the English lines to an LLM (`--llm claude`, `gpt` for Codex,
   `ollama:<model>`, or any command with `--llm-cmd`) and records each suggested fix in a run file
-  under `~/.local/state/subcheck/`. Files unchanged since an earlier scan are skipped.
+  under `~/.local/state/subcheck/`, with each track the timing check below finds shifted. Checks
+  already made of an unchanged file are skipped; `scan --run <run>` adds to that run only the
+  checks it lacks.
   `subcheck review` steps through a run's fixes to accept, reject or reword each (a fix repeated
   across episodes is one row), and `o` opens the moment in mpv, reusing one window.
   `subcheck list` prints the same as text, and `--mpv` adds a command that opens each one.
@@ -61,9 +63,11 @@ make help     # list targets
   Review's keys and mouse, and a KDE window rule that keeps focus in the terminal:
   `subcheck-rs/README.md`.
   `subcheck timing` reports subtitle tracks shifted by whole frames against the video (every line
-  a frame late, or part of a track), with the `mkvmerge --sync` that fixes a whole-track shift. It
-  reads only the index and the subtitles: seconds per file when the subtitles have Cues, as
-  mkvmerge writes them by default. No LLM, nothing recorded.
+  a frame late, or part of a track), with the `mkvmerge --sync` that fixes a whole-track shift. A
+  track with too few lines on cuts for a verdict (a Signs/Songs track, say) is timed by the lines
+  it shares with another track of the file. It reads only the index and the subtitles: seconds
+  per file when the subtitles have Cues, as mkvmerge writes them by default. No LLM, nothing
+  recorded.
 - `tests/` — bash test-suite (`bash tests/run.sh`); Rust tests live in each crate.
 - `dev/` — tooling for working on this repo, deliberately NOT in `scripts/`: the Makefile
   links every `scripts/*` onto your PATH, so a dev script placed there would ship as a

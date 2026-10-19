@@ -16,7 +16,7 @@ fn subcheck(args: &[&str]) -> Output {
 }
 
 #[test]
-fn reports_every_track_and_the_fix_for_a_shifted_one() {
+fn reports_every_track_the_fix_for_a_shifted_one_and_what_shared_lines_give() {
     let out = subcheck(&["timing", "timing.mkv"]);
     assert!(
         out.status.success(),
@@ -30,6 +30,9 @@ fn reports_every_track_and_the_fix_for_a_shifted_one() {
   track 2  Dialogue a frame late  1 frame late     (85 times, +1 in 2 of 2 windows)
            fix: mkvmerge --sync 2:-500
   track 3  Karaoke and effects    too few lines    (0 times)
+  track 4  Signs a frame late     too few lines    (0 times)
+           timed as track 2 (34 of 34 shared times): 1 frame late
+           fix: mkvmerge --sync 4:-500
 "
     );
 }
@@ -143,7 +146,7 @@ fn a_track_that_cannot_be_read_fails_the_run_and_the_others_are_still_checked() 
     // The first block of track 1 (`A0 B0 A1 AA 82 …`, track number 2) gets track number 0, which is
     // no number at all.
     let header = [0xA0, 0xB0, 0xA1, 0xAA, 0x82, 0x00, 0x00, 0x00];
-    let (_dir, path) = patched("timing.mkv", &header, 7, |b| b[4] = 0x00);
+    let (_dir, path) = patched("timing.mkv", &header, 5, |b| b[4] = 0x00);
     let out = subcheck(&["timing", path.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&out.stdout);

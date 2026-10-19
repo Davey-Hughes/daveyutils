@@ -5,13 +5,16 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
 - `subcheck extract` writes a subtitle track out the way mkvextract does, reading only the
   subtitle packets (through the file's Cues) instead of the whole file.
 - `subcheck scan` sends the English lines to an LLM and records each suggested fix in a run file
-  under `~/.local/state/subcheck/`.
+  under `~/.local/state/subcheck/`, with each track `timing` finds shifted. `--run <run>` adds to
+  that run only the checks it lacks: the timing check, say, for a run made before it existed. An
+  LLM check the cache has from another run of the unchanged file is not made again.
 - `subcheck review` steps through a run's fixes to accept, reject or reword each one.
 - `subcheck list` prints a run's fixes as text; `--mpv` adds a command that opens each one.
 - `subcheck apply` makes a run's accepted fixes in the MKV files, keeping each original as
-  `<name>.mkv.orig`. Needs mkvtoolnix.
+  `<name>.mkv.orig`. Needs mkvtoolnix. Timing fixes are not made yet.
 - `subcheck timing` reports subtitle tracks shifted by whole frames against the video, with the
-  `mkvmerge --sync` that fixes a whole-track shift. No LLM, nothing recorded.
+  `mkvmerge --sync` that fixes a whole-track shift. A track with too few lines on cuts is timed by
+  the lines it shares with another track. No LLM, nothing recorded.
 
 ## Review
 
