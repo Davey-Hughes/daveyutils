@@ -189,24 +189,19 @@ fn flags(f: &Flags) -> [bool; 6] {
     ]
 }
 
-/// An ASS header as mkvextract writes it and mkvmerge reads it back: LF line ends, no trailing
-/// blank lines. Bytes, not text: a rewrite that changed bytes that are not UTF-8 must show.
+/// An ASS header as mkvextract writes it and mkvmerge reads it back: its lines but the blank ones,
+/// with LF line ends, and nothing blank at its end. A section that followed `[Events]` (Aegisub's
+/// extradata, in K-On!! E09) is written after the events, and mkvmerge reads the blank line before
+/// it into the header. Bytes, not text: a rewrite that changed bytes that are not UTF-8 must show.
 fn script(private: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let bytes = subs::c_bytes(private);
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
-            i += 1;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    while out
-        .last()
-        .is_some_and(|b| matches!(b, b'\n' | b' ' | b'\t' | b'\r'))
-    {
+    let blank = |b: &u8| matches!(b, b' ' | b'\t' | b'\r');
+    let lines: Vec<&[u8]> = subs::c_bytes(private)
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .filter(|l| !l.iter().all(blank))
+        .collect();
+    let mut out = lines.join(&b'\n');
+    while out.last().is_some_and(blank) {
         out.pop();
     }
     out
@@ -396,17 +391,10 @@ fn events(
         .map(|b| subs::c_bytes(&b.payload).to_vec())
         .collect();
     if kind != Kind::Srt {
-        let order = |t: &[u8]| {
-            let digits = t.split(|&b| b == b',').next().unwrap_or_default();
-            std::str::from_utf8(digits)
-                .ok()
-                .and_then(|o| o.parse::<i64>().ok())
-                .unwrap_or(i64::MAX)
-        };
         let mut orders: Vec<(i64, usize)> = texts
             .iter()
             .enumerate()
-            .map(|(i, t)| (order(t), i))
+            .map(|(i, t)| (subs::read_order(t).unwrap_or(i64::MAX), i))
             .collect();
         orders.sort_unstable();
         for (rank, &(_, i)) in orders.iter().enumerate() {
@@ -720,11 +708,19 @@ mod tests {
     }
 
     #[test]
-    fn an_ass_header_compares_without_crlf_or_trailing_blank_lines() {
+    fn an_ass_header_compares_without_crlf_or_blank_lines() {
         assert_eq!(
             script(b"[Script Info]\r\nA: 1\r\n\r\n"),
             script(b"[Script Info]\nA: 1\n")
         );
+        // As K-On!! E09's header comes back: a blank line more before Aegisub's extradata.
+        assert_eq!(
+            script(b"[Events]\r\nFormat: Text\r\n\r\n[Aegisub Extradata]\r\nData: 0\r\n"),
+            script(b"[Events]\r\nFormat: Text\r\n\r\n\r\n[Aegisub Extradata]\r\nData: 0\r\n")
+        );
+        // Its last line's trailing blanks, which the writer drops.
+        assert_eq!(script(b"Data: 0  \t\r\n"), script(b"Data: 0"));
         assert_ne!(script(b"A: 1\n"), script(b"A: 2\n"));
+        assert_ne!(script(b"A: 1\nB: 2\n"), script(b"A: 1 B: 2\n"));
     }
 }

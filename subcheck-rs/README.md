@@ -11,7 +11,8 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
 - `subcheck review` steps through a run's fixes to accept, reject or reword each one.
 - `subcheck list` prints a run's fixes as text; `--mpv` adds a command that opens each one.
 - `subcheck apply` makes a run's accepted fixes in the MKV files, keeping each original as
-  `<name>.mkv.orig`. Needs mkvtoolnix. Timing fixes are not made yet.
+  `<name>.mkv.orig`: a file's typos and timing fixes in one remux, each shifted line moved by whole
+  frames on the video's frame grid. Needs mkvtoolnix.
 - `subcheck timing` reports subtitle tracks shifted by whole frames against the video, with the
   `mkvmerge --sync` that fixes a whole-track shift. A track with too few lines on cuts is timed by
   the lines it shares with another track. No LLM, nothing recorded.

@@ -175,7 +175,7 @@ impl AssWriter {
         let end = start + duration_ns(block, scale, default_duration) / 1_000_000;
         let mut fields = split(&c_string(&block.payload), ",", self.num_fields);
         fields.resize(self.num_fields, String::new());
-        let read_order = fields[0].parse::<i64>().ok()?;
+        let read_order = read_order(&block.payload)?;
 
         let mut line = String::from("Dialogue: ");
         let mut idx = 1;
@@ -301,6 +301,13 @@ fn srt_time(ms: i128) -> String {
         (ms / 1000) % 60,
         ms % 1000
     )
+}
+
+/// An ASS or SSA block's ReadOrder, its first field; `None` when that is no number (mkvextract
+/// leaves such a block out).
+pub(crate) fn read_order(payload: &[u8]) -> Option<i64> {
+    let field = c_bytes(payload).split(|&b| b == b',').next()?;
+    std::str::from_utf8(field).ok()?.parse().ok()
 }
 
 /// Bytes up to the first NUL, as text: mkvextract handles these as C strings.

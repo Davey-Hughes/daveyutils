@@ -5,6 +5,7 @@
 pub mod karaoke;
 pub mod patch;
 pub mod remux;
+pub mod shift;
 pub mod verify;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,11 +20,12 @@ use crate::group;
 use crate::list::shell_quote;
 use crate::mkv::{self, Layout, Track};
 use crate::review::model::changed;
-use crate::store::{self, Applied, Record, RunWriter, State};
+use crate::store::{self, Applied, Finding, Record, RunWriter};
 use crate::subs::{self, Kind};
 use crate::text::timestamp;
 use patch::{Fix, Outcome};
 use remux::Replacement;
+use shift::{Grid, Lines, Shifts};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -76,9 +78,9 @@ pub fn run(
 ) -> anyhow::Result<Summary> {
     let run = store::read_run(run_path)?;
     let accepted = patch::fixes(&run);
-    note_timing(&run, out)?;
+    let timing = shift::fixes(&run);
     let mut summary = Summary::default();
-    if accepted.is_empty() {
+    if accepted.is_empty() && timing.is_empty() {
         writeln!(out, "No accepted fixes in run {}.", run.name)?;
         return Ok(summary);
     }
@@ -87,12 +89,7 @@ pub fn run(
         remux::run(mkvmerge, &["--version".into()]).map_err(anyhow::Error::msg)?;
         writer = Some(RunWriter::open(run_path)?);
     }
-    let mut paths: Vec<&str> = Vec::new();
-    for f in &accepted {
-        if !paths.contains(&f.finding.file.as_str()) {
-            paths.push(&f.finding.file);
-        }
-    }
+    let paths = with_fixes(&run, &accepted, &timing);
     let names = track_names(&paths);
     for (path, name) in paths.iter().zip(names) {
         let mine: Vec<Fix> = accepted
@@ -100,11 +97,13 @@ pub fn run(
             .filter(|f| f.finding.file == *path)
             .cloned()
             .collect();
+        let shifts: Vec<&Finding> = timing.iter().filter(|f| f.file == *path).copied().collect();
         writeln!(out, "{path}")?;
         let job = Job {
             path: Path::new(path),
             name,
             fixes: &mine,
+            timing: &shifts,
             mode,
             karaoke,
             state,
@@ -114,7 +113,9 @@ pub fn run(
             Ok(done) => {
                 for (_, o) in &done.outcomes {
                     match o {
-                        Outcome::Patched | Outcome::Respaced { .. } => summary.fixed += 1,
+                        Outcome::Patched | Outcome::Respaced { .. } | Outcome::Shifted { .. } => {
+                            summary.fixed += 1;
+                        }
                         Outcome::AlreadyApplied => summary.already += 1,
                         Outcome::ByHand(_) => summary.by_hand += 1,
                         Outcome::NotFound => summary.not_found += 1,
@@ -132,6 +133,7 @@ pub fn run(
                                 Outcome::AlreadyApplied
                                     | Outcome::Patched
                                     | Outcome::Respaced { .. }
+                                    | Outcome::Shifted { .. }
                             )
                         })
                         .map(|&(finding, _)| Record::Applied(Applied { finding, at }))
@@ -174,21 +176,26 @@ pub fn run(
     Ok(summary)
 }
 
-/// Says how many accepted timing fixes there are, which apply leaves alone: it does not shift
-/// tracks yet.
-fn note_timing(run: &store::Run, out: &mut impl Write) -> std::io::Result<()> {
-    let n = run
-        .findings
+/// The files with fixes, in the order the scan checked them.
+fn with_fixes<'r>(run: &store::Run, accepted: &[Fix<'r>], timing: &[&'r Finding]) -> Vec<&'r str> {
+    let mut files: Vec<&str> = accepted
         .iter()
-        .filter(|f| f.timing.is_some() && run.state_of(f.id) == State::Accepted)
-        .count();
-    if n > 0 {
-        writeln!(
-            out,
-            "{n} accepted timing fixes left alone: apply does not shift tracks yet."
-        )?;
+        .map(|f| f.finding.file.as_str())
+        .chain(timing.iter().map(|f| f.file.as_str()))
+        .collect();
+    files.sort_by_cached_key(|p| {
+        run.files
+            .iter()
+            .position(|r| r.path == *p)
+            .unwrap_or(usize::MAX)
+    });
+    let mut paths: Vec<&str> = Vec::new();
+    for p in files {
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
     }
-    Ok(())
+    paths
 }
 
 /// What each file's fixed tracks are named for: its stem, unless another file in the run has the
@@ -230,6 +237,8 @@ struct Job<'a> {
     /// What its fixed tracks are named for: `<name>.track<ID>.<ext>`.
     name: String,
     fixes: &'a [Fix<'a>],
+    /// Its accepted timing findings.
+    timing: &'a [&'a Finding],
     mode: &'a Mode,
     karaoke: bool,
     state: &'a Path,
@@ -267,6 +276,7 @@ impl Job<'_> {
             .fixes
             .iter()
             .flat_map(|f| f.finding.occurrences.iter().map(|o| o.track))
+            .chain(self.timing.iter().map(|f| timing_fix(f).track))
             .collect();
         let chosen: Vec<&Track> = layout
             .tracks
@@ -305,7 +315,7 @@ impl Job<'_> {
             })
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
-        let views: Vec<patch::Track> = chosen
+        let mut views: Vec<patch::Track> = chosen
             .iter()
             .zip(&headers)
             .map(|(t, header)| patch::Track {
@@ -315,19 +325,22 @@ impl Job<'_> {
                 header,
                 scale: layout.timestamp_scale,
                 default_duration: t.default_duration,
+                timing: patch::Timing::AsScanned,
             })
             .collect();
-        let plan = patch::plan(&views, self.fixes, self.karaoke);
-        self.report(&plan, &views, out).map_err(|e| e.to_string())?;
+        let (plan, grid) = self.plan(&mut views, &layout);
+        self.report(&plan, &views, grid.as_ref(), out)
+            .map_err(|e| e.to_string())?;
         note_tags(&r, &layout, &chosen, &plan, out)?;
         let fixed: Vec<Fixed> = chosen
             .iter()
             .filter_map(|t| {
                 let edits = plan.edits.get(&t.id)?;
+                let kind = Kind::of(t).expect("a text subtitle track");
                 Some(Fixed {
                     track: t,
-                    kind: Kind::of(t).expect("a text subtitle track"),
-                    patched: patch::edited(read[&t.id], edits),
+                    kind,
+                    patched: patch::edited(kind, read[&t.id], edits),
                 })
             })
             .collect();
@@ -345,6 +358,79 @@ impl Job<'_> {
             outcomes: plan.outcomes,
             remuxed,
         })
+    }
+
+    /// Both kinds of fix: the timing fixes first, as a track remuxed with its timing fix has its
+    /// typos at their times shifted. And the file's frame grid, where it has timing fixes and one.
+    fn plan<'v>(
+        &'v self,
+        views: &mut [patch::Track<'v>],
+        layout: &Layout,
+    ) -> (patch::Plan, Option<Grid>) {
+        if self.timing.is_empty() {
+            return (patch::plan(views, self.fixes, self.karaoke), None);
+        }
+        let grid = crate::timing::video(layout).and_then(|v| Grid::fit(&v, layout.timestamp_scale));
+        let shifted = self.shift(views, &grid);
+        // Where each track's typos are, by where its timing fix's lines are.
+        for view in views.iter_mut() {
+            let mut mine = self.timing.iter().zip(&shifted);
+            let Some((f, p)) = mine.find(|(f, _)| timing_fix(f).track == view.id) else {
+                continue;
+            };
+            let fix = timing_fix(f);
+            view.timing = match (p.lines, &grid) {
+                (Lines::AsScanned, _) => patch::Timing::AsScanned,
+                (Lines::Moved, Ok(grid)) => {
+                    patch::Timing::Moved(Shifts::new(fix, *grid, view.kind))
+                }
+                _ => patch::Timing::Unsure(fix),
+            };
+        }
+        let mut plan = patch::plan(views, self.fixes, self.karaoke);
+        for (f, p) in self.timing.iter().zip(shifted) {
+            // A track with nothing to change gets no edits: they would remux it.
+            if !p.times.is_empty() {
+                let times = &mut plan.edits.entry(timing_fix(f).track).or_default().times;
+                times.extend(p.times.iter().map(|&(i, t, d)| (i, (t, d))));
+            }
+            plan.outcomes.push((f.id, p.outcome));
+        }
+        (plan, grid.ok())
+    }
+
+    /// Each timing fix's plan on its track, on the file's frame grid (or why it has none).
+    fn shift(&self, views: &[patch::Track], grid: &Result<Grid, String>) -> Vec<shift::Plan> {
+        // Not looked at: where its lines are is not known.
+        let none = |outcome| shift::Plan {
+            outcome,
+            times: Vec::new(),
+            lines: Lines::Unsure,
+        };
+        self.timing
+            .iter()
+            .map(|f| {
+                let fix = timing_fix(f);
+                let Some(view) = views.iter().find(|v| v.id == fix.track) else {
+                    return none(Outcome::NotFound);
+                };
+                let on_track = self
+                    .timing
+                    .iter()
+                    .filter(|g| timing_fix(g).track == fix.track);
+                if on_track.count() > 1 {
+                    return none(Outcome::ByHand("two timing fixes on one track".into()));
+                }
+                match grid {
+                    Ok(grid) => shift::plan(fix, view, grid),
+                    // Where its lines are needs no grid where they are as the scan found them.
+                    Err(why) => shift::Plan {
+                        lines: shift::lines_without_grid(fix, view),
+                        ..none(Outcome::ByHand(why.clone()))
+                    },
+                }
+            })
+            .collect()
     }
 
     /// What the mode does with a file that has fixes to make; whether it was remuxed.
@@ -410,21 +496,55 @@ impl Job<'_> {
         &self,
         plan: &patch::Plan,
         views: &[patch::Track],
+        grid: Option<&Grid>,
         out: &mut impl Write,
     ) -> io::Result<()> {
-        for (fix, (_, outcome)) in self.fixes.iter().zip(&plan.outcomes) {
+        let (typos, shifts) = plan.outcomes.split_at(self.fixes.len());
+        for (fix, (_, outcome)) in self.fixes.iter().zip(typos) {
             let f = fix.finding;
             let when = f.occurrences.first().map_or(0, |o| o.start_ms);
             let (a, b) = changed(&f.original, &fix.text);
             let what = format!("{} → {}", &f.original[a], &fix.text[b]);
-            let status = match outcome {
-                Outcome::Patched => "ok".to_string(),
-                Outcome::Respaced { px, guessed } => respaced(*px, guessed),
-                Outcome::AlreadyApplied => "already applied".into(),
-                Outcome::ByHand(why) => format!("by hand: {why}"),
-                Outcome::NotFound => "not found: the file changed since the scan".into(),
+            writeln!(out, "  {}  {what}  {}", timestamp(when), status(outcome))?;
+        }
+        for (f, (_, outcome)) in self.timing.iter().zip(shifts) {
+            let fix = timing_fix(f);
+            let what = format!("{} → {}", f.original, f.suggestion);
+            writeln!(out, "  track {}  {what}  {}", fix.track, status(outcome))?;
+            let Some(view) = views.iter().find(|v| v.id == fix.track) else {
+                continue;
             };
-            writeln!(out, "  {}  {what}  {status}", timestamp(when))?;
+            for l in &fix.unshifted {
+                let (start, end) = (time(view.kind, l.start_ms), time(view.kind, l.end_ms));
+                let text = line_text(view.kind, &l.raw);
+                writeln!(out, "    left where it is: {start} – {end}  {text}")?;
+            }
+            // Each moving stretch's first and last line, before and after.
+            let shifted = grid
+                .filter(|_| matches!(outcome, Outcome::Shifted { .. }))
+                .map(|grid| Shifts::new(fix, *grid, view.kind));
+            if let (Mode::DryRun, Some(shifts)) = (self.mode, shifted) {
+                let ends = fix
+                    .stretches
+                    .iter()
+                    .flat_map(|s| s.first.iter().chain(&s.last));
+                for l in ends {
+                    let Some((start, end)) = shifts.times(l.start_ms, l.end_ms) else {
+                        continue;
+                    };
+                    let t = |ms| time(view.kind, ms);
+                    writeln!(
+                        out,
+                        "    track {}: {} – {} → {} – {}  {}",
+                        fix.track,
+                        t(l.start_ms),
+                        t(l.end_ms),
+                        t(start),
+                        t(end),
+                        line_text(view.kind, &l.raw)
+                    )?;
+                }
+            }
         }
         if *self.mode == Mode::DryRun {
             for (id, edits) in &plan.edits {
@@ -773,6 +893,37 @@ fn respaced(px: i64, guessed: &str) -> String {
     format!("karaoke re-spaced by {px:+} px{guess}: check it (review, o)")
 }
 
+/// What a fix came to, as its line ends.
+fn status(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Patched => "ok".to_string(),
+        Outcome::Respaced { px, guessed } => respaced(*px, guessed),
+        Outcome::Shifted { events: 1 } => "ok (1 event moved)".into(),
+        Outcome::Shifted { events } => format!("ok ({events} events moved)"),
+        Outcome::AlreadyApplied => "already applied".into(),
+        Outcome::ByHand(why) => format!("by hand: {why}"),
+        Outcome::NotFound => "not found: the file changed since the scan".into(),
+    }
+}
+
+/// A timing finding's fix.
+fn timing_fix(f: &Finding) -> &store::TimingFix {
+    f.timing.as_ref().expect("a timing finding has its fix")
+}
+
+/// A time as the track writes it: centiseconds for ASS and SSA, milliseconds for SRT.
+fn time(kind: Kind, ms: i64) -> String {
+    match kind {
+        Kind::Ass | Kind::Ssa => timestamp(ms),
+        Kind::Srt => crate::text::timestamp_ms(ms),
+    }
+}
+
+/// A recorded line's text.
+fn line_text(kind: Kind, raw: &str) -> &str {
+    shift::fields_and_text(kind, raw).1
+}
+
 fn quick_or_full(full: bool) -> &'static str {
     if full { "full" } else { "quick" }
 }
@@ -807,6 +958,64 @@ fn free_space(dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_go_in_the_order_the_scan_checked_them() {
+        let finding = |id, file: &str| Finding {
+            id,
+            file: file.into(),
+            style: String::new(),
+            original: String::new(),
+            suggestion: String::new(),
+            reason: String::new(),
+            source: "llm".into(),
+            occurrences: vec![],
+            before: vec![],
+            after: vec![],
+            timing: None,
+        };
+        let record = |path: &str| store::FileRecord {
+            path: path.into(),
+            size: 0,
+            mtime: jiff::Timestamp::UNIX_EPOCH,
+            error: None,
+            tracks: vec![],
+            lines: 0,
+            truncated: None,
+            checks: vec![],
+        };
+        // A typo in b found first, then a's timing, added by a later `scan --run`.
+        let run = store::Run {
+            files: vec![record("a.mkv"), record("b.mkv")],
+            findings: vec![
+                finding(1, "b.mkv"),
+                finding(2, "a.mkv"),
+                finding(3, "c.mkv"),
+            ],
+            ..store::Run::default()
+        };
+        let typos = [Fix {
+            finding: &run.findings[0],
+            text: String::new(),
+        }];
+        let timing = [&run.findings[1], &run.findings[2]];
+        assert_eq!(
+            with_fixes(&run, &typos, &timing),
+            ["a.mkv", "b.mkv", "c.mkv"]
+        );
+    }
+
+    #[test]
+    fn a_shift_says_how_many_events_it_moves() {
+        assert_eq!(
+            status(&Outcome::Shifted { events: 1 }),
+            "ok (1 event moved)"
+        );
+        assert_eq!(
+            status(&Outcome::Shifted { events: 2 }),
+            "ok (2 events moved)"
+        );
+    }
 
     #[test]
     fn a_karaoke_rows_counts_leave_out_the_zeros() {

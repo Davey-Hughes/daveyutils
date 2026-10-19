@@ -5,10 +5,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use super::karaoke::{self, Align, Letter, Widths};
+use super::shift::{self, Shifts};
 use crate::blocks::Block;
-use crate::store::{Finding, Run, State};
+use crate::store::{Finding, Run, State, TimingFix};
 use crate::subs::{self, Kind};
-use crate::text::{self, Event};
+use crate::text::{self, Event, Occurrence};
 
 /// A finding and the text it should read.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,7 +20,7 @@ pub struct Fix<'a> {
 
 /// The run's accepted findings, in run order, each with the reviewer's wording where they reworded
 /// it and else the suggestion, whitespace collapsed as the original was. Timing findings are not
-/// among them: apply does not shift tracks yet.
+/// among them: they are [`shift::fixes`](super::shift::fixes).
 pub fn fixes(run: &Run) -> Vec<Fix<'_>> {
     run.findings
         .iter()
@@ -42,6 +43,8 @@ pub enum Outcome {
     /// row; narrower when negative), with the widths of the characters in `guessed` measured in no
     /// row's style.
     Respaced { px: i64, guessed: String },
+    /// A timing fix: this many events move by whole frames.
+    Shifted { events: usize },
     /// Its events read the fix already.
     AlreadyApplied,
     /// Left for a fix by hand, and why.
@@ -63,6 +66,21 @@ pub struct Track<'a> {
     pub scale: u64,
     /// Nanoseconds.
     pub default_duration: Option<u64>,
+    /// Where its typos are, by its timing fix.
+    pub timing: Timing<'a>,
+}
+
+/// Where a track's typos are, by its timing fix.
+#[derive(Debug, Clone, Copy)]
+pub enum Timing<'a> {
+    /// No timing fix, or one still to do: at the times the scan recorded.
+    AsScanned,
+    /// Its timing fix is in: a typo found before the shift is at its times shifted.
+    Moved(Shifts<'a>),
+    /// Its timing fix reads as neither in nor to do, or could not be read: a typo on a line it
+    /// moves could be at either time, where a sign set frame by frame has another copy of it, so
+    /// is left for a hand fix; one on a line it does not move is where the scan found it.
+    Unsure(&'a TimingFix),
 }
 
 /// What the fixes do to one track's blocks.
@@ -74,6 +92,8 @@ pub struct Edits {
     pub removed: BTreeSet<usize>,
     /// New blocks, by the index of the block each is cloned from and takes its times from.
     pub added: BTreeMap<usize, Added>,
+    /// New times, as (timestamp, duration) in TimestampScale units, by block index.
+    pub times: BTreeMap<usize, (i64, Option<u64>)>,
 }
 
 /// New blocks beside one block: right before it and right after it, each in order.
@@ -111,15 +131,29 @@ pub struct Plan {
     pub rows: Vec<KaraokeRow>,
 }
 
-/// `blocks` as `edits` leaves them: payloads replaced, blocks left out, and new blocks beside the
-/// ones they were cloned from, with their times.
-pub fn edited(blocks: &[Block], edits: &Edits) -> Vec<Block> {
+/// `blocks` as `edits` leaves them: payloads replaced, blocks left out, new blocks beside the ones
+/// they were cloned from, with their times, and times moved. Blocks with new times are put in the
+/// order mkvmerge writes the track in: by timestamp, then as the file lists them (ASS by ReadOrder,
+/// SRT as written).
+pub fn edited(kind: Kind, blocks: &[Block], edits: &Edits) -> Vec<Block> {
     let with = |b: &Block, payload: &Vec<u8>| Block {
         payload: payload.clone(),
         ..b.clone()
     };
     let mut out = Vec::with_capacity(blocks.len());
     for (i, b) in blocks.iter().enumerate() {
+        let moved;
+        let b = match edits.times.get(&i) {
+            Some(&(timestamp, duration)) => {
+                moved = Block {
+                    timestamp,
+                    duration,
+                    ..b.clone()
+                };
+                &moved
+            }
+            None => b,
+        };
         let added = edits.added.get(&i);
         out.extend(
             added
@@ -137,7 +171,18 @@ pub fn edited(blocks: &[Block], edits: &Edits) -> Vec<Block> {
         }
         out.extend(added.into_iter().flat_map(|a| &a.after).map(|p| with(b, p)));
     }
+    if !edits.times.is_empty() {
+        match kind {
+            Kind::Ass | Kind::Ssa => out.sort_by_cached_key(|b| (b.timestamp, read_order(b))),
+            Kind::Srt => out.sort_by_key(|b| b.timestamp),
+        }
+    }
     out
+}
+
+/// An ASS block's ReadOrder; one that does not parse goes after the rest.
+fn read_order(b: &Block) -> i64 {
+    subs::read_order(&b.payload).unwrap_or(i64::MAX)
 }
 
 /// What one fix does.
@@ -273,15 +318,7 @@ impl Context<'_> {
                 return Err(Outcome::ByHand("the fix has markup characters".into()));
             }
             let events = &self.events[&track.id];
-            // The events at this time, in this style: the line is among them.
-            let here: Vec<(usize, &Event)> = events
-                .iter()
-                .enumerate()
-                .filter_map(|(i, e)| Some((i, e.as_ref()?)))
-                .filter(|(_, e)| {
-                    e.start_ms == o.start_ms && e.end_ms == o.end_ms && e.style == f.style
-                })
-                .collect();
+            let here = occurrence(events, track, o, fix)?;
             let original: Vec<usize> = here
                 .iter()
                 .filter(|(_, e)| e.text == f.original)
@@ -354,6 +391,37 @@ impl Context<'_> {
         }
         Ok(change)
     }
+}
+
+/// The events of `track` at occurrence `o`'s time, in its fix's style: the line is among them. In a
+/// track remuxed with its timing fix, at that time shifted: what is at the time itself now came
+/// from a frame later (a sign set frame by frame has a copy of the line there). An error where its
+/// track's timing cannot tell which.
+fn occurrence<'e>(
+    events: &'e [Option<Event>],
+    track: &Track,
+    o: &Occurrence,
+    fix: &Fix,
+) -> Result<Vec<(usize, &'e Event)>, Outcome> {
+    let f = fix.finding;
+    let at = |start_ms: i64, end_ms: i64| -> Vec<(usize, &Event)> {
+        events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| Some((i, e.as_ref()?)))
+            .filter(|(_, e)| e.start_ms == start_ms && e.end_ms == end_ms && e.style == f.style)
+            .collect()
+    };
+    let recorded = (o.start_ms, o.end_ms);
+    let (start, end) = match track.timing {
+        Timing::Moved(s) => s.times(o.start_ms, o.end_ms).unwrap_or(recorded),
+        Timing::Unsure(t) if shift::moves(t, o.start_ms, o.end_ms) => {
+            let why = "its track's timing fix leaves its time unknown";
+            return Err(Outcome::ByHand(why.into()));
+        }
+        Timing::AsScanned | Timing::Unsure(_) => recorded,
+    };
+    Ok(at(start, end))
 }
 
 /// Block `i` of `track` (an ordinary line reading `original`) with the change to `fixed` made in
@@ -921,6 +989,7 @@ mod tests {
             header: HEADER,
             scale: 1_000_000,
             default_duration: None,
+            timing: Timing::AsScanned,
         }
     }
 
@@ -974,6 +1043,82 @@ mod tests {
         let p = plan(&[track(0, &blocks)], &[fix], false);
         assert_eq!(p.outcomes, [(1, Outcome::AlreadyApplied)]);
         assert!(p.edits.is_empty());
+    }
+
+    #[test]
+    fn a_typo_on_a_shifted_track_is_found_at_its_times_shifted_too() {
+        use crate::store::{Basis, FixStretch, TimingFix};
+        use crate::timing::Video;
+        // 25 fps, a cut every 2 s; the line was found a frame after the cut at 2 s.
+        let video = Video {
+            frame_ns: 40_000_000,
+            keyframes_ns: (0..=10).map(|i| i * 2_000_000_000).collect(),
+        };
+        let grid = super::super::shift::Grid::fit(&video, 1_000_000).unwrap();
+        let shift = TimingFix {
+            track: 0,
+            frame_ns: 40_000_000,
+            stretches: vec![FixStretch {
+                from_ms: None,
+                to_ms: None,
+                frames: 1,
+                first: None,
+                last: None,
+                frame_ms: None,
+            }],
+            unshifted: vec![],
+            basis: Basis::Cuts {
+                times: 2,
+                agreeing: 0,
+                windows: 0,
+            },
+        };
+        let f = finding(1, "D", "teh end", &[(0, 2040)]);
+        let fix = Fix {
+            finding: &f,
+            text: "the end".into(),
+        };
+        let plan_on = |blocks: &[Block]| {
+            let t = Track {
+                timing: Timing::Moved(Shifts::new(&shift, grid, Kind::Ass)),
+                ..track(0, blocks)
+            };
+            plan(&[t], std::slice::from_ref(&fix), false)
+        };
+        // Remuxed with the shift: the typo is a frame earlier, and patched there.
+        let p = plan_on(&[block(2000, 0, "D", "teh end")]);
+        assert_eq!(p.outcomes, [(1, Outcome::Patched)]);
+        assert_eq!(payload(&p, 0, 0), "0,0,D,,0,0,0,,the end");
+        // Or in already.
+        let p = plan_on(&[block(2000, 0, "D", "the end")]);
+        assert_eq!(p.outcomes, [(1, Outcome::AlreadyApplied)]);
+        // A sign set frame by frame has a copy where the scan found it, come from a frame later:
+        // the one patched is the one at the time shifted.
+        let p = plan_on(&[
+            block(2040, 0, "D", "teh end"),
+            block(2000, 0, "D", "teh end"),
+        ]);
+        assert_eq!(p.edits[&0].changed.keys().collect::<Vec<_>>(), [&1]);
+        // A track whose timing fix reads as neither in nor to do: a line it moves could be at
+        // either time, and is left for a hand fix.
+        let blocks = [block(2040, 0, "D", "teh end")];
+        let unsure = |fix_of_track| Track {
+            timing: Timing::Unsure(fix_of_track),
+            ..track(0, &blocks)
+        };
+        let p = plan(&[unsure(&shift)], std::slice::from_ref(&fix), false);
+        let why = "its track's timing fix leaves its time unknown";
+        assert_eq!(p.outcomes, [(1, Outcome::ByHand(why.into()))]);
+        // A line it does not move (in a stretch in sync) is where the scan found it.
+        let in_sync = TimingFix {
+            stretches: vec![FixStretch {
+                frames: 0,
+                ..shift.stretches[0].clone()
+            }],
+            ..shift.clone()
+        };
+        let p = plan(&[unsure(&in_sync)], std::slice::from_ref(&fix), false);
+        assert_eq!(p.outcomes, [(1, Outcome::Patched)]);
     }
 
     #[test]
@@ -1527,6 +1672,58 @@ mod tests {
     }
 
     #[test]
+    fn blocks_with_new_times_go_by_timestamp_then_read_order() {
+        // ReadOrder 2 moves onto ReadOrder 5's time, and a block added beside it moves with it.
+        let mut blocks = [block(1000, 0, "D", "a"), block(1040, 0, "D", "b")];
+        blocks[0].payload = b"5,0,D,,0,0,0,,a".to_vec();
+        blocks[1].payload = b"2,0,D,,0,0,0,,b".to_vec();
+        let mut e = Edits::default();
+        e.times.insert(1, (1000, Some(960)));
+        e.added.insert(
+            1,
+            Added {
+                before: vec![],
+                after: vec![b"9,0,D,,0,0,0,,c".to_vec()],
+            },
+        );
+        let got: Vec<(i64, Option<u64>, String)> = edited(Kind::Ass, &blocks, &e)
+            .into_iter()
+            .map(|b| {
+                (
+                    b.timestamp,
+                    b.duration,
+                    String::from_utf8(b.payload).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1000, Some(960), "2,0,D,,0,0,0,,b".into()),
+                (1000, Some(1000), "5,0,D,,0,0,0,,a".into()),
+                (1000, Some(960), "9,0,D,,0,0,0,,c".into()),
+            ]
+        );
+        // SRT keeps the order it is written in among blocks of one time.
+        let srt = [
+            block(1000, 0, "D", "a"),
+            block(1040, 0, "D", "b"),
+            block(2000, 0, "D", "c"),
+        ];
+        let mut e = Edits::default();
+        e.times.insert(1, (1000, Some(1000)));
+        e.times.insert(2, (900, Some(1000)));
+        let order: Vec<String> = edited(Kind::Srt, &srt, &e)
+            .into_iter()
+            .map(|b| String::from_utf8(b.payload).unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            ["0,0,D,,0,0,0,,c", "0,0,D,,0,0,0,,a", "0,0,D,,0,0,0,,b"]
+        );
+    }
+
+    #[test]
     fn new_blocks_go_beside_the_block_they_were_cloned_from_with_its_times() {
         let blocks = [block(1000, 0, "D", "a"), block(2000, 0, "D", "b")];
         let mut e = Edits::default();
@@ -1538,7 +1735,7 @@ mod tests {
                 after: vec![b"y".to_vec(), b"z".to_vec()],
             },
         );
-        let got: Vec<(i64, String)> = edited(&blocks, &e)
+        let got: Vec<(i64, String)> = edited(Kind::Ass, &blocks, &e)
             .into_iter()
             .map(|b| (b.timestamp, String::from_utf8(b.payload).unwrap()))
             .collect();
@@ -1698,7 +1895,7 @@ mod tests {
     }
 
     #[test]
-    fn an_accepted_timing_finding_is_no_fix_yet() {
+    fn an_accepted_timing_finding_is_a_shift_not_a_text_fix() {
         use crate::store::{Basis, Decision, TimingFix};
         let mut f = finding(1, "", "1 frame late", &[(0, 1000)]);
         f.timing = Some(TimingFix {
@@ -1726,5 +1923,6 @@ mod tests {
             },
         );
         assert_eq!(fixes(&run), []);
+        assert_eq!(super::super::shift::fixes(&run), [&run.findings[0]]);
     }
 }

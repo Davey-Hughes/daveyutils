@@ -132,6 +132,50 @@ impl Setup {
         s
     }
 
+    /// A copy of fixture `name` in `media/`, scanned with the fake LLM (which finds nothing in
+    /// it), and every finding accepted.
+    fn scanned(name: &str) -> Setup {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir(root.join("media")).unwrap();
+        let file = root.join("media").join(name);
+        std::fs::copy(fixture(name), &file).unwrap();
+        let s = Setup {
+            _dir: dir,
+            root,
+            file,
+        };
+        let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+        let o = Command::new(env!("CARGO_BIN_EXE_subcheck"))
+            .arg("scan")
+            .arg(&s.file)
+            .arg("--llm-cmd")
+            .arg(format!("'{}'", fake.display()))
+            .env("XDG_STATE_HOME", s.root.join("state"))
+            .env("FAKE_LLM_LOG", s.root.join("llm-calls.log"))
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let run = subcheck::store::read_run(&s.run_file()).unwrap();
+        let accepted: Vec<Record> = run
+            .findings
+            .iter()
+            .map(|f| {
+                Record::Decision(Decision {
+                    finding: f.id,
+                    state: State::Accepted,
+                    edited: None,
+                    at: jiff::Timestamp::UNIX_EPOCH,
+                })
+            })
+            .collect();
+        RunWriter::open(&s.run_file())
+            .unwrap()
+            .append(&accepted)
+            .unwrap();
+        s
+    }
+
     /// More findings, for `path`, in the same run.
     fn add(&self, path: &Path, lines: &[Line], first: u64) {
         let mut w = RunWriter::open(&self.run_file()).unwrap();
@@ -791,4 +835,264 @@ fn a_probe_left_by_an_interrupted_run_is_no_obstacle() {
         String::from_utf8_lossy(&o.stderr)
     );
     assert!(!Path::new(&probe).exists());
+}
+
+/// A typo on timing.mkv's late track 2, in its first line: the line the timing fix is found by.
+const LATE_TYPO: &[Line] = &[(
+    "Default",
+    "Line 0 on the cut.",
+    "Line zero on the cut.",
+    &[(2, 500, 7250)],
+)];
+
+/// `subcheck timing` on `file`.
+fn timing(file: &Path) -> String {
+    let o = Command::new(env!("CARGO_BIN_EXE_subcheck"))
+        .arg("timing")
+        .arg(file)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    stdout(&o)
+}
+
+#[test]
+fn timing_fixes_shift_their_tracks_with_the_typos_in_one_remux() {
+    if !have_mkvmerge() {
+        return;
+    }
+    let s = Setup::scanned("timing.mkv");
+    s.add(&s.file, LATE_TYPO, 3);
+    let o = s.apply(&["--dry-run"]);
+    let text = stdout(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(
+        text.contains(
+            "  0:00:00.50  0 → zero  ok\n\
+             \x20 track 2  1 frame late → shift 1 frame earlier  ok (68 events moved)\n\
+             \x20   track 2: 0:00:00.50 – 0:00:07.25 → 0:00:00.00 – 0:00:06.75  Line 0 on the cut.\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("  track 4  1 frame late → shift 1 frame earlier  ok ("),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "to apply 3, already applied 0, by hand 0, not found 0; 0 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+    let o = s.apply(&[]);
+    let text = stdout(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(
+        text.ends_with(
+            "applied 3, already applied 0, by hand 0, not found 0; 1 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+    assert_eq!(
+        subcheck::store::read_run(&s.run_file())
+            .unwrap()
+            .applied
+            .len(),
+        3
+    );
+    let now = track(&s.file, 2);
+    assert!(
+        now.contains("Dialogue: 0,0:00:00.00,0:00:06.75,Default,,0,0,0,,Line zero on the cut.\n"),
+        "{now}"
+    );
+    let report = timing(&s.file);
+    assert!(!report.contains("fix:"), "{report}");
+    assert!(
+        report.contains("track 2  Dialogue a frame late  in sync"),
+        "{report}"
+    );
+    // Run again: every fix is in, the typo found at its line's new times.
+    let o = s.apply(&[]);
+    let text = stdout(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(
+        text.ends_with(
+            "applied 0, already applied 3, by hand 0, not found 0; 0 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn shifted_tracks_written_remuxed_elsewhere_then_checked() {
+    if !have_mkvmerge() {
+        return;
+    }
+    let s = Setup::scanned("timing.mkv");
+    let out = s.root.join("tracks");
+    let text = stdout(&s.apply(&["--tracks-only", out.to_str().unwrap()]));
+    let command = text.lines().find(|l| l.starts_with("  mkvmerge ")).unwrap();
+    let ran = Command::new("sh")
+        .arg("-c")
+        .arg(command.trim())
+        .output()
+        .unwrap();
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stdout)
+    );
+    let o = s.apply(&["--check"]);
+    let text = stdout(&o);
+    assert!(o.status.success(), "{text}");
+    let remuxed = subcheck::apply::remux_path(&s.file);
+    assert!(
+        text.contains(&format!("  {} checked (quick): OK\n", remuxed.display())),
+        "{text}"
+    );
+    assert!(!timing(&remuxed).contains("fix:"));
+}
+
+#[test]
+fn a_timing_fix_that_cannot_be_made_is_left_for_a_hand_fix() {
+    // A file whose video has too few keyframes to give the frame grid.
+    let s = Setup::with("apply.mkv", &[], 0);
+    let mut late = subcheck::store::read_run(&Setup::scanned("timing.mkv").run_file())
+        .unwrap()
+        .findings
+        .remove(0);
+    late.id = 1;
+    late.file = s.file.to_string_lossy().into_owned();
+    // Its one stretch's ends: apply.mkv's first line on track 2, where the scan found it.
+    let first = subcheck::store::LineRef {
+        raw: "0,Default,,0,0,0,,We should leave befor it rains.".into(),
+        start_ms: 1000,
+        end_ms: 2500,
+    };
+    let fix = late.timing.as_mut().unwrap();
+    fix.stretches.truncate(1);
+    fix.stretches[0].first = Some(first.clone());
+    fix.stretches[0].last = Some(first);
+    let accepted = |finding| {
+        Record::Decision(Decision {
+            finding,
+            state: State::Accepted,
+            edited: None,
+            at: jiff::Timestamp::UNIX_EPOCH,
+        })
+    };
+    let mut w = RunWriter::open(&s.run_file()).unwrap();
+    w.append(&[Record::Finding(late.clone()), accepted(1)])
+        .unwrap();
+    // A typo on that line: with the fix's lines where the scan found them, no grid is needed to
+    // know it is there too.
+    s.add(&s.file, &APPLY_LINES[..1], 2);
+    let text = stdout(&s.apply(&["--dry-run"]));
+    assert!(
+        text.contains(
+            "  track 2  1 frame late → shift 1 frame earlier  by hand: only 2 video keyframes in the Cues\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("  0:00:01.00  befor → before  ok\n"),
+        "{text}"
+    );
+    // Two timing findings on one track: neither is made.
+    let s = Setup::scanned("timing.mkv");
+    let mut again = subcheck::store::read_run(&s.run_file()).unwrap().findings[0].clone();
+    again.id = 3;
+    let mut w = RunWriter::open(&s.run_file()).unwrap();
+    w.append(&[Record::Finding(again), accepted(3)]).unwrap();
+    let text = stdout(&s.apply(&["--dry-run"]));
+    let hand =
+        "  track 2  1 frame late → shift 1 frame earlier  by hand: two timing fixes on one track\n";
+    assert_eq!(text.matches(hand).count(), 2, "{text}");
+    assert!(
+        text.contains("  track 4  1 frame late → shift 1 frame earlier  ok ("),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_typo_is_looked_for_at_shifted_times_only_on_a_track_shifted_already() {
+    // Recorded a frame after where the line is: on the track as it is, not yet shifted, it is not
+    // there, though the line sits where the shift would move its times.
+    let s = Setup::scanned("timing.mkv");
+    let early: &[Line] = &[(
+        "Default",
+        "Line 0 on the cut.",
+        "Line zero on the cut.",
+        &[(2, 1000, 7750)],
+    )];
+    s.add(&s.file, early, 3);
+    let not_found = "  0:00:01.00  0 → zero  not found: the file changed since the scan\n";
+    let text = stdout(&s.apply(&["--dry-run"]));
+    assert!(text.contains(not_found), "{text}");
+    // Nor with the track's timing fix left for a hand fix: two of them on it.
+    let mut again = subcheck::store::read_run(&s.run_file()).unwrap().findings[0].clone();
+    again.id = 4;
+    let accepted = Record::Decision(Decision {
+        finding: 4,
+        state: State::Accepted,
+        edited: None,
+        at: jiff::Timestamp::UNIX_EPOCH,
+    });
+    let mut w = RunWriter::open(&s.run_file()).unwrap();
+    w.append(&[Record::Finding(again), accepted]).unwrap();
+    // Nor with the track's two timing fixes left for a hand fix: not knowing whether the track
+    // is shifted, a line they move is left for one too.
+    let text = stdout(&s.apply(&["--dry-run"]));
+    assert!(
+        text.contains("by hand: two timing fixes on one track"),
+        "{text}"
+    );
+    let unsure = "by hand: its track's timing fix leaves its time unknown\n";
+    assert!(
+        text.contains(&format!("  0:00:01.00  0 → zero  {unsure}")),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_typo_on_a_line_a_timing_fix_reading_not_found_moves_is_left_for_a_hand_fix() {
+    if !have_mkvmerge() {
+        return;
+    }
+    let s = Setup::scanned("timing.mkv");
+    assert!(s.apply(&[]).status.success());
+    // Track 2's first line, as the run recorded it, reads otherwise now (its style changed by
+    // hand, say): its timing fix reads neither in nor to do, and a typo on a line it moves could
+    // be at either time.
+    let run = std::fs::read_to_string(s.run_file()).unwrap();
+    let changed = run.replacen(
+        "\"raw\":\"0,Default,,0,0,0,,Line 0 on the cut.\"",
+        "\"raw\":\"0,Sign,,0,0,0,,Line 0 on the cut.\"",
+        1,
+    );
+    assert_ne!(changed, run);
+    std::fs::write(s.run_file(), changed).unwrap();
+    s.add(&s.file, LATE_TYPO, 3);
+    // At the times where the line is now, too.
+    let where_now: &[Line] = &[(
+        "Default",
+        "Line 0 on the cut.",
+        "Line nought on the cut.",
+        &[(2, 0, 6750)],
+    )];
+    s.add(&s.file, where_now, 4);
+    let text = stdout(&s.apply(&["--dry-run"]));
+    assert!(
+        text.contains("  track 2  1 frame late → shift 1 frame earlier  not found: "),
+        "{text}"
+    );
+    let unsure = "by hand: its track's timing fix leaves its time unknown\n";
+    assert!(
+        text.contains(&format!("  0:00:00.50  0 → zero  {unsure}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("  0:00:00.00  0 → nought  {unsure}")),
+        "{text}"
+    );
 }

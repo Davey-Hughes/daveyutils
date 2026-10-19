@@ -96,7 +96,7 @@ fn a_track_is_written_with_edited_payloads_in_place_of_theirs() {
             changed: edits.clone(),
             ..Default::default()
         };
-        let blocks = subcheck::apply::patch::edited(&read.blocks, &edits);
+        let blocks = subcheck::apply::patch::edited(kind, &read.blocks, &edits);
         subs::write_track(track, kind, &blocks, layout.timestamp_scale, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     };

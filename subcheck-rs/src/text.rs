@@ -75,12 +75,7 @@ pub fn event(
     scale: u64,
     default_duration: Option<u64>,
 ) -> Option<Event> {
-    let start_ms = ms(i128::from(b.timestamp) * i128::from(scale));
-    let duration_ms = b
-        .duration
-        .map(|d| ms(i128::from(d) * i128::from(scale)))
-        .or(default_duration.map(|d| ms(i128::from(d))))
-        .unwrap_or(0);
+    let (start_ms, end_ms) = event_times(b, scale, default_duration);
     // Up to the first NUL, as extract reads it: NUL padding would otherwise reach the LLM and
     // stop identical lines from matching across files.
     let payload = crate::subs::c_string(&b.payload);
@@ -93,14 +88,11 @@ pub fn event(
         Kind::Srt => (String::new(), String::new()),
     };
     let Cleaned { text, pos, karaoke } = clean(&payload[at..], kind)?;
-    let raw = match kind {
-        Kind::Ass | Kind::Ssa => payload.split_once(',').map_or("", |(_, rest)| rest),
-        Kind::Srt => &payload,
-    };
+    let raw = raw(kind, &payload);
     Some(Event {
         track,
         start_ms,
-        end_ms: start_ms + duration_ms,
+        end_ms,
         layer,
         style,
         text,
@@ -108,6 +100,26 @@ pub fn event(
         karaoke,
         raw: raw.to_string(),
     })
+}
+
+/// A block's start and end in ms, as its event has them: the end is the start plus the duration,
+/// each cut to the millisecond.
+pub fn event_times(b: &Block, scale: u64, default_duration: Option<u64>) -> (i64, i64) {
+    let start_ms = ms(i128::from(b.timestamp) * i128::from(scale));
+    let duration_ms = b
+        .duration
+        .map(|d| ms(i128::from(d) * i128::from(scale)))
+        .or(default_duration.map(|d| ms(i128::from(d))))
+        .unwrap_or(0);
+    (start_ms, start_ms + duration_ms)
+}
+
+/// A block's payload (as `c_string` reads it) as its event's `raw`: but for its ReadOrder.
+pub fn raw(kind: Kind, payload: &str) -> &str {
+    match kind {
+        Kind::Ass | Kind::Ssa => payload.split_once(',').map_or("", |(_, rest)| rest),
+        Kind::Srt => payload,
+    }
 }
 
 /// Where the text starts in a block's payload (as `c_string` reads it): after the eighth comma
