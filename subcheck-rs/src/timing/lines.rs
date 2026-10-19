@@ -17,19 +17,25 @@ pub struct Block {
 
 /// The track's events in blocks, in time order.
 pub fn blocks(events: &[Event]) -> Vec<Block> {
-    let mut order: Vec<usize> = (0..events.len()).collect();
-    order.sort_by_key(|&i| (events[i].start_ms, events[i].end_ms));
+    let times: Vec<(i64, i64)> = events.iter().map(|e| (e.start_ms, e.end_ms)).collect();
+    blocks_of(&times)
+}
+
+/// Lines at these (start, end) times in blocks, in time order; a block's indices are into `times`.
+pub fn blocks_of(times: &[(i64, i64)]) -> Vec<Block> {
+    let mut order: Vec<usize> = (0..times.len()).collect();
+    order.sort_by_key(|&i| times[i]);
     let mut out: Vec<Block> = Vec::new();
     for i in order {
-        let e = &events[i];
+        let (start_ms, end_ms) = times[i];
         match out.last_mut() {
-            Some(b) if e.start_ms <= b.end_ms => {
-                b.end_ms = b.end_ms.max(e.end_ms);
+            Some(b) if start_ms <= b.end_ms => {
+                b.end_ms = b.end_ms.max(end_ms);
                 b.events.push(i);
             }
             _ => out.push(Block {
-                start_ms: e.start_ms,
-                end_ms: e.end_ms,
+                start_ms,
+                end_ms,
                 events: vec![i],
             }),
         }

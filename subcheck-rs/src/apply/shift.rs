@@ -8,7 +8,7 @@ use super::patch::{Outcome, Track};
 use crate::store::{Finding, FixStretch, LineRef, Run, State, TimingFix};
 use crate::subs::{self, Kind};
 use crate::text;
-use crate::timing::Video;
+use crate::timing::{Video, lines};
 
 /// The run's accepted timing findings, in run order.
 pub fn fixes(run: &Run) -> Vec<&Finding> {
@@ -195,7 +195,8 @@ fn ms(ns: i128) -> i64 {
 }
 
 /// The stretch an event starting at `start_ms` belongs to: the last that starts at or before it.
-/// A block between two stretches (one the scan did not see, a drawing say) goes with the first.
+/// A block between two stretches (one the scan did not see, a drawing say, that overlaps none of
+/// the lines it did) goes with the first.
 fn stretch_of(stretches: &[FixStretch], start_ms: i64) -> Option<&FixStretch> {
     stretches
         .iter()
@@ -205,7 +206,8 @@ fn stretch_of(stretches: &[FixStretch], start_ms: i64) -> Option<&FixStretch> {
 
 /// The stretch that moves a line of these times, if one does: not an unshifted line's. The scan
 /// leaves lines where they are a block of overlapping lines at a time, so an event at an unshifted
-/// line's times, whatever its text (a typo fixed since, a drawing), is in that block.
+/// line's times, whatever its text (a typo fixed since), is in that block. A drawing goes by its
+/// neighbours ([`stretches`]).
 fn moving(fix: &TimingFix, start_ms: i64, end_ms: i64) -> Option<&FixStretch> {
     let unshifted = fix
         .unshifted
@@ -221,7 +223,8 @@ pub fn moves(fix: &TimingFix, start_ms: i64, end_ms: i64) -> bool {
 }
 
 /// A track's times as a timing fix moves them: for looking up a typo found before the shift in
-/// a track remuxed with it.
+/// a track remuxed with it. Lines the scan read, as typos are: a drawing goes by its neighbours
+/// ([`stretches`]).
 #[derive(Debug, Clone, Copy)]
 pub struct Shifts<'a> {
     pub fix: &'a TimingFix,
@@ -244,9 +247,13 @@ impl<'a> Shifts<'a> {
     /// to no time, and an SRT line of none is dropped by mkvmerge. One of no time moves (an SRT
     /// line with no duration is shown until the next).
     fn stretch(&self, start_ms: i64, end_ms: i64) -> Option<&FixStretch> {
+        moving(self.fix, start_ms, end_ms).filter(|_| self.shown(start_ms, end_ms))
+    }
+
+    /// Whether a line of these times is shown on a frame, or has no time to show: one that moves.
+    fn shown(&self, start_ms: i64, end_ms: i64) -> bool {
         let frame = |t: i64| self.grid.frame_of(i128::from(t) * 1_000_000);
-        moving(self.fix, start_ms, end_ms)
-            .filter(|_| start_ms == end_ms || frame(start_ms) < frame(end_ms))
+        start_ms == end_ms || frame(start_ms) < frame(end_ms)
     }
 
     /// A line's times (ms) after the shift; `None` when it does not move.
@@ -344,6 +351,43 @@ pub fn lines_without_grid(fix: &TimingFix, track: &Track) -> Lines {
     }
 }
 
+/// Each line's moving stretch, as [`moving`] gives it, for `track`'s lines as `keys`; but a line
+/// the scan did not read (a drawing) goes with the read lines it overlaps or touches when they all
+/// move alike, as the scan moves a block of such lines together. One that meets none, or lines
+/// that move apart, goes by its own times.
+fn stretches<'f>(
+    fix: &'f TimingFix,
+    track: &Track,
+    keys: &[(&str, i64, i64)],
+) -> Vec<Option<&'f FixStretch>> {
+    let mut each: Vec<Option<&FixStretch>> = keys.iter().map(|k| moving(fix, k.1, k.2)).collect();
+    let read: Vec<bool> = track
+        .blocks
+        .iter()
+        .map(|b| {
+            text::event(track.id, track.kind, b, track.scale, track.default_duration).is_some()
+        })
+        .collect();
+    let times: Vec<(i64, i64)> = keys.iter().map(|k| (k.1, k.2)).collect();
+    // A drawing's neighbours are in its block, which holds them earliest first.
+    for block in lines::blocks_of(&times) {
+        let (seen, drawn): (Vec<usize>, Vec<usize>) = block.events.iter().partition(|&&i| read[i]);
+        for d in drawn {
+            let (start, end) = times[d];
+            let by_end = seen.partition_point(|&i| times[i].0 <= end);
+            let mut near = seen[..by_end].iter().filter(|&&i| times[i].1 >= start);
+            let Some(&first) = near.next() else {
+                continue;
+            };
+            let frames = |i: usize| each[i].map(|s| s.frames);
+            if near.all(|&i| frames(i) == frames(first)) {
+                each[d] = each[first];
+            }
+        }
+    }
+    each
+}
+
 /// The fix on `track`: which blocks move and to where, or why none do. Each stretch's first and
 /// last moved line says whether the fix is still to do (at the recorded times), in already (at
 /// those times shifted), or the file changed (neither). Every time must move by exactly its
@@ -372,9 +416,10 @@ pub fn plan(fix: &TimingFix, track: &Track, grid: &Grid) -> Plan {
         return none(Outcome::NotFound, Lines::Unsure);
     }
     let hand = |why: &str| none(Outcome::ByHand(why.into()), Lines::AsScanned);
+    let each = stretches(fix, track, &keys);
     let mut times = Vec::new();
     for (i, k) in keys.iter().enumerate() {
-        let Some(s) = shifts.stretch(k.1, k.2) else {
+        let Some(s) = each[i].filter(|_| shifts.shown(k.1, k.2)) else {
             continue;
         };
         let (start, end) = (i128::from(k.1) * 1_000_000, i128::from(k.2) * 1_000_000);
@@ -875,5 +920,127 @@ mod tests {
         let shifts = Shifts::new(&kept, grid(), Kind::Ass);
         assert_eq!(shifts.times(6040, 8040), None);
         assert_eq!(shifts.times(2040, 4040), Some((2000, 4000)));
+    }
+
+    /// A drawing (`\p1`): a line the scan does not read, so no stretch starts or ends on it.
+    fn drawing(order: usize, start_ms: i64, end_ms: i64) -> Block {
+        block(order, start_ms, end_ms, r"{\p1}m 0 0 l 100 0 l 100 2 l 0 2")
+    }
+
+    /// In sync to line one, then a frame late from line two: the late stretch starts at its first
+    /// line the scan read.
+    fn late_from_two() -> TimingFix {
+        let ends = (line(6040, 8040, "Two."), line(10_040, 12_040, "Three."));
+        fix(
+            vec![
+                stretch(None, Some(4040), 0, None),
+                stretch(Some(6040), None, 1, Some(ends)),
+            ],
+            vec![],
+        )
+    }
+
+    fn moved(p: &Plan) -> Vec<usize> {
+        p.times.iter().map(|t| t.0).collect()
+    }
+
+    #[test]
+    fn a_drawing_moves_with_the_lines_it_overlaps_though_it_starts_before_their_stretch() {
+        // K-On!! E16's ED: a drawing starts 0.6 s before the first line of the stretch it
+        // overlaps, and must move with it.
+        let mut blocks = late();
+        blocks.push(drawing(3, 5500, 7000));
+        let p = plan(&late_from_two(), &track(&blocks), &grid());
+        assert_eq!(p.outcome, Outcome::Shifted { events: 3 });
+        assert_eq!(moved(&p), [1, 2, 3]);
+        assert_eq!(p.times[2], (3, 5460, Some(1500)));
+    }
+
+    #[test]
+    fn a_drawing_stays_with_the_lines_it_overlaps_though_it_starts_in_a_moving_stretch() {
+        let ends = (line(2040, 4040, "One."), line(2040, 4040, "One."));
+        let partial = fix(
+            vec![
+                stretch(None, Some(4040), 1, Some(ends)),
+                stretch(Some(6040), None, 0, None),
+            ],
+            vec![],
+        );
+        let mut blocks = late();
+        blocks.push(drawing(3, 5000, 6500));
+        assert_eq!(moved(&plan(&partial, &track(&blocks), &grid())), [0]);
+    }
+
+    #[test]
+    fn a_drawing_over_a_line_left_where_it_is_stays_too() {
+        let ends = (line(2040, 4040, "One."), line(2040, 4040, "One."));
+        let kept = fix(
+            vec![
+                stretch(None, Some(8040), 1, Some(ends)),
+                stretch(Some(10_040), None, 0, None),
+            ],
+            vec![line(6040, 8040, "Two.")],
+        );
+        let mut blocks = late();
+        blocks.push(drawing(3, 7000, 7500));
+        assert_eq!(moved(&plan(&kept, &track(&blocks), &grid())), [0]);
+    }
+
+    #[test]
+    fn a_drawing_overlapping_no_line_goes_with_the_stretch_before_it() {
+        let mut blocks = late();
+        blocks.push(drawing(3, 4500, 5000));
+        let p = plan(&late_from_two(), &track(&blocks), &grid());
+        assert_eq!(moved(&p), [1, 2]);
+    }
+
+    #[test]
+    fn a_drawing_overlapping_lines_that_move_apart_goes_by_its_own_times() {
+        // It starts in line one's stretch, which stays: so does it, and the fix still applies.
+        let mut blocks = late();
+        blocks.push(drawing(3, 3000, 6500));
+        let p = plan(&late_from_two(), &track(&blocks), &grid());
+        assert_eq!(
+            (moved(&p), p.outcome),
+            (vec![1, 2], Outcome::Shifted { events: 2 })
+        );
+        // Late only at line two: one starting before it and reaching line three stays too, though
+        // the first line it meets moves.
+        let two = (line(6040, 8040, "Two."), line(6040, 8040, "Two."));
+        let middle = fix(
+            vec![
+                stretch(None, Some(4040), 0, None),
+                stretch(Some(6040), Some(8040), 1, Some(two)),
+                stretch(Some(10_040), None, 0, None),
+            ],
+            vec![],
+        );
+        let mut blocks = late();
+        blocks.push(drawing(3, 5000, 11_000));
+        assert_eq!(moved(&plan(&middle, &track(&blocks), &grid())), [1]);
+    }
+
+    #[test]
+    fn a_drawing_touching_a_line_moves_with_it() {
+        // It ends where line two starts: left behind, it would show a frame with it.
+        let mut blocks = late();
+        blocks.push(drawing(3, 5000, 6040));
+        assert_eq!(
+            moved(&plan(&late_from_two(), &track(&blocks), &grid())),
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn a_drawing_goes_by_the_lines_it_overlaps_not_those_a_longer_one_reaches() {
+        // A bar over the whole track overlaps lines that move apart and goes by its own times;
+        // the drawing under it overlaps only line two and moves with it.
+        let mut blocks = late();
+        blocks.push(drawing(3, 0, 12_040));
+        blocks.push(drawing(4, 5500, 7000));
+        assert_eq!(
+            moved(&plan(&late_from_two(), &track(&blocks), &grid())),
+            [1, 2, 4]
+        );
     }
 }
