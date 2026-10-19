@@ -102,6 +102,13 @@ not compare tags. Any that may not come over exactly are noted in the output, th
 a value that is not plain UTF-8 text, a tag that also targets something else (another track, a
 chapter, an edition), or an element mkvmerge's tags XML cannot hold.
 
+mkvmerge leaves a text subtitle track's default duration out of any remux and gives each event a
+duration of its own instead, rounded to the millisecond. The check expects that rounding, so a file
+whose events take their duration from the track's header passes, without the header field. A fix
+on such a track itself goes through its text format, which cuts each time down to the millisecond
+(SRT) or the centisecond (ASS), and the check refuses the remux unless that still gives the rounded
+duration: a 23.976 fps frame of 41.708 ms rounds to 42, which SRT writes as 41 and ASS as 40.
+
 `--no-backup` keeps no original. `--dry-run` shows each changed event before and after, and writes
 nothing. Running apply again is safe: a fix already in its file is reported and left alone.
 

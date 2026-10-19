@@ -342,6 +342,46 @@ fn apply_remuxes_checks_and_swaps_keeping_the_original() {
     );
 }
 
+#[test]
+fn a_file_whose_text_tracks_are_timed_by_their_default_duration_is_fixed() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // The remux leaves out both tracks' DefaultDuration, the one fixed and the one not.
+    let s = Setup::with(
+        "timed.mkv",
+        &[("", "Over tehre", "Over there", &[(0, 0, 2000)])],
+        0,
+    );
+    let o = s.apply(&[]);
+    let text = stdout(&o);
+    assert!(
+        o.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        text.ends_with(
+            "applied 1, already applied 0, by hand 0, not found 0; 1 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+    let expected = |name| std::fs::read_to_string(fixture(&format!("expected/{name}"))).unwrap();
+    assert_eq!(
+        track(&s.file, 0),
+        expected("timed.track0.srt").replace("tehre", "there")
+    );
+    assert_eq!(track(&s.file, 1), expected("timed.track1.ass"));
+    let o = s.apply(&[]);
+    assert!(
+        stdout(&o).ends_with(
+            "applied 0, already applied 1, by hand 0, not found 0; 0 remuxed, 0 failed\n"
+        ),
+        "{}",
+        stdout(&o)
+    );
+}
+
 /// The apply fixture's per-letter OP row ("go trough it", letters 20 px apart from x 200 in track
 /// 3) as `--karaoke` leaves it: an h after the t, the row spread 10 px each way about its centre.
 fn karaoke_row() -> String {

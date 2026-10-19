@@ -28,10 +28,21 @@ jobs:
           components: rustfmt, clippy
       # The `apply` tests remux with mkvmerge: installed on Linux and required
       # there (SUBCHECK_NEED_MKVMERGE), left out on macOS, where they skip. The
-      # other tests read MKV fixtures committed under tests/fixtures/.
+      # other tests read MKV fixtures committed under tests/fixtures/. From
+      # MKVToolNix's own apt repository, pinned to the version the Forgejo
+      # subcheck-rs job installs, its key checked the same way (see why there):
+      # Ubuntu's own is years behind.
       - name: Install mkvtoolnix
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mkvtoolnix
+        run: |
+          . /etc/os-release
+          key=/etc/apt/keyrings/gpg-pub-moritzbunkus.gpg
+          sudo install -d /etc/apt/keyrings
+          sudo curl -fsSL -o "$key" https://mkvtoolnix.download/gpg-pub-moritzbunkus.gpg
+          fpr=$(gpg --show-keys --with-colons "$key" | awk -F: '$1 == "pub" { getline; print $10 }')
+          [ "$fpr" = D9199745B0545F2E8197062B0F92290A445B9007 ] || { echo "unexpected MKVToolNix key: $fpr" >&2; exit 1; }
+          echo "deb [signed-by=$key] https://mkvtoolnix.download/$ID/ $VERSION_CODENAME main" | sudo tee /etc/apt/sources.list.d/mkvtoolnix.list >/dev/null
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends 'mkvtoolnix=103.0-*'
       #
       # Keep these three in step with the subcheck-rs job in
       # .forgejo/workflows/ci.yml, which runs them with --manifest-path.

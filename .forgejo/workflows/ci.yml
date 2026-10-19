@@ -166,8 +166,21 @@ jobs:
       - name: Install rustfmt and clippy
         run: rustup component add rustfmt clippy
 
+      # From MKVToolNix's own apt repository, pinned: bookworm's is 74.0, years behind the
+      # mkvmerge that remuxes the library, and apply's check models what mkvmerge writes. The
+      # repository keeps old releases, so the pin holds; to move on, change it here and in
+      # .github/workflows/subcheck-rs.yml. Its signing key must be the one keyserver.ubuntu.com
+      # has too, alone in the file.
       - name: Install mkvtoolnix
-        run: apt-get update && apt-get install -y --no-install-recommends mkvtoolnix
+        run: |
+          . /etc/os-release
+          key=/etc/apt/keyrings/gpg-pub-moritzbunkus.gpg
+          install -d /etc/apt/keyrings
+          curl -fsSL -o "$key" https://mkvtoolnix.download/gpg-pub-moritzbunkus.gpg
+          fpr=$(gpg --show-keys --with-colons "$key" | awk -F: '$1 == "pub" { getline; print $10 }')
+          [ "$fpr" = D9199745B0545F2E8197062B0F92290A445B9007 ] || { echo "unexpected MKVToolNix key: $fpr" >&2; exit 1; }
+          echo "deb [signed-by=$key] https://mkvtoolnix.download/$ID/ $VERSION_CODENAME main" >/etc/apt/sources.list.d/mkvtoolnix.list
+          apt-get update && apt-get install -y --no-install-recommends 'mkvtoolnix=103.0-*'
 
       - run: cargo fmt --manifest-path subcheck-rs/Cargo.toml --all --check
       - run: cargo clippy --manifest-path subcheck-rs/Cargo.toml --all-targets -- -D warnings

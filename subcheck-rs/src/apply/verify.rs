@@ -147,7 +147,11 @@ fn header(t: &Track, u: &Track, fixed: bool, diffs: &mut Vec<String>) -> Result<
     if t.default != u.default || t.forced != u.forced || flags(&t.flags) != flags(&u.flags) {
         differs("flags");
     }
-    if t.default_duration != u.default_duration {
+    // mkvmerge leaves a text track's DefaultDuration out of any remux and writes each block's
+    // duration instead, which the events are compared with.
+    if t.default_duration != u.default_duration
+        && !(t.is_text_subtitle() && u.default_duration.is_none())
+    {
         differs("default duration");
     }
     if t.encodings != u.encodings {
@@ -324,6 +328,7 @@ fn subtitles(
         reread(original, unread)?
     };
     let after = reread(remuxed, text.iter().map(|(_, u)| *u).collect())?;
+    let scale = remuxed.layout.timestamp_scale;
     for ((t, u), now) in text.iter().zip(&after) {
         let kind = Kind::of(t).expect("a text subtitle track");
         let expected: &[Block] = match fixed.get(&t.id).or(read.get(&t.id)) {
@@ -336,18 +341,20 @@ fn subtitles(
                     .blocks
             }
         };
+        // A block with no duration of its own, on either side, as the remux has or would have
+        // written its track's DefaultDuration in it.
         let want = events(
             kind,
             expected,
             original.layout.timestamp_scale,
-            t,
+            as_remuxed(t.default_duration, scale),
             fixed.contains_key(&t.id),
         );
         let got = events(
             kind,
             &now.blocks,
-            remuxed.layout.timestamp_scale,
-            u,
+            scale,
+            as_remuxed(u.default_duration, scale),
             fixed.contains_key(&t.id),
         );
         if want.len() != got.len() {
@@ -374,15 +381,24 @@ pub fn must_walk(layout: &Layout, tracks: &[&Track]) -> bool {
         .any(|t| !layout.frame_counts.contains_key(&t.uid))
 }
 
-/// Each block as (start ns, duration ns, bytes up to its first NUL): ASS's ReadOrder as its rank
-/// in the track (mkvmerge numbers events afresh, in file order), and for a rewritten SRT track no
-/// CRs (mkvmerge puts CRLF between an event's rows whatever its source had; ffmpeg puts LF). Bytes,
-/// not text: a rewrite that changed bytes that are not UTF-8 must show.
+/// A text track's DefaultDuration, in ns, as a remux at `scale` writes it in a block with no
+/// duration of its own: whole `scale` units, rounded to the nearest (mkvmerge 74, 82, 102 and 103
+/// make 42 ms of 41.708333; 102 makes 42 of 41.5 and 41 of 41.499999).
+fn as_remuxed(default_duration: Option<u64>, scale: u64) -> Option<i128> {
+    let scale = i128::from(scale.max(1));
+    default_duration.map(|d| (i128::from(d) + scale / 2) / scale * scale)
+}
+
+/// Each block as (start ns, duration ns, bytes up to its first NUL): a block with no duration of
+/// its own has `default` (ns); ASS's ReadOrder as its rank in the track (mkvmerge numbers events
+/// afresh, in file order), and for a rewritten SRT track no CRs (mkvmerge puts CRLF between an
+/// event's rows whatever its source had; ffmpeg puts LF). Bytes, not text: a rewrite that changed
+/// bytes that are not UTF-8 must show.
 fn events(
     kind: Kind,
     blocks: &[Block],
     scale: u64,
-    track: &Track,
+    default: Option<i128>,
     rewritten: bool,
 ) -> Vec<(i128, Option<i128>, Vec<u8>)> {
     let scale = i128::from(scale);
@@ -413,10 +429,7 @@ fn events(
         .iter()
         .zip(texts)
         .map(|(b, text)| {
-            let duration = b
-                .duration
-                .map(|d| i128::from(d) * scale)
-                .or(track.default_duration.map(i128::from));
+            let duration = b.duration.map(|d| i128::from(d) * scale).or(default);
             (i128::from(b.timestamp) * scale, duration, text)
         })
         .collect()
@@ -546,13 +559,15 @@ mod tests {
         }
     }
 
+    /// What [`header`] finds between two tracks, neither one fixed.
+    fn diffs(a: &Track, b: &Track) -> Vec<String> {
+        let mut d = Vec::new();
+        header(a, b, false, &mut d).unwrap();
+        d
+    }
+
     #[test]
     fn a_bcp_47_tag_added_by_a_newer_mkvmerge_is_no_difference() {
-        let diffs = |a: &Track, b: &Track| {
-            let mut d = Vec::new();
-            header(a, b, false, &mut d).unwrap();
-            d
-        };
         let old = track("eng", None);
         assert_eq!(diffs(&old, &track("eng", Some("en"))), [] as [String; 0]);
         assert_eq!(
@@ -566,8 +581,52 @@ mod tests {
     }
 
     #[test]
+    fn a_text_tracks_default_duration_is_compared_as_its_lines_durations() {
+        let timed = |d: u64, t: &Track| Track {
+            default_duration: Some(d),
+            ..t.clone()
+        };
+        // 23.976 fps.
+        let frame = 41_708_333;
+        let ass = track("eng", None);
+        let differs = ["track 2: default duration differs"];
+        // Left out of a text track's header, it is in its lines, below; kept, it is the same.
+        assert_eq!(diffs(&timed(frame, &ass), &ass), [] as [String; 0]);
+        assert_eq!(
+            diffs(&timed(frame, &ass), &timed(40_000_000, &ass)),
+            differs
+        );
+        assert_eq!(diffs(&ass, &timed(frame, &ass)), differs);
+        // An image track's blocks are compared by their frames only, not their durations.
+        let pgs = Track {
+            codec: "S_HDMV/PGS".into(),
+            ..track("eng", None)
+        };
+        assert_eq!(diffs(&timed(frame, &pgs), &pgs), differs);
+        // A line with no duration of its own, as a remux writes it: its track's DefaultDuration in
+        // whole milliseconds, rounded to the nearest (mkvmerge 102 makes 42 ms of 41.708333 and of
+        // 41.5, 41 of 41.499999).
+        let line = |duration| Block {
+            track: 3,
+            position: 0,
+            timestamp: 0,
+            duration,
+            payload: b"0,0,D,,0,0,0,,line".to_vec(),
+        };
+        let lines =
+            |duration, default| events(Kind::Ass, &[line(duration)], 1_000_000, default, true);
+        let remuxed = |ms| lines(Some(ms), None);
+        let original = |ns| lines(None, as_remuxed(Some(ns), 1_000_000));
+        assert_eq!(original(frame), remuxed(42));
+        assert_ne!(original(frame), remuxed(41));
+        assert_eq!(original(41_500_000), remuxed(42));
+        assert_eq!(original(41_499_999), remuxed(41));
+        // A remux whose line has no duration and no DefaultDuration to take one from.
+        assert_ne!(original(frame), lines(None, None));
+    }
+
+    #[test]
     fn read_orders_compare_by_rank() {
-        let t = track("eng", None);
         let block = |order: u32, ms: i64| Block {
             track: 3,
             position: 0,
@@ -581,7 +640,7 @@ mod tests {
                 .zip([0, 1000, 2000])
                 .map(|(&o, ms)| block(o, ms))
                 .collect();
-            events(Kind::Ass, &blocks, 1_000_000, &t, true)
+            events(Kind::Ass, &blocks, 1_000_000, None, true)
         };
         assert_eq!(numbered([7, 3, 9]), numbered([1, 0, 2]));
         assert_ne!(numbered([7, 3, 9]), numbered([0, 1, 2]));
@@ -589,10 +648,6 @@ mod tests {
 
     #[test]
     fn a_rewritten_srt_track_compares_without_crs() {
-        let t = Track {
-            codec: "S_TEXT/UTF8".into(),
-            ..track("eng", None)
-        };
         let rows = |text: &str, rewritten| {
             let b = Block {
                 track: 3,
@@ -601,7 +656,7 @@ mod tests {
                 duration: Some(1000),
                 payload: text.as_bytes().to_vec(),
             };
-            events(Kind::Srt, &[b], 1_000_000, &t, rewritten)
+            events(Kind::Srt, &[b], 1_000_000, None, rewritten)
         };
         assert_eq!(rows("Two\r\nrows", true), rows("Two\nrows", true));
         assert_ne!(rows("Two\r\nrows", false), rows("Two\nrows", false));
@@ -693,7 +748,6 @@ mod tests {
     #[test]
     fn bytes_that_are_not_utf8_compare_as_bytes() {
         // Latin-1 é, and what a lossy rewrite would make of it.
-        let t = track("eng", None);
         let line = |bytes: &[u8]| {
             let b = Block {
                 track: 3,
@@ -702,7 +756,7 @@ mod tests {
                 duration: Some(1000),
                 payload: [b"0,0,D,,0,0,0,,caf".as_slice(), bytes].concat(),
             };
-            events(Kind::Ass, &[b], 1_000_000, &t, true)
+            events(Kind::Ass, &[b], 1_000_000, None, true)
         };
         assert_ne!(line(&[0xE9]), line("\u{FFFD}".as_bytes()));
     }

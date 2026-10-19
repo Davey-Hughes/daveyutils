@@ -254,6 +254,19 @@ mux -o "$out/apply.mkv" --title 'Apply fixture' --chapters "$src/apply-chapters.
   --language 0:eng --track-name '0:English SDH' --default-track-flag 0:no \
   --hearing-impaired-flag 0:yes "$src/apply.srt"
 
+# Text tracks timed by their DefaultDuration: blocks with no BlockDuration, so each line lasts the
+# track's DefaultDuration. mkvmerge's --default-duration also retimes a track's lines to one per
+# DefaultDuration: the SRT's are already that, 2 s each from 0 s; the ASS's become a frame each at
+# 23.976 fps (0, 42 ms), a DefaultDuration no whole number of milliseconds. A typo in each.
+printf '1\n00:00:00,000 --> 00:00:02,000\nOver tehre\n\n2\n00:00:02,000 --> 00:00:04,000\nAnd back\n\n' >"$src/timed.srt"
+{
+  timing_header
+  printf 'Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Over tehre\n'
+  printf 'Dialogue: 0,0:00:02.00,0:00:04.00,Default,,0,0,0,,And back\n'
+} >"$src/timed.ass"
+mux -o "$out/timed.mkv" --language 0:eng --default-duration 0:2s "$src/timed.srt" \
+  --language 0:eng --default-duration 0:24000/1001p "$src/timed.ass"
+
 # The oracle: mkvextract's output for every text subtitle track, named the way `subcheck extract`
 # names its default output (<stem>.track<ID>.<ext>).
 for mkv in "$out"/*.mkv; do

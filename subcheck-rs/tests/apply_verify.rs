@@ -19,10 +19,20 @@ type Fixed = BTreeMap<usize, Vec<Block>>;
 /// The fixture's Signs/Songs (3) and SDH (4) tracks with a fix each, written to `dir`: the
 /// patched blocks, and the files for mkvmerge.
 fn fixed(dir: &Path) -> (Fixed, Vec<Replacement>) {
-    let (r, layout) = mkv::open(&fixture("apply.mkv")).unwrap();
+    fix(
+        &fixture("apply.mkv"),
+        dir,
+        &[(3, "Libary", "Library"), (4, "tehre", "there")],
+    )
+}
+
+/// The tracks of `original` with each `(id, from, to)` typo fixed, written to `dir` as [`fixed`]
+/// writes them.
+fn fix(original: &Path, dir: &Path, typos: &[(usize, &str, &str)]) -> (Fixed, Vec<Replacement>) {
+    let (r, layout) = mkv::open(original).unwrap();
     let mut blocks = BTreeMap::new();
     let mut files = Vec::new();
-    for (id, from, to) in [(3, "Libary", "Library"), (4, "tehre", "there")] {
+    for &(id, from, to) in typos {
         let track = &layout.tracks[id];
         let read = blocks::read_tracks(&r, &layout, &[track.number], false)
             .unwrap()
@@ -48,7 +58,8 @@ fn fixed(dir: &Path) -> (Fixed, Vec<Replacement>) {
                 ..Default::default()
             },
         );
-        let file = dir.join(format!("apply.track{id}.{}", kind.extension()));
+        let stem = original.file_stem().unwrap().to_string_lossy();
+        let file = dir.join(format!("{stem}.track{id}.{}", kind.extension()));
         let mut out = Vec::new();
         subs::write_track(track, kind, &patched, layout.timestamp_scale, &mut out).unwrap();
         std::fs::write(&file, out).unwrap();
@@ -78,7 +89,11 @@ fn remuxed(dir: &Path, files: &[Replacement], extra: &[&str]) -> PathBuf {
 }
 
 fn compare(remuxed: &Path, fixed: &Fixed, full: bool) -> Vec<String> {
-    let (r, layout) = mkv::open(&fixture("apply.mkv")).unwrap();
+    compare_with(&fixture("apply.mkv"), remuxed, fixed, full)
+}
+
+fn compare_with(original: &Path, remuxed: &Path, fixed: &Fixed, full: bool) -> Vec<String> {
+    let (r, layout) = mkv::open(original).unwrap();
     let (r2, layout2) = mkv::open(remuxed).unwrap();
     let fixed: BTreeMap<usize, &[Block]> = fixed.iter().map(|(k, v)| (*k, v.as_slice())).collect();
     verify::compare(
@@ -107,6 +122,74 @@ fn a_good_remux_passes_quick_and_full() {
     let out = remuxed(dir.path(), &files, &[]);
     assert_eq!(compare(&out, &blocks, false), [] as [String; 0]);
     assert_eq!(compare(&out, &blocks, true), [] as [String; 0]);
+}
+
+#[test]
+fn tracks_timed_by_their_default_duration_pass() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // Two text tracks whose lines take their duration from the track's DefaultDuration, 2 s and
+    // a 23.976 fps frame; the first gets a fix. mkvmerge (74, 82, 102 and 103) leaves a text track's
+    // DefaultDuration out of any remux, fixed or not, and writes each line's duration instead,
+    // rounded to the millisecond: no difference.
+    let dir = tempfile::tempdir().unwrap();
+    let original = fixture("timed.mkv");
+    let (r, layout) = mkv::open(&original).unwrap();
+    for (t, ns) in layout.tracks.iter().zip([2_000_000_000, 41_708_333]) {
+        assert_eq!(t.default_duration, Some(ns));
+        let read = blocks::read_tracks(&r, &layout, &[t.number], false)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(read.blocks.iter().all(|b| b.duration.is_none()), "{read:?}");
+    }
+    let remux = |typos: &[(usize, &str, &str)]| {
+        let (blocks, files) = fix(&original, dir.path(), typos);
+        let out = dir.path().join("out.mkv");
+        remux::run(
+            "mkvmerge".as_ref(),
+            &remux::args(&original, &layout, &files, &out),
+        )
+        .unwrap();
+        (out, blocks)
+    };
+    let (out, blocks) = remux(&[(0, "tehre", "there")]);
+    assert_eq!(
+        compare_with(&original, &out, &blocks, false),
+        [] as [String; 0]
+    );
+    assert_eq!(
+        compare_with(&original, &out, &blocks, true),
+        [] as [String; 0]
+    );
+    // A fix on the frame-timed track itself: its lines go through the .ass file, which holds
+    // their 42 ms only as 40.
+    let (out, blocks) = remux(&[(1, "tehre", "there")]);
+    assert_eq!(
+        compare_with(&original, &out, &blocks, false),
+        ["track 1: the event at 0:00:00.00 differs"]
+    );
+    // A remux that keeps the DefaultDuration, as no mkvmerge here does: the file as it is, and
+    // the remux with the field put back beside the durations mkvmerge wrote.
+    assert_eq!(
+        compare_with(&original, &original, &Fixed::new(), false),
+        [] as [String; 0]
+    );
+    let (out, blocks) = remux(&[(0, "tehre", "there")]);
+    let o = std::process::Command::new("mkvpropedit")
+        .arg(&out)
+        .args(["--edit", "track:1", "--set", "default-duration=2000000000"])
+        .args(["--edit", "track:2", "--set", "default-duration=41708333"])
+        .output()
+        .expect("running mkvpropedit, which comes with mkvmerge in mkvtoolnix");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+    let (_, kept) = mkv::open(&out).unwrap();
+    assert_eq!(kept.tracks[1].default_duration, Some(41_708_333));
+    assert_eq!(
+        compare_with(&original, &out, &blocks, false),
+        [] as [String; 0]
+    );
 }
 
 #[test]
