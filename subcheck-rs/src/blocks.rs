@@ -642,10 +642,11 @@ pub struct Timed {
 }
 
 /// The frames of the tracks numbered `tracks` whose times fall in `from_ns..to_ns`, by track
-/// number, in file order. Reads the Clusters from the last Cue at or before `from_ns` (the first
-/// Cluster, without one) to the first that starts past `to_ns`. A frame laced behind a block's
-/// first is timed by the track's DefaultDuration, or the block's duration split evenly over its
-/// frames; with neither, it has no time, and is given if its block's falls in the span.
+/// number, in file order. Reads the Clusters from the last Cue at or before `from_ns` that leads to
+/// a Cluster starting no later (the first Cluster, without one) to the first that starts past
+/// `to_ns`. A frame laced behind a block's first is timed by the track's DefaultDuration, or the
+/// block's duration split evenly over its frames; with neither, it has no time, and is given if its
+/// block's falls in the span.
 pub fn frames_between(
     r: &Reader,
     layout: &Layout,
@@ -661,15 +662,28 @@ pub fn frames_between(
         .map(|t| (t.number, t))
         .collect();
     let mut out: HashMap<u64, Vec<Timed>> = HashMap::new();
-    // The last cue at or before `from_ns` that leads inside the Segment: one past it is corrupt.
-    let start = layout
+    // The last cue at or before `from_ns` that leads to a Cluster starting no later. One that leads
+    // past the Segment, to anything but a Cluster, or to a later Cluster is corrupt: reading from
+    // there would miss the span's first frames.
+    let mut cued: Vec<(u64, u64)> = layout
         .cues
         .iter()
         .filter(|c| i128::from(c.time) * scale <= from_ns)
         .filter_map(|c| Some((c.time, layout.cluster_at(c)?)))
-        .max()
-        .map(|(_, at)| at)
-        .or(layout.first_cluster);
+        .collect();
+    cued.sort_unstable();
+    // Cues to one Cluster ask about it again: from the window's bytes, unless a cue to another
+    // Cluster came between (another few bytes read).
+    let mut window = Window::default();
+    let mut start = layout.first_cluster;
+    for (_, at) in cued.into_iter().rev() {
+        if let Some((_, ts)) = cluster_timestamp(r, &mut window, at)?
+            && i128::from(ts) * scale <= from_ns
+        {
+            start = Some(at);
+            break;
+        }
+    }
     let Some(start) = start else {
         return Ok(out);
     };
@@ -677,11 +691,15 @@ pub fn frames_between(
         let mut cluster_ts = None;
         for (id, at, child) in ebml::children(data, data_start)? {
             if id == mkv::TIMESTAMP {
-                let ts = i128::from(ebml::uint(child)) * scale;
-                if ts > to_ns {
+                // One no i64 holds is no time, as walking: an error for a wanted block, and only
+                // then. Nor does it say the Cluster starts past the span.
+                let ts = i64::try_from(ebml::uint(child))
+                    .ok()
+                    .map(|ts| i128::from(ts) * scale);
+                if ts.is_some_and(|ts| ts > to_ns) {
                     return Ok(false);
                 }
-                cluster_ts = Some(ts);
+                cluster_ts = Some((at, ts));
                 continue;
             }
             let Some(Body {
@@ -692,18 +710,25 @@ pub fn frames_between(
             else {
                 continue;
             };
-            let Some(ts) = cluster_ts else {
-                return ebml::parse_err(at, "block before its Cluster's Timestamp");
+            // The track first: a block of a track not asked for is passed over, its lacing and
+            // its Cluster's time unread, as walking.
+            let Some((track, n, _)) = ebml::read_vint(body) else {
+                return ebml::parse_err(at, "bad block track number");
             };
-            let (track, frames) = frames(body, at)?;
             let Some(t) = wanted.get(&track) else {
                 continue;
             };
+            let Some((ts_at, ts)) = cluster_ts else {
+                return ebml::parse_err(at, "block before its Cluster's Timestamp");
+            };
+            let Some(ts) = ts else {
+                return ebml::parse_err(ts_at, "Cluster timestamp out of range");
+            };
             // After the track number, the block's 16-bit time relative to its Cluster's.
-            let Some(&[hi, lo]) = ebml::read_vint(body).and_then(|(_, n, _)| body.get(n..n + 2))
-            else {
+            let Some(&[hi, lo]) = body.get(n..n + 2) else {
                 return ebml::parse_err(at, "block too short");
             };
+            let (_, frames) = frames(body, at)?;
             let block_ns = ts + i128::from(i16::from_be_bytes([hi, lo])) * scale;
             let duration = duration.map(|d| i128::from(d) * scale);
             let times = lace_times(block_ns, frames.len(), t.default_duration, duration);
@@ -1156,6 +1181,156 @@ mod tests {
             frames_between(&r, &bad, from, i128::MAX, &[track.number]).unwrap(),
             good
         );
+    }
+
+    #[test]
+    fn frames_from_a_cue_to_no_cluster_or_a_later_one_from_a_good_one() {
+        let (r, layout, track) = typos();
+        // From 7 s, whose cue leads to the Cluster of 7 s; the one of 4 s leads to the one of 1 s.
+        let from = 7_000_000_000;
+        let good = frames_between(&r, &layout, from, i128::MAX, &[track.number]).unwrap();
+        assert_eq!(good[&track.number].len(), 27);
+        let seven = |l: &Layout| -> Cue { *l.cues.iter().find(|c| c.time == 7000).unwrap() };
+        let cue = seven(&layout);
+        let later = layout
+            .cues
+            .iter()
+            .find(|c| c.time == 20_000)
+            .unwrap()
+            .cluster;
+        let head = r.header_at(layout.segment_data + cue.cluster).unwrap();
+        let block = head.data_start + cue.relative.unwrap() - layout.segment_data;
+        // Its block, a byte into the Cluster's ID, and the Cluster of 20 s.
+        for (i, cluster) in [block, cue.cluster + 1, later].into_iter().enumerate() {
+            let mut bad = layout.clone();
+            bad.cues
+                .iter_mut()
+                .filter(|c| c.time == 7000)
+                .for_each(|c| c.cluster = cluster);
+            assert_eq!(seven(&bad).cluster, cluster);
+            let got = frames_between(&r, &bad, from, i128::MAX, &[track.number]);
+            assert_eq!(got.ok().as_ref(), Some(&good), "case {i}");
+        }
+    }
+
+    #[test]
+    fn a_cluster_timestamp_past_i64_is_no_time_for_a_wanted_frame() {
+        // 2^64 - 1 ticks, read before as 2^64 - 1 ms.
+        let (_dir, r) = one_cluster_file([0xFF; 8], 0);
+        let (_, mut layout, track) = typos();
+        assert_eq!(track.number, 1);
+        layout.segment_data = 0;
+        layout.segment_end = r.file_size();
+        layout.first_cluster = Some(0);
+        layout.cues.clear();
+        // However short the span: the Cluster's time says nothing of where it falls.
+        for to in [i128::MAX, 1_000_000_000] {
+            let err = frames_between(&r, &layout, 0, to, &[1]).unwrap_err();
+            assert!(
+                err.to_string().contains("Cluster timestamp out of range"),
+                "{err}"
+            );
+        }
+        // A Cluster with no wanted frame needs no time.
+        assert!(
+            frames_between(&r, &layout, 0, i128::MAX, &[2])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A SimpleBlock for `track` at +0: `flags`, then `data`.
+    fn simple_block(track: u8, flags: u8, data: &[u8]) -> Vec<u8> {
+        let body = [&[0x80 | track, 0, 0, flags][..], data].concat();
+        [&[0xA3, size(body.len())][..], &body].concat()
+    }
+
+    /// A one-byte EBML size: up to 126 (127 is the unknown size).
+    fn size(len: usize) -> u8 {
+        assert!(len < 0x7F, "{len} bytes need a longer size");
+        0x80 | u8::try_from(len).unwrap()
+    }
+
+    /// A Cluster Timestamp element of `ticks`.
+    fn timestamp(ticks: [u8; 8]) -> Vec<u8> {
+        [&[0xE7, 0x88][..], &ticks].concat()
+    }
+
+    /// A Cluster of these children, in this order.
+    fn cluster_of(children: &[Vec<u8>]) -> Vec<u8> {
+        let data = children.concat();
+        [&[0x1F, 0x43, 0xB6, 0x75, size(data.len())][..], &data].concat()
+    }
+
+    /// A Cluster of Timestamp `ticks` holding `blocks`.
+    fn cluster(ticks: [u8; 8], blocks: &[Vec<u8>]) -> Vec<u8> {
+        cluster_of(&[&[timestamp(ticks)][..], blocks].concat())
+    }
+
+    /// A file of `clusters` alone, and a layout reading them: typos.mkv's track 1, and a copy of
+    /// it as track 2.
+    fn clusters_file(clusters: &[Vec<u8>]) -> (tempfile::TempDir, Reader, Layout) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, clusters.concat()).unwrap();
+        let r = Reader::open(&path).unwrap();
+        let (_, mut layout, _) = typos();
+        layout.segment_data = 0;
+        layout.segment_end = r.file_size();
+        layout.first_cluster = Some(0);
+        layout.cues.clear();
+        let mut two = layout.tracks[0].clone();
+        two.number = 2;
+        layout.tracks.push(two);
+        (dir, r, layout)
+    }
+
+    #[test]
+    fn a_badly_laced_block_of_a_track_not_asked_for_is_passed_over() {
+        // Track 2's block laces three frames of 9 bytes into 3: corrupt, but not asked for.
+        let (_dir, r, layout) = clusters_file(&[cluster(
+            [0; 8],
+            &[
+                simple_block(2, 0x02, &[2, 9, 9]),
+                simple_block(1, 0x80, b"x"),
+            ],
+        )]);
+        let got = frames_between(&r, &layout, 0, i128::MAX, &[1]).unwrap();
+        assert_eq!(got[&1].len(), 1);
+        // Asked for, it is an error.
+        let err = frames_between(&r, &layout, 0, i128::MAX, &[1, 2]).unwrap_err();
+        assert!(err.to_string().contains("bad lacing"), "{err}");
+    }
+
+    #[test]
+    fn a_block_of_a_track_not_asked_for_before_its_clusters_timestamp_is_passed_over() {
+        let (_dir, r, layout) = clusters_file(&[cluster_of(&[
+            simple_block(2, 0x80, b"y"),
+            timestamp([0; 8]),
+            simple_block(1, 0x80, b"x"),
+        ])]);
+        let got = frames_between(&r, &layout, 0, i128::MAX, &[1]).unwrap();
+        assert_eq!(got[&1].len(), 1);
+        // Asked for, it is an error.
+        let err = frames_between(&r, &layout, 0, i128::MAX, &[1, 2]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("block before its Cluster's Timestamp"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_cluster_with_no_time_and_no_wanted_frame_is_walked_past() {
+        // A Cluster no i64 times, holding only track 2, then track 1's frame at 1 s.
+        let second = 1000_u64.to_be_bytes();
+        let (_dir, r, layout) = clusters_file(&[
+            cluster([0xFF; 8], &[simple_block(2, 0x80, b"y")]),
+            cluster(second, &[simple_block(1, 0x80, b"x")]),
+        ]);
+        let got = frames_between(&r, &layout, 0, 10_000_000_000, &[1]).unwrap();
+        let times: Vec<Option<i128>> = got[&1].iter().map(|f| f.time_ns).collect();
+        assert_eq!(times, [Some(1_000_000_000)]);
     }
 
     #[test]
