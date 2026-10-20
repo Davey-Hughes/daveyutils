@@ -795,21 +795,33 @@ mod tests {
     /// never waits for one it killed, so it is still there to wait for; one still up is killed
     /// here, so that no test leaves it behind.
     fn killed(pid: u32) -> bool {
-        let pid = i32::try_from(pid).unwrap();
+        use rustix::io::Errno;
+        use rustix::process::{
+            Pid, Signal, WaitOptions, kill_process, kill_process_group, waitpid,
+        };
+        let pid = Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut status = 0;
-        // SAFETY: waitpid writes only to `status`, and kill only reads its integer arguments.
-        unsafe {
-            while libc::waitpid(pid, &raw mut status, libc::WNOHANG) == 0 {
-                if Instant::now() >= deadline {
-                    libc::kill(-pid, libc::SIGKILL);
-                    libc::waitpid(pid, &raw mut status, 0);
-                    return false;
-                }
-                thread::sleep(Duration::from_millis(10));
+        let status = loop {
+            match waitpid(Some(pid), WaitOptions::NOHANG) {
+                Ok(Some((_, status))) => break status,
+                Ok(None) | Err(Errno::INTR) => {}
+                // Reaped already, or gone: no kill to tell of, and none to make (its pid may be
+                // another process's by now).
+                Err(_) => return false,
             }
-        }
-        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL
+            if Instant::now() >= deadline {
+                // Its group, or it alone should it lead none; waited for only once killed, as a
+                // failed kill would leave the wait hanging.
+                let killed = kill_process_group(pid, Signal::KILL)
+                    .or_else(|_| kill_process(pid, Signal::KILL));
+                if killed.is_ok() {
+                    let _ = waitpid(Some(pid), WaitOptions::empty());
+                }
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        status.terminating_signal() == Some(Signal::KILL.as_raw())
     }
 
     #[test]

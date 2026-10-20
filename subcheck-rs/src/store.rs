@@ -331,27 +331,23 @@ impl RunWriter {
     /// The lock if no one else holds it. On a filesystem with no locks (some network mounts)
     /// there is none to take, and that is no error.
     fn try_lock(&self) -> io::Result<Lock> {
-        use std::os::fd::AsRawFd;
-        // SAFETY: flock on a descriptor this RunWriter owns, open for as long as it lives.
-        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(Lock::Held);
-        }
-        let e = io::Error::last_os_error();
-        match e.raw_os_error() {
-            Some(libc::EWOULDBLOCK) => Ok(Lock::Busy),
-            Some(libc::ENOLCK | libc::EOPNOTSUPP) => Ok(Lock::NoLocks),
-            _ => Err(e),
+        match self.file.try_lock() {
+            Ok(()) => Ok(Lock::Held),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(Lock::Busy),
+            // By errno: EOPNOTSUPP and ENOTSUP are one on Linux, two on macOS. (Not by
+            // `Unsupported`, which is also std's for a platform with no flock at all: that should
+            // fail, not go on unlocked.)
+            Err(std::fs::TryLockError::Error(e)) => match e.raw_os_error() {
+                Some(code) if [libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP].contains(&code) => {
+                    Ok(Lock::NoLocks)
+                }
+                _ => Err(e),
+            },
         }
     }
 
     fn unlock(&self) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
-        // SAFETY: as in try_lock.
-        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        self.file.unlock()
     }
 
     /// Append records as JSON lines and flush them, so a crash loses nothing already written.

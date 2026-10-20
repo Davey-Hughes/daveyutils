@@ -1347,8 +1347,7 @@ mod tests {
     #[test]
     fn an_unreadable_directory_is_skipped_with_a_warning() {
         use std::os::unix::fs::PermissionsExt;
-        // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
+        if rustix::process::geteuid().is_root() {
             return; // root reads a 0o000 directory anyway (CI containers run as root)
         }
         let dir = tempfile::tempdir().unwrap();

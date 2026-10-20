@@ -189,19 +189,13 @@ impl Reader {
     /// them in one sweep. A hint only: failure, or a platform without it, just means slower reads.
     pub fn prefetch(&self, ranges: impl IntoIterator<Item = (u64, u64)>) {
         #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            let fd = self.file.as_raw_fd();
-            for (offset, len) in ranges {
-                let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) else {
-                    continue;
-                };
-                // SAFETY: posix_fadvise only reads its integer arguments; `fd` is open for as
-                // long as `self` lives.
-                unsafe {
-                    libc::posix_fadvise(fd, offset, len, libc::POSIX_FADV_WILLNEED);
-                }
-            }
+        for (offset, len) in ranges {
+            // An empty range is no hint: fadvise would read it as the rest of the file.
+            let Some(len) = std::num::NonZeroU64::new(len) else {
+                continue;
+            };
+            let _ =
+                rustix::fs::fadvise(&self.file, offset, Some(len), rustix::fs::Advice::WillNeed);
         }
         #[cfg(not(target_os = "linux"))]
         let _ = ranges.into_iter();

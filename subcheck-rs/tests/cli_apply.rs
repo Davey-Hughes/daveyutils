@@ -652,8 +652,7 @@ fn an_unwritable_directory_points_to_tracks_only() {
     if !have_mkvmerge() {
         return;
     }
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
+    if rustix::process::geteuid().is_root() {
         eprintln!("skipped: root writes anywhere");
         return;
     }
@@ -919,8 +918,7 @@ fn a_replaced_tracks_own_tags_are_carried_over() {
 
 #[test]
 fn a_file_tracks_only_could_not_write_is_left_alone() {
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
+    if rustix::process::geteuid().is_root() {
         eprintln!("skipped: root writes anywhere");
         return;
     }

@@ -13,7 +13,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::blocks::{self, Block};
@@ -690,7 +689,7 @@ impl Job<'_> {
             ));
         }
         let size = fs::metadata(self.path).map_err(|e| e.to_string())?.len();
-        let dir = self.path.parent().unwrap_or(Path::new("."));
+        let dir = dir_of(self.path);
         if let Some(free) = free_space(dir)
             && free < size
         {
@@ -963,23 +962,39 @@ fn text_of(kind: Kind, payload: &str) -> &str {
     crate::text::text_field(kind, payload).map_or(payload, |at| &payload[at..])
 }
 
+/// The directory `file` is in: `.` for a bare file name, whose parent is "" (which statvfs, for
+/// one, refuses).
+fn dir_of(file: &Path) -> &Path {
+    file.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
 /// Bytes free to an ordinary user in the filesystem holding `dir`; `None` when it cannot be told.
-#[allow(clippy::useless_conversion)] // the counts are u32 on macOS
 fn free_space(dir: &Path) -> Option<u64> {
-    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
-    // SAFETY: statvfs writes only to `s`, from a NUL-terminated path.
-    unsafe {
-        let mut s: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c.as_ptr(), &raw mut s) != 0 {
-            return None;
-        }
-        Some(u64::from(s.f_bavail) * u64::from(s.f_frsize))
-    }
+    let s = rustix::fs::statvfs(dir).ok()?;
+    Some(s.f_bavail.saturating_mul(s.f_frsize))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_file_name_is_in_the_current_directory() {
+        assert_eq!(dir_of(Path::new("ep01.mkv")), Path::new("."));
+        assert_eq!(dir_of(Path::new("s1/ep01.mkv")), Path::new("s1"));
+        assert_eq!(dir_of(Path::new("/m/ep01.mkv")), Path::new("/m"));
+        assert!(free_space(dir_of(Path::new("ep01.mkv"))).is_some());
+    }
+
+    #[test]
+    fn free_space_is_told_for_a_directory_and_not_for_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        // Some: a full filesystem has 0 bytes free, and that is told too.
+        assert!(free_space(dir.path()).is_some());
+        assert_eq!(free_space(&dir.path().join("missing")), None);
+    }
 
     #[test]
     fn files_go_in_the_order_the_scan_checked_them() {

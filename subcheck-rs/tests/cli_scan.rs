@@ -430,8 +430,7 @@ fn scan_run_does_not_repeat_an_llm_check_the_cache_has_from_another_run() {
 #[test]
 fn a_failure_adding_a_check_leaves_the_files_record_as_it_was() {
     use std::os::unix::fs::PermissionsExt;
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
+    if rustix::process::geteuid().is_root() {
         return; // root reads a 0o000 file anyway (CI containers run as root)
     }
     let env = Env::new();

@@ -2,6 +2,8 @@
 name = "subcheck"
 version = "0.1.0"
 edition = "2024"
+# `Duration::from_mins` in a const (and `File::try_lock`, 1.89).
+rust-version = "1.91"
 description = "Proofread the text subtitles embedded in MKV files"
 license = "GPL-3.0-or-later"
 
@@ -14,7 +16,8 @@ name = "subcheck"
 path = "src/lib.rs"
 
 [dependencies]
-# posix_fadvise, for Reader::prefetch on Linux.
+# `group`'s read of a signal's disposition, which no safe crate offers, and its tests' `pre_exec`
+# calls; and libc's constants.
 libc = "0.2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -29,10 +32,11 @@ ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29.0"
 # `audio`'s cross-correlation. Pure Rust, like flate2's backend.
 rustfft = "6"
-# `group`: signals taken on a thread of their own and process groups killed, by safe calls. Both
-# are already in the build through crossterm and tempfile.
+# Safe calls for what std lacks: signals taken on a thread of their own (`group`), process groups
+# killed, a filesystem's free space, read-ahead hints. Both come into the build through crossterm
+# already; rustix's `process` and `fs` features are ours.
 signal-hook = "0.3"
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile = "3"
