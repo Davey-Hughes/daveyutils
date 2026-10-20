@@ -29,9 +29,15 @@ ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29.0"
 # `audio`'s cross-correlation. Pure Rust, like flate2's backend.
 rustfft = "6"
+# `group`: signals taken on a thread of their own and process groups killed, by safe calls. Both
+# are already in the build through crossterm and tempfile.
+signal-hook = "0.3"
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 tempfile = "3"
+# `group`'s tests point a child's stderr elsewhere.
+rustix = { version = "1", features = ["stdio"] }
 
 # Same policy as nudge-rs: CI gates on `cargo clippy --all-targets -- -D warnings`, so pedantic is
 # effectively deny. The three allows are the library-author lints nudge-rs turns off for the same

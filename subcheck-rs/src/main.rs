@@ -10,6 +10,7 @@ use subcheck::apply::{self, Mode};
 use subcheck::audio::{self, correlate, decode};
 use subcheck::blocks::{self, ReadPath};
 use subcheck::ebml;
+use subcheck::group;
 use subcheck::list::{self, Filter};
 use subcheck::llm::Backend;
 use subcheck::mkv::{self, Track};
@@ -191,7 +192,9 @@ struct ApplyArgs {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let ran = run(Cli::parse());
+    group::finish();
+    match ran {
         Ok(code) => code,
         Err(e) => {
             eprintln!("subcheck: {e:#}");

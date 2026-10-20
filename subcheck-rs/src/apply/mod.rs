@@ -700,13 +700,19 @@ impl Job<'_> {
             ));
         }
         let remuxed = remux_path(self.path);
-        // Created here first: an unwritable directory says so before any work.
-        if let Err(e) = fs::File::create(&remuxed) {
-            return Err(format!(
-                "cannot write in {}: {e} (use --tracks-only)",
-                dir.display()
-            ));
-        }
+        // Created here first: an unwritable directory says so before any work. Held through the
+        // swap too: once the remux is renamed into place, removing it by its old name finds
+        // nothing.
+        let _removing =
+            match group::create_removing(&remuxed, |path| fs::File::create(path).map(drop)) {
+                Ok(removing) => removing,
+                Err(e) => {
+                    return Err(format!(
+                        "cannot write in {}: {e} (use --tracks-only)",
+                        dir.display()
+                    ));
+                }
+            };
         // And the original can be linked as the backup: a refusal (a filesystem without links,
         // or an original another user owns) says so now, not after the remux. The probe's name
         // is ours: one left by an interrupted run is removed first.
@@ -715,10 +721,10 @@ impl Job<'_> {
             probe.push(".link");
             let probe = PathBuf::from(probe);
             let _ = fs::remove_file(&probe);
-            let removing = group::remove_on_signal(&probe);
-            let linked = fs::hard_link(self.path, &probe);
-            let _ = fs::remove_file(&probe);
-            drop(removing);
+            let linked = group::create_removing(&probe, |probe| fs::hard_link(self.path, probe))
+                .map(|removing| {
+                    let _ = removing.forget_after(|| fs::remove_file(&probe));
+                });
             if let Err(e) = linked {
                 let _ = fs::remove_file(&remuxed);
                 return Err(format!(
@@ -726,9 +732,6 @@ impl Job<'_> {
                 ));
             }
         }
-        // Held through the swap too: once the remux is renamed into place, removing it by its old
-        // name finds nothing.
-        let _removing = group::remove_on_signal(&remuxed);
         let result = self
             .remux_and_check(o, fixed, &remuxed, full)
             .and_then(|()| swap(self.path, &remuxed, backup.then_some(kept.as_path())));
@@ -775,11 +778,16 @@ impl Job<'_> {
 fn swap(file: &Path, remuxed: &Path, kept: Option<&Path>) -> Result<(), String> {
     let perms = fs::metadata(file).map_err(|e| e.to_string())?.permissions();
     fs::set_permissions(remuxed, perms).map_err(|e| e.to_string())?;
-    // Between the link and the rename, a signal removes the link too: left behind, it would
-    // stop every later run as an earlier backup.
-    let mut unlinking = None;
-    if let Some(kept) = kept {
-        fs::hard_link(file, kept).map_err(|e| {
+    let swapped = |e| format!("swapping in the remux: {e}");
+    let Some(kept) = kept else {
+        return fs::rename(remuxed, file).map_err(swapped);
+    };
+    // Until the rename, a signal removes the link too: left behind, it would stop every later run
+    // as an earlier backup. Linked and registered as one, and renamed (or, failing that, removed)
+    // before it is forgotten, with no signal between: after the rename, the link is the only
+    // original.
+    let unlinking =
+        group::create_removing(kept, |kept| fs::hard_link(file, kept)).map_err(|e| {
             if e.kind() == io::ErrorKind::AlreadyExists {
                 format!(
                     "{} exists: an earlier backup is never overwritten",
@@ -792,16 +800,13 @@ fn swap(file: &Path, remuxed: &Path, kept: Option<&Path>) -> Result<(), String> 
                 )
             }
         })?;
-        unlinking = Some(group::remove_on_signal(kept));
-    }
-    let renamed = fs::rename(remuxed, file);
-    drop(unlinking);
-    renamed.map_err(|e| {
-        if let Some(kept) = kept {
-            let _ = fs::remove_file(kept);
-        }
-        format!("swapping in the remux: {e}")
-    })
+    unlinking
+        .forget_after(|| {
+            fs::rename(remuxed, file).inspect_err(|_| {
+                let _ = fs::remove_file(kept);
+            })
+        })
+        .map_err(swapped)
 }
 
 /// `remuxed` against the original, with `fixed` in place of its tracks.

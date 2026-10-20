@@ -1613,8 +1613,10 @@ dependencies = [
  "libc",
  "ratatui",
  "rustfft",
+ "rustix",
  "serde",
  "serde_json",
+ "signal-hook",
  "tempfile",
  "thiserror 2.0.21",
 ]

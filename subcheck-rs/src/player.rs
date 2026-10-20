@@ -5,7 +5,6 @@
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -233,27 +232,26 @@ impl Player {
         }
         let mut server = OsString::from("--input-ipc-server=");
         server.push(&self.socket);
-        let child = Command::new(&self.program)
-            .arg(server)
-            .args(["--idle=yes", "--force-window=yes", "--no-terminal"])
-            .args(&focus_flags()[..focus])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            // Its own process group: the terminal's signals stay with the review, which closes the
-            // window itself.
-            .process_group(0)
-            .spawn()
-            .map_err(|e| {
-                let program = self.program.to_string_lossy();
-                Start::Failed(if e.kind() == io::ErrorKind::NotFound {
-                    format!("{program} not found: install mpv to open findings")
-                } else {
-                    format!("starting {program}: {e}")
-                })
-            })?;
-        let pgid = i32::try_from(child.id()).unwrap_or(0);
-        self.children.push((child, group::register(pgid)));
+        // In a process group of its own: the terminal's signals stay with the review, which closes
+        // the window itself.
+        let (child, running) = group::spawn(
+            Command::new(&self.program)
+                .arg(server)
+                .args(["--idle=yes", "--force-window=yes", "--no-terminal"])
+                .args(&focus_flags()[..focus])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .map_err(|e| {
+            let program = self.program.to_string_lossy();
+            Start::Failed(if e.kind() == io::ErrorKind::NotFound {
+                format!("{program} not found: install mpv to open findings")
+            } else {
+                format!("starting {program}: {e}")
+            })
+        })?;
+        self.children.push((child, running));
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
             if let Ok(conn) = Conn::connect(&self.socket) {
@@ -292,7 +290,7 @@ impl Drop for Player {
     fn drop(&mut self) {
         self.reap();
         for (child, _) in &self.children {
-            group::kill(i32::try_from(child.id()).unwrap_or(0));
+            group::kill(child);
         }
     }
 }

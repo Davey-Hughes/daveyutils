@@ -3,7 +3,6 @@
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -253,22 +252,20 @@ const GRACE: Duration = Duration::from_secs(2);
 ///
 /// The command runs in its own process group, so a timeout kills everything it started (a wrapper
 /// script's children, or what dash forks for `sh -c`), not just the direct child. That takes it out
-/// of the terminal's foreground group, where Ctrl-C would reach it, so [`group`] forwards SIGINT,
-/// SIGTERM and SIGHUP to every group still running.
+/// of the terminal's foreground group, where Ctrl-C would reach it, so when SIGINT, SIGTERM or
+/// SIGHUP ends subcheck, [`group`] kills every group still running.
 pub fn run(argv: &[String], input: &str, timeout: Duration) -> Result<String, String> {
     let Some((program, rest)) = argv.split_first() else {
         return Err("empty command".into());
     };
-    let mut child = Command::new(program)
-        .args(rest)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("cannot run {program}: {e}"))?;
-    let pgid = i32::try_from(child.id()).unwrap_or(0);
-    let _running = group::register(pgid);
+    let (mut child, _running) = group::spawn(
+        Command::new(program)
+            .args(rest)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|e| format!("cannot run {program}: {e}"))?;
     let mut stdin = child.stdin.take().expect("stdin was piped");
     let input = input.to_string();
     // Written from its own thread: a child that replies before reading all its input would
@@ -291,7 +288,7 @@ pub fn run(argv: &[String], input: &str, timeout: Duration) -> Result<String, St
             break status;
         }
         if Instant::now() >= deadline {
-            group::kill(pgid);
+            group::kill(&child);
             let _ = child.wait();
             // The pipe threads finish on their own once the group is gone; not joined, in case
             // something left the group and still holds a pipe.
@@ -304,7 +301,7 @@ pub fn run(argv: &[String], input: &str, timeout: Duration) -> Result<String, St
         thread::sleep(Duration::from_millis(20));
     }
     if !(stdout.is_finished() && stderr.is_finished()) {
-        group::kill(pgid);
+        group::kill(&child);
     }
     let _ = writer.join();
     let out = stdout.join().unwrap_or_default();
