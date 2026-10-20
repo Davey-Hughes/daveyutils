@@ -140,10 +140,17 @@ fn header(t: &Track, u: &Track, fixed: bool, diffs: &mut Vec<String>) -> Result<
     if t.name != u.name {
         differs("name");
     }
-    // A new mkvmerge adds the BCP 47 tag an old one left out.
-    if t.language != u.language
-        || t.language_bcp47.is_some() && t.language_bcp47 != u.language_bcp47
-    {
+    // Beside a BCP 47 tag Matroska ignores Language, and mkvmerge rewrites it from the tag, whatever
+    // the file gave. BCP 47 tags ignore case. Without a tag, a new mkvmerge adds the one an old one
+    // left out.
+    let same_language = match &t.language_bcp47 {
+        Some(tag) => u
+            .language_bcp47
+            .as_ref()
+            .is_some_and(|theirs| theirs.eq_ignore_ascii_case(tag)),
+        None => t.language == u.language,
+    };
+    if !same_language {
         differs("language");
     }
     if t.default != u.default || t.forced != u.forced || flags(&t.flags) != flags(&u.flags) {
@@ -742,6 +749,32 @@ mod tests {
         assert_eq!(
             diffs(&old, &track("jpn", None)),
             ["track 2: language differs"]
+        );
+    }
+
+    #[test]
+    fn beside_a_bcp_47_tag_the_language_element_is_no_difference() {
+        // Tagged only `ja`: Language reads as Matroska's default, and mkvmerge's remux fills it in
+        // from the BCP 47 tag.
+        let only = Track {
+            language_element: false,
+            ..track("eng", Some("ja"))
+        };
+        assert_eq!(diffs(&only, &track("jpn", Some("ja"))), [] as [String; 0]);
+        assert_eq!(
+            diffs(&only, &track("jpn", Some("ja-JP"))),
+            ["track 2: language differs"]
+        );
+        // Nor is one the file gives: mkvmerge writes Language `eng` beside `ja` back as `jpn`
+        // (checked, mkvmerge v102.0).
+        assert_eq!(
+            diffs(&track("eng", Some("ja")), &track("jpn", Some("ja"))),
+            [] as [String; 0]
+        );
+        // BCP 47 tags ignore case: mkvmerge writes `ja-jp` back as `ja-JP`.
+        assert_eq!(
+            diffs(&track("jpn", Some("ja-jp")), &track("jpn", Some("ja-JP"))),
+            [] as [String; 0]
         );
     }
 

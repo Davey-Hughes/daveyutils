@@ -48,7 +48,7 @@ fn lang_narrows_the_tracks_and_a_video_without_enough_keyframes_is_unsupported()
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "multi.mkv\n  track 3  (jpn)  unsupported: only 2 video keyframes in the Cues\n"
+        "multi.mkv\n  track 3  (ja)  unsupported: only 2 video keyframes in the Cues\n"
     );
 }
 

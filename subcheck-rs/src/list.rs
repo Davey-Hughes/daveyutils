@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::mkv::Truncated;
+use crate::mkv::{self, Truncated};
 use crate::store::{FileRecord, Finding, Run, State, TrackRecord};
 use crate::text::{Occurrence, timestamp, timestamp_ms};
 
@@ -175,23 +175,20 @@ fn track_label(run: &Run, f: &Finding, id: usize) -> String {
     }
 }
 
-/// Track `id` among a file record's `tracks` by name: its name, else its language, `(eng)`; and
-/// whether that tells it apart, being a name no other track of the file has. `None` when it is
-/// not among them.
+/// Track `id` among a file record's `tracks` by [name](TrackRecord::shown_name), and whether that
+/// tells it apart, being a name of its own no other track of the file has. `None` when it is not
+/// among them.
 pub fn track_name_in(tracks: &[TrackRecord], id: usize) -> Option<(String, bool)> {
     let t = tracks.iter().find(|t| t.id == id)?;
-    Some(match own_name(t) {
-        Some(own) => {
-            let alike = tracks.iter().filter(|x| own_name(x) == Some(own));
-            (own.to_string(), alike.count() == 1)
-        }
-        None => (format!("({})", t.language), false),
-    })
-}
-
-/// A track's name, if it has one: an empty TrackName names nothing.
-fn own_name(t: &TrackRecord) -> Option<&str> {
-    t.name.as_deref().filter(|n| !n.trim().is_empty())
+    let own = mkv::own_name(t.name.as_deref());
+    let apart = own.is_some_and(|own| {
+        tracks
+            .iter()
+            .filter(|x| mkv::own_name(x.name.as_deref()) == Some(own))
+            .count()
+            == 1
+    });
+    Some((t.shown_name(), apart))
 }
 
 /// The tracks the run's record of file `path` lists; none when it has no record of it.
@@ -271,6 +268,7 @@ mod tests {
             id,
             name: None,
             language: "eng".into(),
+            language_bcp47: None,
             sid,
             default,
             read: "cues".into(),
@@ -509,6 +507,7 @@ mod tests {
             id,
             name: name.map(Into::into),
             language: "eng".into(),
+            language_bcp47: None,
             sid: id,
             default: false,
             read: "cues".into(),
@@ -521,6 +520,28 @@ mod tests {
         assert_eq!(track_name_in(&tracks, 5), Some(("(eng)".into(), false)));
         assert_eq!(track_name_in(&tracks, 6), Some(("(eng)".into(), false)));
         assert_eq!(track_name_in(&tracks, 7), Some(("Signs".into(), true)));
+    }
+
+    #[test]
+    fn an_unnamed_track_is_named_by_its_bcp_47_tag_first() {
+        let track = |id, language: &str, bcp47: Option<&str>| TrackRecord {
+            id,
+            name: None,
+            language: language.into(),
+            language_bcp47: bcp47.map(Into::into),
+            sid: id,
+            default: false,
+            read: "cues".into(),
+        };
+        // `eng` beside `ja` is a track tagged only in BCP 47: Language's default, as recorded.
+        let tracks = [
+            track(3, "jpn", Some("ja")),
+            track(4, "eng", Some("ja")),
+            track(5, "jpn", None),
+        ];
+        assert_eq!(track_name_in(&tracks, 3), Some(("(ja)".into(), false)));
+        assert_eq!(track_name_in(&tracks, 4), Some(("(ja)".into(), false)));
+        assert_eq!(track_name_in(&tracks, 5), Some(("(jpn)".into(), false)));
     }
 
     #[test]

@@ -87,12 +87,7 @@ pub const SCALE: u64 = 1_000_000;
 /// A replaced track's properties, as mkvmerge options for its file's track 0.
 fn track_options(t: &Track) -> Vec<(&'static str, String)> {
     let yes = |b: bool| if b { "yes" } else { "no" }.to_string();
-    let mut out = vec![(
-        "--language",
-        t.language_bcp47
-            .clone()
-            .unwrap_or_else(|| t.language.clone()),
-    )];
+    let mut out = vec![("--language", t.shown_language().to_string())];
     if let Some(name) = &t.name {
         out.push(("--track-name", name.clone()));
     }

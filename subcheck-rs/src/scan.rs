@@ -141,7 +141,8 @@ pub fn wanted_language(track: &Track, langs: &[String]) -> bool {
         .any(|want| match track.language_bcp47.as_deref() {
             Some(tag) => {
                 let primary = tag.split('-').next().unwrap_or(tag);
-                primary == want || iso639_1(want) == Some(primary)
+                primary.eq_ignore_ascii_case(want)
+                    || iso639_1(want).is_some_and(|code| primary.eq_ignore_ascii_case(code))
             }
             None => track.language == *want,
         })
@@ -225,6 +226,7 @@ fn prepare(path: &Path, langs: &[String], checks: &[Check]) -> Prepared {
     let reads = blocks::read_each(&r, &layout, &numbers);
     let mut events: Vec<(usize, Vec<Event>)> = Vec::new();
     for ((track, kind, sid), read) in wanted.into_iter().zip(reads) {
+        let named = format!("track {} {}", track.id, track.shown_name());
         let read = match read {
             Ok(t) => {
                 let path = match t.path {
@@ -232,12 +234,8 @@ fn prepare(path: &Path, langs: &[String], checks: &[Check]) -> Prepared {
                     ReadPath::Walk => "walk",
                     ReadPath::Empty => "empty",
                 };
-                p.notes.push(format!(
-                    "track {} {}: {} events via {path}",
-                    track.id,
-                    track.name.as_deref().unwrap_or(""),
-                    t.blocks.len()
-                ));
+                p.notes
+                    .push(format!("{named}: {} events via {path}", t.blocks.len()));
                 let mine = text::events(
                     track.id,
                     kind,
@@ -250,7 +248,7 @@ fn prepare(path: &Path, langs: &[String], checks: &[Check]) -> Prepared {
             }
             // An unsupported encoding loses that track, not the file.
             Err(e) => {
-                p.notes.push(format!("track {}: skipped: {e}", track.id));
+                p.notes.push(format!("{named}: skipped: {e}"));
                 p.skipped_tracks = true;
                 format!("skipped: {e}")
             }
@@ -259,6 +257,7 @@ fn prepare(path: &Path, langs: &[String], checks: &[Check]) -> Prepared {
             id: track.id,
             name: track.name.clone(),
             language: track.language.clone(),
+            language_bcp47: track.language_bcp47.clone(),
             sid,
             default: track.default,
             read,
@@ -1334,6 +1333,7 @@ mod tests {
         let eng = ["eng".to_string()];
         assert!(wanted_language(&track("eng", None), &eng));
         assert!(wanted_language(&track("und", Some("en-US")), &eng));
+        assert!(wanted_language(&track("und", Some("EN-us")), &eng));
         assert!(!wanted_language(&track("und", Some("und")), &eng));
         assert!(!wanted_language(&track("jpn", Some("ja")), &eng));
         assert!(wanted_language(

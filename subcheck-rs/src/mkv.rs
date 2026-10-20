@@ -114,7 +114,8 @@ pub struct Track {
     pub name: Option<String>,
     /// ISO 639-2. Matroska's default when the element is absent is "eng".
     pub language: String,
-    /// Whether the file gives a Language: absent or empty, `language` is only Matroska's default.
+    /// Whether the file gives a Language: absent, empty or blank, `language` is only Matroska's
+    /// default.
     pub language_element: bool,
     pub language_bcp47: Option<String>,
     pub default: bool,
@@ -142,7 +143,32 @@ pub struct Flags {
     pub commentary: Option<bool>,
 }
 
+/// A track's name, if it has one: an empty or blank TrackName names nothing.
+pub fn own_name(name: Option<&str>) -> Option<&str> {
+    name.filter(|name| !name.trim().is_empty())
+}
+
+/// A track's language as the reports give it: its BCP 47 tag when it has one (Matroska ignores
+/// Language beside one), else Language.
+pub fn shown_language<'a>(language: &'a str, bcp47: Option<&'a str>) -> &'a str {
+    bcp47.unwrap_or(language)
+}
+
+/// How the reports name a track: its [own name](own_name), else its
+/// [language](shown_language) in brackets, `(ja)`.
+pub fn shown_name(name: Option<&str>, language: &str) -> String {
+    own_name(name).map_or_else(|| format!("({language})"), str::to_owned)
+}
+
 impl Track {
+    pub fn shown_language(&self) -> &str {
+        shown_language(&self.language, self.language_bcp47.as_deref())
+    }
+
+    pub fn shown_name(&self) -> String {
+        shown_name(self.name.as_deref(), self.shown_language())
+    }
+
     pub fn is_text_subtitle(&self) -> bool {
         self.kind == TRACK_TYPE_SUBTITLE
             && matches!(
@@ -465,17 +491,20 @@ fn parse_track(id: usize, data: &[u8], base: u64) -> Result<Track> {
             FLAG_FORCED => t.forced = ebml::uint(v) != 0,
             DEFAULT_DURATION => t.default_duration = Some(ebml::uint(v)),
             NAME => t.name = Some(ebml::string(v)),
-            // An empty element reads as its default: for Language "eng", for LanguageBCP47 none.
+            // An empty or blank element reads as its default: for Language "eng", for
+            // LanguageBCP47 none. Spaces around a tag are not part of it.
             LANGUAGE => {
                 let language = ebml::string(v);
+                let language = language.trim();
                 if !language.is_empty() {
-                    t.language = language;
+                    t.language = language.to_string();
                     t.language_element = true;
                 }
             }
             LANGUAGE_BCP47 => {
                 let tag = ebml::string(v);
-                t.language_bcp47 = (!tag.is_empty()).then_some(tag);
+                let tag = tag.trim();
+                t.language_bcp47 = (!tag.is_empty()).then(|| tag.to_string());
             }
             CODEC_ID => t.codec = ebml::string(v),
             CODEC_PRIVATE => t.codec_private = v.to_vec(),
@@ -706,16 +735,43 @@ mod tests {
         let t = parse_track(3, &empty, 0).unwrap();
         assert_eq!(t.language, "eng");
         assert!(!t.language_element);
+        // A blank one too; one padded with spaces reads without.
+        let blank = [el(&[0xD7], &[2]), el(&[0x22, 0xB5, 0x9C], b"  ")].concat();
+        let t = parse_track(3, &blank, 0).unwrap();
+        assert_eq!((t.language.as_str(), t.language_element), ("eng", false));
+        let padded = [el(&[0xD7], &[2]), el(&[0x22, 0xB5, 0x9C], b" jpn ")].concat();
+        assert_eq!(parse_track(3, &padded, 0).unwrap().language, "jpn");
         let jpn = [el(&[0xD7], &[2]), el(&[0x22, 0xB5, 0x9C], b"jpn")].concat();
         let t = parse_track(3, &jpn, 0).unwrap();
         assert_eq!(t.language, "jpn");
         assert!(t.language_element);
-        // An empty LanguageBCP47 is none.
-        let empty_bcp47 = [el(&[0xD7], &[2]), el(&[0x22, 0xB5, 0x9D], &[])].concat();
-        assert_eq!(
-            parse_track(3, &empty_bcp47, 0).unwrap().language_bcp47,
-            None
-        );
+        // An empty LanguageBCP47 is none, a blank one too; one padded with spaces reads without.
+        let bcp47 = |tag: &[u8]| {
+            let entry = [el(&[0xD7], &[2]), el(&[0x22, 0xB5, 0x9D], tag)].concat();
+            parse_track(3, &entry, 0).unwrap().language_bcp47
+        };
+        assert_eq!(bcp47(b""), None);
+        assert_eq!(bcp47(b" "), None);
+        assert_eq!(bcp47(b" ja "), Some("ja".into()));
+    }
+
+    #[test]
+    fn an_unnamed_track_is_named_by_its_language_bcp_47_first() {
+        let named = |els: &[Vec<u8>]| {
+            let entry = [vec![el(&[0xD7], &[2])], els.to_vec()].concat().concat();
+            parse_track(3, &entry, 0).unwrap().shown_name()
+        };
+        let name = |n: &str| el(&[0x53, 0x6E], n.as_bytes());
+        let iso = |l: &str| el(&[0x22, 0xB5, 0x9C], l.as_bytes());
+        let bcp47 = |l: &str| el(&[0x22, 0xB5, 0x9D], l.as_bytes());
+        assert_eq!(named(&[name("Signs"), iso("jpn"), bcp47("ja")]), "Signs");
+        assert_eq!(named(&[iso("jpn"), bcp47("ja")]), "(ja)");
+        // Tagged only in BCP 47: not Matroska's default English.
+        assert_eq!(named(&[bcp47("ja")]), "(ja)");
+        assert_eq!(named(&[iso("jpn")]), "(jpn)");
+        assert_eq!(named(&[]), "(eng)");
+        // An empty name names nothing.
+        assert_eq!(named(&[name(" "), bcp47("ja")]), "(ja)");
     }
 
     #[test]

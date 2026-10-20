@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::mkv::Truncated;
+use crate::mkv::{self, Truncated};
 use crate::text::Occurrence;
 
 /// The state directory, from explicit inputs. An empty or relative `XDG_STATE_HOME` is ignored,
@@ -107,12 +107,25 @@ pub struct TrackRecord {
     /// mkvmerge track ID.
     pub id: usize,
     pub name: Option<String>,
+    /// ISO 639-2, as the parser reads it: Matroska's default `eng` when the file gives none.
     pub language: String,
+    /// LanguageBCP47, as the parser reads it. Left out of the JSON when absent, so run files from
+    /// before it read the same (and name a track tagged only in BCP 47 `(eng)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_bcp47: Option<String>,
     /// mpv's `--sid`: 1-based among the file's subtitle tracks of any codec.
     pub sid: usize,
     pub default: bool,
     /// `cues` or `walk`; for a track that could not be read, why.
     pub read: String,
+}
+
+impl TrackRecord {
+    /// The track's name in the reports, as [`crate::mkv::shown_name`] gives it.
+    pub fn shown_name(&self) -> String {
+        let language = mkv::shown_language(&self.language, self.language_bcp47.as_deref());
+        mkv::shown_name(self.name.as_deref(), language)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

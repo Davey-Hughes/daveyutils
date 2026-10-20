@@ -603,11 +603,6 @@ fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)
         .filter_map(|t| Some((t, Kind::of(t)?)))
         .filter(|(t, _)| langs.is_empty() || scan::wanted_language(t, langs))
         .collect();
-    let name = |t: &Track| {
-        t.name
-            .clone()
-            .unwrap_or_else(|| format!("({})", t.language))
-    };
     let video = match timing::video(&layout) {
         Ok(v) => v,
         Err(reason) => {
@@ -615,7 +610,7 @@ fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)
                 .iter()
                 .map(|(t, _)| TrackReport {
                     id: t.id,
-                    name: name(t),
+                    name: t.shown_name(),
                     result: Err(format!("unsupported: {reason}")),
                     lines: None,
                 })
@@ -661,7 +656,7 @@ fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)
         .iter()
         .map(|(t, result)| TrackReport {
             id: t.id,
-            name: name(t),
+            name: t.shown_name(),
             result: result
                 .as_ref()
                 .map(|(_, a)| a.clone())
@@ -759,13 +754,12 @@ fn pick_track(tracks: &[Track], id: Option<usize>) -> Result<&Track> {
             let list: Vec<String> = many
                 .iter()
                 .map(|t| {
-                    format!(
-                        "  {}: {} {} {}",
-                        t.id,
-                        t.codec,
-                        t.language,
-                        t.name.as_deref().unwrap_or("")
-                    )
+                    let mut line = format!("  {}: {} {}", t.id, t.codec, t.shown_language());
+                    if let Some(name) = mkv::own_name(t.name.as_deref()) {
+                        line.push(' ');
+                        line.push_str(name);
+                    }
+                    line
                 })
                 .collect();
             bail!(

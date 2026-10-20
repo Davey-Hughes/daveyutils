@@ -543,6 +543,7 @@ pub mod tests_support {
             id,
             name: Some(name.into()),
             language: "eng".into(),
+            language_bcp47: None,
             sid,
             default,
             read: "cues".into(),

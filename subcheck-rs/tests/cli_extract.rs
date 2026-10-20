@@ -83,7 +83,8 @@ fn several_text_tracks_need_a_track_id() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("3 text subtitle tracks"), "{err}");
-    assert!(err.contains("1: S_TEXT/ASS eng English Full"), "{err}");
+    // The BCP 47 tag first, as every report names a language.
+    assert!(err.contains("1: S_TEXT/ASS en English Full"), "{err}");
     assert!(
         std::fs::read_dir(dir.path()).unwrap().next().is_none(),
         "wrote a file anyway"
@@ -175,4 +176,18 @@ fn a_truncated_file_is_warned_about_and_still_extracted() {
     );
     assert!(err.contains(&warning), "{err}");
     assert_eq!(out.stdout, whole.stdout);
+}
+
+#[test]
+fn the_track_list_names_a_track_tagged_only_in_bcp_47_by_it() {
+    // multi.mkv's track 3 (`jpn`, `ja`, unnamed) loses its Language to a Void of the same length.
+    let language = [0x22, 0xB5, 0x9C, 0x83, b'j', b'p', b'n'];
+    let (dir, file) = common::patched("multi.mkv", &language, 1, |b| {
+        b.copy_from_slice(&[0xEC, 0x85, 0, 0, 0, 0, 0]);
+    });
+    let out = subcheck(dir.path(), &["extract", file.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    // Unnamed: no name, and nothing after the language.
+    assert!(err.contains("  3: S_TEXT/UTF8 ja\n"), "{err}");
 }

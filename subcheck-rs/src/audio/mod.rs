@@ -178,32 +178,13 @@ pub struct Track {
 impl Track {
     /// The report's view of a file's audio track, its language tags as Matroska reads them: a
     /// track with no Language element is `eng`, unless it has a LanguageBCP47 (which Language
-    /// would only stand beside). An unnamed track is named by its language, BCP 47 first.
+    /// would only stand beside).
     pub fn of(t: &crate::mkv::Track) -> Track {
-        let bcp47 = t
-            .language_bcp47
-            .clone()
-            .filter(|tag| !tag.trim().is_empty());
-        let language = if t.language_element {
-            Some(t.language.clone())
-        } else if bcp47.is_none() {
-            Some("eng".to_string())
-        } else {
-            None
-        };
-        let name = t
-            .name
-            .clone()
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| {
-                format!(
-                    "({})",
-                    bcp47.as_deref().or(language.as_deref()).unwrap_or("und")
-                )
-            });
+        let bcp47 = t.language_bcp47.clone();
+        let language = (t.language_element || bcp47.is_none()).then(|| t.language.clone());
         Track {
             id: t.id,
-            name,
+            name: t.shown_name(),
             language,
             language_bcp47: bcp47,
         }
@@ -236,13 +217,9 @@ const BIBLIOGRAPHIC: [(&str, &str); 20] = [
 
 /// A track's BCP 47 language, as compared (lowercase: its primary subtag with an extended one,
 /// `zh-yue`, but not its script or region, so `en-us` is `en-gb`) and as tagged. `None` without a
-/// LanguageBCP47, or with an empty one.
+/// LanguageBCP47.
 fn bcp47(t: &Track) -> Option<(String, String)> {
-    let tag = t
-        .language_bcp47
-        .as_deref()
-        .map(str::trim)
-        .filter(|tag| !tag.is_empty())?;
+    let tag = t.language_bcp47.as_deref()?;
     let lower = tag.to_lowercase();
     let mut subtags = lower.split('-');
     let primary = subtags.next().unwrap_or_default();
@@ -258,7 +235,7 @@ fn bcp47(t: &Track) -> Option<(String, String)> {
 /// A track's ISO 639-2 language, as compared (lowercase, a bibliographic code as its terminology
 /// twin: `fre` is `fra`) and as tagged. `None` for a track tagged only in BCP 47.
 fn iso639_2(t: &Track) -> Option<(String, String)> {
-    let tag = t.language.as_deref()?.trim();
+    let tag = t.language.as_deref()?;
     let code = tag.to_lowercase();
     let compared = BIBLIOGRAPHIC
         .iter()
@@ -1011,9 +988,6 @@ mod tests {
         // Tagged only in BCP 47: Japanese, named so, and not the default English.
         let ja = Track::of(&file_track(None, Some("ja")));
         assert_eq!((ja.language.as_deref(), ja.name.as_str()), (None, "(ja)"));
-        // An empty BCP 47 tag is none.
-        let empty = Track::of(&file_track(Some("jpn"), Some("")));
-        assert_eq!(empty.language_bcp47, None);
     }
 
     #[test]
@@ -1031,14 +1005,12 @@ mod tests {
         // ISO 639-2: a code's two spellings and its case.
         assert!(same(iso("fre"), iso("fra")));
         assert!(same(iso("JPN"), iso("jpn")));
-        // BCP 47 when both have it: two dubs that share the old code differ; a region does not,
-        // nor does space around a tag.
+        // BCP 47 when both have it: two dubs that share the old code differ; a region does not.
+        // (A blank or padded tag never gets here: the parser reads it as none, or trims it.)
         assert!(!same(both("chi", "zh-yue"), both("chi", "zh-Hans")));
         assert!(same(both("eng", "en-US"), both("eng", "en-GB")));
-        assert!(same(both("jpn", " ja"), both("jpn", "ja")));
-        // Else ISO 639-2 when both have it: never `pl` against `pol`, and an empty BCP 47 is none.
+        // Else ISO 639-2 when both have it: never `pl` against `pol`.
         assert!(same(both("pol", "pl"), iso("pol")));
-        assert!(same(both("jpn", ""), both("jpn", "ja")));
         // One only in BCP 47, the other only in ISO 639-2: nothing says they are the same.
         assert!(!same(bcp("ja"), iso("jpn")));
         assert!(!same(iso("und"), iso("jpn")));

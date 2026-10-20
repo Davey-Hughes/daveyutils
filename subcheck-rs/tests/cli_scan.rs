@@ -660,6 +660,37 @@ fn lines_shared_between_files_are_sent_once() {
 }
 
 #[test]
+fn a_track_tagged_only_in_bcp_47_is_named_by_it() {
+    let env = Env::new();
+    // multi.mkv's track 3 (`jpn`, `ja`, unnamed) loses its Language to a Void of the same length.
+    let language = [0x22, 0xB5, 0x9C, 0x83, b'j', b'p', b'n'];
+    let (_dir, file) = common::patched("multi.mkv", &language, 1, |b| {
+        b.copy_from_slice(&[0xEC, 0x85, 0, 0, 0, 0, 0]);
+    });
+    let file = file.to_string_lossy();
+    let out = env.subcheck(&["scan", &file, "--lang", "jpn", "-v"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("    track 3 (ja): "),
+        "{}",
+        stderr(&out)
+    );
+    let run = env.newest_run();
+    let tracks = &run.files[0].tracks;
+    assert_eq!(
+        tracks
+            .iter()
+            .map(|t| (t.id, t.language.as_str(), t.language_bcp47.as_deref()))
+            .collect::<Vec<_>>(),
+        [(3, "eng", Some("ja"))]
+    );
+    assert_eq!(
+        subcheck::list::track_name_in(tracks, 3),
+        Some(("(ja)".into(), false))
+    );
+}
+
+#[test]
 fn a_directory_is_walked_and_a_bad_file_does_not_stop_the_scan() {
     let env = Env::new();
     let dir = tempfile::tempdir().unwrap();

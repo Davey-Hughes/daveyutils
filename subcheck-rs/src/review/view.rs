@@ -310,13 +310,7 @@ pub fn detail_lines(m: &Model) -> Vec<Line<'static>> {
     };
     let mut at = occurrence.map_or_else(String::new, |o| timestamp(o.start_ms));
     if let Some(t) = track {
-        let _ = write!(
-            at,
-            "  {} [track {} · sid {}]",
-            t.name.as_deref().unwrap_or("(unnamed)"),
-            t.id,
-            t.sid
-        );
+        let _ = write!(at, "  {} [track {} · sid {}]", t.shown_name(), t.id, t.sid);
     }
     if finding.occurrences.len() > 1 && finding.timing.is_none() {
         let _ = write!(at, "  (+{} more)", finding.occurrences.len() - 1);
@@ -646,6 +640,20 @@ mod tests {
             "{screen}"
         );
         assert!(screen.contains("state: pending"), "{screen}");
+    }
+
+    #[test]
+    fn the_detail_pane_names_an_unnamed_track_by_its_language_bcp_47_first() {
+        let mut m = sample();
+        for file in &mut m.run.files {
+            let track = &mut file.tracks[0];
+            (track.name, track.language_bcp47) = (None, Some("ja".into()));
+        }
+        let screen = render(&m, 160, 20);
+        assert!(
+            screen.contains("0:02:45.06  (ja) [track 5 · sid 1]"),
+            "{screen}"
+        );
     }
 
     #[test]

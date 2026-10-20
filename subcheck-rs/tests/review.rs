@@ -46,6 +46,7 @@ fn file(path: &str) -> Record {
             id: 2,
             name: Some("English".into()),
             language: "eng".into(),
+            language_bcp47: None,
             sid: 1,
             default: true,
             read: "cues".into(),
