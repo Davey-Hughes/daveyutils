@@ -711,6 +711,7 @@ mod tests {
             codec: "S_TEXT/ASS".into(),
             name: None,
             language: language.into(),
+            language_element: true,
             language_bcp47: bcp47.map(Into::into),
             default: true,
             forced: false,

@@ -114,6 +114,8 @@ pub struct Track {
     pub name: Option<String>,
     /// ISO 639-2. Matroska's default when the element is absent is "eng".
     pub language: String,
+    /// Whether the file gives a Language: absent or empty, `language` is only Matroska's default.
+    pub language_element: bool,
     pub language_bcp47: Option<String>,
     pub default: bool,
     pub forced: bool,
@@ -442,6 +444,7 @@ fn parse_track(id: usize, data: &[u8], base: u64) -> Result<Track> {
         codec: String::new(),
         name: None,
         language: "eng".into(),
+        language_element: false,
         language_bcp47: None,
         default: true,
         forced: false,
@@ -462,8 +465,18 @@ fn parse_track(id: usize, data: &[u8], base: u64) -> Result<Track> {
             FLAG_FORCED => t.forced = ebml::uint(v) != 0,
             DEFAULT_DURATION => t.default_duration = Some(ebml::uint(v)),
             NAME => t.name = Some(ebml::string(v)),
-            LANGUAGE => t.language = ebml::string(v),
-            LANGUAGE_BCP47 => t.language_bcp47 = Some(ebml::string(v)),
+            // An empty element reads as its default: for Language "eng", for LanguageBCP47 none.
+            LANGUAGE => {
+                let language = ebml::string(v);
+                if !language.is_empty() {
+                    t.language = language;
+                    t.language_element = true;
+                }
+            }
+            LANGUAGE_BCP47 => {
+                let tag = ebml::string(v);
+                t.language_bcp47 = (!tag.is_empty()).then_some(tag);
+            }
             CODEC_ID => t.codec = ebml::string(v),
             CODEC_PRIVATE => t.codec_private = v.to_vec(),
             CONTENT_ENCODINGS => t.encodings = parse_encodings(v, at)?,
@@ -687,7 +700,22 @@ mod tests {
     fn a_track_without_language_is_english() {
         let t = parse_track(3, &el(&[0xD7], &[2]), 0).unwrap();
         assert_eq!((t.id, t.number, t.language.as_str()), (3, 2, "eng"));
-        assert!(t.default && !t.forced);
+        assert!(t.default && !t.forced && !t.language_element);
+        // An empty Language element is its default too.
+        let empty = [el(&[0xD7], &[2]), el(&[0x22, 0xB5, 0x9C], &[])].concat();
+        let t = parse_track(3, &empty, 0).unwrap();
+        assert_eq!(t.language, "eng");
+        assert!(!t.language_element);
+        let jpn = [el(&[0xD7], &[2]), el(&[0x22, 0xB5, 0x9C], b"jpn")].concat();
+        let t = parse_track(3, &jpn, 0).unwrap();
+        assert_eq!(t.language, "jpn");
+        assert!(t.language_element);
+        // An empty LanguageBCP47 is none.
+        let empty_bcp47 = [el(&[0xD7], &[2]), el(&[0x22, 0xB5, 0x9D], &[])].concat();
+        assert_eq!(
+            parse_track(3, &empty_bcp47, 0).unwrap().language_bcp47,
+            None
+        );
     }
 
     #[test]

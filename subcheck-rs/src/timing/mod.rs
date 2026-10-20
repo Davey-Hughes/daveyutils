@@ -1177,6 +1177,7 @@ mod tests {
             codec: String::new(),
             name: None,
             language: "eng".into(),
+            language_element: true,
             language_bcp47: None,
             default: true,
             forced: false,

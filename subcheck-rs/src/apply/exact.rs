@@ -354,6 +354,7 @@ mod tests {
             codec: codec.into(),
             name: None,
             language: "eng".into(),
+            language_element: true,
             language_bcp47: None,
             default: false,
             forced: false,

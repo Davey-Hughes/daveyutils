@@ -685,14 +685,7 @@ fn audio_file(
         .tracks
         .iter()
         .filter(|t| t.kind == mkv::TRACK_TYPE_AUDIO)
-        .map(|t| audio::Track {
-            id: t.id,
-            name: t
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("({})", t.language)),
-            language: t.language.clone(),
-        })
+        .map(audio::Track::of)
         .collect();
     if tracks.len() < 2 {
         return Ok((tracks, Vec::new(), Vec::new()));

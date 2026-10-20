@@ -37,7 +37,7 @@ audio.mkv
   track 0  Main                  reference
   track 1  27 ms late            27.0 ms late against track 0
            fix: mkvmerge --sync 1:-27
-           tagged jpn, track 0 eng
+           tagged ja, track 0 en
   track 2  20 ms late from 0:16  drifts against track 0
            no one --sync fixes a drift; ms late by window: 0:06 +0.0  0:18 +20.0
   track 3  Other sound           no other track holds this audio

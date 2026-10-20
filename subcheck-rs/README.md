@@ -97,9 +97,11 @@ window and leave focus alone. The ways below rest on two mpv options, `--focus-o
 
 `subcheck audio <files or directories>` decodes every audio track with ffmpeg in ten-second
 windows spread over each file (0:30, 20, 40, 60 and 80 % in, and a minute before the end) and
-cross-correlates every pair of tracks in each. Two tracks hold the same sound when they match in
-every window, or all but one in four; each is reported against the lower-numbered track it matches
-best:
+cross-correlates every pair of tracks in each. It is for one audio in two codecs (a TrueHD and
+its AC-3, a FLAC and an AAC of it), not a dub against its original. Two tracks hold the same
+sound when they match in every window, or all but one in four; tracks in different languages
+only when every window with sound in both scores 0.5 or more (see below). Each track is
+reported against the lower-numbered track it matches best:
 
 ```
 FMAB - E16.mkv
@@ -116,28 +118,35 @@ FMAB - E16.mkv
 - `drifts`: the windows disagree, so no one `--sync` fixes it; each window's lag is printed. A sync
   step partway through a track reads like this.
 - `no other track holds this audio`: no track matches it; `track N holds this audio too, but goes
-  with another track`: track N matches it, but another better (an AC-3 that matches its TrueHD,
-  and the Japanese track through the music it shares with the dub).
+  with another track`: track N matches it, but another better (a copy of a copy, say).
 
 A `fix` moves a track onto the one it is reported against. The sound alone cannot say which of
 the two is off, so when that one is the top of its group (reported against none), no other
 track holds its sound and none is reported against the track to move, moving it instead is given
-too. A track in sync with one that has a fix
-gets the same move. One late or early against a track that is itself off gets no fix: it names
-the track to fix first, and `audio` says the rest once that is done. No `--sync` moves a drift,
-so a track steady against one is fixed against it, as against the top of a group: FMAB E61's
-AC-3 lines up with its TrueHD, whose dub drifts against the Japanese track.
+too. A track in sync with one that has a fix gets the same move. One late or early against a
+track that is itself off gets no fix: it names the track to fix first, and `audio` says the rest
+once that is done. No `--sync` moves a drift, so a track steady against one is fixed against it,
+as against the top of a group.
 
 Measured as ffmpeg plays a file, which is how mpv and Plex do: an AC-3 or AAC whose encoder
 priming the file does not record plays late by it, and is reported late (an AC-3 ffmpeg made, by
 5.3 ms; an AAC, by about 21). Samples are placed by their timestamps, so a track with frames
 missing reads in sync around the gap, not shifted.
 
-A dub shares its original's music and effects, and its dialogue windows tell them apart; a dub
-of an episode that is music and effects from end to end can match its original, and is then
-reported against it, with the two languages said. `-v` prints every pair's lag and score in every
-window. The exit status is 1 only when a file or a window cannot be read; `--ffmpeg` names the
-program.
+A dub shares its original's music and effects, and its dialogue windows tell them apart; but an
+episode of action can carry it through every window. So tracks in different languages hold the
+same sound only when every window with sound in both scores 0.5 or more, as a clean copy does
+(FMAB's dubs reached 0.37 at worst, its AC-3 copies 0.88 or more). A clean copy tagged with the
+wrong language still matches, with the two languages said; a poor one does not (K-On's AAC copies
+scored 0.26 at worst). Two tracks' languages compare in BCP 47 when both have it (`zh-yue` and
+`zh-Hans` differ, `en-US` and `en-GB` do not), else in ISO 639-2 when both have it (`fre` is
+`fra`, case aside), and the line names them in that kind, as tagged. A track with no Language
+element is `eng`, Matroska's default, unless it has a BCP 47 tag. One tagged only in BCP 47 and
+one only in ISO 639-2 count as different languages, as does `und` against any other: nothing says
+they are the same, so they need the same 0.5.
+
+`-v` prints every pair's lag and score in every window. The exit status is 1 only when a file or
+a window cannot be read; `--ffmpeg` names the program.
 
 ## Apply
 

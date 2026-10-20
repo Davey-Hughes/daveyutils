@@ -24,9 +24,18 @@ pub const WINDOW_NS: u64 = 10_000_000_000;
 /// Commentaries score below it everywhere.
 pub const MATCH_SCORE: f64 = 0.25;
 
+/// Tracks tagged with different languages hold the same sound only when every window with sound
+/// in both scores at least this, as a copy in another codec does: the check is for one audio in
+/// two codecs, not a dub against its original. A dub shares the original's music and effects, so
+/// an episode of action can match in every window: FMAB's dubs score 0.37 at worst in their worst
+/// window (E61), its AC-3 copies 0.88 or more. A copy tagged with the wrong language is caught so
+/// when it is clean; a poor one (K-On's AAC copies of its FLAC, 0.26-0.49) is not.
+pub const COPY_SCORE: f64 = 0.5;
+
 /// How much less alike (median score) than the best match a track may be and still be the one
-/// reported against. FMAB E61's English AC-3 matches its TrueHD at 0.97, and the Japanese track,
-/// through the music and effects, at 0.63.
+/// reported against. Two copies of one sound match a third about as well as each other; a dub
+/// that matches through its music and effects (FMAB E61's AC-3 against the Japanese, 0.63 where
+/// both are tagged alike) does not come close to its own track (0.97).
 const ALIKE_SLACK: f64 = 0.05;
 
 /// How many of a pair's windows with sound may be unclear with the pair still the same audio:
@@ -160,7 +169,129 @@ fn median(mut v: Vec<f64>) -> f64 {
 pub struct Track {
     pub id: usize,
     pub name: String,
-    pub language: String,
+    /// ISO 639-2, as tagged (or Matroska's default `eng`); `None` for a track tagged only in BCP 47.
+    pub language: Option<String>,
+    /// LanguageBCP47, as tagged.
+    pub language_bcp47: Option<String>,
+}
+
+impl Track {
+    /// The report's view of a file's audio track, its language tags as Matroska reads them: a
+    /// track with no Language element is `eng`, unless it has a LanguageBCP47 (which Language
+    /// would only stand beside). An unnamed track is named by its language, BCP 47 first.
+    pub fn of(t: &crate::mkv::Track) -> Track {
+        let bcp47 = t
+            .language_bcp47
+            .clone()
+            .filter(|tag| !tag.trim().is_empty());
+        let language = if t.language_element {
+            Some(t.language.clone())
+        } else if bcp47.is_none() {
+            Some("eng".to_string())
+        } else {
+            None
+        };
+        let name = t
+            .name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "({})",
+                    bcp47.as_deref().or(language.as_deref()).unwrap_or("und")
+                )
+            });
+        Track {
+            id: t.id,
+            name,
+            language,
+            language_bcp47: bcp47,
+        }
+    }
+}
+
+/// ISO 639-2's bibliographic codes, each with its terminology twin: one language, two codes.
+const BIBLIOGRAPHIC: [(&str, &str); 20] = [
+    ("alb", "sqi"),
+    ("arm", "hye"),
+    ("baq", "eus"),
+    ("bur", "mya"),
+    ("chi", "zho"),
+    ("cze", "ces"),
+    ("dut", "nld"),
+    ("fre", "fra"),
+    ("geo", "kat"),
+    ("ger", "deu"),
+    ("gre", "ell"),
+    ("ice", "isl"),
+    ("mac", "mkd"),
+    ("mao", "mri"),
+    ("may", "msa"),
+    ("per", "fas"),
+    ("rum", "ron"),
+    ("slo", "slk"),
+    ("tib", "bod"),
+    ("wel", "cym"),
+];
+
+/// A track's BCP 47 language, as compared (lowercase: its primary subtag with an extended one,
+/// `zh-yue`, but not its script or region, so `en-us` is `en-gb`) and as tagged. `None` without a
+/// LanguageBCP47, or with an empty one.
+fn bcp47(t: &Track) -> Option<(String, String)> {
+    let tag = t
+        .language_bcp47
+        .as_deref()
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())?;
+    let lower = tag.to_lowercase();
+    let mut subtags = lower.split('-');
+    let primary = subtags.next().unwrap_or_default();
+    let compared = match subtags.next() {
+        Some(ext) if ext.len() == 3 && ext.chars().all(|c| c.is_ascii_alphabetic()) => {
+            format!("{primary}-{ext}")
+        }
+        _ => primary.to_string(),
+    };
+    Some((compared, tag.to_string()))
+}
+
+/// A track's ISO 639-2 language, as compared (lowercase, a bibliographic code as its terminology
+/// twin: `fre` is `fra`) and as tagged. `None` for a track tagged only in BCP 47.
+fn iso639_2(t: &Track) -> Option<(String, String)> {
+    let tag = t.language.as_deref()?.trim();
+    let code = tag.to_lowercase();
+    let compared = BIBLIOGRAPHIC
+        .iter()
+        .find(|(b, _)| *b == code)
+        .map_or(code.clone(), |(_, t)| (*t).to_string());
+    Some((compared, tag.to_string()))
+}
+
+/// Two tracks' languages, each as compared and as tagged, in one kind of tag: BCP 47 when both
+/// have one (two dubs tagged `chi` differ as `zh-yue` and `zh-Hans`), else ISO 639-2 when both
+/// have it. Never one kind against the other, which would take a table of every language: a track
+/// tagged only in BCP 47 and one only in ISO 639-2 differ, as nothing says they are the same. `und`
+/// is a language like any other.
+fn languages(a: &Track, b: &Track) -> ((String, String), (String, String)) {
+    if let (Some(x), Some(y)) = (bcp47(a), bcp47(b)) {
+        return (x, y);
+    }
+    if let (Some(x), Some(y)) = (iso639_2(a), iso639_2(b)) {
+        return (x, y);
+    }
+    // At most one tag kind each, not the same one: each by its own kind, marked so they differ.
+    let own = |t: &Track| match (bcp47(t), iso639_2(t)) {
+        (Some((c, shown)), _) => (format!("bcp47 {c}"), shown),
+        (None, Some((c, shown))) => (format!("iso639-2 {c}"), shown),
+        (None, None) => ("none".to_string(), "und".to_string()),
+    };
+    (own(a), own(b))
+}
+
+/// Two tracks' languages as tagged, when they differ as compared.
+fn shown_languages(a: &Track, b: &Track) -> Option<(String, String)> {
+    let ((x, mine), (y, theirs)) = languages(a, b);
+    (x != y).then_some((mine, theirs))
 }
 
 /// Two tracks' lags, window by window, the second's against the first's; `a` < `b`.
@@ -181,8 +312,8 @@ pub enum Said {
         reference: usize,
         lineup: Lineup,
         advice: Advice,
-        /// The reference's language, when it differs from this track's.
-        other_language: Option<String>,
+        /// This track's language and the reference's, when they differ (see `shown_languages`).
+        languages: Option<(String, String)>,
     },
     /// Track `by` holds its sound too, but is reported against another track it matches better.
     Matched { by: usize },
@@ -214,8 +345,29 @@ pub enum Advice {
 /// whose sound it matches best, so a compatibility AC-3 goes with its TrueHD even where a dub
 /// before them both matches it through the music. Of tracks that match it about as well (within
 /// [`ALIKE_SLACK`]), the lowest-numbered: two copies of one sound are as good as each other.
+/// Tracks tagged with different languages match only as a copy does ([`COPY_SCORE`]).
 pub fn report(tracks: &[Track], pairs: &[Pair]) -> Vec<(usize, Said)> {
-    let verdicts: Vec<Match> = pairs.iter().map(|p| assess(&p.lags)).collect();
+    // Two languages that differ: a dub, unless it matches as a copy.
+    let differ = |a: usize, b: usize| {
+        let track = |id: usize| tracks.iter().find(|t| t.id == id);
+        track(a)
+            .zip(track(b))
+            .is_some_and(|(a, b)| shown_languages(a, b).is_some())
+    };
+    let verdicts: Vec<Match> = pairs
+        .iter()
+        .map(|p| {
+            let verdict = assess(&p.lags);
+            if matches!(verdict, Match::Same(_))
+                && differ(p.a, p.b)
+                && !p.lags.iter().flatten().all(|l| l.score >= COPY_SCORE)
+            {
+                Match::Different
+            } else {
+                verdict
+            }
+        })
+        .collect();
     let pair = |a: usize, b: usize| {
         let (a, b) = (a.min(b), a.max(b));
         pairs.iter().position(|p| p.a == a && p.b == b)
@@ -255,7 +407,7 @@ pub fn report(tracks: &[Track], pairs: &[Pair]) -> Vec<(usize, Said)> {
                     reference: r.id,
                     lineup: *lineup,
                     advice: *advice,
-                    other_language: (r.language != t.language).then(|| r.language.clone()),
+                    languages: shown_languages(t, r),
                 }
             } else if against.iter().flatten().any(|(r, _)| r.id == t.id) {
                 Said::Reference
@@ -447,7 +599,7 @@ fn details(
         reference,
         lineup,
         advice,
-        other_language,
+        languages,
     } = said
     else {
         return;
@@ -511,12 +663,8 @@ fn details(
             let _ = writeln!(out, "{indent}unclear at {}", unclear.join(", "));
         }
     }
-    if let Some(theirs) = other_language {
-        let _ = writeln!(
-            out,
-            "{indent}tagged {}, track {reference} {theirs}",
-            t.language
-        );
+    if let Some((mine, theirs)) = languages {
+        let _ = writeln!(out, "{indent}tagged {mine}, track {reference} {theirs}");
     }
 }
 
@@ -665,7 +813,8 @@ mod tests {
         Track {
             id,
             name: name.into(),
-            language: language.into(),
+            language: Some(language.into()),
+            language_bcp47: None,
         }
     }
 
@@ -706,7 +855,7 @@ mod tests {
                     Said::Against {
                         reference: 2,
                         lineup: Lineup::Off { .. },
-                        other_language: None,
+                        languages: None,
                         ..
                     }
                 )
@@ -716,16 +865,10 @@ mod tests {
         assert_eq!(said[3], (4, Said::TooQuiet));
     }
 
-    #[test]
-    fn a_track_goes_with_the_one_it_matches_best() {
-        // FMAB E61: the dub matches the Japanese in every window, through the music and effects,
-        // and so does its AC-3; the AC-3 still goes with its TrueHD.
-        let tracks = [
-            track(1, "Japanese FLAC 2.0", "jpn"),
-            track(2, "English TrueHD 5.1", "eng"),
-            track(3, "English AC-3 5.1", "eng"),
-        ];
-        let dub = [
+    /// FMAB E61's lags: its English dub against the Japanese, which the music and effects carry
+    /// in every window; the AC-3 against the Japanese; and the AC-3 against its TrueHD.
+    fn e61() -> [Vec<Option<Lag>>; 3] {
+        let dub = vec![
             lag(-5.4, 0.58),
             lag(-3.2, 0.80),
             lag(-0.6, 0.44),
@@ -733,7 +876,7 @@ mod tests {
             lag(2.1, 0.37),
             lag(3.5, 0.94),
         ];
-        let dub_ac3 = [
+        let dub_ac3 = vec![
             lag(21.3, 0.52),
             lag(23.7, 0.77),
             lag(25.8, 0.41),
@@ -741,7 +884,7 @@ mod tests {
             lag(28.7, 0.35),
             lag(30.4, 0.92),
         ];
-        let core = [
+        let core = vec![
             lag(26.7, 0.97),
             lag(26.9, 0.98),
             lag(26.4, 0.94),
@@ -749,13 +892,34 @@ mod tests {
             lag(26.6, 0.98),
             lag(26.9, 0.97),
         ];
+        [dub, dub_ac3, core]
+    }
+
+    #[test]
+    fn a_track_goes_with_the_one_it_matches_best() {
+        // E61's lags with one language throughout, so the dub's match counts: the AC-3 matches
+        // track 1 too, and still goes with its TrueHD.
+        let tracks = [
+            track(1, "FLAC 2.0", "eng"),
+            track(2, "TrueHD 5.1", "eng"),
+            track(3, "AC-3 5.1", "eng"),
+        ];
+        let [dub, dub_ac3, core] = e61();
         let pairs = [pair(1, 2, &dub), pair(1, 3, &dub_ac3), pair(2, 3, &core)];
         let said = report(&tracks, &pairs);
         assert_eq!(said[0], (1, Said::Reference));
         assert!(
             matches!(
                 &said[1],
-                (2, Said::Against { reference: 1, lineup: Lineup::Drifts, other_language: Some(l), .. }) if l == "jpn"
+                (
+                    2,
+                    Said::Against {
+                        reference: 1,
+                        lineup: Lineup::Drifts,
+                        languages: None,
+                        ..
+                    }
+                )
             ),
             "{said:?}"
         );
@@ -776,11 +940,129 @@ mod tests {
     }
 
     #[test]
+    fn tracks_in_different_languages_match_only_as_a_copy() {
+        // E61 as it is tagged: the dub no longer matches the Japanese, and the AC-3 goes with
+        // its TrueHD.
+        let w = [10 * S, 20 * S, 30 * S, 40 * S, 50 * S, 60 * S];
+        let tracks = [
+            track(1, "Japanese FLAC 2.0", "jpn"),
+            track(2, "English TrueHD 5.1", "eng"),
+            track(3, "English AC-3 5.1", "eng"),
+        ];
+        let [dub, dub_ac3, core] = e61();
+        let pairs = [pair(1, 2, &dub), pair(1, 3, &dub_ac3), pair(2, 3, &core)];
+        assert_eq!(
+            render("e61.mkv", &tracks, &w, &pairs, false),
+            "e61.mkv
+  track 1  Japanese FLAC 2.0   no other track holds this audio
+  track 2  English TrueHD 5.1  reference
+  track 3  English AC-3 5.1    26.6 ms late against track 2
+           fix: mkvmerge --sync 3:-27, or --sync 2:27 if track 2 is the one off
+"
+        );
+        // A clean copy tagged with another language still matches, and says so: one window of
+        // 0.5 is enough of a copy, one of 0.49 is not.
+        let copy = |worst: f64| {
+            let lags = [lag(0.0, 0.95), lag(0.0, worst), lag(0.0, 0.95)];
+            let tracks = [track(1, "FLAC", "jpn"), track(2, "AAC", "eng")];
+            render("c.mkv", &tracks, &w[..3], &[pair(1, 2, &lags)], false)
+        };
+        assert!(copy(0.5).contains("in sync with track 1\n           tagged eng, track 1 jpn\n"));
+        assert!(copy(0.49).contains("  track 2  AAC   no other track holds this audio\n"));
+        // Nothing says a track tagged und is in the same language: it needs a copy's match too.
+        let lags = [lag(0.0, 0.95), lag(0.0, 0.3), lag(0.0, 0.95)];
+        let und = [track(1, "FLAC", "jpn"), track(2, "AAC", "und")];
+        let out = render("u.mkv", &und, &w[..3], &[pair(1, 2, &lags)], false);
+        assert!(
+            out.contains("  track 2  AAC   no other track holds this audio\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_files_track_reads_its_language_as_matroska_does() {
+        let file_track = |language: Option<&str>, bcp47: Option<&str>| crate::mkv::Track {
+            id: 1,
+            number: 2,
+            uid: 2,
+            kind: crate::mkv::TRACK_TYPE_AUDIO,
+            codec: "A_AC3".into(),
+            name: None,
+            language: language.unwrap_or("eng").into(),
+            language_element: language.is_some(),
+            language_bcp47: bcp47.map(String::from),
+            default: true,
+            forced: false,
+            default_duration: None,
+            codec_private: Vec::new(),
+            encodings: Vec::new(),
+            flags: crate::mkv::Flags::default(),
+            video: None,
+            audio: None,
+        };
+        // No tag at all is English, as one tagged eng is.
+        let untagged = Track::of(&file_track(None, None));
+        assert_eq!(untagged.language.as_deref(), Some("eng"));
+        assert_eq!(untagged.name, "(eng)");
+        assert_eq!(
+            shown_languages(&untagged, &Track::of(&file_track(Some("eng"), None))),
+            None
+        );
+        // Tagged only in BCP 47: Japanese, named so, and not the default English.
+        let ja = Track::of(&file_track(None, Some("ja")));
+        assert_eq!((ja.language.as_deref(), ja.name.as_str()), (None, "(ja)"));
+        // An empty BCP 47 tag is none.
+        let empty = Track::of(&file_track(Some("jpn"), Some("")));
+        assert_eq!(empty.language_bcp47, None);
+    }
+
+    #[test]
+    fn languages_compare_in_one_kind_of_tag() {
+        let tagged = |language: Option<&str>, bcp47: Option<&str>| Track {
+            id: 0,
+            name: String::new(),
+            language: language.map(String::from),
+            language_bcp47: bcp47.map(String::from),
+        };
+        let both = |iso: &str, bcp: &str| tagged(Some(iso), Some(bcp));
+        let iso = |code: &str| tagged(Some(code), None);
+        let bcp = |tag: &str| tagged(None, Some(tag));
+        let same = |a: Track, b: Track| shown_languages(&a, &b).is_none();
+        // ISO 639-2: a code's two spellings and its case.
+        assert!(same(iso("fre"), iso("fra")));
+        assert!(same(iso("JPN"), iso("jpn")));
+        // BCP 47 when both have it: two dubs that share the old code differ; a region does not,
+        // nor does space around a tag.
+        assert!(!same(both("chi", "zh-yue"), both("chi", "zh-Hans")));
+        assert!(same(both("eng", "en-US"), both("eng", "en-GB")));
+        assert!(same(both("jpn", " ja"), both("jpn", "ja")));
+        // Else ISO 639-2 when both have it: never `pl` against `pol`, and an empty BCP 47 is none.
+        assert!(same(both("pol", "pl"), iso("pol")));
+        assert!(same(both("jpn", ""), both("jpn", "ja")));
+        // One only in BCP 47, the other only in ISO 639-2: nothing says they are the same.
+        assert!(!same(bcp("ja"), iso("jpn")));
+        assert!(!same(iso("und"), iso("jpn")));
+        // Said as tagged: the kind compared, or each its own.
+        assert_eq!(
+            shown_languages(&both("jpn", "ja"), &both("eng", "en")),
+            Some(("ja".into(), "en".into()))
+        );
+        assert_eq!(
+            shown_languages(&both("chi", "zh-yue"), &both("chi", "zh-Hans")),
+            Some(("zh-yue".into(), "zh-Hans".into()))
+        );
+        assert_eq!(
+            shown_languages(&bcp("fr"), &iso("jpn")),
+            Some(("fr".into(), "jpn".into()))
+        );
+    }
+
+    #[test]
     fn a_file_reads_as_one_block_with_each_fix() {
         let tracks = [
             track(1, "Main", "eng"),
             track(2, "Copy", "eng"),
-            track(3, "Late copy", "jpn"),
+            track(3, "Late copy", "eng"),
             track(4, "Stepped copy", "eng"),
             track(5, "Other", "eng"),
         ];
@@ -822,7 +1104,6 @@ mod tests {
   track 3  Late copy     27.0 ms late against track 1
            fix: mkvmerge --sync 3:-27
            unclear at 0:40 (score 0.20)
-           tagged jpn, track 1 eng
   track 4  Stepped copy  drifts against track 1
            no one --sync fixes a drift; ms late by window: 0:10 +0.0  0:20 +0.0  0:30 +20.0  0:40 quiet
   track 5  Other         no other track holds this audio
