@@ -46,8 +46,9 @@ if [ "$no_rust" -eq 1 ]; then
   echo; echo "==> SKIPPED: ${crates[*]} (--no-rust)"
   echo "    CI still runs them. Do not land on the strength of this run alone."
 else
-  # As in CI: subcheck's `apply` tests fail, rather than skip, without mkvmerge.
-  export SUBCHECK_NEED_MKVMERGE=1
+  # As in CI: subcheck's `apply` tests fail, rather than skip, without mkvmerge, and its `audio`
+  # tests without ffmpeg.
+  export SUBCHECK_NEED_MKVMERGE=1 SUBCHECK_NEED_FFMPEG=1
   for crate in "${crates[@]}"; do
     manifest=$crate/Cargo.toml
     run cargo fmt --manifest-path "$manifest" --all --check

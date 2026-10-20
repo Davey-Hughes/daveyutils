@@ -294,3 +294,44 @@ fn a_changed_video_frame_is_caught_by_the_full_check_only() {
     assert_eq!(compare(&out, &blocks, false), [] as [String; 0]);
     assert_eq!(compare(&out, &blocks, true), ["track 0: frames differ"]);
 }
+
+/// audio.mkv remuxed as apply remuxes, nothing replaced, into `dir` as `name`, with `extra`
+/// options for it.
+fn audio_remuxed(dir: &Path, name: &str, extra: &[&str]) -> PathBuf {
+    let audio = fixture("audio.mkv");
+    let (_, layout) = mkv::open(&audio).unwrap();
+    let out = dir.join(name);
+    let mut args = remux::args(&audio, &layout, &[], &out);
+    // No track replaced, so none left out: `--subtitle-tracks !` with no IDs is not an option.
+    let skip = args.iter().position(|a| a == "--subtitle-tracks").unwrap();
+    args.drain(skip..skip + 2);
+    let original = args.iter().position(|a| Path::new(a) == audio).unwrap();
+    args.splice(original..original, extra.iter().map(OsString::from));
+    remux::run("mkvmerge".as_ref(), &args).unwrap();
+    out
+}
+
+#[test]
+fn a_remux_that_moves_an_audio_track_is_caught() {
+    if !have_mkvmerge() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let audio = fixture("audio.mkv");
+    let check = |out: &Path| compare_with(&audio, out, &Fixed::new(), false);
+    assert_eq!(
+        check(&audio_remuxed(dir.path(), "same.mkv", &[])),
+        [] as [String; 0]
+    );
+    // A millisecond is the rounding any remux may bring.
+    assert_eq!(
+        check(&audio_remuxed(dir.path(), "nudged.mkv", &["--sync", "1:1"])),
+        [] as [String; 0]
+    );
+    // Track 1 moved 30 ms later. Every frame and byte is still there, so nothing else in the check
+    // sees it: FMAB's TrueHD, moved 67 ms early by mkvmerge 102, passed the same way.
+    assert_eq!(
+        check(&audio_remuxed(dir.path(), "moved.mkv", &["--sync", "1:30"])),
+        ["track 1: audio frame at 0:00:00.026 is at 0:00:00.057 in the remux"]
+    );
+}

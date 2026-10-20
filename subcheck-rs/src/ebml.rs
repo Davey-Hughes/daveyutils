@@ -108,6 +108,18 @@ pub fn uint(data: &[u8]) -> u64 {
     data.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
 }
 
+/// Float element data: big-endian, 4 or 8 bytes; `None` for any other length.
+pub fn float(data: &[u8]) -> Option<f64> {
+    match data.len() {
+        4 => data
+            .try_into()
+            .map(|b| f64::from(f32::from_be_bytes(b)))
+            .ok(),
+        8 => data.try_into().map(f64::from_be_bytes).ok(),
+        _ => None,
+    }
+}
+
 /// String element data, up to its first NUL (Matroska pads strings with them).
 pub fn string(data: &[u8]) -> String {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());

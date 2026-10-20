@@ -6,6 +6,7 @@
 //! not cover a track.
 
 pub mod apply;
+pub mod audio;
 pub mod blocks;
 pub mod ebml;
 pub mod group;

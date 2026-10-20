@@ -1,14 +1,15 @@
 //! The check before a swap: whether a remuxed file is its original with the fixed tracks replaced
 //! and nothing else changed. Every difference found is listed, so a failure says what differs.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use crate::blocks::{self, Block};
+use crate::audio;
+use crate::blocks::{self, Block, Timed};
 use crate::ebml::{self, Reader, Result};
 use crate::mkv::{self, Flags, Layout, Track};
 use crate::subs::{self, Kind};
-use crate::text::timestamp;
+use crate::text::{timestamp, timestamp_ms};
 
 /// An open file.
 #[derive(Clone, Copy)]
@@ -61,6 +62,7 @@ pub fn compare(
     }
     subtitles(original, remuxed, fixed, read, &mut diffs)?;
     others(original, remuxed, full, &mut diffs)?;
+    audio_times(original, remuxed, &mut diffs)?;
     Ok(diffs)
 }
 
@@ -278,15 +280,10 @@ fn values(data: &[u8], masters: &[u32]) -> Option<Vec<(u32, Value)>> {
 /// A leaf as a value: a float by its value, anything else of 8 bytes or fewer as an unsigned
 /// integer (mkvmerge may write one wider than the original did), longer data as it is.
 fn value(id: u32, v: &[u8]) -> Value {
-    if FLOATS.contains(&id) {
-        let f = match v.len() {
-            4 => v.try_into().map(|b| f64::from(f32::from_be_bytes(b))).ok(),
-            8 => v.try_into().map(f64::from_be_bytes).ok(),
-            _ => None,
-        };
-        if let Some(f) = f {
-            return Value::Float(f.to_bits());
-        }
+    if FLOATS.contains(&id)
+        && let Some(f) = ebml::float(v)
+    {
+        return Value::Float(f.to_bits());
     }
     if v.len() <= 8 {
         Value::Uint(ebml::uint(v))
@@ -477,6 +474,108 @@ fn others(original: File, remuxed: File, full: bool, diffs: &mut Vec<String>) ->
     Ok(())
 }
 
+/// How long each span [`audio_times`] reads is.
+const SPAN_NS: u64 = 5_000_000_000;
+/// How far an audio frame's time may move in a remux: mkvmerge stores times to the millisecond,
+/// and a plain remux moves a few audio frames by 1-2 ms.
+const MOVED_NS: i128 = 2_000_000;
+/// How far around its old time a frame is looked for in the remux.
+const SEARCH_NS: i128 = 1_000_000_000;
+
+/// Whether every audio track's frames kept their times, frame by frame, in six spans of the file:
+/// frame counts and bytes say nothing of times, and a remux can move a track. mkvmerge 102 stamped
+/// FMAB's TrueHD by frame count over a hole at its head, 67 ms early there. Only frames whose bytes
+/// occur once in their span count: digital silence repeats one frame, which would match anywhere.
+/// The first frame out of place is named, once per track.
+fn audio_times(original: File, remuxed: File, diffs: &mut Vec<String>) -> Result<()> {
+    let (a, b) = (original.layout, remuxed.layout);
+    let audio: Vec<(&Track, &Track)> = a
+        .tracks
+        .iter()
+        .zip(&b.tracks)
+        .filter(|(t, _)| t.kind == mkv::TRACK_TYPE_AUDIO)
+        .collect();
+    if audio.is_empty() {
+        return Ok(());
+    }
+    let was_numbers: Vec<u64> = audio.iter().map(|(t, _)| t.number).collect();
+    let now_numbers: Vec<u64> = audio.iter().map(|(_, u)| u.number).collect();
+    let at = |ns: i128| timestamp_ms(i64::try_from(ns / 1_000_000).unwrap_or(i64::MAX));
+    let mut moved = HashSet::new();
+    for from in spans(a.duration_ns) {
+        let to = from + i128::from(SPAN_NS);
+        let was = blocks::frames_between(original.r, a, from, to, &was_numbers)?;
+        let now =
+            blocks::frames_between(remuxed.r, b, from - SEARCH_NS, to + SEARCH_NS, &now_numbers)?;
+        for (t, u) in &audio {
+            let Some(frames) = was.get(&t.number).filter(|_| !moved.contains(&t.id)) else {
+                continue;
+            };
+            let there = now.get(&u.number).map_or(&[][..], Vec::as_slice);
+            if let Some((old, new)) = first_moved(frames, there) {
+                diffs.push(match new {
+                    Some(new) => format!(
+                        "track {}: audio frame at {} is at {} in the remux",
+                        t.id,
+                        at(old),
+                        at(new)
+                    ),
+                    None => format!(
+                        "track {}: audio frame at {} is missing from the remux (none within a second)",
+                        t.id,
+                        at(old)
+                    ),
+                });
+                moved.insert(t.id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The first frame of `was` that `now` has out of place: its time, and its time in `now` (`None`
+/// where `now` has no copy of it). Only frames whose bytes occur once in `was` and that have a time
+/// count. A copy in `now` with no time to read (laced behind its block's first, with no duration)
+/// says nothing, so it passes: a track laced that way (mkvmerge laces Vorbis eight to a block,
+/// with no durations) is checked only at the frames that start a block in both files.
+fn first_moved(was: &[Timed], now: &[Timed]) -> Option<(i128, Option<i128>)> {
+    let mut copies: HashMap<u64, usize> = HashMap::new();
+    for f in was {
+        *copies.entry(f.hash).or_default() += 1;
+    }
+    let mut there: HashMap<u64, Vec<Option<i128>>> = HashMap::new();
+    for g in now {
+        there.entry(g.hash).or_default().push(g.time_ns);
+    }
+    for f in was.iter().filter(|f| copies[&f.hash] == 1) {
+        let Some(old) = f.time_ns else {
+            continue;
+        };
+        let times = there.get(&f.hash).map_or(&[][..], Vec::as_slice);
+        let nearest = times
+            .iter()
+            .flatten()
+            .min_by_key(|&&t| (t - old).abs())
+            .copied();
+        match nearest {
+            Some(t) if (t - old).abs() <= MOVED_NS => {}
+            _ if times.iter().any(Option::is_none) => {}
+            found => return Some((old, found)),
+        }
+    }
+    None
+}
+
+/// Where [`audio_times`] looks, as span starts: where `audio` decodes, from the head (see
+/// [`audio::spread`]). The head alone in a file without a Duration, or of none.
+fn spans(duration_ns: Option<u64>) -> Vec<i128> {
+    let placed = duration_ns.map_or_else(Vec::new, |d| audio::spread(d, SPAN_NS, 0));
+    if placed.is_empty() {
+        return vec![0];
+    }
+    placed.iter().map(|&(start, _)| i128::from(start)).collect()
+}
+
 /// Per track number: frame count, byte total and a hash of every frame in order.
 fn digests(f: File) -> Result<HashMap<u64, (u64, u64, u64)>> {
     let mut state: HashMap<u64, (u64, u64, DefaultHasher)> = HashMap::new();
@@ -495,6 +594,64 @@ fn digests(f: File) -> Result<HashMap<u64, (u64, u64, u64)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_out_of_place_is_the_first_one_moved_or_missing() {
+        const MS: i128 = 1_000_000;
+        let frame = |ms: i128, hash: u64| Timed {
+            time_ns: Some(ms * MS),
+            hash,
+        };
+        let was = [frame(0, 1), frame(32, 2), frame(64, 3)];
+        // Kept, to within the 2 ms a remux may move a frame.
+        assert_eq!(
+            first_moved(&was, &[frame(1, 1), frame(30, 2), frame(64, 3)]),
+            None
+        );
+        // Moved 30 ms, and the first of them named.
+        let moved = [frame(30, 1), frame(62, 2), frame(94, 3)];
+        assert_eq!(first_moved(&was, &moved), Some((0, Some(30 * MS))));
+        // Gone, and only frame 3 is there.
+        assert_eq!(first_moved(&was, &[frame(64, 3)]), Some((0, None)));
+        // Bytes the span holds twice (digital silence) say nothing, nor does a frame of its own
+        // with no time.
+        let silence = [
+            frame(0, 9),
+            frame(32, 9),
+            Timed {
+                time_ns: None,
+                hash: 4,
+            },
+        ];
+        assert_eq!(first_moved(&silence, &[frame(500, 9)]), None);
+        // A copy in the remux with no time to read passes; with a time, it is checked.
+        let untimed = [
+            Timed {
+                time_ns: None,
+                hash: 1,
+            },
+            frame(32, 2),
+            frame(64, 3),
+        ];
+        assert_eq!(first_moved(&was, &untimed), None);
+    }
+
+    #[test]
+    fn audio_is_checked_at_the_head_and_spread_over_the_file() {
+        const S: i128 = 1_000_000_000;
+        let starts = |d: u64| {
+            spans(Some(d * 1_000_000_000))
+                .iter()
+                .map(|s| s / S)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(starts(1440), [0, 288, 576, 864, 1152, 1380]);
+        // 30 s: 5 s spans from 0 and every 6 s; nothing a minute before the end.
+        assert_eq!(starts(30), [0, 6, 12, 18, 24]);
+        assert_eq!(starts(8), [0], "1.6 s overlaps the head");
+        assert_eq!(starts(3), [0], "shorter than a span");
+        assert_eq!(spans(None), [0]);
+    }
 
     #[test]
     fn integers_compare_by_value_and_floats_as_floats() {

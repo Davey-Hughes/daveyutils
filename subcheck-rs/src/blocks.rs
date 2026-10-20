@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
 
 use crate::ebml::{self, Error, Header, Reader, Result};
@@ -510,20 +511,17 @@ fn bytes_at<'a>(
     }
 }
 
-/// The largest Cluster read whole by [`each_frame`]: real ones are a few MB.
+/// The largest Cluster read whole by [`each_cluster`]: real ones are a few MB.
 const MAX_CLUSTER: u64 = 512 << 20;
 
-/// Every frame of every track, in file order, as `(track number, frame)`: lacing and content
-/// encodings undone. Reads the whole file, a Cluster at a time: for checking a remux frame by frame.
-pub fn each_frame(r: &Reader, layout: &Layout, mut f: impl FnMut(u64, &[u8])) -> Result<()> {
-    let encodings: HashMap<u64, &[ContentEncoding]> = layout
-        .tracks
-        .iter()
-        .map(|t| (t.number, t.encodings.as_slice()))
-        .collect();
-    let Some(mut pos) = layout.first_cluster else {
-        return Ok(());
-    };
+/// Each Cluster from the element at `pos` on, read whole, in file order: `f` gets its data's
+/// offset and bytes, and says whether to go on.
+fn each_cluster(
+    r: &Reader,
+    layout: &Layout,
+    mut pos: u64,
+    mut f: impl FnMut(u64, &[u8]) -> Result<bool>,
+) -> Result<()> {
     while pos < layout.segment_end {
         let h = r.header_at(pos)?;
         let Some(end) = h.end() else {
@@ -538,28 +536,184 @@ pub fn each_frame(r: &Reader, layout: &Layout, mut f: impl FnMut(u64, &[u8])) ->
                 return ebml::parse_err(pos, format!("Cluster of {size} bytes"));
             }
             let data = r.read_exact(h.data_start, usize::try_from(size).unwrap_or(usize::MAX))?;
-            for (id, at, child) in ebml::children(&data, h.data_start)? {
-                let body = match id {
-                    mkv::SIMPLE_BLOCK => Some((at, child)),
-                    mkv::BLOCK_GROUP => ebml::children(child, at)?
-                        .into_iter()
-                        .find(|(cid, _, _)| *cid == mkv::BLOCK)
-                        .map(|(_, bat, b)| (bat, b)),
-                    _ => None,
-                };
-                let Some((at, body)) = body else {
-                    continue;
-                };
-                let (track, frames) = frames(body, at)?;
-                let enc = encodings.get(&track).copied().unwrap_or_default();
-                for frame in frames {
-                    f(track, &decode(frame.to_vec(), enc, mkv::SCOPE_FRAMES)?);
-                }
+            if !f(h.data_start, &data)? {
+                return Ok(());
             }
         }
         pos = end;
     }
     Ok(())
+}
+
+/// A block's body (a Block's or SimpleBlock's data), as a Cluster holds it.
+struct Body<'a> {
+    /// Its offset, for errors.
+    at: u64,
+    data: &'a [u8],
+    /// The BlockGroup's BlockDuration, in TimestampScale units, if it has one.
+    duration: Option<u64>,
+}
+
+/// The block a Cluster child holds, given as `(id, offset, data)` the way [`ebml::children`]
+/// gives it; `None` for any other child, and for a BlockGroup without a Block.
+fn block_body(id: u32, at: u64, child: &[u8]) -> Result<Option<Body<'_>>> {
+    Ok(match id {
+        mkv::SIMPLE_BLOCK => Some(Body {
+            at,
+            data: child,
+            duration: None,
+        }),
+        mkv::BLOCK_GROUP => {
+            let kids = ebml::children(child, at)?;
+            let duration = kids
+                .iter()
+                .find(|(cid, _, _)| *cid == mkv::BLOCK_DURATION)
+                .map(|(_, _, v)| ebml::uint(v));
+            kids.into_iter()
+                .find(|(cid, _, _)| *cid == mkv::BLOCK)
+                .map(|(_, at, data)| Body { at, data, duration })
+        }
+        _ => None,
+    })
+}
+
+/// Every frame of every track, in file order, as `(track number, frame)`: lacing and content
+/// encodings undone. Reads the whole file, a Cluster at a time: for checking a remux frame by frame.
+pub fn each_frame(r: &Reader, layout: &Layout, mut f: impl FnMut(u64, &[u8])) -> Result<()> {
+    let encodings: HashMap<u64, &[ContentEncoding]> = layout
+        .tracks
+        .iter()
+        .map(|t| (t.number, t.encodings.as_slice()))
+        .collect();
+    let Some(first) = layout.first_cluster else {
+        return Ok(());
+    };
+    each_cluster(r, layout, first, |data_start, data| {
+        for (id, at, child) in ebml::children(data, data_start)? {
+            let Some(body) = block_body(id, at, child)? else {
+                continue;
+            };
+            let (track, frames) = frames(body.data, body.at)?;
+            let enc = encodings.get(&track).copied().unwrap_or_default();
+            for frame in frames {
+                f(track, &decode(frame.to_vec(), enc, mkv::SCOPE_FRAMES)?);
+            }
+        }
+        Ok(true)
+    })
+}
+
+/// A frame's time and what it holds, for telling whether a remux kept each frame where it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timed {
+    /// `None` for a frame laced behind its block's first with no duration to time it by.
+    pub time_ns: Option<i128>,
+    /// Of the frame, its content encodings undone.
+    pub hash: u64,
+}
+
+/// The frames of the tracks numbered `tracks` whose times fall in `from_ns..to_ns`, by track
+/// number, in file order. Reads the Clusters from the last Cue at or before `from_ns` (the first
+/// Cluster, without one) to the first that starts past `to_ns`. A frame laced behind a block's
+/// first is timed by the track's DefaultDuration, or the block's duration split evenly over its
+/// frames; with neither, it has no time, and is given if its block's falls in the span.
+pub fn frames_between(
+    r: &Reader,
+    layout: &Layout,
+    from_ns: i128,
+    to_ns: i128,
+    tracks: &[u64],
+) -> Result<HashMap<u64, Vec<Timed>>> {
+    let scale = i128::from(layout.timestamp_scale);
+    let wanted: HashMap<u64, &Track> = layout
+        .tracks
+        .iter()
+        .filter(|t| tracks.contains(&t.number))
+        .map(|t| (t.number, t))
+        .collect();
+    let mut out: HashMap<u64, Vec<Timed>> = HashMap::new();
+    let start = layout
+        .cues
+        .iter()
+        .filter(|c| i128::from(c.time) * scale <= from_ns)
+        .max_by_key(|c| (c.time, c.cluster))
+        .map(|c| layout.segment_data + c.cluster)
+        .or(layout.first_cluster);
+    let Some(start) = start else {
+        return Ok(out);
+    };
+    each_cluster(r, layout, start, |data_start, data| {
+        let mut cluster_ts = None;
+        for (id, at, child) in ebml::children(data, data_start)? {
+            if id == mkv::TIMESTAMP {
+                let ts = i128::from(ebml::uint(child)) * scale;
+                if ts > to_ns {
+                    return Ok(false);
+                }
+                cluster_ts = Some(ts);
+                continue;
+            }
+            let Some(Body {
+                at,
+                data: body,
+                duration,
+            }) = block_body(id, at, child)?
+            else {
+                continue;
+            };
+            let Some(ts) = cluster_ts else {
+                return ebml::parse_err(at, "block before its Cluster's Timestamp");
+            };
+            let (track, frames) = frames(body, at)?;
+            let Some(t) = wanted.get(&track) else {
+                continue;
+            };
+            // After the track number, the block's 16-bit time relative to its Cluster's.
+            let Some(&[hi, lo]) = ebml::read_vint(body).and_then(|(_, n, _)| body.get(n..n + 2))
+            else {
+                return ebml::parse_err(at, "block too short");
+            };
+            let block_ns = ts + i128::from(i16::from_be_bytes([hi, lo])) * scale;
+            let duration = duration.map(|d| i128::from(d) * scale);
+            let times = lace_times(block_ns, frames.len(), t.default_duration, duration);
+            for (frame, time_ns) in frames.into_iter().zip(times) {
+                let when = time_ns.unwrap_or(block_ns);
+                if when < from_ns || when >= to_ns {
+                    continue;
+                }
+                let mut hasher = DefaultHasher::new();
+                decode(frame.to_vec(), &t.encodings, mkv::SCOPE_FRAMES)?.hash(&mut hasher);
+                out.entry(track).or_default().push(Timed {
+                    time_ns,
+                    hash: hasher.finish(),
+                });
+            }
+        }
+        Ok(true)
+    })?;
+    Ok(out)
+}
+
+/// The times of the `count` frames laced in a block at `block_ns`: one a frame duration after the
+/// other, by the track's DefaultDuration or else the block's duration (ns) split evenly. Without
+/// either, only the first frame's time is known. mkvmerge laces Vorbis eight to a block that way.
+fn lace_times(
+    block_ns: i128,
+    count: usize,
+    default_duration: Option<u64>,
+    block_duration: Option<i128>,
+) -> Vec<Option<i128>> {
+    let n = i128::try_from(count).unwrap_or(i128::MAX).max(1);
+    let step = default_duration
+        .map(i128::from)
+        .or(block_duration.map(|d| d / n));
+    (0..n)
+        .map(|i| match (i, step) {
+            (0, _) => Some(block_ns),
+            (_, Some(step)) => Some(block_ns + step * i),
+            (_, None) => None,
+        })
+        .collect()
 }
 
 /// A Block or SimpleBlock body's track number and frames, its lacing (Xiph, EBML or fixed-size)
@@ -711,6 +865,57 @@ mod tests {
                 t.id
             );
         }
+    }
+
+    #[test]
+    fn laced_frames_are_timed_one_frame_duration_apart() {
+        // 8 MP3 frames of 24 ms, as mkvmerge laces them.
+        assert_eq!(
+            lace_times(1_000, 3, Some(24_000_000), Some(1)),
+            [Some(1_000), Some(24_001_000), Some(48_001_000)]
+        );
+        // No DefaultDuration: the block's duration split evenly.
+        assert_eq!(
+            lace_times(0, 4, None, Some(100)),
+            [Some(0), Some(25), Some(50), Some(75)]
+        );
+        // Neither: only the first frame has a time.
+        assert_eq!(lace_times(7, 3, None, None), [Some(7), None, None]);
+        assert_eq!(lace_times(7, 1, None, None), [Some(7)]);
+    }
+
+    #[test]
+    fn frames_between_gives_each_frame_in_the_span_with_its_time() {
+        let (r, layout) = mkv::open(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/audio.mkv"
+        )))
+        .unwrap();
+        let all = frames_between(&r, &layout, 0, i128::MAX, &[1, 2]).unwrap();
+        for t in &layout.tracks[..2] {
+            let frames = &all[&t.number];
+            assert_eq!(
+                Some(&(frames.len() as u64)),
+                layout.frame_counts.get(&t.uid),
+                "track {}",
+                t.id
+            );
+            assert!(frames.windows(2).all(|w| w[0].time_ns < w[1].time_ns));
+            assert!(frames.iter().all(|f| f.time_ns.is_some()));
+        }
+        // Track 2 is track 1 muxed 27 ms late: the same frames, each 27 ms on.
+        assert_eq!(all[&1][5].hash, all[&2][5].hash);
+        let (late, main) = (all[&2][5].time_ns.unwrap(), all[&1][5].time_ns.unwrap());
+        assert!((late - main - 27_000_000).abs() < 1_000_000);
+        // 10-11 s: every frame from 10 s up to 11 s, 128 ms apart, and none outside.
+        let span = frames_between(&r, &layout, 10_000_000_000, 11_000_000_000, &[1]).unwrap();
+        let times: Vec<i128> = span[&1].iter().filter_map(|f| f.time_ns).collect();
+        assert_eq!(times.len(), 7, "{times:?}");
+        assert!(
+            (10_000_000_000..10_128_000_000).contains(&times[0])
+                && (10_872_000_000..11_000_000_000).contains(&times[6]),
+            "{times:?}"
+        );
     }
 
     #[test]

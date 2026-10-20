@@ -5,9 +5,8 @@ use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use crate::ebml;
 use crate::group;
@@ -269,25 +268,14 @@ fn xml(s: &str) -> String {
 /// signal that ends subcheck ends it too. Ok with mkvmerge's warnings (exit 1), if any; an error
 /// with what it said otherwise.
 pub fn run(program: &OsStr, args: &[OsString]) -> Result<Option<String>, String> {
-    let child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| {
-            let name = program.to_string_lossy();
-            if e.kind() == io::ErrorKind::NotFound {
-                format!("{name} not found: install mkvtoolnix")
-            } else {
-                format!("starting {name}: {e}")
-            }
-        })?;
-    let _running = group::register(i32::try_from(child.id()).unwrap_or(0));
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("waiting for mkvmerge: {e}"))?;
+    let name = program.to_string_lossy();
+    let out = group::output(Command::new(program).args(args)).map_err(|e| match e {
+        group::Failed::Start(e) if e.kind() == io::ErrorKind::NotFound => {
+            format!("{name} not found: install mkvtoolnix")
+        }
+        group::Failed::Start(e) => format!("starting {name}: {e}"),
+        group::Failed::Wait(e) => format!("waiting for mkvmerge: {e}"),
+    })?;
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

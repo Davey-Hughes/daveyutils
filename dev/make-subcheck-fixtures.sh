@@ -267,6 +267,37 @@ printf '1\n00:00:00,000 --> 00:00:02,000\nOver tehre\n\n2\n00:00:02,000 --> 00:0
 mux -o "$out/timed.mkv" --language 0:eng --default-duration 0:2s "$src/timed.srt" \
   --language 0:eng --default-duration 0:24000/1001p "$src/timed.ass"
 
+# `subcheck audio`'s files, and apply's check that a remux keeps each audio frame's time: low-passed
+# noise in 30 ms bursts, 0.7 a second (FLAC packs the silence between them small), as copies that
+# line up and copies that do not. audio.mkv, 30 s at 8 kHz: the sound; a copy 27 ms late, tagged
+# jpn; a copy 20 ms late from 0:16 on (its second part placed 20 ms after the first ends); other
+# noise. audio-ac3.mkv, 6 s: a FLAC, and an AC-3 of it at 48 kHz as ffmpeg encodes one, with
+# ffmpeg's 256 samples of priming that nothing in the file records: 5.3 ms late.
+burst="lowpass=f=3000,aeval=val(0)*lt(mod(t*0.7\,1)\,0.03)"
+# flac OUT INPUT-ARGS...: the options must come before the output name, or ffmpeg ignores them.
+flac() {
+  local out=$1
+  shift
+  ffmpeg -nostdin -loglevel error -y "$@" -c:a flac -sample_fmt s16 -compression_level 12 \
+    -fflags +bitexact -flags:a +bitexact "$out"
+}
+flac "$src/audio.flac" -f lavfi -i "anoisesrc=d=30:c=white:r=8000:a=0.2:seed=1" -af "$burst"
+flac "$src/audio-other.flac" -f lavfi -i "anoisesrc=d=30:c=white:r=8000:a=0.2:seed=2" -af "$burst"
+flac "$src/audio-head.flac" -i "$src/audio.flac" -af atrim=end_sample=128000
+flac "$src/audio-tail.flac" -i "$src/audio.flac" -af "atrim=start_sample=128000,asetpts=PTS-STARTPTS"
+printf "file '%s'\nduration 16.02\nfile '%s'\n" "$src/audio-head.flac" "$src/audio-tail.flac" >"$src/audio-stepped.txt"
+ffmpeg -nostdin -loglevel error -y -f concat -safe 0 -i "$src/audio-stepped.txt" -c copy \
+  -fflags +bitexact "$src/audio-stepped.mka"
+mux -o "$out/audio.mkv" --language 0:eng --track-name '0:Main' "$src/audio.flac" \
+  --language 0:jpn --track-name '0:27 ms late' --default-track-flag 0:no --sync 0:27 "$src/audio.flac" \
+  --language 0:eng --track-name '0:20 ms late from 0:16' --default-track-flag 0:no "$src/audio-stepped.mka" \
+  --language 0:eng --track-name '0:Other sound' --default-track-flag 0:no "$src/audio-other.flac"
+flac "$src/audio-short.flac" -f lavfi -i "anoisesrc=d=6:c=white:r=8000:a=0.2:seed=3" -af "$burst"
+ffmpeg -nostdin -loglevel error -y -i "$src/audio-short.flac" -ar 48000 -c:a ac3 -b:a 32k \
+  -fflags +bitexact -flags:a +bitexact "$src/audio-short.ac3"
+mux -o "$out/audio-ac3.mkv" --language 0:eng --track-name '0:FLAC' "$src/audio-short.flac" \
+  --language 0:eng --track-name '0:AC-3 by ffmpeg' --default-track-flag 0:no "$src/audio-short.ac3"
+
 # The oracle: mkvextract's output for every text subtitle track, named the way `subcheck extract`
 # names its default output (<stem>.track<ID>.<ext>).
 for mkv in "$out"/*.mkv; do

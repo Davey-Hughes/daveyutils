@@ -14,6 +14,7 @@ pub const SEEK_ID: u32 = 0x53AB;
 pub const SEEK_POSITION: u32 = 0x53AC;
 pub const INFO: u32 = 0x1549_A966;
 pub const TIMESTAMP_SCALE: u32 = 0x002A_D7B1;
+pub const DURATION: u32 = 0x4489;
 pub const SEGMENT_UID: u32 = 0x73A4;
 pub const TITLE: u32 = 0x7BA9;
 pub const TRACKS: u32 = 0x1654_AE6B;
@@ -78,6 +79,7 @@ pub const BLOCK: u32 = 0xA1;
 pub const BLOCK_DURATION: u32 = 0x9B;
 
 pub const TRACK_TYPE_VIDEO: u64 = 0x01;
+pub const TRACK_TYPE_AUDIO: u64 = 0x02;
 pub const TRACK_TYPE_SUBTITLE: u64 = 0x11;
 
 /// The ContentEncodingScope bit for frame contents; 2 is CodecPrivate.
@@ -168,6 +170,8 @@ pub struct Layout {
     pub segment_end: u64,
     /// Nanoseconds per timestamp unit.
     pub timestamp_scale: u64,
+    /// The Segment's Duration, in nanoseconds.
+    pub duration_ns: Option<u64>,
     pub tracks: Vec<Track>,
     pub cues: Vec<Cue>,
     /// `NUMBER_OF_FRAMES` statistics tags, by track UID.
@@ -256,6 +260,7 @@ pub fn read_layout(r: &Reader) -> Result<Layout> {
         segment_data: seg.data_start,
         segment_end,
         timestamp_scale: 1_000_000,
+        duration_ns: None,
         tracks: Vec::new(),
         cues: Vec::new(),
         frame_counts: HashMap::new(),
@@ -390,9 +395,11 @@ fn parse_seek_head(data: &[u8], base: u64, segment_data: u64) -> Result<Vec<u64>
 
 fn parse_info(data: &[u8], base: u64, layout: &mut Layout) -> Result<()> {
     let mut scale = 1_000_000;
+    let mut duration = None;
     for (id, _, v) in ebml::children(data, base)? {
         match id {
             TIMESTAMP_SCALE => scale = ebml::uint(v),
+            DURATION => duration = ebml::float(v),
             SEGMENT_UID => layout.segment_uid = Some(v.to_vec()),
             TITLE => layout.title = Some(ebml::string(v)),
             _ => {}
@@ -402,6 +409,17 @@ fn parse_info(data: &[u8], base: u64, layout: &mut Layout) -> Result<()> {
         return ebml::parse_err(base, "TimestampScale is 0");
     }
     layout.timestamp_scale = scale;
+    // In TimestampScale units, as a float.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    {
+        layout.duration_ns = duration
+            .filter(|d| d.is_finite() && *d >= 0.0)
+            .map(|d| (d * scale as f64) as u64);
+    }
     Ok(())
 }
 

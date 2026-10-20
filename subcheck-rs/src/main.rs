@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use subcheck::apply::{self, Mode};
+use subcheck::audio::{self, correlate, decode};
 use subcheck::blocks::{self, ReadPath};
 use subcheck::ebml;
 use subcheck::list::{self, Filter};
@@ -112,6 +113,25 @@ enum Command {
         #[arg(long = "lang")]
         langs: Vec<String>,
         /// Add each style's offset counts, and whether its times were used.
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Report whether the audio tracks that hold the same sound line up. Decodes a few windows of
+    /// each with ffmpeg; nothing recorded.
+    ///
+    /// Every pair of audio tracks is cross-correlated in ten-second windows spread over the file.
+    /// A track whose sound matches a lower-numbered one's is reported against it: in sync, late or
+    /// early by a steady amount (with the mkvmerge --sync that lines it up, where one does), or
+    /// drifting.
+    /// Directories are walked recursively.
+    Audio {
+        /// MKV files, or directories to search for them.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// The ffmpeg program.
+        #[arg(long, default_value = "ffmpeg")]
+        ffmpeg: PathBuf,
+        /// Add every pair's lag and score in every window.
         #[arg(short, long)]
         verbose: bool,
     },
@@ -297,6 +317,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             langs,
             verbose,
         } => Ok(timing(&paths, &langs, verbose)),
+        Command::Audio {
+            paths,
+            ffmpeg,
+            verbose,
+        } => Ok(audio(&paths, ffmpeg.as_os_str(), verbose)),
         Command::Apply(args) => apply_run(args),
         Command::List {
             run,
@@ -457,6 +482,59 @@ fn extract(
 /// that cannot be read in its row, and the rest are still checked; any of them makes the exit status
 /// 1. A shifted or unsupported track is a result, not a failure.
 fn timing(paths: &[PathBuf], langs: &[String], verbose: bool) -> ExitCode {
+    let (files, mut failed) = labelled_files(paths);
+    for (file, name) in &files {
+        match timing_file(file, langs) {
+            Ok((tracks, unread)) => {
+                print!("{}", timing::render(name, &tracks, verbose));
+                failed |= unread;
+            }
+            Err(e) => {
+                eprintln!("subcheck: {}: {e:#}", file.display());
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// As `timing`: a block per file on stdout, and exit status 1 when a path, a file or a window
+/// cannot be read. A track out of line is a result, not a failure. A missing ffmpeg stops it
+/// before the first file.
+fn audio(paths: &[PathBuf], ffmpeg: &std::ffi::OsStr, verbose: bool) -> ExitCode {
+    if let Err(e) = decode::check(ffmpeg) {
+        eprintln!("subcheck: {e}");
+        return ExitCode::FAILURE;
+    }
+    let (files, mut failed) = labelled_files(paths);
+    for (file, name) in &files {
+        match audio_file(file, ffmpeg) {
+            Ok((tracks, windows, pairs)) => {
+                print!(
+                    "{}",
+                    audio::render(name, &tracks, &windows, &pairs, verbose)
+                );
+            }
+            Err(e) => {
+                eprintln!("subcheck: {}: {e:#}", file.display());
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// The MKV files under `paths`, by path, each with the label its block is headed by, and whether
+/// a path could not be read (said on stderr). Says so when there are none.
+fn labelled_files(paths: &[PathBuf]) -> (Vec<(PathBuf, String)>, bool) {
     let mut failed = false;
     let mut files = Vec::new();
     for p in paths {
@@ -483,25 +561,14 @@ fn timing(paths: &[PathBuf], langs: &[String], verbose: bool) -> ExitCode {
     if files.is_empty() && !failed {
         eprintln!("Nothing to check: no MKV files found");
     }
-    for (file, short, long) in &files {
-        let alike = files.iter().filter(|(_, s, _)| s == short).count() > 1;
-        let name = if alike { long } else { short };
-        match timing_file(file, langs) {
-            Ok((tracks, unread)) => {
-                print!("{}", timing::render(name, &tracks, verbose));
-                failed |= unread;
-            }
-            Err(e) => {
-                eprintln!("subcheck: {}: {e:#}", file.display());
-                failed = true;
-            }
-        }
-    }
-    if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
+    let labelled = files
+        .iter()
+        .map(|(file, short, long)| {
+            let alike = files.iter().filter(|(_, s, _)| s == short).count() > 1;
+            (file.clone(), if alike { long } else { short }.clone())
+        })
+        .collect();
+    (labelled, failed)
 }
 
 /// How a file's block is headed: its path below the directory argument it was found under (`root`),
@@ -603,6 +670,85 @@ fn timing_file(file: &Path, langs: &[String]) -> Result<(Vec<TrackReport>, bool)
         })
         .collect();
     Ok((tracks, unread))
+}
+
+/// One file's audio tracks, its windows' starts, and every pair's lag in each window.
+fn audio_file(
+    file: &Path,
+    ffmpeg: &std::ffi::OsStr,
+) -> Result<(Vec<audio::Track>, Vec<u64>, Vec<audio::Pair>)> {
+    let (_, layout) = mkv::open(file)?;
+    if let Some(t) = layout.truncated {
+        eprintln!("{}", t.warning(file));
+    }
+    let tracks: Vec<audio::Track> = layout
+        .tracks
+        .iter()
+        .filter(|t| t.kind == mkv::TRACK_TYPE_AUDIO)
+        .map(|t| audio::Track {
+            id: t.id,
+            name: t
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("({})", t.language)),
+            language: t.language.clone(),
+        })
+        .collect();
+    if tracks.len() < 2 {
+        return Ok((tracks, Vec::new(), Vec::new()));
+    }
+    let duration = layout
+        .duration_ns
+        .context("the file's Info has no Duration")?;
+    let windows = audio::windows(duration);
+    let mut pairs: Vec<audio::Pair> = Vec::new();
+    for (i, a) in tracks.iter().enumerate() {
+        for b in &tracks[i + 1..] {
+            pairs.push(audio::Pair {
+                a: a.id,
+                b: b.id,
+                lags: Vec::new(),
+            });
+        }
+    }
+    // One set of FFT plans: every window is as long as the first (ten seconds, or a short file's
+    // only one).
+    let Some(&(_, first_len)) = windows.first() else {
+        return Ok((tracks, Vec::new(), pairs));
+    };
+    debug_assert!(windows.iter().all(|w| w.1 == first_len), "{windows:?}");
+    let samples =
+        usize::try_from(u128::from(first_len) * u128::from(correlate::RATE) / 1_000_000_000)
+            .unwrap_or(usize::MAX);
+    let c = correlate::Correlator::new(samples);
+    for &(start, len) in &windows {
+        // Every track at once: each its own ffmpeg, reading the same clusters.
+        let decoded: Vec<Result<Vec<f32>, String>> = std::thread::scope(|s| {
+            let running: Vec<_> = (0..tracks.len())
+                .map(|index| s.spawn(move || decode::window(ffmpeg, file, index, start, len)))
+                .collect();
+            running
+                .into_iter()
+                .map(|r| r.join().expect("decoding does not panic"))
+                .collect()
+        });
+        let decoded = decoded
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("decoding the window at {} s", start / 1_000_000_000))?;
+        let prepared: Vec<correlate::Prepared> = decoded.iter().map(|d| c.prepare(d)).collect();
+        let at = |id: usize| {
+            tracks
+                .iter()
+                .position(|t| t.id == id)
+                .expect("a pair of its tracks")
+        };
+        for p in &mut pairs {
+            p.lags.push(c.lag(&prepared[at(p.a)], &prepared[at(p.b)]));
+        }
+    }
+    Ok((tracks, windows.iter().map(|w| w.0).collect(), pairs))
 }
 
 fn pick_track(tracks: &[Track], id: Option<usize>) -> Result<&Track> {

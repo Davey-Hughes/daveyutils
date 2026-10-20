@@ -139,11 +139,12 @@ jobs:
       - run: cargo clippy --manifest-path nudge-rs/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path nudge-rs/Cargo.toml
 
-  # The nudge-rs job's three commands, for the other crate, with mkvtoolnix: the
-  # `apply` tests remux with mkvmerge. They skip without it, so the job sets
-  # SUBCHECK_NEED_MKVMERGE to make a missing mkvmerge fail them instead. The other
-  # tests read MKV fixtures committed under subcheck-rs/tests/fixtures/; only
-  # dev/make-subcheck-fixtures.sh wants ffmpeg, and only when a fixture changes.
+  # The nudge-rs job's three commands, for the other crate, with mkvtoolnix and
+  # ffmpeg: the `apply` tests remux with mkvmerge, the `audio` tests decode with
+  # ffmpeg. They skip without them, so the job sets SUBCHECK_NEED_MKVMERGE and
+  # SUBCHECK_NEED_FFMPEG to make a missing one fail them instead. The tests read
+  # MKV fixtures committed under subcheck-rs/tests/fixtures/;
+  # dev/make-subcheck-fixtures.sh builds them, only when a fixture changes.
   subcheck-rs:
     name: subcheck-rs
     runs-on: docker
@@ -182,11 +183,16 @@ jobs:
           echo "deb [signed-by=$key] https://mkvtoolnix.download/$ID/ $VERSION_CODENAME main" >/etc/apt/sources.list.d/mkvtoolnix.list
           apt-get update && apt-get install -y --no-install-recommends 'mkvtoolnix=103.0-*'
 
+      # bookworm's own (5.1): `audio`'s output on the fixtures is the same from it as from 9.0.
+      - name: Install ffmpeg
+        run: apt-get install -y --no-install-recommends ffmpeg
+
       - run: cargo fmt --manifest-path subcheck-rs/Cargo.toml --all --check
       - run: cargo clippy --manifest-path subcheck-rs/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path subcheck-rs/Cargo.toml
         env:
           SUBCHECK_NEED_MKVMERGE: "1"
+          SUBCHECK_NEED_FFMPEG: "1"
 
   # The Makefile is how every utility here gets onto a PATH, and a `make` that
   # exits 0 while installing a non-functional bin/ ships green -- which is

@@ -16,6 +16,9 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
 - `subcheck timing` reports subtitle tracks shifted by whole frames against the video, with the
   `mkvmerge --sync` that fixes a whole-track shift. A track with too few lines on cuts is timed by
   the lines it shares with another track. No LLM, nothing recorded.
+- `subcheck audio` reports whether audio tracks holding the same sound in different formats (a
+  TrueHD and its AC-3, a FLAC and an AAC of it) line up, with the `mkvmerge --sync` that fixes a
+  steady lag. Needs ffmpeg; nothing recorded.
 
 ## Review
 
@@ -90,6 +93,52 @@ window and leave focus alone. The ways below rest on two mpv options, `--focus-o
   window that is refused focus opens behind the active one, so a maximized terminal would hide
   it. Alt+F3 → More Actions → Keep Above turns that off.
 
+## Audio
+
+`subcheck audio <files or directories>` decodes every audio track with ffmpeg in ten-second
+windows spread over each file (0:30, 20, 40, 60 and 80 % in, and a minute before the end) and
+cross-correlates every pair of tracks in each. Two tracks hold the same sound when they match in
+every window, or all but one in four; each is reported against the lower-numbered track it matches
+best:
+
+```
+FMAB - E16.mkv
+  track 1  Japanese FLAC 2.0   no other track holds this audio
+  track 2  English TrueHD 5.1  reference
+  track 3  English AC-3 5.1    34.2 ms late against track 2
+           fix: mkvmerge --sync 3:-34, or --sync 2:34 if track 2 is the one off
+```
+
+- `in sync`: within 1 ms. Matroska keeps times to the millisecond, so a window can read that much
+  off for tracks that are in step.
+- `N ms late` (or early): the same in every window, within 3 ms (a lossy track's lag wanders
+  that much with its codec).
+- `drifts`: the windows disagree, so no one `--sync` fixes it; each window's lag is printed. A sync
+  step partway through a track reads like this.
+- `no other track holds this audio`: no track matches it; `track N holds this audio too, but goes
+  with another track`: track N matches it, but another better (an AC-3 that matches its TrueHD,
+  and the Japanese track through the music it shares with the dub).
+
+A `fix` moves a track onto the one it is reported against. The sound alone cannot say which of
+the two is off, so when that one is the top of its group (reported against none), no other
+track holds its sound and none is reported against the track to move, moving it instead is given
+too. A track in sync with one that has a fix
+gets the same move. One late or early against a track that is itself off gets no fix: it names
+the track to fix first, and `audio` says the rest once that is done. No `--sync` moves a drift,
+so a track steady against one is fixed against it, as against the top of a group: FMAB E61's
+AC-3 lines up with its TrueHD, whose dub drifts against the Japanese track.
+
+Measured as ffmpeg plays a file, which is how mpv and Plex do: an AC-3 or AAC whose encoder
+priming the file does not record plays late by it, and is reported late (an AC-3 ffmpeg made, by
+5.3 ms; an AAC, by about 21). Samples are placed by their timestamps, so a track with frames
+missing reads in sync around the gap, not shifted.
+
+A dub shares its original's music and effects, and its dialogue windows tell them apart; a dub
+of an episode that is music and effects from end to end can match its original, and is then
+reported against it, with the two languages said. `-v` prints every pair's lag and score in every
+window. The exit status is 1 only when a file or a window cannot be read; `--ffmpeg` names the
+program.
+
 ## Apply
 
 `subcheck apply` takes the newest run's accepted fixes (or those of the run named), with your
@@ -100,8 +149,10 @@ wording where you reworded one, and makes them in each file:
 2. mkvmerge writes `.<name>.mkv.subcheck` beside the file: the same file with the fixed tracks
    replaced, each in its place, with its name, language, flags and compression.
 3. That remux is checked against the original: titles, chapters, attachments, every track's
-   header, frame counts, and every subtitle event. With `--full` (or `--no-backup`), every frame of
-   every track too, which reads both files end to end.
+   header, frame counts, every subtitle event, and the times of the audio frames in six 5-second
+   spans (the head, 20 to 80 % in, a minute before the end): a frame moved more than 2 ms fails
+   it. With `--full` (or `--no-backup`), every frame of every track too, which reads both files end
+   to end.
 4. The original becomes `<name>.mkv.orig` and the remux takes its name. The original is linked to
    that name first, so the file is never missing on the way; a filesystem without hard links
    needs `--no-backup`.

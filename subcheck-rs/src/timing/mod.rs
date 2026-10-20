@@ -1194,6 +1194,7 @@ mod tests {
             segment_data: 0,
             segment_end: 0,
             timestamp_scale: 1_000_000,
+            duration_ns: None,
             tracks,
             cues: cue_times
                 .iter()

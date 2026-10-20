@@ -3,8 +3,11 @@
 //! groups too and leaves no half-written file behind.
 
 use std::ffi::{CString, c_char};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::{Command, Output, Stdio};
 use std::sync::Once;
 use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 
@@ -68,6 +71,27 @@ pub fn remove_on_signal(path: &Path) -> Removing {
         )
         .is_ok()
     }))
+}
+
+/// Why [`output`] has no output: the command did not start, or could not be waited for.
+#[derive(Debug)]
+pub enum Failed {
+    Start(io::Error),
+    Wait(io::Error),
+}
+
+/// Run `cmd` to its end with an empty stdin and its stdout and stderr captured, in a process
+/// group of its own, registered so that a signal that ends subcheck ends it too.
+pub fn output(cmd: &mut Command) -> Result<Output, Failed> {
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(Failed::Start)?;
+    let _running = register(i32::try_from(child.id()).unwrap_or(0));
+    child.wait_with_output().map_err(Failed::Wait)
 }
 
 pub fn kill(pgid: i32) {

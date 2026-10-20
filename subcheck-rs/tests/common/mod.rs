@@ -62,6 +62,25 @@ pub fn have_mkvmerge() -> bool {
     ok
 }
 
+/// Whether ffmpeg can be run, as [`have_mkvmerge`] asks of mkvmerge: the `audio` tests skip
+/// without it, and fail instead with SUBCHECK_NEED_FFMPEG set.
+#[allow(dead_code)] // only the audio tests run ffmpeg
+pub fn have_ffmpeg() -> bool {
+    let ok = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    let needed = std::env::var_os("SUBCHECK_NEED_FFMPEG").is_some_and(|v| !v.is_empty());
+    assert!(
+        ok || !needed,
+        "ffmpeg not found, and SUBCHECK_NEED_FFMPEG is set"
+    );
+    if !ok {
+        eprintln!("skipped: ffmpeg not found");
+    }
+    ok
+}
+
 /// A file under tests/fixtures/, built by dev/make-subcheck-fixtures.sh.
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
