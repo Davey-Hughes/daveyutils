@@ -111,7 +111,7 @@ pub fn event_times(b: &Block, scale: u64, default_duration: Option<u64>) -> (i64
         .map(|d| ms(i128::from(d) * i128::from(scale)))
         .or(default_duration.map(|d| ms(i128::from(d))))
         .unwrap_or(0);
-    (start_ms, start_ms + duration_ms)
+    (start_ms, start_ms.saturating_add(duration_ms))
 }
 
 /// A block's payload (as `c_string` reads it) as its event's `raw`: but for its ReadOrder.
@@ -133,8 +133,9 @@ pub fn text_field(kind: Kind, payload: &str) -> Option<usize> {
     }
 }
 
+/// Nanoseconds as whole ms; past either end of i64 (a corrupt time), that end.
 fn ms(ns: i128) -> i64 {
-    i64::try_from(ns / 1_000_000).unwrap_or(i64::MAX)
+    i64::try_from(ns / 1_000_000).unwrap_or(if ns < 0 { i64::MIN } else { i64::MAX })
 }
 
 /// What [`clean`] makes of an event's text.
@@ -486,6 +487,19 @@ mod tests {
             duration: Some(dur),
             payload: format!("{read_order},0,{style},,0,0,0,,{text}").into_bytes(),
         }
+    }
+
+    #[test]
+    fn times_past_i64_in_ms_stop_at_its_ends() {
+        // A corrupt time, at the end of i64 in ms: its end does not run past it.
+        let late = ass(0, i64::MAX - 5, 10, "D", "x");
+        assert_eq!(
+            event_times(&late, 1_000_000, None),
+            (i64::MAX - 5, i64::MAX)
+        );
+        // A time before the start of i64 in ms stops at its start, not at its end.
+        let early = ass(0, i64::MIN, 0, "D", "x");
+        assert_eq!(event_times(&early, 1 << 40, None).0, i64::MIN);
     }
 
     fn texts(lines: &[Line]) -> Vec<&str> {

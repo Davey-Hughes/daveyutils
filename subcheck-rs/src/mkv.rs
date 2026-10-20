@@ -160,6 +160,15 @@ pub fn shown_name(name: Option<&str>, language: &str) -> String {
     own_name(name).map_or_else(|| format!("({language})"), str::to_owned)
 }
 
+impl Layout {
+    /// The Cluster `cue` leads to, if it leads inside the Segment: one past it, or past the end of
+    /// the number, is corrupt.
+    pub fn cluster_at(&self, cue: &Cue) -> Option<u64> {
+        let at = self.segment_data.checked_add(cue.cluster)?;
+        (at < self.segment_end).then_some(at)
+    }
+}
+
 impl Track {
     pub fn shown_language(&self) -> &str {
         shown_language(&self.language, self.language_bcp47.as_deref())
@@ -409,13 +418,15 @@ fn parse_seek_head(data: &[u8], base: u64, segment_data: u64) -> Result<Vec<u64>
                 _ => {}
             }
         }
+        // A position past the end of u64 is corrupt: no element is there to find.
         if let (Some(target), Some(position)) = (target, position)
             && matches!(
                 target,
                 SEEK_HEAD | INFO | TRACKS | CUES | TAGS | CHAPTERS | ATTACHMENTS
             )
+            && let Some(at) = segment_data.checked_add(position)
         {
-            out.push(segment_data + position);
+            out.push(at);
         }
     }
     Ok(out)
@@ -433,8 +444,10 @@ fn parse_info(data: &[u8], base: u64, layout: &mut Layout) -> Result<()> {
             _ => {}
         }
     }
-    if scale == 0 {
-        return ebml::parse_err(base, "TimestampScale is 0");
+    // Nanoseconds per tick, a second's worth being 10^9. Past 2^62 a time (a u64) times the scale
+    // could run past the i128 that times in nanoseconds are reckoned in.
+    if scale == 0 || scale > 1 << 62 {
+        return ebml::parse_err(base, format!("TimestampScale {scale} is out of range"));
     }
     layout.timestamp_scale = scale;
     // In TimestampScale units, as a float.
@@ -801,6 +814,29 @@ mod tests {
         assert_eq!(named(&[]), "(eng)");
         // An empty name names nothing.
         assert_eq!(named(&[name(" "), bcp47("ja")]), "(ja)");
+    }
+
+    #[test]
+    fn a_timestamp_scale_past_2_to_the_62_is_an_error() {
+        let typos = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/typos.mkv");
+        let (_, mut layout) = open(std::path::Path::new(typos)).unwrap();
+        let info = |scale: u64| el(&[0x2A, 0xD7, 0xB1], &scale.to_be_bytes());
+        // Odd but harmless: a time times it still fits in i128.
+        parse_info(&info(1 << 40), 0, &mut layout).unwrap();
+        assert_eq!(layout.timestamp_scale, 1 << 40);
+        let err = parse_info(&info((1 << 62) + 1), 0, &mut layout).unwrap_err();
+        assert!(err.to_string().contains("TimestampScale"), "{err}");
+    }
+
+    #[test]
+    fn a_seek_position_that_overflows_is_no_position() {
+        let seek = |position: u64| {
+            let target = el(&[0x53, 0xAB], &CUES.to_be_bytes());
+            let at = el(&[0x53, 0xAC], &position.to_be_bytes());
+            el(&[0x4D, 0xBB], &[target, at].concat())
+        };
+        let head = [seek(u64::MAX), seek(40)].concat();
+        assert_eq!(parse_seek_head(&head, 0, 100).unwrap(), [140]);
     }
 
     #[test]

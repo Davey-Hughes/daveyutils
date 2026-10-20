@@ -172,20 +172,32 @@ fn via_cues(r: &Reader, layout: &Layout, track: &Track) -> Result<Option<Vec<Blo
     {
         return Ok(None);
     }
-    // Every Cluster head and block this loop will read. A block sits at Cluster start + header
-    // (at most 12 bytes) + relative position, so starting at Cluster start + relative covers it.
-    r.prefetch(cues.iter().flat_map(|c| {
-        let at = layout.segment_data + c.cluster;
-        [
-            (at, 64),
-            (at + c.relative.unwrap_or_default(), WINDOW as u64 + 12),
-        ]
-    }));
+    // Where each cue leads: its Cluster, and its block at Cluster start + header (at most 12 bytes)
+    // + relative position. One that leads outside the Segment is corrupt, and the Cues with it;
+    // inside, nothing read from them can run past the end of the number.
+    let mut placed = Vec::with_capacity(cues.len());
+    for cue in cues {
+        let relative = cue.relative.unwrap_or_default();
+        let at = layout.cluster_at(cue);
+        let block = at.and_then(|at| at.checked_add(relative));
+        match (at, block) {
+            (Some(at), Some(block)) if block < layout.segment_end => {
+                placed.push((cue, at, relative, block));
+            }
+            _ => return Ok(None),
+        }
+    }
+    // Every Cluster head and block the loop will read; starting the block's at Cluster start +
+    // relative covers its header.
+    r.prefetch(
+        placed
+            .iter()
+            .flat_map(|&(_, at, _, block)| [(at, 64), (block, WINDOW as u64 + 12)]),
+    );
     let mut window = Window::default();
     let mut clusters: HashMap<u64, (u64, i64)> = HashMap::new();
-    let mut blocks = Vec::with_capacity(cues.len());
-    for cue in cues {
-        let at = layout.segment_data + cue.cluster;
+    let mut blocks = Vec::with_capacity(placed.len());
+    for (cue, at, relative, _) in placed {
         let (data_start, cluster_ts) = if let Some(&c) = clusters.get(&at) {
             c
         } else {
@@ -195,7 +207,11 @@ fn via_cues(r: &Reader, layout: &Layout, track: &Track) -> Result<Option<Vec<Blo
             clusters.insert(at, c);
             c
         };
-        let position = data_start + cue.relative.unwrap_or_default();
+        // At or past the Segment's end once the Cluster's header is counted: corrupt too.
+        let position = data_start + relative;
+        if position >= layout.segment_end {
+            return Ok(None);
+        }
         // A cue that leads to something other than a well-formed block is a Cues problem, not a
         // file problem: the walk may still read the file. Only an I/O error is final.
         let parsed = match window
@@ -206,7 +222,10 @@ fn via_cues(r: &Reader, layout: &Layout, track: &Track) -> Result<Option<Vec<Blo
             Err(Error::Io(e)) => return Err(Error::Io(e)),
             Err(_) => return Ok(None),
         };
-        let timestamp = cluster_ts + i64::from(parsed.relative);
+        // A time past the end of i64 is no time the cue could give.
+        let Some(timestamp) = cluster_ts.checked_add(i64::from(parsed.relative)) else {
+            return Ok(None);
+        };
         if parsed.track != track.number || u64::try_from(timestamp).ok() != Some(cue.time) {
             return Ok(None);
         }
@@ -250,7 +269,10 @@ fn cluster_timestamp(r: &Reader, window: &mut Window, at: u64) -> Result<Option<
                 let Some(v) = head.get(from..to) else {
                     return Ok(None);
                 };
-                let ts = i64::try_from(ebml::uint(v)).unwrap_or(i64::MAX);
+                // A time no i64 holds is no Cluster the cues can be trusted to lead to.
+                let Ok(ts) = i64::try_from(ebml::uint(v)) else {
+                    return Ok(None);
+                };
                 return Ok(Some((h.data_start, ts)));
             }
             0xBF | 0xEC => pos = end, // CRC-32, Void
@@ -431,13 +453,17 @@ fn walk_cluster(
         match c.id {
             mkv::TIMESTAMP => {
                 let v = bytes_at(r, &head, pos, c.data_start, c_end - c.data_start)?;
-                cluster_ts = Some(i64::try_from(ebml::uint(&v)).unwrap_or(i64::MAX));
+                // One no i64 holds is an error for a block that needs it, and only then.
+                cluster_ts = Some((pos, i64::try_from(ebml::uint(&v)).ok()));
             }
             mkv::SIMPLE_BLOCK | mkv::BLOCK_GROUP
                 if tracks.contains(&block_track(r, &c, &head)?) =>
             {
-                let Some(ts) = cluster_ts else {
+                let Some((ts_at, ts)) = cluster_ts else {
                     return ebml::parse_err(pos, "block before its Cluster's Timestamp");
+                };
+                let Some(ts) = ts else {
+                    return ebml::parse_err(ts_at, "Cluster timestamp out of range");
                 };
                 if c_end > end {
                     return ebml::parse_err(pos, "block runs past the end of its Cluster");
@@ -450,10 +476,13 @@ fn walk_cluster(
                 }
                 let len = usize::try_from(c_end - pos).unwrap_or(usize::MAX);
                 let parsed = parse_block_element(&r.read_exact(pos, len)?, pos)?;
+                let Some(timestamp) = ts.checked_add(i64::from(parsed.relative)) else {
+                    return ebml::parse_err(pos, "block timestamp out of range");
+                };
                 out.entry(parsed.track).or_default().push(Block {
                     track: parsed.track,
                     position: pos,
-                    timestamp: ts + i64::from(parsed.relative),
+                    timestamp,
                     duration: parsed.duration,
                     payload: parsed.payload,
                 });
@@ -632,12 +661,14 @@ pub fn frames_between(
         .map(|t| (t.number, t))
         .collect();
     let mut out: HashMap<u64, Vec<Timed>> = HashMap::new();
+    // The last cue at or before `from_ns` that leads inside the Segment: one past it is corrupt.
     let start = layout
         .cues
         .iter()
         .filter(|c| i128::from(c.time) * scale <= from_ns)
-        .max_by_key(|c| (c.time, c.cluster))
-        .map(|c| layout.segment_data + c.cluster)
+        .filter_map(|c| Some((c.time, layout.cluster_at(c)?)))
+        .max()
+        .map(|(_, at)| at)
         .or(layout.first_cluster);
     let Some(start) = start else {
         return Ok(out);
@@ -987,6 +1018,144 @@ mod tests {
         let r = Reader::open(&path).unwrap();
         let err = Window::default().element(&r, 0).unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    /// typos.mkv opened, with its one text track.
+    fn typos() -> (Reader, Layout, Track) {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/typos.mkv");
+        let (r, layout) = mkv::open(std::path::Path::new(path)).unwrap();
+        let track = layout.tracks[0].clone();
+        (r, layout, track)
+    }
+
+    #[test]
+    fn a_cue_whose_position_overflows_is_no_cue_to_trust() {
+        let (r, layout, track) = typos();
+        assert!(
+            via_cues(&r, &layout, &track).unwrap().is_some(),
+            "its Cues are good"
+        );
+        // Past the end of the number, just short of it, and past the Segment, for the Cluster and
+        // for the block in it; and a block that would start in the Segment's last byte but for its
+        // Cluster's header.
+        let near = u64::MAX - layout.segment_data - 10;
+        let corrupt: [fn(&mut Cue, u64, &Layout); 7] = [
+            |c, _, _| c.cluster = u64::MAX,
+            |c, near, _| c.cluster = near,
+            |c, _, _| c.cluster = 1 << 40,
+            |c, _, _| c.relative = Some(u64::MAX),
+            |c, near, _| c.relative = Some(near),
+            |c, _, _| c.relative = Some(1 << 40),
+            |c, _, l| c.relative = Some(l.segment_end - 1 - l.segment_data - c.cluster),
+        ];
+        for (i, corrupt) in corrupt.iter().enumerate() {
+            let mut bad = layout.clone();
+            let cue = bad
+                .cues
+                .iter_mut()
+                .find(|c| c.track == track.number)
+                .unwrap();
+            corrupt(cue, near, &layout);
+            assert_eq!(via_cues(&r, &bad, &track).unwrap(), None, "case {i}");
+        }
+    }
+
+    /// A file of one Cluster: Timestamp `i64::MAX`, then a SimpleBlock for track 1 at +1.
+    fn cluster_at_the_end_of_time() -> (tempfile::TempDir, Reader) {
+        one_cluster_file(i64::MAX.to_be_bytes(), 1)
+    }
+
+    /// A file of one Cluster: Timestamp `timestamp`, then a SimpleBlock for track 1 at `relative`.
+    fn one_cluster_file(timestamp: [u8; 8], relative: i8) -> (tempfile::TempDir, Reader) {
+        let [hi, lo] = i16::from(relative).to_be_bytes();
+        let timestamp = [&[0xE7, 0x88][..], &timestamp].concat();
+        let block = [0xA3, 0x85, 0x81, hi, lo, 0x80, b'x'];
+        let data = [timestamp.as_slice(), &block].concat();
+        let cluster = [
+            &[
+                0x1F,
+                0x43,
+                0xB6,
+                0x75,
+                0x80 | u8::try_from(data.len()).unwrap(),
+            ][..],
+            &data,
+        ]
+        .concat();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, cluster).unwrap();
+        let r = Reader::open(&path).unwrap();
+        (dir, r)
+    }
+
+    #[test]
+    fn a_block_timestamp_past_the_end_of_time_is_an_error() {
+        let (_dir, r) = cluster_at_the_end_of_time();
+        let h = r.header_at(0).unwrap();
+        let mut out = HashMap::new();
+        let end = h.end().unwrap();
+        let err = walk_cluster(&r, &h, end, false, &HashSet::from([1]), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("block timestamp out of range"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_cue_to_a_block_timestamp_past_the_end_of_time_is_no_cue_to_trust() {
+        let (_dir, r) = cluster_at_the_end_of_time();
+        let (_, mut layout, mut track) = typos();
+        track.number = 1;
+        layout.segment_data = 0;
+        layout.frame_counts.clear();
+        layout.cues = vec![Cue {
+            time: 0,
+            track: 1,
+            cluster: 0,
+            relative: Some(10),
+        }];
+        assert_eq!(via_cues(&r, &layout, &track).unwrap(), None);
+    }
+
+    #[test]
+    fn a_cluster_timestamp_past_i64_is_an_error_not_the_largest_time() {
+        // 2^64 - 1 ticks: no i64 holds it, and a block at 0 would otherwise be read at i64::MAX.
+        let (_dir, r) = one_cluster_file([0xFF; 8], 0);
+        let h = r.header_at(0).unwrap();
+        let mut out = HashMap::new();
+        let end = h.end().unwrap();
+        let err = walk_cluster(&r, &h, end, false, &HashSet::from([1]), &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("Cluster timestamp out of range"),
+            "{err}"
+        );
+        assert_eq!(
+            cluster_timestamp(&r, &mut Window::default(), 0).unwrap(),
+            None
+        );
+        // A Cluster none of whose blocks is wanted needs no time: walking past it is fine.
+        let mut out = HashMap::new();
+        walk_cluster(&r, &h, end, false, &HashSet::from([2]), &mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn frames_from_a_cue_past_the_segment_start_from_a_good_one() {
+        let (r, layout, track) = typos();
+        // From the last cue's time, so that cue is where the read starts.
+        let last = layout.cues.iter().map(|c| c.time).max().unwrap();
+        let from = i128::from(last) * i128::from(layout.timestamp_scale);
+        let good = frames_between(&r, &layout, from, i128::MAX, &[track.number]).unwrap();
+        assert!(!good.is_empty());
+        // Only the last cue past the Segment: the read starts from the one before.
+        let mut bad = layout.clone();
+        let last = bad.cues.iter_mut().max_by_key(|c| c.time).unwrap();
+        last.cluster = 1 << 40;
+        assert_eq!(
+            frames_between(&r, &bad, from, i128::MAX, &[track.number]).unwrap(),
+            good
+        );
     }
 
     #[test]
