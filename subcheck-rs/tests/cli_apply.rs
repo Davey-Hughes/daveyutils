@@ -6,7 +6,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use common::{fixture, have_mkvmerge};
+use common::{fixture, have_mkvmerge, patch};
 use subcheck::store::{Decision, Finding, Record, RunWriter, State};
 use subcheck::text::Occurrence;
 
@@ -349,6 +349,65 @@ fn apply_remuxes_checks_and_swaps_keeping_the_original() {
 }
 
 #[test]
+fn header_values_mkvmerge_writes_its_own_way_are_no_difference() {
+    if !have_mkvmerge() {
+        return;
+    }
+    let s = Setup::new();
+    let mut bytes = std::fs::read(&s.file).unwrap();
+    // Track 1 (`jpn`, `ja`) tagged only `fra`, which mkvmerge writes as `fre`.
+    patch(
+        &mut bytes,
+        b"\x22\xB5\x9C\x83jpn",
+        1,
+        b"\x22\xB5\x9C\x83fra",
+    );
+    patch(&mut bytes, b"\x22\xB5\x9D\x82ja", 1, b"\xEC\x84\0\0\0\0");
+    // Track 2, a fixed one (`en` only), tagged only `fr`, which mkvmerge writes as `fre` and `fr`.
+    let en = b"\x22\xB5\x9D\x82en";
+    patch(&mut bytes, en, 3, b"\x22\xB5\x9C\x82fr");
+    // Track 3, fixed too, tagged `iw`, a deprecated tag mkvmerge writes as `he` (and `heb`).
+    patch(&mut bytes, en, 2, b"\x22\xB5\x9D\x82iw");
+    // Track 4, fixed too, tagged only `xy`, which mkvmerge reads as `und` and refuses as an option.
+    patch(&mut bytes, en, 1, b"\x22\xB5\x9C\x82xy");
+    // Track 1's name (copied) and fixed track 3's empty, which mkvmerge leaves out; a Void keeps
+    // the length.
+    let empty = |left: u8| [b"\x53\x6E\x80\xEC".as_slice(), &[0x80 | left]].concat();
+    let commentary = b"\x53\x6E\x8ACommentary";
+    patch(&mut bytes, commentary, 1, &[empty(8), vec![0; 8]].concat());
+    let name = b"\x53\x6E\x93English Signs/Songs";
+    patch(&mut bytes, name, 1, &[empty(17), vec![0; 17]].concat());
+    std::fs::write(&s.file, bytes).unwrap();
+    let o = s.apply(&[]);
+    let text = stdout(&o);
+    assert!(
+        o.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        text.contains("  remuxed, verified (quick), swapped;"),
+        "{text}"
+    );
+    // mkvmerge did write them its own way, and the check took that as no change.
+    let (_, layout) = subcheck::mkv::open(&s.file).unwrap();
+    let header = |id: usize| {
+        let t = &layout.tracks[id];
+        (t.language.clone(), t.language_bcp47.clone(), t.name.clone())
+    };
+    assert_eq!(header(1), ("fre".into(), Some("fr".into()), None));
+    assert_eq!(
+        header(2),
+        ("fre".into(), Some("fr".into()), Some("English Full".into()))
+    );
+    assert_eq!(header(3), ("heb".into(), Some("he".into()), None));
+    assert_eq!(
+        header(4),
+        ("und".into(), Some("und".into()), Some("English SDH".into()))
+    );
+}
+
+#[test]
 fn a_file_whose_text_tracks_are_timed_by_their_default_duration_is_fixed() {
     if !have_mkvmerge() {
         return;
@@ -601,12 +660,10 @@ fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
 #[test]
 fn a_bad_remux_leaves_the_original_and_no_remux_behind() {
     let s = Setup::new();
+    // Each reads no languages (`-J`), as mkvmerge reads a file it knows no tracks in.
+    let known = "[ \"$1\" = --version ] && exit 0\n[ \"$1\" = -J ] && echo '{}' && exit 0\n";
     // Says it worked, but writes garbage where the remux goes (-o is its third argument).
-    let garbage = script(
-        &s.root,
-        "garbage",
-        "[ \"$1\" = --version ] && exit 0\necho junk > \"$3\"\n",
-    );
+    let garbage = script(&s.root, "garbage", &format!("{known}echo junk > \"$3\"\n"));
     let o = s.apply(&["--mkvmerge", garbage.to_str().unwrap()]);
     let text = stdout(&o);
     assert_eq!(o.status.code(), Some(1), "{text}");
@@ -615,13 +672,26 @@ fn a_bad_remux_leaves_the_original_and_no_remux_behind() {
     let fails = script(
         &s.root,
         "fails",
-        "[ \"$1\" = --version ] && exit 0\necho 'Error: no' >&2\nexit 2\n",
+        &format!("{known}echo 'Error: no' >&2\nexit 2\n"),
     );
     let o = s.apply(&["--mkvmerge", fails.to_str().unwrap()]);
     let text = stdout(&o);
     assert_eq!(o.status.code(), Some(1), "{text}");
     assert!(
         text.contains("  failed: mkvmerge failed (exit status: 2): Error: no\n"),
+        "{text}"
+    );
+    // Cannot read the original's languages: told before any remux.
+    let unread = script(
+        &s.root,
+        "unread",
+        "[ \"$1\" = --version ] && exit 0\n[ \"$1\" = -J ] && echo 'Error: cannot read' >&2 && exit 2\necho junk > \"$3\"\n",
+    );
+    let o = s.apply(&["--mkvmerge", unread.to_str().unwrap()]);
+    let text = stdout(&o);
+    assert_eq!(o.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("  failed: mkvmerge -J failed (exit status: 2): Error: cannot read\n"),
         "{text}"
     );
     assert_eq!(

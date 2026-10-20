@@ -175,6 +175,15 @@ mkvmerge leaves a text subtitle track's default duration out of any remux and gi
 duration of its own instead, rounded to the millisecond. The check expects that rounding, so a file
 whose events take their duration from the track's header passes, without the header field.
 
+mkvmerge writes a track's language its own way too: Language lowercase and bibliographic (`fra`,
+`Fre` and `fr` as `fre`), and a BCP 47 tag in canonical form (`iw` as `he`, `zh-yue` as `yue`);
+one it does not know (`xyz`) as `und`. So the check takes each track's language as mkvmerge reads
+the original (`mkvmerge -J`) and expects that in the remux: the tag when there is one (Language
+beside it is written from the tag), else Language (the tag mkvmerge adds is no difference).
+A fixed track goes into the remux in that language too, so mkvmerge takes it where it would refuse
+the file's own (`xyz`). mkvmerge also trims spaces and tabs from a track name it is given, and
+leaves an empty one out, which the check expects too.
+
 A fixed track goes through its text format, which cuts each time down to the millisecond (SRT) or
 the centisecond (ASS). Where that would change a time, a fix on that track is left for a hand fix
 before any remux, and the output names the first such time: an ASS track timed to the
@@ -205,4 +214,6 @@ A file in a directory you cannot write to (a library share, say) can be remuxed 
 `--tracks-only DIR` writes its fixed tracks to DIR and prints the mkvmerge command that remuxes
 it to `.<name>.mkv.subcheck` beside the original; `--check` then checks that remux against the
 original (with `--karaoke` too when the tracks were written with it; `--tracks-only` prints the
-command). The swap is yours. Afterwards `subcheck apply` finds the fixes in place and records them.
+command), which takes mkvmerge here too, to read the original's languages: a remux made by an
+mkvmerge that writes them another way fails the check. The swap is yours. Afterwards `subcheck
+apply` finds the fixes in place and records them.

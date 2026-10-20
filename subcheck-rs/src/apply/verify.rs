@@ -27,6 +27,7 @@ pub fn compare(
     remuxed: File,
     fixed: &BTreeMap<usize, &[Block]>,
     read: &BTreeMap<usize, &[Block]>,
+    languages: &Languages,
     full: bool,
 ) -> Result<Vec<String>> {
     let (a, b) = (original.layout, remuxed.layout);
@@ -55,7 +56,13 @@ pub fn compare(
         return Ok(diffs);
     }
     for (t, u) in a.tracks.iter().zip(&b.tracks) {
-        header(t, u, fixed.contains_key(&t.id), &mut diffs)?;
+        header(
+            t,
+            languages.get(&t.uid),
+            u,
+            fixed.contains_key(&t.id),
+            &mut diffs,
+        )?;
     }
     if !diffs.is_empty() {
         return Ok(diffs);
@@ -130,25 +137,46 @@ fn digest_of(data: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// A track's language as mkvmerge reads it from the original (`mkvmerge -J`), and so writes it in a
+/// remux: its BCP 47 tag in canonical form (`iw` as `he`), or for a track with no tag its ISO
+/// 639-2 code, lowercase and bibliographic (`fra` and `fr` as `fre`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Language {
+    Bcp47(String),
+    Iso639_2(String),
+}
+
+/// The original's tracks' languages as mkvmerge reads them, by track UID.
+pub type Languages = BTreeMap<u64, Language>;
+
 /// A track's header against its original's. `fixed`: the track was replaced, so its UID is new
 /// and its CodecPrivate rebuilt from the `.ass` header.
-fn header(t: &Track, u: &Track, fixed: bool, diffs: &mut Vec<String>) -> Result<()> {
+fn header(
+    t: &Track,
+    read_as: Option<&Language>,
+    u: &Track,
+    fixed: bool,
+    diffs: &mut Vec<String>,
+) -> Result<()> {
     let mut differs = |what: &str| diffs.push(format!("track {}: {what} differs", t.id));
     if t.kind != u.kind || t.codec != u.codec {
         differs("codec");
     }
+    // Names read trimmed, and empty or blank as none (see the parser), as mkvmerge writes them.
     if t.name != u.name {
         differs("name");
     }
-    // Beside a BCP 47 tag Matroska ignores Language, and mkvmerge rewrites it from the tag, whatever
-    // the file gave. BCP 47 tags ignore case. Without a tag, a new mkvmerge adds the one an old one
-    // left out.
-    let same_language = match &t.language_bcp47 {
-        Some(tag) => u
-            .language_bcp47
-            .as_ref()
-            .is_some_and(|theirs| theirs.eq_ignore_ascii_case(tag)),
-        None => t.language == u.language,
+    // As mkvmerge reads the original's language (`read_as`), so it writes it. Beside a BCP 47 tag
+    // Matroska ignores Language, which mkvmerge writes from the tag; without one, mkvmerge adds
+    // the tag, which is no difference. A track mkvmerge did not read is compared as the file has
+    // it, a tag (case aside) before Language.
+    let tag_is = |tag: &str| {
+        (u.language_bcp47.as_deref()).is_some_and(|theirs| theirs.eq_ignore_ascii_case(tag))
+    };
+    let same_language = match (read_as, &t.language_bcp47) {
+        (Some(Language::Bcp47(tag)), _) | (None, Some(tag)) => tag_is(tag),
+        (Some(Language::Iso639_2(code)), _) => u.language.eq_ignore_ascii_case(code),
+        (None, None) => t.language == u.language,
     };
     if !same_language {
         differs("language");
@@ -734,7 +762,7 @@ mod tests {
     /// What [`header`] finds between two tracks, neither one fixed.
     fn diffs(a: &Track, b: &Track) -> Vec<String> {
         let mut d = Vec::new();
-        header(a, b, false, &mut d).unwrap();
+        header(a, None, b, false, &mut d).unwrap();
         d
     }
 
@@ -775,6 +803,66 @@ mod tests {
         assert_eq!(
             diffs(&track("jpn", Some("ja-jp")), &track("jpn", Some("ja-JP"))),
             [] as [String; 0]
+        );
+    }
+
+    #[test]
+    fn language_is_compared_as_mkvmerge_reads_the_original() {
+        // As `mkvmerge -J` reads the original, so the remux has it (checked, mkvmerge v102.0): a
+        // tagless Language lowercase and bibliographic (`fra`, `Fre`, `fr` as `fre`; `xyz` as
+        // `und`), and a tag in its canonical form (`iw` as `he`, `zh-yue` as `yue`).
+        let read_as = |iso: &str, bcp47: Option<&str>| {
+            bcp47.map_or_else(
+                || Language::Iso639_2(iso.into()),
+                |tag| Language::Bcp47(tag.into()),
+            )
+        };
+        let check = |t: &Track, read: &Language, u: &Track| {
+            let mut d = Vec::new();
+            header(t, Some(read), u, false, &mut d).unwrap();
+            d
+        };
+        let none = [] as [String; 0];
+        let differs = ["track 2: language differs"];
+        // Tagless: the remux's Language is mkvmerge's reading; the tag it adds is no difference.
+        let fre = read_as("fre", None);
+        assert_eq!(
+            check(&track("fra", None), &fre, &track("fre", Some("fr"))),
+            none
+        );
+        assert_eq!(
+            check(&track("fr", None), &fre, &track("fre", Some("fr"))),
+            none
+        );
+        assert_eq!(
+            check(&track("fra", None), &fre, &track("ger", Some("de"))),
+            differs
+        );
+        let und = read_as("und", None);
+        assert_eq!(
+            check(&track("xyz", None), &und, &track("und", Some("und"))),
+            none
+        );
+        // Tagged: the remux's tag is mkvmerge's reading, case aside, and Language beside it is not
+        // compared.
+        let he = read_as("jpn", Some("he"));
+        assert_eq!(
+            check(&track("jpn", Some("iw")), &he, &track("heb", Some("he"))),
+            none
+        );
+        let yue = read_as("jpn", Some("yue"));
+        assert_eq!(
+            check(
+                &track("jpn", Some("zh-yue")),
+                &yue,
+                &track("chi", Some("yue"))
+            ),
+            none
+        );
+        let ja = read_as("jpn", Some("ja"));
+        assert_eq!(
+            check(&track("jpn", Some("ja")), &ja, &track("jpn", Some("en"))),
+            differs
         );
     }
 

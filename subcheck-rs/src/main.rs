@@ -758,7 +758,7 @@ fn pick_track(tracks: &[Track], id: Option<usize>) -> Result<&Track> {
                 .iter()
                 .map(|t| {
                     let mut line = format!("  {}: {} {}", t.id, t.codec, t.shown_language());
-                    if let Some(name) = mkv::own_name(t.name.as_deref()) {
+                    if let Some(name) = &t.name {
                         line.push(' ');
                         line.push_str(name);
                     }

@@ -78,7 +78,13 @@ fn fix(original: &Path, dir: &Path, typos: &[(usize, &str, &str)]) -> (Fixed, Ve
 fn remuxed(dir: &Path, files: &[Replacement], extra: &[&str]) -> PathBuf {
     let (_, layout) = mkv::open(&fixture("apply.mkv")).unwrap();
     let out = dir.join("out.mkv");
-    let mut args = remux::args(&fixture("apply.mkv"), &layout, files, &out);
+    let mut args = remux::args(
+        &fixture("apply.mkv"),
+        &layout,
+        files,
+        &verify::Languages::new(),
+        &out,
+    );
     let original = args
         .iter()
         .position(|a| Path::new(a) == fixture("apply.mkv"))
@@ -96,6 +102,7 @@ fn compare_with(original: &Path, remuxed: &Path, fixed: &Fixed, full: bool) -> V
     let (r, layout) = mkv::open(original).unwrap();
     let (r2, layout2) = mkv::open(remuxed).unwrap();
     let fixed: BTreeMap<usize, &[Block]> = fixed.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+    let languages = remux::languages("mkvmerge".as_ref(), original).unwrap();
     verify::compare(
         verify::File {
             r: &r,
@@ -107,6 +114,7 @@ fn compare_with(original: &Path, remuxed: &Path, fixed: &Fixed, full: bool) -> V
         },
         &fixed,
         &BTreeMap::new(),
+        &languages,
         full,
     )
     .unwrap()
@@ -149,7 +157,7 @@ fn tracks_timed_by_their_default_duration_pass() {
         let out = dir.path().join("out.mkv");
         remux::run(
             "mkvmerge".as_ref(),
-            &remux::args(&original, &layout, &files, &out),
+            &remux::args(&original, &layout, &files, &verify::Languages::new(), &out),
         )
         .unwrap();
         (out, blocks)
@@ -249,7 +257,13 @@ fn a_changed_track_name_or_a_dropped_track_is_caught() {
     // original's view of it by remuxing with an extra option on the patched file.
     let (_, layout) = mkv::open(&fixture("apply.mkv")).unwrap();
     let out = dir.path().join("renamed.mkv");
-    let mut args = remux::args(&fixture("apply.mkv"), &layout, &files, &out);
+    let mut args = remux::args(
+        &fixture("apply.mkv"),
+        &layout,
+        &files,
+        &verify::Languages::new(),
+        &out,
+    );
     let at = args
         .iter()
         .position(|a| a == "0:English Signs/Songs")
@@ -260,7 +274,13 @@ fn a_changed_track_name_or_a_dropped_track_is_caught() {
     // Track 4 left out of the remux altogether.
     files.pop();
     let out = dir.path().join("dropped.mkv");
-    let mut args = remux::args(&fixture("apply.mkv"), &layout, &files, &out);
+    let mut args = remux::args(
+        &fixture("apply.mkv"),
+        &layout,
+        &files,
+        &verify::Languages::new(),
+        &out,
+    );
     let tracks = args.iter().position(|a| a == "!3").unwrap();
     args[tracks] = "!3,4".into();
     let order = args.len() - 1;
@@ -301,7 +321,7 @@ fn audio_remuxed(dir: &Path, name: &str, extra: &[&str]) -> PathBuf {
     let audio = fixture("audio.mkv");
     let (_, layout) = mkv::open(&audio).unwrap();
     let out = dir.join(name);
-    let mut args = remux::args(&audio, &layout, &[], &out);
+    let mut args = remux::args(&audio, &layout, &[], &verify::Languages::new(), &out);
     // No track replaced, so none left out: `--subtitle-tracks !` with no IDs is not an option.
     let skip = args.iter().position(|a| a == "--subtitle-tracks").unwrap();
     args.drain(skip..skip + 2);

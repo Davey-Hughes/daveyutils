@@ -26,6 +26,7 @@ use crate::text::timestamp;
 use patch::{Fix, Outcome};
 use remux::Replacement;
 use shift::{Grid, Lines, Shifts};
+use verify::Languages;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -85,8 +86,11 @@ pub fn run(
         return Ok(summary);
     }
     let mut writer = None;
-    if matches!(mode, Mode::Apply { .. }) {
+    // The check reads the original's languages as mkvmerge does.
+    if matches!(mode, Mode::Apply { .. } | Mode::Check { .. }) {
         remux::run(mkvmerge, &["--version".into()]).map_err(anyhow::Error::msg)?;
+    }
+    if matches!(mode, Mode::Apply { .. }) {
         writer = Some(RunWriter::open(run_path)?);
     }
     let paths = with_fixes(&run, &accepted, &timing);
@@ -460,7 +464,16 @@ impl Job<'_> {
                         say(out, &format!("wrote {}", written.display()))?;
                     }
                 }
-                let args = remux::args(self.path, o.layout, &files, &remux_path(self.path));
+                // Read as mkvmerge reads them, as `--check` will, where mkvmerge is here to ask;
+                // else each goes as the file has it.
+                let languages = remux::languages(self.mkvmerge, self.path).unwrap_or_default();
+                let args = remux::args(
+                    self.path,
+                    o.layout,
+                    &files,
+                    &languages,
+                    &remux_path(self.path),
+                );
                 let line: Vec<String> = args
                     .iter()
                     .map(|a| shell_quote(&a.to_string_lossy()))
@@ -473,7 +486,8 @@ impl Job<'_> {
                 if !remuxed.exists() {
                     return Err(format!("not built yet: {}", remuxed.display()));
                 }
-                let diffs = verify(o, &remuxed, fixed, *full)?;
+                let languages = remux::languages(self.mkvmerge, self.path)?;
+                let diffs = verify(o, &remuxed, fixed, *full, &languages)?;
                 if !diffs.is_empty() {
                     return Err(differs(&remuxed, &diffs));
                 }
@@ -731,8 +745,10 @@ impl Job<'_> {
                 ));
             }
         }
-        let result = self
-            .remux_and_check(o, fixed, &remuxed, full)
+        // mkvmerge's reading of the languages goes into the remux and its check: read before the
+        // remux, so a file it cannot read is told before many GB are written, not after.
+        let result = remux::languages(self.mkvmerge, self.path)
+            .and_then(|languages| self.remux_and_check(o, fixed, &remuxed, &languages, full))
             .and_then(|()| swap(self.path, &remuxed, backup.then_some(kept.as_path())));
         if result.is_err() {
             let _ = fs::remove_file(&remuxed);
@@ -745,11 +761,12 @@ impl Job<'_> {
         o: &Original,
         fixed: &[Fixed],
         remuxed: &Path,
+        languages: &Languages,
         full: bool,
     ) -> Result<(), String> {
         let tracks = self.state.join("apply");
         let files = self.write_tracks(&tracks, o, fixed)?;
-        let args = remux::args(self.path, o.layout, &files, remuxed);
+        let args = remux::args(self.path, o.layout, &files, languages, remuxed);
         let ran = remux::run(self.mkvmerge, &args);
         for f in &files {
             for written in std::iter::once(&f.file).chain(&f.tags) {
@@ -762,7 +779,7 @@ impl Job<'_> {
                 self.path.display()
             );
         }
-        let diffs = verify(o, remuxed, fixed, full)?;
+        let diffs = verify(o, remuxed, fixed, full, languages)?;
         if !diffs.is_empty() {
             return Err(differs(remuxed, &diffs));
         }
@@ -808,12 +825,14 @@ fn swap(file: &Path, remuxed: &Path, kept: Option<&Path>) -> Result<(), String> 
         .map_err(swapped)
 }
 
-/// `remuxed` against the original, with `fixed` in place of its tracks.
+/// `remuxed` against the original, with `fixed` in place of its tracks, and the original's
+/// `languages` as mkvmerge reads them.
 fn verify(
     o: &Original,
     remuxed: &Path,
     fixed: &[Fixed],
     full: bool,
+    languages: &Languages,
 ) -> Result<Vec<String>, String> {
     let (r2, layout2) =
         mkv::open(remuxed).map_err(|e| format!("reading {}: {e}", remuxed.display()))?;
@@ -832,6 +851,7 @@ fn verify(
         },
         &patched,
         o.read,
+        languages,
         full,
     )
     .map_err(|e| e.to_string())

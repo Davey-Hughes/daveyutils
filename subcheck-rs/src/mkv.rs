@@ -145,7 +145,7 @@ pub struct Flags {
 
 /// A track's name, if it has one: an empty or blank TrackName names nothing.
 pub fn own_name(name: Option<&str>) -> Option<&str> {
-    name.filter(|name| !name.trim().is_empty())
+    name.filter(|name| !name.trim_matches([' ', '\t']).is_empty())
 }
 
 /// A track's language as the reports give it: its BCP 47 tag when it has one (Matroska ignores
@@ -490,7 +490,14 @@ fn parse_track(id: usize, data: &[u8], base: u64) -> Result<Track> {
             FLAG_DEFAULT => t.default = ebml::uint(v) != 0,
             FLAG_FORCED => t.forced = ebml::uint(v) != 0,
             DEFAULT_DURATION => t.default_duration = Some(ebml::uint(v)),
-            NAME => t.name = Some(ebml::string(v)),
+            // Spaces and tabs around a name are not part of it, and an empty or blank one is none:
+            // mkvmerge trims those from a name it is given (`--track-name`), and leaves an empty
+            // one out of a remux.
+            NAME => {
+                let name = ebml::string(v);
+                let name = name.trim_matches([' ', '\t']);
+                t.name = (!name.is_empty()).then(|| name.to_string());
+            }
             // An empty or blank element reads as its default: for Language "eng", for
             // LanguageBCP47 none. Spaces around a tag are not part of it.
             LANGUAGE => {
@@ -753,6 +760,28 @@ mod tests {
         assert_eq!(bcp47(b""), None);
         assert_eq!(bcp47(b" "), None);
         assert_eq!(bcp47(b" ja "), Some("ja".into()));
+    }
+
+    #[test]
+    fn an_empty_or_blank_name_is_none() {
+        let named = |name: &[u8]| {
+            let entry = [el(&[0xD7], &[2]), el(&[0x53, 0x6E], name)].concat();
+            parse_track(3, &entry, 0).unwrap().name
+        };
+        assert_eq!(named(b""), None);
+        assert_eq!(named(b"  "), None);
+        assert_eq!(named(b"Signs"), Some("Signs".into()));
+        // Spaces and tabs around a name are not part of it; what else mkvmerge keeps, so does the
+        // parser (checked, mkvmerge v102.0: a newline, an ideographic or no-break space).
+        assert_eq!(named(b" \tSigns \t"), Some("Signs".into()));
+        assert_eq!(
+            named("Signs\u{3000}".as_bytes()),
+            Some("Signs\u{3000}".into())
+        );
+        assert_eq!(named(b"\nSigns"), Some("\nSigns".into()));
+        // And the reports take a name as the parser does.
+        assert_eq!(own_name(Some("\u{3000}")), Some("\u{3000}"));
+        assert_eq!(own_name(Some(" \t")), None);
     }
 
     #[test]

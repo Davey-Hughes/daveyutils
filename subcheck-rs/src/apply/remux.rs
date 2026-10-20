@@ -8,6 +8,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::Deserialize;
+
+use super::verify::{Language, Languages};
 use crate::ebml;
 use crate::group;
 use crate::mkv::{self, Encoding, Layout, Track};
@@ -22,11 +25,13 @@ pub struct Replacement {
 }
 
 /// mkvmerge's arguments for remuxing `original` (whose layout is `layout`) to `output`, with each
-/// track of `replaced` taken from its file instead.
+/// track of `replaced` taken from its file instead, in its language as mkvmerge read it
+/// (`languages`, by UID; as the file has it for a track not there).
 pub fn args(
     original: &Path,
     layout: &Layout,
     replaced: &[Replacement],
+    languages: &Languages,
     output: &Path,
 ) -> Vec<OsString> {
     let mut out: Vec<OsString> = vec![
@@ -46,7 +51,7 @@ pub fn args(
     out.push(original.into());
     for r in replaced {
         let track = &layout.tracks[r.id];
-        for (option, value) in track_options(track) {
+        for (option, value) in track_options(track, languages.get(&track.uid)) {
             out.push(option.into());
             out.push(format!("0:{value}").into());
         }
@@ -84,10 +89,15 @@ fn hex(bytes: &[u8]) -> String {
 /// at 100 µs to 1 ms without it), so that the plan can count on it. The check reads the remux's own.
 pub const SCALE: u64 = 1_000_000;
 
-/// A replaced track's properties, as mkvmerge options for its file's track 0.
-fn track_options(t: &Track) -> Vec<(&'static str, String)> {
+/// A replaced track's properties, as mkvmerge options for its file's track 0; its language as
+/// mkvmerge read it (`read_as`), which mkvmerge takes where it may refuse the file's own (`xyz`).
+fn track_options(t: &Track, read_as: Option<&Language>) -> Vec<(&'static str, String)> {
     let yes = |b: bool| if b { "yes" } else { "no" }.to_string();
-    let mut out = vec![("--language", t.shown_language().to_string())];
+    let language = match read_as {
+        Some(Language::Bcp47(tag) | Language::Iso639_2(tag)) => tag.clone(),
+        None => t.shown_language().to_string(),
+    };
+    let mut out = vec![("--language", language)];
     if let Some(name) = &t.name {
         out.push(("--track-name", name.clone()));
     }
@@ -263,14 +273,7 @@ fn xml(s: &str) -> String {
 /// signal that ends subcheck ends it too. Ok with mkvmerge's warnings (exit 1), if any; an error
 /// with what it said otherwise.
 pub fn run(program: &OsStr, args: &[OsString]) -> Result<Option<String>, String> {
-    let name = program.to_string_lossy();
-    let out = group::output(Command::new(program).args(args)).map_err(|e| match e {
-        group::Failed::Start(e) if e.kind() == io::ErrorKind::NotFound => {
-            format!("{name} not found: install mkvtoolnix")
-        }
-        group::Failed::Start(e) => format!("starting {name}: {e}"),
-        group::Failed::Wait(e) => format!("waiting for mkvmerge: {e}"),
-    })?;
+    let out = output(program, args)?;
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -285,9 +288,124 @@ pub fn run(program: &OsStr, args: &[OsString]) -> Result<Option<String>, String>
     }
 }
 
+/// `program` (mkvmerge) run to its end with `args`, as [`run`] runs it.
+fn output(program: &OsStr, args: &[OsString]) -> Result<std::process::Output, String> {
+    let name = program.to_string_lossy();
+    group::output(Command::new(program).args(args)).map_err(|e| match e {
+        group::Failed::Start(e) if e.kind() == io::ErrorKind::NotFound => {
+            format!("{name} not found: install mkvtoolnix")
+        }
+        group::Failed::Start(e) => format!("starting {name}: {e}"),
+        group::Failed::Wait(e) => format!("waiting for mkvmerge: {e}"),
+    })
+}
+
+/// The languages of `file`'s tracks as `program` (mkvmerge) reads them (`-J`), by track UID: as it
+/// writes them in a remux, where it rewrites Language and the BCP 47 tag its own way.
+pub fn languages(program: &OsStr, file: &Path) -> Result<Languages, String> {
+    let out = output(program, &["-J".into(), file.into()])?;
+    // mkvmerge says what failed in its JSON; something else in its place, on stderr.
+    read_languages(&out.stdout).map_err(|unread| match unread {
+        Unread::Said(errors) => errors,
+        Unread::NotJson(e) => {
+            let said = String::from_utf8_lossy(&out.stderr);
+            if out.status.success() || said.trim().is_empty() {
+                e
+            } else {
+                format!("mkvmerge -J failed ({}): {}", out.status, said.trim())
+            }
+        }
+    })
+}
+
+/// Why mkvmerge's `-J` output gave no languages: the errors it reports, or no JSON to read.
+#[derive(Debug, PartialEq, Eq)]
+enum Unread {
+    Said(String),
+    NotJson(String),
+}
+
+/// mkvmerge's `-J` output read for each track's language, by UID: the BCP 47 tag, or for a track
+/// with none, Language. A track it gives neither, no UID or another track's UID is left out.
+fn read_languages(json: &[u8]) -> Result<Languages, Unread> {
+    #[derive(Deserialize)]
+    struct Identified {
+        #[serde(default)]
+        errors: Vec<String>,
+        #[serde(default)]
+        tracks: Vec<Identity>,
+    }
+    #[derive(Deserialize)]
+    struct Identity {
+        properties: Properties,
+    }
+    #[derive(Deserialize)]
+    struct Properties {
+        uid: Option<u64>,
+        language: Option<String>,
+        language_ietf: Option<String>,
+    }
+    let read: Identified = serde_json::from_slice(json)
+        .map_err(|e| Unread::NotJson(format!("reading mkvmerge -J's output: {e}")))?;
+    if !read.errors.is_empty() {
+        let errors: Vec<&str> = read.errors.iter().map(|e| e.trim()).collect();
+        return Err(Unread::Said(format!("mkvmerge -J: {}", errors.join("; "))));
+    }
+    let mut languages = Languages::new();
+    let mut shared = BTreeSet::new();
+    for t in read.tracks {
+        let p = t.properties;
+        let Some(uid) = p.uid else { continue };
+        let tag = p.language_ietf.map(Language::Bcp47);
+        if let Some(language) = tag.or(p.language.map(Language::Iso639_2))
+            && languages.insert(uid, language).is_some()
+        {
+            shared.insert(uid);
+        }
+    }
+    // Two tracks of one UID (which Matroska forbids): which is which cannot be told.
+    languages.retain(|uid, _| !shared.contains(uid));
+    Ok(languages)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mkvmerge_s_reading_is_taken_by_track_uid_tag_first() {
+        let json = br#"{"errors": [], "tracks": [
+            {"id": 0, "properties": {"uid": 7, "language": "fre"}},
+            {"id": 1, "properties": {"uid": 13632464868840902250, "language": "heb",
+                "language_ietf": "he"}},
+            {"id": 2, "properties": {"uid": 9}}
+        ]}"#;
+        let read = read_languages(json).unwrap();
+        assert_eq!(
+            read,
+            Languages::from([
+                (7, Language::Iso639_2("fre".into())),
+                (13_632_464_868_840_902_250, Language::Bcp47("he".into())),
+            ])
+        );
+        let failed = br#"{"errors": ["The file 'x' could not be opened for reading.\n"]}"#;
+        assert_eq!(
+            read_languages(failed),
+            Err(Unread::Said(
+                "mkvmerge -J: The file 'x' could not be opened for reading.".into()
+            ))
+        );
+        // Two tracks of one UID: neither is told.
+        let shared = br#"{"tracks": [
+            {"properties": {"uid": 5, "language": "jpn"}},
+            {"properties": {"uid": 5, "language": "eng"}},
+            {"properties": {"uid": 6, "language": "fre"}}
+        ]}"#;
+        assert_eq!(
+            read_languages(shared),
+            Ok(Languages::from([(6, Language::Iso639_2("fre".into()))]))
+        );
+    }
 
     fn fixture() -> (PathBuf, Layout) {
         let path = PathBuf::from(concat!(
@@ -313,10 +431,16 @@ mod tests {
                 tags: None,
             },
         ];
-        let a: Vec<String> = args(&path, &layout, &replaced, Path::new("/o/.x.mkv.subcheck"))
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
+        let a: Vec<String> = args(
+            &path,
+            &layout,
+            &replaced,
+            &Languages::new(),
+            Path::new("/o/.x.mkv.subcheck"),
+        )
+        .iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
         let uid = hex(layout.segment_uid.as_ref().unwrap());
         let expected = [
             "--quiet",
