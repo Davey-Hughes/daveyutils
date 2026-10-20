@@ -189,11 +189,14 @@ fn evidence<'e>(video: &Video, mine: &[&'e Event], s: &Stretch) -> Option<(&'e E
         .from_ms
         .or_else(|| mine.iter().map(|e| e.start_ms).min())?;
     let to = s.to_ms.or_else(|| mine.iter().map(|e| e.end_ms).max())?;
-    let middle = from + (to - from) / 2;
+    // Times read from a corrupt file reach both ends of i64: the middle and distances are taken
+    // without overflow. The middle lies between `from` and `to`, so it is an i64.
+    let (a, b) = (i128::from(from), i128::from(to));
+    let middle = i64::try_from(a + (b - a) / 2).expect("between from and to");
     let nearest = |times: &dyn Fn(&Event) -> i64| {
         mine.iter()
-            .filter(|e| frame_offset(video, times(e)) == s.frames)
-            .min_by_key(|e| ((e.start_ms - middle).abs(), e.start_ms))
+            .filter(|e| frame_offset(video, times(e)) == i128::from(s.frames))
+            .min_by_key(|e| (e.start_ms.abs_diff(middle), e.start_ms))
             .map(|e| (*e, times(e)))
     };
     nearest(&|e| e.end_ms).or_else(|| nearest(&|e| e.start_ms))
@@ -548,5 +551,43 @@ mod tests {
                 "track 6: its times against the cuts say 1 frame late, its lines shared with track 5 say in sync: no fix"
             ]
         );
+    }
+
+    #[test]
+    fn evidence_from_times_at_either_end_of_time_does_not_overflow() {
+        // Ends a frame after keyframes 1 and 0.
+        let late = event(at(1, 0), at(1, 1));
+        let early = event(-1000, at(0, 1));
+        // A corrupt BlockDuration: from before 0 to the end of i64.
+        let corrupt = event(-1000, i64::MAX);
+        let whole = Stretch {
+            from_ms: None,
+            to_ms: None,
+            frames: 1,
+        };
+        let got = evidence(&video(), &[&late, &corrupt], &whole);
+        assert_eq!(got, Some((&late, at(1, 1))));
+        // A stretch at the end of time: its middle is i64::MAX, and a line starts before 0.
+        let last = Stretch {
+            from_ms: Some(i64::MAX),
+            to_ms: Some(i64::MAX),
+            frames: 1,
+        };
+        let got = evidence(&video(), &[&early, &late], &last);
+        assert_eq!(got, Some((&late, at(1, 1))));
+    }
+
+    #[test]
+    fn evidence_nearest_the_middle_rounds_the_middle_toward_the_stretchs_start() {
+        // Both end a frame after a keyframe; the stretch's middle is -501 ms, nearer the first.
+        let first = event(-1001, at(0, 1));
+        let second = event(0, at(1, 1));
+        let s = Stretch {
+            from_ms: Some(-1001),
+            to_ms: Some(0),
+            frames: 1,
+        };
+        let got = evidence(&video(), &[&first, &second], &s);
+        assert_eq!(got, Some((&first, at(0, 1))));
     }
 }

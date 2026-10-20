@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::lines;
-use super::{Analysis, MAX_OFFSET, OFFSETS, Stretch, Verdict, Video, decided, frame_index, slot};
+use super::{Analysis, OFFSETS, Stretch, Verdict, Video, decided, frame_index, slot, within};
 use crate::text::Event;
 
 /// How one track's lines sit against the same lines in another.
@@ -46,7 +46,7 @@ pub fn twins(video: &Video, track: &[Event], other: &[Event]) -> Vec<Option<usiz
             let mut near = by_raw
                 .get(e.raw.as_str())?
                 .iter()
-                .filter(|&&i| (frame_index(video, other[i].start_ms) - at).abs() <= MAX_OFFSET);
+                .filter(|&&i| within(frame_index(video, other[i].start_ms) - at).is_some());
             let one = *near.next()?;
             near.next().is_none().then_some(one)
         })
@@ -66,8 +66,7 @@ pub fn shared(video: &Video, track: &[Event], other: &[Event], twins: &[Option<u
             if !seen.insert((e.style.as_str(), is_end, mine)) {
                 continue;
             }
-            let gap = frame_index(video, mine) - frame_index(video, theirs);
-            if gap.abs() <= MAX_OFFSET {
+            if let Some(gap) = within(frame_index(video, mine) - frame_index(video, theirs)) {
                 counts[slot(gap)] += 1;
             }
         }
@@ -450,5 +449,21 @@ mod tests {
         want.push(Some(0));
         assert_eq!(f.each, want);
         assert_eq!(f.unshifted, [(150_500, 153_500)]);
+    }
+
+    #[test]
+    fn frames_at_either_end_of_time_are_far_apart_not_an_overflow() {
+        // At 1 ns a frame, a line at the end of i64 ms is more frames in than an i64 counts.
+        let video = Video {
+            frame_ns: 1,
+            keyframes_ns: (0..=10).map(|i| i * 1_000_000_000).collect(),
+        };
+        let mine = [event("Sign", -1000, -500)];
+        let theirs = [event("Sign", i64::MAX, i64::MAX)];
+        assert_eq!(twins(&video, &mine, &theirs), [None]);
+        assert_eq!(shared(&video, &mine, &theirs, &[Some(0)]).times, 0);
+        // Two such lines are as far apart as they are, not both at the last frame an i64 counts.
+        let late = [event("Sign", i64::MAX - 1, i64::MAX)];
+        assert_eq!(twins(&video, &theirs, &late), [None]);
     }
 }

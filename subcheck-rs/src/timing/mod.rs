@@ -116,13 +116,25 @@ pub fn video(layout: &Layout) -> Result<Video, String> {
 
 /// The frame on which a line starting or ending at `time_ms` starts or stops showing, counted from
 /// the nearest keyframe: 0 on the keyframe, +1 one frame after it. mpv shows a line on a frame when
-/// `start <= frame time < end`, so that frame is the first one at or after the time.
-pub fn frame_offset(video: &Video, time_ms: i64) -> i64 {
-    let x = i128::from(time_ms) * 1_000_000;
+/// `start <= frame time < end`, so that frame is the first one at or after the time. An i128, as
+/// [`frame_index`].
+pub fn frame_offset(video: &Video, time_ms: i64) -> i128 {
+    frames_from(video, time_ms, nearest_keyframe(video, time_ms))
+}
+
+/// The frame a line starting or ending at `time_ms` starts or stops showing on, counted from the
+/// one at `origin_ns`.
+fn frames_from(video: &Video, time_ms: i64, origin_ns: i128) -> i128 {
     // ceil(d / frame), for a positive frame duration.
-    let d = x - nearest_keyframe(video, time_ms) - SLACK_NS;
-    let frames = -(-d).div_euclid(i128::from(video.frame_ns));
-    i64::try_from(frames).unwrap_or(i64::MAX)
+    let d = i128::from(time_ms) * 1_000_000 - origin_ns - SLACK_NS;
+    -(-d).div_euclid(i128::from(video.frame_ns))
+}
+
+/// An offset or gap in frames, if it is at most MAX_OFFSET either way.
+fn within(frames: i128) -> Option<i64> {
+    i64::try_from(frames)
+        .ok()
+        .filter(|f| (-MAX_OFFSET..=MAX_OFFSET).contains(f))
 }
 
 /// The keyframe nearest `time_ms`, in nanoseconds.
@@ -139,12 +151,12 @@ fn nearest_keyframe(video: &Video, time_ms: i64) -> i128 {
 }
 
 /// The frame on which a line starting or ending at `time_ms` starts or stops showing, counted on
-/// the video's frame grid from its first keyframe. Two times on one frame have the same index.
-pub fn frame_index(video: &Video, time_ms: i64) -> i64 {
+/// the video's frame grid from its first keyframe. Two times on one frame have the same index. An
+/// i128: at a short enough frame, a time read from a corrupt file is more frames in than an i64
+/// counts.
+pub fn frame_index(video: &Video, time_ms: i64) -> i128 {
     let first = video.keyframes_ns.first().map_or(0, |&k| i128::from(k));
-    let d = i128::from(time_ms) * 1_000_000 - first - SLACK_NS;
-    let frames = -(-d).div_euclid(i128::from(video.frame_ns));
-    i64::try_from(frames).unwrap_or(i64::MAX)
+    frames_from(video, time_ms, first)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,8 +384,7 @@ pub fn styles(video: &Video, events: &[Event]) -> (Vec<StyleCounts>, Vec<Time>) 
             if !seen.insert((e.style.as_str(), is_end, ms)) {
                 continue;
             }
-            let offset = frame_offset(video, ms);
-            if offset.abs() <= MAX_OFFSET {
+            if let Some(offset) = within(frame_offset(video, ms)) {
                 by_style
                     .entry(e.style.as_str())
                     .or_default()
@@ -1298,5 +1309,35 @@ mod tests {
         assert!(video(&layout(video_track(40_000_000), &every(4))).is_ok());
         // A corrupt DefaultDuration is unsupported, not a crash.
         assert!(video(&layout(video_track(u64::MAX), &every(4))).is_err());
+    }
+
+    #[test]
+    fn a_time_the_smallest_i64_frames_from_its_keyframe_is_not_counted() {
+        // At 1 ns a frame, 0 ms is i64::MIN frames before keyframes this far in.
+        let first = 9_223_372_036_854_275_808;
+        let video = Video {
+            frame_ns: 1,
+            keyframes_ns: (0..10).map(|i| first + i * 1_000).collect(),
+        };
+        assert_eq!(frame_offset(&video, 0), i128::from(i64::MIN));
+        // Neither time is near a cut: no style has a time to count.
+        let (styles, pool) = styles(&video, &[event("D", 0, 1)]);
+        assert!(styles.is_empty() && pool.is_empty());
+    }
+
+    #[test]
+    fn a_time_more_frames_from_its_keyframe_than_an_i64_counts_is_as_many_frames_off() {
+        // At 1 ns a frame, 0 ms is past i64::MIN frames before keyframes this far in, and the end
+        // of i64 ms past i64::MAX frames after the last.
+        let first = 10_000_000_000_000_000_000;
+        let video = Video {
+            frame_ns: 1,
+            keyframes_ns: (0..10).map(|i| first + i * 1_000).collect(),
+        };
+        assert_eq!(frame_offset(&video, 0), -10_000_000_000_000_500_000);
+        assert_eq!(
+            frame_offset(&video, i64::MAX),
+            9_223_362_036_854_775_806_491_000
+        );
     }
 }

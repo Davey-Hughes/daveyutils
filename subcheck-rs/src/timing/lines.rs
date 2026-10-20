@@ -45,6 +45,7 @@ pub fn blocks_of(times: &[(i64, i64)]) -> Vec<Block> {
 
 /// Whether a start or end in the block sits at `offset` from a cut.
 fn points_to(video: &Video, events: &[Event], block: &Block, offset: i64) -> bool {
+    let offset = i128::from(offset);
     block.events.iter().any(|&i| {
         frame_offset(video, events[i].start_ms) == offset
             || frame_offset(video, events[i].end_ms) == offset
@@ -110,11 +111,14 @@ pub fn line_exact(video: &Video, events: &[Event], stretches: &[Stretch]) -> Mov
                     .filter(|&&e| e == (false, true))
                     .count()
         };
-        let silence = |s: usize| -> i64 {
+        // In i128: corrupt times either side of 0 are further apart than an i64 holds.
+        let silence = |s: usize| -> i128 {
             let k = first + s;
             match (k.checked_sub(1), blocks.get(k)) {
-                (Some(before), Some(after)) => after.start_ms - blocks[before].end_ms,
-                _ => i64::MAX,
+                (Some(before), Some(after)) => {
+                    i128::from(after.start_ms) - i128::from(blocks[before].end_ms)
+                }
+                _ => i128::MAX,
             }
         };
         let best = (0..=here.len()).map(score).max().unwrap_or(0);
@@ -366,5 +370,19 @@ mod tests {
         // Splits after the first or the third line agree with three of four blocks; the silences
         // are equal, so the earlier split wins.
         assert_eq!(each, [Some(0), Some(1), None, Some(1)]);
+    }
+
+    #[test]
+    fn blocks_at_either_end_of_time_split_without_overflow() {
+        // A block before 0 (a block's own time less than its Cluster's) and one at the end of i64
+        // (a corrupt Cluster Timestamp): the silence between them is more than an i64 holds.
+        let events = [event(-1000, -500), event(i64::MAX, i64::MAX)];
+        let pooled = [
+            stretch(None, Some(-1000), 0),
+            stretch(Some(i64::MAX), None, 1),
+        ];
+        let each = line_exact(&video_2s(), &events, &pooled).each;
+        // Neither block points either way; an end of the track is a longer silence still.
+        assert_eq!(each, [Some(1), Some(1)]);
     }
 }

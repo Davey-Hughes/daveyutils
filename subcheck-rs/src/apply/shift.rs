@@ -88,23 +88,25 @@ impl Grid {
     }
 
     /// Frame `n`'s time, in ns.
-    fn at(&self, n: i64) -> i128 {
-        let t = self.phase + i128::from(n) * self.frame;
+    fn at(&self, n: i128) -> i128 {
+        let t = self.phase + n * self.frame;
         let unit = self.den * self.scale;
         (t * 2 + unit).div_euclid(unit * 2) * self.scale
     }
 
     /// The frame a line starting or ending at `x` starts or stops showing on: the first at or after
-    /// it, `T(n-1) < x ≤ T(n)`.
-    pub fn frame_of(&self, x: i128) -> i64 {
-        let mut n = i64::try_from((x * self.den - self.phase).div_euclid(self.frame)).unwrap_or(0);
-        while self.at(n) < x {
-            n += 1;
-        }
-        while self.at(n - 1) >= x {
-            n -= 1;
-        }
-        n
+    /// it, `T(n-1) < x ≤ T(n)`. An i128: at a short enough frame, a time read from a corrupt file is
+    /// more frames in than an i64 counts.
+    pub fn frame_of(&self, x: i128) -> i128 {
+        // T(n) >= x when frame n's time rounds to the k-th multiple of the scale or later, k =
+        // ceil(x / scale): when 2 (phase + n frame) >= (2k - 1) unit. T(n) never falls as n
+        // rises, so the least such n is the frame, however many frames share one stored time.
+        let ceil = |a: i128, b: i128| -(-a).div_euclid(b);
+        let k = ceil(x, self.scale);
+        ceil(
+            (2 * k - 1) * self.den * self.scale - 2 * self.phase,
+            2 * self.frame,
+        )
     }
 
     /// `x` moved `frames` frames earlier (later when negative), to the same place in its new
@@ -112,7 +114,7 @@ impl Grid {
     /// Never before 0: a line at the very start stays there.
     pub fn moved(&self, x: i128, frames: i64, precision: i128) -> i128 {
         let n = self.frame_of(x);
-        let m = n - frames;
+        let m = n - i128::from(frames);
         let y = x - (self.at(n) - self.at(m));
         let rounded = (y + precision / 2).div_euclid(precision) * precision;
         // The multiples of `precision` in (T(m-1), T(m)]: none when a frame is shorter than that.
@@ -133,7 +135,7 @@ impl Grid {
     pub fn moved_surely(&self, x: i128, frames: i64, precision: i128) -> Option<i128> {
         let moved = self.moved(x, frames, precision);
         let n = self.frame_of(x);
-        let m = n - frames;
+        let m = n - i128::from(frames);
         // The move reads frames n-1, n, m-1 and m, each of which another phase may make a frame
         // either way: one phase from each stretch where none of their stored times changes.
         let unit = self.den * self.scale;
@@ -141,7 +143,7 @@ impl Grid {
         for k in (n - 2..=n + 1).chain(m - 2..=m + 1) {
             // Frame k's stored time steps up where phase + k * frame + unit / 2 is a multiple of
             // `unit`: the first such phase above `lo`.
-            let base = i128::from(k) * self.frame + unit / 2;
+            let base = k * self.frame + unit / 2;
             let step = self.lo + 1 + (-(self.lo + 1 + base)).rem_euclid(unit);
             if step < self.hi {
                 phases.push(step);
@@ -430,7 +432,7 @@ pub fn plan(fix: &TimingFix, track: &Track, grid: &Grid) -> Plan {
         // Rounded to the track's precision, a time in a frame shorter than that may land in
         // another; one at the very start stays there.
         for (old, new) in [(start, new_start), (end, new_end)] {
-            if new != 0 && grid.frame_of(new) != grid.frame_of(old) - s.frames {
+            if new != 0 && grid.frame_of(new) != grid.frame_of(old) - i128::from(s.frames) {
                 return hand("the shift did not land on the frame grid");
             }
         }
@@ -1042,5 +1044,69 @@ mod tests {
             moved(&plan(&late_from_two(), &track(&blocks), &grid())),
             [1, 2, 4]
         );
+    }
+
+    #[test]
+    fn a_time_at_the_end_of_i64_is_on_its_frame_however_short_the_frames() {
+        // A corrupt BlockDuration ends a line at i64::MAX ms; at 1 µs a frame, no i64 counts its
+        // frame.
+        let video = Video {
+            frame_ns: 1_000,
+            keyframes_ns: (0..10).map(|i| i * 1_000_000).collect(),
+        };
+        let grid = Grid::fit(&video, 1_000_000).unwrap();
+        let x = i128::from(i64::MAX) * 1_000_000;
+        let n = grid.frame_of(x);
+        assert!(grid.at(n - 1) < x && x <= grid.at(n));
+    }
+
+    #[test]
+    fn a_line_to_the_end_of_i64_on_frames_shorter_than_a_millisecond_is_left_for_a_hand_fix() {
+        // A corrupt BlockDuration: the line ends at i64::MAX ms. At 1 µs a frame, no centisecond
+        // keeps a time on its frame, so the shift is a hand fix, as for any line on such a grid.
+        let video = Video {
+            frame_ns: 1_000,
+            keyframes_ns: (0..10).map(|i| i * 1_000_000).collect(),
+        };
+        let grid = Grid::fit(&video, 1_000_000).unwrap();
+        // From 0, which a shift earlier leaves where it is: the end decides.
+        let blocks = [block(0, 0, i64::MAX, "One.")];
+        let one = line(0, i64::MAX, "One.");
+        let fix = fix(
+            vec![stretch(None, None, 1, Some((one.clone(), one)))],
+            vec![],
+        );
+        let p = plan(&fix, &track(&blocks), &grid);
+        assert_eq!(
+            p.outcome,
+            Outcome::ByHand("the shift did not land on the frame grid".into())
+        );
+    }
+
+    #[test]
+    fn a_frame_far_shorter_than_a_tick_is_found_at_once() {
+        // 1 ns frames on 100 s ticks: a hundred billion frames share each stored time, and a time
+        // between two is on the first frame stored at the later one.
+        let video = Video {
+            frame_ns: 1,
+            keyframes_ns: (0..10).map(|i| i * 100_000_000_000).collect(),
+        };
+        let grid = Grid::fit(&video, 100_000_000_000).unwrap();
+        let x = 40_000_000_000;
+        let n = grid.frame_of(x);
+        assert_eq!(n, 50_000_000_000);
+        assert!(grid.at(n - 1) < x && x <= grid.at(n));
+    }
+
+    #[test]
+    fn every_time_is_on_the_first_frame_stored_at_or_after_it() {
+        let grid = e09_grid();
+        // Each tenth of a millisecond over half a second either side of the cut at 18:11.924, and
+        // of 0, where a time before it (a block's own time less than its Cluster's) is negative.
+        let around = |cut: i128| (cut - 500_000_000..cut + 500_000_000).step_by(100_000);
+        for x in around(1_091_924_000_000).chain(around(0)) {
+            let n = grid.frame_of(x);
+            assert!(grid.at(n - 1) < x && x <= grid.at(n), "{x}");
+        }
     }
 }
