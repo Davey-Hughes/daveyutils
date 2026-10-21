@@ -36,6 +36,41 @@ impl Env {
         cmd.output().unwrap()
     }
 
+    /// `subcheck scan` with the preset `llm`, whose program (`claude`, `codex`) is the fake LLM by
+    /// that name, first on the PATH.
+    fn scan_preset(&self, llm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+        let bin = self.fake_bin();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_subcheck"));
+        cmd.arg("scan")
+            .args(args)
+            .args(["--llm", llm])
+            .env("XDG_STATE_HOME", self.state.path())
+            .env("FAKE_LLM_LOG", &self.log)
+            .env("PATH", path);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd.output().unwrap()
+    }
+
+    /// A directory of links to the fake LLM named `claude` and `codex`.
+    fn fake_bin(&self) -> PathBuf {
+        let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+        let bin = self.state.path().join("bin");
+        if !bin.exists() {
+            std::fs::create_dir(&bin).unwrap();
+            for name in ["claude", "codex"] {
+                std::os::unix::fs::symlink(&fake, bin.join(name)).unwrap();
+            }
+        }
+        bin
+    }
+
     fn calls(&self) -> Vec<String> {
         std::fs::read_to_string(&self.log)
             .unwrap_or_default()
@@ -108,6 +143,207 @@ fn scan_records_the_planted_typos() {
     assert_eq!((file.error.as_deref(), file.lines), (None, 4));
     assert_eq!(file.tracks[0].sid, 1);
     assert_eq!(file.tracks[0].read, "cues");
+}
+
+#[test]
+fn the_claude_and_gpt_presets_read_their_replies_from_json() {
+    for llm in ["claude", "gpt"] {
+        let env = Env::new();
+        let out = env.scan_preset(llm, &[&path("typos.mkv")], &[]);
+        assert!(out.status.success(), "{llm}: {}", stderr(&out));
+        let run = env.newest_run();
+        let pairs: Vec<(&str, &str, &str)> = run
+            .findings
+            .iter()
+            .map(|f| {
+                (
+                    f.original.as_str(),
+                    f.suggestion.as_str(),
+                    f.reason.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                (
+                    "We should leave befor it rains.",
+                    "We should leave before it rains.",
+                    "planted typo"
+                ),
+                ("go trough it", "go through it", "planted typo"),
+            ],
+            "{llm}"
+        );
+        assert_eq!(run.header.unwrap().backend, llm);
+    }
+}
+
+#[test]
+fn the_fake_claude_escapes_every_control_character_in_its_json() {
+    use std::io::Write as _;
+    let env = Env::new();
+    let mut child = Command::new(env.fake_bin().join("claude"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A CRLF subtitle line keeps its CR; a stray control character rides along. ESC, not \x01:
+    // that is bash's own quoting byte, which bash 3.2 mishandles in `read` and `${s:i:1}`.
+    let prompt = "L1 [0:00:01.00] (D) leave befor it\r now\u{1b}\n";
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(prompt.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let reply: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+    assert_eq!(
+        reply["result"],
+        "L1\tleave before it\r now\u{1b}\tplanted typo"
+    );
+}
+
+/// The run file's usage records.
+fn usage_lines(run: &Path) -> Vec<String> {
+    std::fs::read_to_string(run)
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with(r#"{"type":"usage""#))
+        .map(String::from)
+        .collect()
+}
+
+#[test]
+fn each_llm_call_is_recorded_with_what_it_used_and_the_scan_says_what_they_cost() {
+    let env = Env::new();
+    let typos = path("typos.mkv");
+    let out = env.scan_preset("claude", &[&typos], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // The summary, then what the calls cost; the fake claude's price, 1.25 cents a call.
+    assert!(
+        stderr(&out).contains(
+            "; 2 findings\nLLM: 1 call, 1.20k in / 40 out tokens, $0.013 at API prices\n"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    let run_path = store::find_run(&env.state.path().join("subcheck"), None).unwrap();
+    assert_eq!(
+        usage_lines(&run_path),
+        [format!(
+            r#"{{"type":"usage","file":"{typos}","lines":4,"input_tokens":1203,"output_tokens":40,"cache_read_tokens":200,"cache_write_tokens":1000,"cost_usd":0.0125}}"#
+        )]
+    );
+    assert_eq!(env.newest_run().spent.calls, 1);
+    let list = env.subcheck(&["list"], &[]);
+    let text = String::from_utf8_lossy(&list.stdout);
+    assert_eq!(
+        text.lines().nth(1),
+        Some("LLM: 1 call, 1.20k in / 40 out tokens, $0.013 at API prices"),
+        "{text}"
+    );
+
+    // codex reports tokens and no price: none is shown.
+    let env = Env::new();
+    let out = env.scan_preset("gpt", &[&typos], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("\nLLM: 1 call, 1.50k in / 40 out tokens\n"),
+        "{}",
+        stderr(&out)
+    );
+    let run_path = store::find_run(&env.state.path().join("subcheck"), None).unwrap();
+    assert_eq!(
+        usage_lines(&run_path),
+        [format!(
+            r#"{{"type":"usage","file":"{typos}","lines":4,"input_tokens":1500,"output_tokens":40,"cache_read_tokens":1000}}"#
+        )]
+    );
+
+    // A command LLM reports nothing, and nothing is said.
+    let env = Env::new();
+    let out = env.subcheck(&["scan", &typos], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("LLM:"), "{}", stderr(&out));
+    let run_path = store::find_run(&env.state.path().join("subcheck"), None).unwrap();
+    assert_eq!(usage_lines(&run_path), [] as [String; 0]);
+}
+
+#[test]
+fn a_failed_call_is_recorded_too_and_so_is_a_call_adding_to_a_run() {
+    let env = Env::new();
+    let typos = path("typos.mkv");
+    // A reply the parser cannot read, twice: both calls cost.
+    let out = env.scan_preset(
+        "claude",
+        &[&typos],
+        &[("FAKE_LLM_REPLY", "These lines look fine to me.")],
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("\nLLM: 2 calls, 2.41k in / 80 out tokens, $0.025 at API prices\n"),
+        "{}",
+        stderr(&out)
+    );
+    let run = env.newest_run();
+    assert!(run.files[0].error.is_some());
+    assert_eq!(run.spent.calls, 2);
+
+    // Adding the failed file to the run again: the run's calls are both scans'.
+    let out = env.scan_preset("claude", &[&typos, "--run", &run.name], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(
+            "; 2 findings\nLLM: 1 call, 1.20k in / 40 out tokens, $0.013 at API prices\n"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.newest_run().spent.calls, 3);
+}
+
+#[test]
+fn a_call_that_says_nothing_of_what_it_used_is_counted_and_said_so() {
+    let typos = path("typos.mkv");
+    let silent = format!(r#"{{"type":"usage","file":"{typos}","lines":4}}"#);
+    // The fake claude replies in plain text, not its JSON; or fails with nothing on stdout. Twice
+    // either way (a call and its retry): two calls, each counted with no numbers.
+    for (fake, failed) in [
+        ("FAKE_LLM_PLAIN", "FAILED: LLM: reply is not claude's JSON"),
+        (
+            "FAKE_LLM_FAIL",
+            "FAILED: LLM: claude exited with exit status: 3: fake-llm: told to fail\n",
+        ),
+    ] {
+        let env = Env::new();
+        let out = env.scan_preset("claude", &[&typos], &[(fake, "1")]);
+        assert!(!out.status.success());
+        let err = stderr(&out);
+        assert!(err.contains(failed), "{fake}: {err}");
+        assert!(
+            err.contains("\nLLM: 2 calls (none reported usage)\n"),
+            "{fake}: {err}"
+        );
+        let run_path = store::find_run(&env.state.path().join("subcheck"), None).unwrap();
+        assert_eq!(
+            usage_lines(&run_path),
+            [silent.clone(), silent.clone()],
+            "{fake}"
+        );
+    }
+
+    // A command LLM that fails is not counted: it never reports.
+    let env = Env::new();
+    let out = env.subcheck(&["scan", &typos], &[("FAKE_LLM_FAIL", "1")]);
+    assert!(
+        stderr(&out).contains("FAILED: LLM: sh exited"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stderr(&out).contains("\nLLM:"), "{}", stderr(&out));
 }
 
 #[test]

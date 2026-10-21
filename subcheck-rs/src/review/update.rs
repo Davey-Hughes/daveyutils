@@ -78,7 +78,14 @@ pub fn update(m: &mut Model, msg: Msg, now: Timestamp) -> Vec<Effect> {
     let before = m.selected_entry();
     // A double-click is two clicks in a row: anything in between starts over.
     let last_click = m.last_click.take();
+    let input = matches!(msg, Msg::Key(_) | Msg::KillLine | Msg::Mouse(..));
     let effects = apply(m, msg, last_click, now);
+    // The cost line review opened with ends at the first key (Ctrl-U too), click or turn of the
+    // wheel, the box of keys open or not: once the message is handled, so a click lands on the
+    // status line as it was drawn.
+    if input {
+        m.show_cost = false;
+    }
     if m.selected_entry() != before {
         m.detail_scroll = 0;
     }

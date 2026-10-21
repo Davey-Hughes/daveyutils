@@ -156,6 +156,7 @@ pub fn run(path: &Path, state: &Path) -> anyhow::Result<()> {
     let mut writer =
         RunWriter::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut player = Player::new("mpv", player::socket_path(state));
+    // Else the status line opens on what the run's LLM calls cost (`Model::show_cost`).
     let mut model = Model::new(run, notes);
     if bad_lines > 0 {
         model.status = Some(format!(

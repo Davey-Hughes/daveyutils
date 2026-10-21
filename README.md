@@ -51,9 +51,10 @@ make help     # list targets
   `dev/make-subcheck-fixtures.sh` and committed, with mkvextract's output for each as the oracle.
   `subcheck scan` sends the English lines to an LLM (`--llm claude`, `gpt` for Codex,
   `ollama:<model>`, or any command with `--llm-cmd`) and records each suggested fix in a run file
-  under `~/.local/state/subcheck/`, with each track the timing check below finds shifted. Checks
-  already made of an unchanged file are skipped; `scan --run <run>` adds to that run only the
-  checks it lacks.
+  under `~/.local/state/subcheck/`, with each track the timing check below finds shifted, and the
+  tokens each LLM call used (and claude's price for it at API rates), which `scan`, `list` and
+  `review` add up. Checks already made of an unchanged file are skipped; `scan --run <run>` adds
+  to that run only the checks it lacks.
   `subcheck review` steps through a run's fixes to accept, reject or reword each (a fix repeated
   across episodes is one row, as is a season's track's timing), and `o` opens the moment in mpv,
   reusing one window: a timing finding paused on the frame that shows the error, which `[` `]` step

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+use crate::llm::{self, Spent, Usage};
 use crate::mkv::{self, Truncated};
 use crate::text::Occurrence;
 
@@ -50,6 +51,11 @@ pub enum Record {
     Finding(Finding),
     Decision(Decision),
     Applied(Applied),
+    Usage(LlmCall),
+    /// A type of record from a later subcheck: passed over, as a field this one does not know is.
+    /// A later type is no damage to the run, so it is not counted as a line that cannot be read.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -234,6 +240,87 @@ pub struct Applied {
     pub at: Timestamp,
 }
 
+/// One LLM call a scan started with claude or codex, retries and failed ones too, with what its
+/// backend says it used. A backend that never says (ollama, `--llm-cmd`), or a call that could not
+/// be started, leaves no record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "CallFields", into = "CallFields")]
+pub struct LlmCall {
+    /// The file whose lines it carried: a line other files share is sent once, with the first.
+    pub file: String,
+    pub lines: usize,
+    /// `None`, and no numbers in the record, when its backend said nothing of it: killed at the
+    /// timeout, failing with nothing on stdout, printing something other than its JSON, or JSON
+    /// with no usage in it.
+    pub usage: Option<Usage>,
+}
+
+/// [`LlmCall`] as its record holds it: the usage's numbers flat beside the file, all of them or
+/// none. Some without the rest, a number that is no count (`"12"`, `-1`), or a price below 0 or
+/// not finite, makes a line that cannot be read, not a call that reported nothing.
+#[derive(Serialize, Deserialize)]
+struct CallFields {
+    file: String,
+    lines: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_write_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
+}
+
+impl TryFrom<CallFields> for LlmCall {
+    type Error = &'static str;
+
+    fn try_from(f: CallFields) -> Result<LlmCall, &'static str> {
+        if f.cost_usd.is_some_and(|c| !llm::is_price(c)) {
+            return Err("a usage record with a price that is no price");
+        }
+        let usage = match (f.input_tokens, f.output_tokens) {
+            (Some(input_tokens), Some(output_tokens)) => Some(Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens: f.cache_read_tokens,
+                cache_write_tokens: f.cache_write_tokens,
+                cost_usd: f.cost_usd,
+            }),
+            (None, None)
+                if f.cache_read_tokens.is_none()
+                    && f.cache_write_tokens.is_none()
+                    && f.cost_usd.is_none() =>
+            {
+                None
+            }
+            _ => return Err("a usage record with some of its numbers and not the rest"),
+        };
+        Ok(LlmCall {
+            file: f.file,
+            lines: f.lines,
+            usage,
+        })
+    }
+}
+
+impl From<LlmCall> for CallFields {
+    fn from(call: LlmCall) -> CallFields {
+        let u = call.usage;
+        CallFields {
+            file: call.file,
+            lines: call.lines,
+            input_tokens: u.as_ref().map(|u| u.input_tokens),
+            output_tokens: u.as_ref().map(|u| u.output_tokens),
+            cache_read_tokens: u.as_ref().and_then(|u| u.cache_read_tokens),
+            cache_write_tokens: u.as_ref().and_then(|u| u.cache_write_tokens),
+            cost_usd: u.as_ref().and_then(|u| u.cost_usd),
+        }
+    }
+}
+
 /// An open run file that records are appended to.
 pub struct RunWriter {
     pub name: String,
@@ -382,6 +469,8 @@ pub struct Run {
     pub decisions: HashMap<u64, Decision>,
     /// Findings whose fix is in their file.
     pub applied: HashSet<u64>,
+    /// What its LLM calls used, summed: none recorded in a run from before calls were.
+    pub spent: Spent,
     /// Lines that did not parse (a run cut off mid-write leaves at most one).
     pub bad_lines: usize,
 }
@@ -436,6 +525,8 @@ pub fn read_run(path: &Path) -> io::Result<Run> {
             Ok(Record::Applied(a)) => {
                 run.applied.insert(a.finding);
             }
+            Ok(Record::Usage(call)) => run.spent.add(call.usage.as_ref()),
+            Ok(Record::Unknown) => {}
             Err(_) => run.bad_lines += 1,
         }
     }
@@ -613,6 +704,7 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::Usage;
 
     #[test]
     fn state_dir_prefers_an_absolute_xdg_value() {
@@ -878,6 +970,121 @@ mod tests {
     }
 
     #[test]
+    fn llm_calls_read_back_summed_and_a_run_from_before_them_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = RunWriter::create(dir.path()).unwrap();
+        w.append(&[Record::Finding(finding(1))]).unwrap();
+        assert_eq!(read_run(&w.path).unwrap().spent, Spent::default());
+        let call = |cost_usd| {
+            Record::Usage(LlmCall {
+                file: "/m/a.mkv".into(),
+                lines: 4,
+                usage: Some(Usage {
+                    input_tokens: 1203,
+                    output_tokens: 40,
+                    cache_read_tokens: Some(200),
+                    cache_write_tokens: Some(1000),
+                    cost_usd,
+                }),
+            })
+        };
+        w.append(&[call(Some(0.0125)), call(Some(0.5))]).unwrap();
+        let text = fs::read_to_string(&w.path).unwrap();
+        assert!(
+            text.contains(
+                "\n{\"type\":\"usage\",\"file\":\"/m/a.mkv\",\"lines\":4,\"input_tokens\":1203,\
+                 \"output_tokens\":40,\"cache_read_tokens\":200,\"cache_write_tokens\":1000,\
+                 \"cost_usd\":0.0125}\n"
+            ),
+            "{text}"
+        );
+        let run = read_run(&w.path).unwrap();
+        assert_eq!(
+            run.spent,
+            Spent {
+                calls: 2,
+                unreported: 0,
+                input_tokens: 2406,
+                output_tokens: 80,
+                priced: 2,
+                cost_usd: 0.0125 + 0.5,
+            }
+        );
+        assert_eq!((run.findings.len(), run.bad_lines), (1, 0));
+        // A backend that reports no price, or no cache, leaves the field out.
+        let codex = Record::Usage(LlmCall {
+            file: "/m/a.mkv".into(),
+            lines: 4,
+            usage: Some(Usage {
+                input_tokens: 1500,
+                output_tokens: 40,
+                ..Usage::default()
+            }),
+        });
+        let line = serde_json::to_string(&codex).unwrap();
+        assert_eq!(
+            line,
+            r#"{"type":"usage","file":"/m/a.mkv","lines":4,"input_tokens":1500,"output_tokens":40}"#
+        );
+        assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), codex);
+    }
+
+    #[test]
+    fn a_call_that_reported_nothing_is_a_record_without_numbers_and_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = RunWriter::create(dir.path()).unwrap();
+        let silent = Record::Usage(LlmCall {
+            file: "/m/a.mkv".into(),
+            lines: 4,
+            usage: None,
+        });
+        let line = serde_json::to_string(&silent).unwrap();
+        assert_eq!(line, r#"{"type":"usage","file":"/m/a.mkv","lines":4}"#);
+        assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), silent);
+        w.append(&[silent]).unwrap();
+        let spent = read_run(&w.path).unwrap().spent;
+        assert_eq!((spent.calls, spent.unreported), (1, 1));
+    }
+
+    #[test]
+    fn a_usage_record_with_bad_or_partial_numbers_is_unreadable_not_unreported() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = RunWriter::create(dir.path()).unwrap();
+        let call =
+            |numbers: &str| format!(r#"{{"type":"usage","file":"/m/a.mkv","lines":4{numbers}}}"#);
+        let lines = [
+            call(r#","input_tokens":"12","output_tokens":40"#),
+            call(r#","input_tokens":-1,"output_tokens":40"#),
+            call(r#","input_tokens":12"#),
+            call(r#","cost_usd":0.5"#),
+            // A price that is no price.
+            call(r#","input_tokens":12,"output_tokens":40,"cost_usd":-0.5"#),
+            call(r#","input_tokens":12,"output_tokens":40,"cost_usd":1e999"#),
+            // No numbers at all: a call that reported none.
+            call(""),
+            call(r#","input_tokens":12,"output_tokens":40"#),
+        ];
+        fs::write(&w.path, lines.join("\n") + "\n").unwrap();
+        let run = read_run(&w.path).unwrap();
+        assert_eq!(run.bad_lines, 6);
+        assert_eq!((run.spent.calls, run.spent.unreported), (2, 1));
+        assert_eq!(run.spent.input_tokens, 12);
+        // Nor a price JSON cannot write but a record could be given.
+        for cost in [f64::NAN, f64::INFINITY] {
+            let fields = CallFields {
+                file: "/m/a.mkv".into(),
+                lines: 4,
+                input_tokens: Some(12),
+                output_tokens: Some(40),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cost_usd: Some(cost),
+            };
+            assert!(LlmCall::try_from(fields).is_err(), "{cost}");
+        }
+    }
+
+    #[test]
     fn a_decision_after_a_line_cut_off_mid_write_is_kept() {
         // A scan killed mid-write leaves its last line unfinished. The first decision appended
         // after it must start a line of its own, or it is lost with the broken one.
@@ -901,6 +1108,25 @@ mod tests {
             .unwrap();
         let run = read_run(&w.path).unwrap();
         assert_eq!((run.state_of(1), run.bad_lines), (State::Accepted, 1));
+    }
+
+    #[test]
+    fn a_record_of_a_type_this_subcheck_does_not_know_is_passed_over_not_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = RunWriter::create(dir.path()).unwrap();
+        w.append(&[Record::Finding(finding(1))]).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&w.path)
+            .unwrap()
+            .write_all(
+                b"{\"type\":\"from_a_later_subcheck\",\"n\":1}\n\
+                  {\"type\":\"finding\",\"id\":\"not a number\"}\n",
+            )
+            .unwrap();
+        let run = read_run(&w.path).unwrap();
+        // A known type that does not parse is still unreadable.
+        assert_eq!((run.findings.len(), run.bad_lines), (1, 1));
     }
 
     #[test]

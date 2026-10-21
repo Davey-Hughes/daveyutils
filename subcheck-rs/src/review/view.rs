@@ -14,6 +14,7 @@ use ratatui::widgets::{
 use super::layout;
 use super::model::{Entry, FileNote, Model, changed, fix_label};
 use crate::list::{self, Filter, label};
+use crate::llm::Spent;
 use crate::store::{State, TimingFix};
 use crate::text::{timestamp, timestamp_ms};
 use crate::timing::shift_label;
@@ -24,7 +25,7 @@ pub fn view(m: &Model, f: &mut Frame) {
     detail_pane(m, f, p.detail);
     status_line(m, f, p.status);
     if m.help {
-        keys_box(f, f.area());
+        keys_box(m, f, f.area());
     }
 }
 
@@ -126,12 +127,39 @@ fn keys_lines(columns: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// Under the keys, what the run's LLM calls cost, when it was recorded: its parts on as few lines
+/// of `columns` as they fit.
+fn spent_lines(spent: &Spent, columns: usize) -> Vec<Line<'static>> {
+    const SEP: &str = " · ";
+    let parts = spent.parts();
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    let w = |s: &str| usize::from(layout::width(s));
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let mut lines = vec![Line::raw(""), Line::styled("LLM", bold)];
+    let mut line = String::new();
+    for part in parts {
+        if !line.is_empty() && w(&line) + w(SEP) + w(&part) > columns {
+            lines.push(Line::raw(std::mem::take(&mut line)));
+        }
+        if !line.is_empty() {
+            line.push_str(SEP);
+        }
+        line.push_str(&part);
+    }
+    lines.push(Line::raw(line));
+    lines
+}
+
 /// The box of keys `?` opens, over the middle of `area`, with how to leave it in its bottom
 /// border: on a screen too short for every key that still shows.
-fn keys_box(f: &mut Frame, area: Rect) {
+fn keys_box(m: &Model, f: &mut Frame, area: Rect) {
     const LEAVE: &str = " q quits · any other key closes this ";
     // Inside a border and a column of padding each side.
-    let lines = keys_lines(usize::from(area.width.saturating_sub(4)));
+    let columns = usize::from(area.width.saturating_sub(4));
+    let mut lines = keys_lines(columns);
+    lines.extend(spent_lines(&m.run.spent, columns));
     let widest = lines.iter().map(Line::width).max().unwrap_or(0);
     let widest = widest.max(usize::from(layout::width(LEAVE)));
     let width = u16::try_from(widest + 4)
@@ -509,8 +537,8 @@ fn status_line(m: &Model, f: &mut Frame, area: Rect) {
         f.set_cursor_position(Position::new(x.min(text.right().saturating_sub(1)), text.y));
         return;
     }
-    if let Some(status) = &m.status {
-        f.render_widget(Paragraph::new(status.as_str()), text);
+    if let Some(status) = m.status_text(area) {
+        f.render_widget(Paragraph::new(status), text);
     }
 }
 
@@ -776,6 +804,135 @@ mod tests {
             screen.contains("q quits · any other key closes"),
             "{screen}"
         );
+    }
+
+    fn with_cost() -> Model {
+        let mut m = sample();
+        m.run.spent.add(Some(&crate::llm::Usage {
+            input_tokens: 1_234_567,
+            output_tokens: 31_234,
+            cost_usd: Some(3.21),
+            ..crate::llm::Usage::default()
+        }));
+        m
+    }
+
+    #[test]
+    fn review_opens_with_what_the_llm_calls_cost_beside_the_help_button() {
+        let mut m = with_cost();
+        let last = |m: &Model, width| render(m, width, 20).lines().nth(19).unwrap().to_string();
+        let full = "LLM: 1 call · 1.23M in / 31.2k out tokens · $3.21 at API prices";
+        let line = last(&m, 80);
+        assert!(
+            line.starts_with(full) && line.ends_with(" ? help"),
+            "{line}"
+        );
+        // Narrower, the tokens go, then the calls: the price stays, and so does `? help`.
+        let line = last(&m, 60);
+        assert!(
+            line.starts_with("LLM: 1 call · $3.21 at API prices ") && line.ends_with(" ? help"),
+            "{line}"
+        );
+        let line = last(&m, 35);
+        assert!(
+            line.starts_with("LLM: $3.21 at API prices ") && line.ends_with(" ? help"),
+            "{line}"
+        );
+        // Too narrow for even that beside the button: the price, and the button gives way.
+        assert_eq!(last(&m, 20), "LLM: $3.21 at API pr");
+        // A message of its own takes the line.
+        m.status = Some("2 line(s) of the run file could not be read".into());
+        assert!(last(&m, 80).starts_with("2 line(s) of"), "{}", last(&m, 80));
+        // Gone after the first key, whatever the width after.
+        m.status = None;
+        update::update(&mut m, Msg::Key(KeyCode::Char('j')), now());
+        update::update(&mut m, Msg::Resize(80, 20), now());
+        assert_eq!(last(&m, 80).trim_start(), "? help");
+    }
+
+    #[test]
+    fn any_click_or_wheel_ends_the_cost_line_as_a_key_does() {
+        use update::Mouse::{Click, WheelDown};
+        // A row of the list, the wheel over the detail pane, an empty part of the status line,
+        // and a click with the box of keys open.
+        for (action, x, y, help) in [
+            (Click, 5, 2, false),
+            (WheelDown, 70, 5, false),
+            (Click, 30, 19, false),
+            (Click, 30, 5, true),
+        ] {
+            let mut m = with_cost();
+            update::update(&mut m, Msg::Resize(80, 20), now());
+            m.help = help;
+            let status = layout::panes(m.area).status;
+            assert!(m.status_text(status).is_some());
+            update::update(&mut m, Msg::Mouse(action, x, y), now());
+            assert_eq!(m.status_text(status), None, "{action:?} at {x},{y}");
+        }
+    }
+
+    #[test]
+    fn a_key_with_the_box_of_keys_open_ends_the_cost_line_too() {
+        let mut m = with_cost();
+        m.help = true;
+        update::update(&mut m, Msg::Key(KeyCode::Esc), now());
+        assert!(!m.help);
+        assert!(!m.show_cost);
+        // Ctrl-U, which comes as its own message.
+        let mut m = with_cost();
+        update::update(&mut m, Msg::KillLine, now());
+        assert!(!m.show_cost);
+    }
+
+    #[test]
+    fn a_click_lands_on_the_status_line_as_it_was_drawn() {
+        // 20 columns: the cost line leaves no room for `? help`, so a click where it would be
+        // presses nothing, and only ends the cost line.
+        let mut m = with_cost();
+        update::update(&mut m, Msg::Resize(20, 20), now());
+        update::update(&mut m, Msg::Mouse(update::Mouse::Click, 17, 19), now());
+        assert!(!m.help);
+        assert!(!m.show_cost);
+    }
+
+    #[test]
+    fn the_help_button_is_clickable_beside_the_cost_on_a_narrow_screen() {
+        let mut m = with_cost();
+        update::update(&mut m, Msg::Resize(60, 20), now());
+        update::update(&mut m, Msg::Mouse(update::Mouse::Click, 57, 19), now());
+        assert!(m.help);
+    }
+
+    #[test]
+    fn the_keys_box_ends_with_what_the_runs_llm_calls_cost() {
+        let mut m = sample();
+        m.help = true;
+        // None recorded: nothing is said of them.
+        let screen = render(&m, 120, 30);
+        assert!(!screen.contains("LLM"), "{screen}");
+        m.run.spent.add(Some(&crate::llm::Usage {
+            input_tokens: 1_234_567,
+            output_tokens: 31_234,
+            cost_usd: Some(3.21),
+            ..crate::llm::Usage::default()
+        }));
+        let screen = render(&m, 120, 30);
+        let lines: Vec<&str> = screen.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("1 call · 1.23M in / 31.2k out tokens · $3.21 at API prices"))
+            .unwrap_or_else(|| panic!("{screen}"));
+        // Under the last row of keys: a blank line, a heading, then the costs.
+        let last_key = lines.iter().position(|l| l.contains("f          filter"));
+        assert_eq!(last_key, Some(at - 3), "{screen}");
+        assert!(lines[at - 1].contains("│ LLM "), "{screen}");
+        // Too narrow for one line, it wraps between the parts.
+        let screen = render(&m, 50, 30);
+        assert!(
+            screen.contains("│ 1 call · 1.23M in / 31.2k out tokens "),
+            "{screen}"
+        );
+        assert!(screen.contains("│ $3.21 at API prices "), "{screen}");
     }
 
     #[test]

@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 
 use super::layout::{self, EDIT_KEYS, HELP, Item};
 use crate::list::{self, Filter};
+use crate::llm::Spent;
 use crate::store::{Decision, Finding, Run, State, TrackRecord};
 use crate::timing::frame_count;
 
@@ -73,6 +74,9 @@ pub struct Model {
     /// Files that are not as they were scanned, by path.
     pub notes: HashMap<String, FileNote>,
     pub status: Option<String>,
+    /// Whether the status line, with no message of its own, says what the run's LLM calls cost:
+    /// from opening until the first key or click.
+    pub show_cost: bool,
     pub should_quit: bool,
     /// The name each file goes by in the list.
     pub labels: HashMap<String, String>,
@@ -105,6 +109,7 @@ impl Model {
             undo: Vec::new(),
             notes,
             status: None,
+            show_cost: true,
             should_quit: false,
             area: Rect::default(),
             scroll: 0,
@@ -150,9 +155,22 @@ impl Model {
                 EDIT_KEYS,
                 layout::width(layout::PROMPT) + layout::EDIT_FIELD,
             ),
-            None => (HELP, self.status.as_deref().map_or(0, layout::width)),
+            None => (
+                HELP,
+                self.status_text(status).map_or(0, |s| layout::width(&s)),
+            ),
         };
         layout::right_shown(status, items, left).then_some(items)
+    }
+
+    /// What the status line `status` says: its message, else what the run's LLM calls cost while
+    /// [`Model::show_cost`] holds, as much of it as fits beside `? help`.
+    pub fn status_text(&self, status: Rect) -> Option<String> {
+        match &self.status {
+            Some(message) => Some(message.clone()),
+            None if self.show_cost => cost_status(&self.run.spent, status),
+            None => None,
+        }
     }
 
     /// The name a file goes by in the list (see [`labels`]).
@@ -522,6 +540,31 @@ fn words(s: &str) -> Vec<Range<usize>> {
         out.push(st..s.len());
     }
     out
+}
+
+/// What the run's LLM calls cost, for the status line `status`: all of it if it fits beside
+/// `? help`, else without the tokens, else the price alone, which is what it is there for. The
+/// shortest when none fits. `None` with no calls recorded.
+fn cost_status(spent: &Spent, status: Rect) -> Option<String> {
+    let calls = spent.calls_part()?;
+    let (tokens, price) = (spent.tokens_part(), spent.price_part());
+    let shapes = [
+        vec![Some(calls.clone()), tokens, price.clone()],
+        vec![Some(calls), price.clone()],
+        vec![price],
+    ];
+    let lines: Vec<String> = shapes
+        .into_iter()
+        .filter_map(|parts| {
+            let parts: Vec<String> = parts.into_iter().flatten().collect();
+            (!parts.is_empty()).then(|| format!("LLM: {}", parts.join(" · ")))
+        })
+        .collect();
+    lines
+        .iter()
+        .find(|line| layout::right_shown(status, HELP, layout::width(line)))
+        .or(lines.last())
+        .cloned()
 }
 
 /// A small run for the review's tests: the OP lyric "trough" in E01, E02 and E03, and one other

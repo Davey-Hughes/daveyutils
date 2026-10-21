@@ -5,11 +5,13 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
 - `subcheck extract` writes a subtitle track out the way mkvextract does, reading only the
   subtitle packets (through the file's Cues) instead of the whole file.
 - `subcheck scan` sends the English lines to an LLM and records each suggested fix in a run file
-  under `~/.local/state/subcheck/`, with each track `timing` finds shifted. `--run <run>` adds to
-  that run only the checks it lacks: the timing check, say, for a run made before it existed. An
-  LLM check the cache has from another run of the unchanged file is not made again.
+  under `~/.local/state/subcheck/`, with each track `timing` finds shifted, and what each LLM call
+  used ([LLM costs](#llm-costs)). `--run <run>` adds to that run only the checks it lacks: the
+  timing check, say, for a run made before it existed. An LLM check the cache has from another
+  run of the unchanged file is not made again.
 - `subcheck review` steps through a run's fixes to accept, reject or reword each one.
-- `subcheck list` prints a run's fixes as text; `--mpv` adds a command that opens each one.
+- `subcheck list` prints a run's fixes as text, under what its LLM calls cost; `--mpv` adds a
+  command that opens each one.
 - `subcheck apply` makes a run's accepted fixes in the MKV files, keeping each original as
   `<name>.mkv.orig`: a file's typos and timing fixes in one remux, each shifted line moved by whole
   frames on the video's frame grid. Needs mkvtoolnix.
@@ -47,13 +49,46 @@ filter, to the next row).
 | ← → | mpv back or forward 5 s |
 | `,` `.` | mpv back or forward 1 s |
 | `[` `]` | mpv back or forward one frame (it stays paused) |
-| `?` | show every key, in a box over the list; `q` quits from it, any other key closes it |
+| `?` | show every key, and what the run's LLM calls cost, in a box over the list; `q` quits from it, any other key closes it |
 | `q` | quit, closing the mpv window review started |
 
 The mouse works too. Click a row to select it, and double-click to open it in mpv. The wheel moves
 the selection over the list and scrolls the detail pane. `? help` at the end of the status line, and
 the editor's `⏎ accept · Esc cancel` there, are clickable. Since review takes the mouse, select text
 in the terminal with Shift+drag.
+
+## LLM costs
+
+A scan records in its run file what each LLM call used, retries and failed calls too, and after
+its summary says what its calls cost. `list` says it for the whole run under its first line, and
+review in `?`'s box and on the status line as it opens, until the first key or click (as much as
+fits beside `? help`: the tokens go first, then the calls, keeping the price):
+
+```
+LLM: 98 calls, 1.23M in / 31.2k out tokens, $3.21 at API prices
+```
+
+- `claude` reports tokens and a price. The price is what the calls would cost at Anthropic's API
+  rates, not what a Claude subscription bills.
+- `gpt` (Codex) reports tokens only, so no price is shown: subcheck keeps no price list of its own
+  to go stale.
+- `ollama:<model>` and `--llm-cmd` report nothing, and nothing is shown; nor for a run made before
+  calls were recorded.
+
+The tokens in are all of each call's input, read from the prompt cache or not.
+
+Every call claude or codex started is counted, failed ones too. One that said nothing of what it
+used (killed at the 10-minute limit, failing with nothing on stdout, printing something other
+than its JSON, or JSON with no usage in it) is counted without numbers, and the sums leave it out;
+any call without a price makes the price a floor:
+
+```
+LLM: 99 calls (1 reported no usage), 1.21M in / 30.5k out tokens, at least $3.15 at API prices
+LLM: 200 calls (none reported usage)
+```
+
+A failed call's error is the exit status and stderr, then what the backend's JSON says of it:
+`claude exited with exit status: 1; claude said: You've hit your session limit`.
 
 ## Keeping focus in the terminal
 

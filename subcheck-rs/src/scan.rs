@@ -3,7 +3,7 @@
 //!
 //! One reader thread reads files in order (the array's disks are the bottleneck, so never two at
 //! once), `-j` workers run the LLM, and the calling thread collects: it appends a file's records
-//! the moment every one of that file's lines has an answer.
+//! the moment every one of that file's lines has an answer, and each LLM call's usage as it comes.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -14,11 +14,11 @@ use std::thread;
 use jiff::Timestamp;
 
 use crate::blocks::{self, ReadPath};
-use crate::llm::{self, Backend, Suggestion};
+use crate::llm::{self, Answer, Backend, Spent, Suggestion, Usage, Used};
 use crate::mkv::{self, Layout, TRACK_TYPE_SUBTITLE, Track, Truncated};
 use crate::store::{
-    self, Cache, CacheEntry, Check, CheckedWith, FileRecord, Finding, Record, Run, RunHeader,
-    RunWriter, TrackRecord,
+    self, Cache, CacheEntry, Check, CheckedWith, FileRecord, Finding, LlmCall, Record, Run,
+    RunHeader, RunWriter, TrackRecord,
 };
 use crate::subs::Kind;
 use crate::text::{self, Event, Line};
@@ -39,7 +39,7 @@ pub struct Options {
     pub into: Option<PathBuf>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Summary {
     pub run: String,
     pub files: usize,
@@ -53,6 +53,8 @@ pub struct Summary {
     pub changed: usize,
     /// With `--run`: files whose LLM check is in another run, and was not made again.
     pub elsewhere: usize,
+    /// What this scan's LLM calls used.
+    pub spent: Spent,
 }
 
 /// `paths` expanded to MKV files: files as given, directories walked recursively for `*.mkv`
@@ -461,9 +463,17 @@ pub fn dry_run(
     Ok(())
 }
 
+/// A chunk on its way to a worker, with the file whose lines it carries.
+struct Queued {
+    chunk: Chunk,
+    file: Arc<str>,
+}
+
 struct ChunkDone {
     id: usize,
     result: Result<Vec<Suggestion>, String>,
+    /// Each call made for it to count (see [`ask`]).
+    calls: Vec<LlmCall>,
 }
 
 struct FileJob {
@@ -478,32 +488,49 @@ enum Msg {
 }
 
 /// One chunk through the LLM: two attempts, where a failed run and an unreadable reply both
-/// count as failures.
-fn ask(backend: &Backend, lines: &[Line]) -> Result<Vec<Suggestion>, String> {
+/// count as failures. Also each call to count, with what it used when its backend said: a failed
+/// one costs too.
+fn ask(backend: &Backend, lines: &[Line]) -> (Result<Vec<Suggestion>, String>, Vec<Option<Usage>>) {
     let refs: Vec<&Line> = lines.iter().collect();
     let prompt = llm::prompt(&refs);
+    let mut calls = Vec::new();
     let mut last = String::new();
     for _ in 0..2 {
-        match llm::run(&backend.argv, &prompt, llm::TIMEOUT)
-            .and_then(|reply| llm::parse(&reply, &refs))
-        {
-            Ok(reply) => return Ok(reply.suggestions),
+        let Answer { reply, used } = backend.call(&prompt, llm::TIMEOUT);
+        match used {
+            Used::Reported(usage) => calls.push(Some(usage)),
+            Used::Unreported => calls.push(None),
+            Used::Untracked => {}
+        }
+        match reply.and_then(|reply| llm::parse(&reply, &refs)) {
+            Ok(reply) => return (Ok(reply.suggestions), calls),
             Err(e) => last = e,
         }
     }
-    Err(last)
+    (Err(last), calls)
 }
 
 /// A worker: runs chunks through the LLM until the queue closes or the collector hangs up.
-fn work(backend: &Backend, queue: &Mutex<mpsc::Receiver<Chunk>>, out: &mpsc::Sender<Msg>) {
+fn work(backend: &Backend, queue: &Mutex<mpsc::Receiver<Queued>>, out: &mpsc::Sender<Msg>) {
     loop {
         let next = queue.lock().map(|rx| rx.recv());
-        let Ok(Ok(chunk)) = next else { return };
-        let result = ask(backend, &chunk.lines);
+        let Ok(Ok(Queued { chunk, file })) = next else {
+            return;
+        };
+        let (result, used) = ask(backend, &chunk.lines);
+        let calls = used
+            .into_iter()
+            .map(|usage| LlmCall {
+                file: file.to_string(),
+                lines: chunk.lines.len(),
+                usage,
+            })
+            .collect();
         if out
             .send(Msg::Chunk(ChunkDone {
                 id: chunk.id,
                 result,
+                calls,
             }))
             .is_err()
         {
@@ -513,7 +540,7 @@ fn work(backend: &Backend, queue: &Mutex<mpsc::Receiver<Chunk>>, out: &mpsc::Sen
 }
 
 /// The reader: files in order, each one's new lines queued as chunks, then the file itself.
-fn read(todo: &[Todo], opts: &Options, queue: &mpsc::SyncSender<Chunk>, out: &mpsc::Sender<Msg>) {
+fn read(todo: &[Todo], opts: &Options, queue: &mpsc::SyncSender<Queued>, out: &mpsc::Sender<Msg>) {
     let mut chunker = Chunker::new(opts.chunk_lines);
     for (path, checks) in todo {
         let prepared = prepare(path, &opts.langs, checks);
@@ -522,8 +549,10 @@ fn read(todo: &[Todo], opts: &Options, queue: &mpsc::SyncSender<Chunk>, out: &mp
         } else {
             (Vec::new(), Vec::new())
         };
-        for c in chunks {
-            if queue.send(c).is_err() {
+        let file: Arc<str> = path.to_string_lossy().into();
+        for chunk in chunks {
+            let file = Arc::clone(&file);
+            if queue.send(Queued { chunk, file }).is_err() {
                 return;
             }
         }
@@ -569,6 +598,7 @@ pub fn resume(
             label: header.backend.clone(),
             argv: Vec::new(),
             chunk_lines: llm::CHUNK_LINES,
+            output: llm::Output::Text,
         }),
     };
     // A run from before the languages were kept: as the cache recorded them; with nothing to say,
@@ -868,7 +898,7 @@ pub fn run(
     thread::scope(|scope| -> anyhow::Result<()> {
         // Created inside the scope so an early return drops the receivers: workers and the
         // reader then fail their next send and stop, instead of running the rest of the queue.
-        let (queue_tx, queue_rx) = mpsc::sync_channel::<Chunk>(opts.jobs.max(1) * 2);
+        let (queue_tx, queue_rx) = mpsc::sync_channel::<Queued>(opts.jobs.max(1) * 2);
         let queue_rx = Arc::new(Mutex::new(queue_rx));
         let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
         for _ in 0..opts.jobs.max(1) {
@@ -905,6 +935,14 @@ impl Collector<'_> {
             match msg {
                 Msg::File(job) => self.waiting.push(*job),
                 Msg::Chunk(c) => {
+                    // Written as they come, so a scan cut short still says what it used.
+                    if !c.calls.is_empty() {
+                        for call in &c.calls {
+                            self.summary.spent.add(call.usage.as_ref());
+                        }
+                        let records: Vec<Record> = c.calls.into_iter().map(Record::Usage).collect();
+                        self.writer.append(&records)?;
+                    }
                     self.answers.insert(c.id, c.result);
                 }
             }

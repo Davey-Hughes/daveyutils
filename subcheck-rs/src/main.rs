@@ -299,6 +299,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 "run {}: {} files, {} checked, {} failed, {} unchanged since an earlier scan; {} findings{of_timing}",
                 s.run, s.files, s.checked, s.failed, s.cached, s.findings
             );
+            if let Some(spent) = s.spent.line(", ") {
+                eprintln!("{spent}");
+            }
             eprintln!(
                 "Review them with: subcheck review {} (or print them: subcheck list {0})",
                 s.run
@@ -387,6 +390,9 @@ fn continued(s: &scan::Summary) -> ExitCode {
         s.failed,
         s.findings
     );
+    if let Some(spent) = s.spent.line(", ") {
+        eprintln!("{spent}");
+    }
     eprintln!(
         "Review them with: subcheck review {} (or print them: subcheck list {0})",
         s.run

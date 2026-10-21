@@ -46,6 +46,9 @@ pub fn render(run: &Run, filter: Filter, mpv: bool) -> String {
         },
         failed.len()
     );
+    if let Some(spent) = run.spent.line(", ") {
+        let _ = writeln!(out, "{spent}");
+    }
     let mut current = "";
     for f in &shown {
         if f.file != current {
@@ -341,6 +344,28 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("mpv "));
+    }
+
+    #[test]
+    fn what_the_runs_llm_calls_cost_follows_its_line_when_they_were_recorded() {
+        let mut r = run();
+        // A run from before calls were recorded, or one whose LLM reports nothing.
+        let text = render(&r, Filter::All, false);
+        assert!(!text.contains("LLM"), "{text}");
+        r.spent.add(Some(&crate::llm::Usage {
+            input_tokens: 1_234_567,
+            output_tokens: 31_234,
+            cost_usd: Some(3.21),
+            ..crate::llm::Usage::default()
+        }));
+        let text = render(&r, Filter::All, false);
+        assert!(
+            text.starts_with(
+                "Run 2026-10-17T14-03-22 (?): 1 files, 2 findings, 0 failed\n\
+                 LLM: 1 call, 1.23M in / 31.2k out tokens, $3.21 at API prices\n\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
