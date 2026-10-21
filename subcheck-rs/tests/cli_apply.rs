@@ -259,6 +259,8 @@ fn a_dry_run_says_what_would_change_and_writes_nothing() {
         !text.contains("hear."),
         "a rejected finding is not a fix: {text}"
     );
+    // Its tracks are written as they are: none early.
+    assert!(!text.contains("past the centisecond"), "{text}");
     assert!(
         text.contains(
             "    track 2: {\\i1}Ihave{\\i0} to go.\n         now: {\\i1}I have{\\i0} to go.\n"
@@ -487,8 +489,14 @@ fn a_fix_on_a_track_whose_times_its_format_cannot_keep_is_left_for_a_hand_fix() 
         expected("timed.track0.srt").replace("tehre", "there")
     );
     assert_eq!(track(&s.file, 1), expected("timed.track1.ass"));
+}
 
-    // A track timed to the millisecond: nothing left to make, so no remux, and the file as it was.
+#[test]
+fn a_track_whose_every_time_is_whole_ms_past_the_centisecond_is_written_early_and_synced_back() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // Every time in track 0 is 7 ms past the centisecond, which its .ass cannot hold.
     let s = Setup::with(
         "ass-sync7.mkv",
         &[(
@@ -499,25 +507,100 @@ fn a_fix_on_a_track_whose_times_its_format_cannot_keep_is_left_for_a_hand_fix() 
         )],
         0,
     );
+    let said = "  track 0: every time is 7 ms past the centisecond: its .ass is written 7 ms early and remuxed with --sync 0:7\n";
+    let fixed = std::fs::read_to_string(fixture("expected/ass-sync7.track0.ass"))
+        .unwrap()
+        .replace("in the file", "in this file");
+    // For a remux elsewhere: the command it prints puts the times back too.
+    let out = s.root.join("tracks");
+    let o = s.apply(&["--tracks-only", out.to_str().unwrap()]);
+    let text = stdout(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(text.contains(said), "{text}");
+    let command = text.lines().find(|l| l.starts_with("  mkvmerge ")).unwrap();
+    assert!(command.contains(" '--sync' '0:7' "), "{command}");
+    assert_eq!(
+        std::fs::read_to_string(out.join("ass-sync7.track0.ass")).unwrap(),
+        fixed
+    );
+    // Made here, in one remux the check passes.
+    let o = s.apply(&[]);
+    let text = stdout(&o);
+    assert!(
+        o.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(text.contains("  0:00:30.00  the → this  ok\n"), "{text}");
+    assert!(text.contains(said), "{text}");
+    assert!(
+        text.ends_with(
+            "applied 1, already applied 0, by hand 0, not found 0; 1 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+    assert_eq!(track(&s.file, 0), fixed);
+    // Every line starts and lasts as it did.
+    let times = |file: &Path| -> Vec<(i64, Option<u64>)> {
+        let (r, layout) = subcheck::mkv::open(file).unwrap();
+        assert_eq!(layout.timestamp_scale, 1_000_000);
+        let number = layout.tracks[0].number;
+        subcheck::blocks::read_tracks(&r, &layout, &[number], true).unwrap()[0]
+            .blocks
+            .iter()
+            .map(|b| (b.timestamp, b.duration))
+            .collect()
+    };
+    assert_eq!(times(&s.file), times(&fixture("ass-sync7.mkv")));
+    // Run again, it finds the fix in, and has nothing to write.
+    let o = s.apply(&[]);
+    let text = stdout(&o);
+    assert!(
+        text.ends_with(
+            "applied 0, already applied 1, by hand 0, not found 0; 0 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains(said), "{text}");
+}
+
+#[test]
+fn a_track_past_the_centisecond_by_different_amounts_is_left_for_a_hand_fix_with_no_remux() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // ass-sync7's line at 30.007 moved to 30.003 (its Cluster's timestamp), so not every time is
+    // 7 ms past the centisecond: no `--sync` puts them all back.
+    let s = Setup::with(
+        "ass-sync7.mkv",
+        &[(
+            "Default",
+            "Out of order in the file",
+            "Out of order in this file",
+            &[(0, 30_003, 31_003)],
+        )],
+        0,
+    );
+    let mut bytes = std::fs::read(&s.file).unwrap();
+    patch(&mut bytes, b"\xE7\x82\x75\x37", 1, b"\xE7\x82\x75\x33");
+    std::fs::write(&s.file, &bytes).unwrap();
     let o = s.apply(&[]);
     let text = stdout(&o);
     assert!(o.status.success(), "{text}");
     assert!(
         text.contains(
-            "  by hand: track 0's .ass file cannot keep its times (0:00:01.007 is finer than centiseconds)\n"
+            "  by hand: track 0's .ass file cannot keep its times (0:00:30.003 is not 7 ms past the centisecond, as most lines' starts are)\n"
         ),
         "{text}"
     );
+    assert!(!text.contains("--sync"), "{text}");
     assert!(
         text.ends_with(
             "applied 0, already applied 0, by hand 1, not found 0; 0 remuxed, 0 failed\n"
         ),
         "{text}"
     );
-    assert_eq!(
-        std::fs::read(&s.file).unwrap(),
-        std::fs::read(fixture("ass-sync7.mkv")).unwrap()
-    );
+    assert_eq!(std::fs::read(&s.file).unwrap(), bytes);
 }
 
 /// The apply fixture's per-letter OP row ("go trough it", letters 20 px apart from x 200 in track

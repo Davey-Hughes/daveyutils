@@ -1,18 +1,39 @@
 //! Whether a fixed track can be written out exactly: its header as it is, and every line's times as
-//! the check after the remux expects them; and whether a file can be remuxed at all as it is. Where
-//! not, the fixes are left for a hand fix before any remux, rather than refused by the check after
-//! one.
+//! the check after the remux expects them, where need be with a `--sync` that puts back times its
+//! format cuts; and whether a file can be remuxed at all as it is. Where not, the fixes are left for
+//! a hand fix before any remux, rather than refused by the check after one.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 
 use super::patch;
 use super::remux;
+use super::shift;
 use super::verify;
 use crate::blocks::Block;
 use crate::mkv;
 use crate::subs::{self, Kind};
 use crate::text::timestamp_ms;
+
+/// How a track that can be written out exactly comes back: its written times `ms` milliseconds
+/// early, which the remux's `--sync` puts back (0: as written). An ASS track whose every time is the
+/// same few milliseconds past the centisecond is written cut to the centisecond, each time early by
+/// that much.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Early {
+    pub ms: i64,
+}
+
+impl Early {
+    pub const NONE: Early = Early { ms: 0 };
+
+    fn ns(self) -> i128 {
+        i128::from(self.ms) * MS
+    }
+}
+
+const MS: i128 = 1_000_000;
 
 /// Why a track cannot be written out exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +59,9 @@ pub enum Why {
     NoDuration(i128),
     /// A line (its start, ns) the writer does not write on its own.
     NotWritten(i128),
+    /// A start or end (ns) not as far past the centisecond as most lines' starts, which a `--sync`
+    /// putting that back would move.
+    Past(i128, Early),
 }
 
 impl fmt::Display for Unwritable {
@@ -75,43 +99,78 @@ impl fmt::Display for Unwritable {
                     exact(*ns)
                 )
             }
+            Why::Past(ns, early) => write!(
+                f,
+                "{} is not {} ms past the centisecond, as most lines' starts are",
+                exact(*ns),
+                early.ms
+            ),
         }?;
         f.write_str(")")
     }
 }
 
 /// Whether `track` can be written out exactly, each block at its times in `moved` (by block index:
-/// timestamp and duration, in TimestampScale units) where it has some there; then `file`, the
-/// file's verdict ([`remuxable`]), which judges its lines' bytes with every other track's.
+/// timestamp and duration, in TimestampScale units) where it has some there, and how; then `file`,
+/// the file's verdict ([`remuxable`]), which judges its lines' bytes with every other track's. A
+/// track most of whose lines start the same whole milliseconds past the centisecond is held to that
+/// offset, and its reason names the first time that is not that far past, or whatever else first
+/// keeps it from being written so.
 pub fn writable(
     track: &patch::Track,
     moved: &BTreeMap<usize, (i64, Option<u64>)>,
     file: Result<(), Unwritable>,
-) -> Result<(), Unwritable> {
+) -> Result<Early, Unwritable> {
     if !utf8(track.header) {
         return Err(Unwritable::HeaderNotUtf8 { track: track.id });
     }
     let default = verify::as_remuxed(track.default_duration, remux::SCALE);
-    for (i, b) in track.blocks.iter().enumerate() {
-        let at;
-        let b = match moved.get(&i) {
-            Some(&(timestamp, duration)) => {
-                at = Block {
-                    timestamp,
-                    duration,
-                    ..b.clone()
-                };
-                &at
-            }
-            None => b,
+    // At the times a timing fix moves them to, as they are written.
+    let blocks: Cow<[Block]> = if moved.is_empty() {
+        Cow::Borrowed(track.blocks)
+    } else {
+        let edits = patch::Edits {
+            times: moved.clone(),
+            ..patch::Edits::default()
         };
-        times(track, b, default).map_err(|why| Unwritable::Times {
-            track: track.id,
-            kind: track.kind,
-            why,
-        })?;
+        Cow::Owned(patch::edited(track.kind, track.blocks, &edits))
+    };
+    let exact = |early| {
+        blocks
+            .iter()
+            .try_for_each(|b| times(track, b, default, early))
+    };
+    let early = exact(Early::NONE).map(|()| Early::NONE).or_else(|why| {
+        match remainder(track, &blocks, default) {
+            Some(early) => exact(early).map(|()| early),
+            None => Err(why),
+        }
+    });
+    let early = early.map_err(|why| Unwritable::Times {
+        track: track.id,
+        kind: track.kind,
+        why,
+    })?;
+    file.map(|()| early)
+}
+
+/// The whole milliseconds (`--sync` takes no less) past what the format holds that more than half
+/// of `blocks` start, where that is not none: the one offset every line could share, which the
+/// others break. An SRT track, which holds milliseconds, has none.
+fn remainder(track: &patch::Track, blocks: &[Block], default: Option<i128>) -> Option<Early> {
+    let precision = shift::precision(track.kind);
+    let mut starts = [0_usize; 10];
+    for b in blocks {
+        let past = verify::expected(b, track.scale, default)
+            .0
+            .rem_euclid(precision);
+        if past % MS == 0 {
+            starts[usize::try_from(past / MS).expect("under 10")] += 1;
+        }
     }
-    file
+    (1..10_u8)
+        .find(|&ms| starts[usize::from(ms)] * 2 > blocks.len())
+        .map(|ms| Early { ms: i64::from(ms) })
 }
 
 /// Whether mkvmerge rewrites `track`'s lines that are not UTF-8 in a remux: any `S_TEXT` subtitle
@@ -149,24 +208,30 @@ fn utf8(bytes: &[u8]) -> bool {
     std::str::from_utf8(subs::c_bytes(bytes)).is_ok()
 }
 
-/// One block's times, as written, against what the check expects of them. `default`: the track's
-/// DefaultDuration as a remux writes it.
-fn times(track: &patch::Track, b: &Block, default: Option<i128>) -> Result<(), Why> {
+/// One block's times, as written and put back `early`, against what the check expects of them.
+/// `default`: the track's DefaultDuration as a remux writes it.
+fn times(track: &patch::Track, b: &Block, default: Option<i128>, early: Early) -> Result<(), Why> {
     let (start, duration) = verify::expected(b, track.scale, default);
     let Some(duration) = duration else {
         return Err(Why::NoDuration(start));
     };
-    let Some(written) = subs::written_times(track.kind, b, track.scale, track.default_duration)
+    let Some((at, lasts)) = subs::written_times(track.kind, b, track.scale, track.default_duration)
     else {
         return Err(Why::NotWritten(start));
     };
+    let written = (at + early.ns(), lasts);
     if written == (start, duration) {
         return Ok(());
     }
+    let off = if written.0 == start {
+        start + duration
+    } else {
+        start
+    };
     Err(match track.default_duration {
         Some(dd) if b.duration.is_none() && written.0 == start => Why::DefaultDuration(dd),
-        _ if written.0 != start => Why::Finer(start),
-        _ => Why::Finer(start + duration),
+        _ if early == Early::NONE => Why::Finer(off),
+        _ => Why::Past(off, early),
     })
 }
 
@@ -217,18 +282,23 @@ mod tests {
             scale: 1_000_000,
             default_duration,
             timing: patch::Timing::AsScanned,
-            writable: Ok(()),
+            writable: Ok(Early::NONE),
         }
     }
 
-    /// The verdict on one block's track, as its reason.
-    fn verdict(kind: Kind, b: Block, default_duration: Option<u64>) -> Result<(), String> {
-        let blocks = [b];
+    /// The verdict on one block's track: how many ms early it is written, or the reason.
+    fn verdict(kind: Kind, b: Block, default_duration: Option<u64>) -> Result<i64, String> {
+        lines(kind, &[b], default_duration)
+    }
+
+    /// The verdict on a track of `blocks`, as [`verdict`] gives it.
+    fn lines(kind: Kind, blocks: &[Block], default_duration: Option<u64>) -> Result<i64, String> {
         writable(
-            &track(kind, &blocks, default_duration),
+            &track(kind, blocks, default_duration),
             &BTreeMap::new(),
             Ok(()),
         )
+        .map(|e| e.ms)
         .map_err(|e| e.to_string())
     }
 
@@ -236,25 +306,27 @@ mod tests {
 
     #[test]
     fn times_the_format_keeps_pass() {
-        assert_eq!(verdict(Kind::Ass, block(1000, Some(1500)), None), Ok(()));
-        assert_eq!(verdict(Kind::Ssa, block(1000, Some(1500)), None), Ok(()));
-        assert_eq!(verdict(Kind::Srt, block(1007, Some(1499)), None), Ok(()));
+        assert_eq!(verdict(Kind::Ass, block(1000, Some(1500)), None), Ok(0));
+        assert_eq!(verdict(Kind::Ssa, block(1000, Some(1500)), None), Ok(0));
+        assert_eq!(verdict(Kind::Srt, block(1007, Some(1499)), None), Ok(0));
         // 25 fps lines last 40 ms, which both keep; 2 s lines too.
-        assert_eq!(verdict(Kind::Ass, block(0, None), Some(40_000_000)), Ok(()));
+        assert_eq!(verdict(Kind::Ass, block(0, None), Some(40_000_000)), Ok(0));
         assert_eq!(
             verdict(Kind::Srt, block(0, None), Some(2_000_000_000)),
-            Ok(())
+            Ok(0)
         );
         // A line of no length: a remux writes it a BlockDuration of 0 (mkvmerge 102).
-        assert_eq!(verdict(Kind::Ass, block(1000, Some(0)), None), Ok(()));
+        assert_eq!(verdict(Kind::Ass, block(1000, Some(0)), None), Ok(0));
     }
 
     #[test]
     fn a_time_finer_than_the_format_is_said_with_its_track() {
+        // 7 ms past the centisecond, after a line on it.
+        let blocks = [block(1000, Some(1500)), block(3007, Some(1000))];
         assert_eq!(
-            verdict(Kind::Ass, block(1007, Some(1500)), None),
+            lines(Kind::Ass, &blocks, None),
             Err(
-                "track 1's .ass file cannot keep its times (0:00:01.007 is finer than centiseconds)"
+                "track 1's .ass file cannot keep its times (0:00:03.007 is finer than centiseconds)"
                     .into()
             )
         );
@@ -293,7 +365,7 @@ mod tests {
             );
         }
         // A line with a BlockDuration of its own is held to that, not to the DefaultDuration.
-        assert_eq!(verdict(Kind::Srt, block(0, Some(42)), FRAME), Ok(()));
+        assert_eq!(verdict(Kind::Srt, block(0, Some(42)), FRAME), Ok(0));
     }
 
     #[test]
@@ -340,7 +412,7 @@ mod tests {
         let blocks = [block(0, Some(1000)), cafe];
         assert_eq!(
             writable(&track(Kind::Ass, &blocks, None), &BTreeMap::new(), Ok(())),
-            Ok(())
+            Ok(Early::NONE)
         );
     }
 
@@ -433,12 +505,16 @@ mod tests {
         let fine = [block(1000, Some(1000))];
         let t = track(Kind::Ass, &fine, None);
         assert_eq!(writable(&t, &BTreeMap::new(), Err(other)), Err(other));
-        let finer = [block(1007, Some(1000))];
+        let finer = [block(1007, Some(1000)), block(2003, Some(1000))];
         let t = track(Kind::Ass, &finer, None);
         assert!(matches!(
             writable(&t, &BTreeMap::new(), Err(other)),
             Err(Unwritable::Times { .. })
         ));
+        // One written early: the file's verdict still holds.
+        let early = [block(1007, Some(1000))];
+        let t = track(Kind::Ass, &early, None);
+        assert_eq!(writable(&t, &BTreeMap::new(), Err(other)), Err(other));
     }
 
     #[test]
@@ -447,8 +523,140 @@ mod tests {
         let blocks = [block(1000, Some(1000)), block(2047, Some(1000))];
         let t = track(Kind::Ass, &blocks, None);
         let moved = BTreeMap::from([(1, (2000, Some(1000)))]);
-        assert_eq!(writable(&t, &moved, Ok(())), Ok(()));
+        assert_eq!(writable(&t, &moved, Ok(())), Ok(Early::NONE));
         let moved = BTreeMap::from([(0, (960, Some(1000)))]);
         assert!(writable(&t, &moved, Ok(())).is_err());
+    }
+
+    #[test]
+    fn a_track_whose_every_time_is_the_same_whole_ms_past_the_centisecond_is_written_that_early() {
+        let at7 = [
+            block(1007, Some(1500)),
+            block(12_347, Some(1660)),
+            // No length: both its ends are 7 ms past.
+            block(20_007, Some(0)),
+            block(30_007, Some(1000)),
+        ];
+        assert_eq!(lines(Kind::Ass, &at7, None), Ok(7));
+        assert_eq!(lines(Kind::Ssa, &at7, None), Ok(7));
+        // 3 ms past, at 100 µs units.
+        let blocks = [block(10_030, Some(15_000)), block(20_030, Some(9_000))];
+        let t = patch::Track {
+            scale: 100_000,
+            ..track(Kind::Ass, &blocks, None)
+        };
+        assert_eq!(writable(&t, &BTreeMap::new(), Ok(())), Ok(Early { ms: 3 }));
+    }
+
+    #[test]
+    fn a_track_not_all_one_whole_ms_offset_past_the_centisecond_says_which_line_breaks_it() {
+        let reason = |why: &str| Err(format!("track 1's .ass file cannot keep its times ({why})"));
+        let off = |at: &str| {
+            reason(&format!(
+                "{at} is not 7 ms past the centisecond, as most lines' starts are"
+            ))
+        };
+        // 7 ms past, but one line 3.
+        let mut mixed: Vec<Block> = (1..=99).map(|s| block(s * 1000 + 7, Some(1000))).collect();
+        mixed[49] = block(50_003, Some(1000));
+        assert_eq!(lines(Kind::Ass, &mixed, None), off("0:00:50.003"));
+        // One on the centisecond.
+        mixed[49] = block(50_000, Some(1000));
+        assert_eq!(lines(Kind::Ass, &mixed, None), off("0:00:50.000"));
+        // A start 7 ms past whose end is on the centisecond.
+        let end = [block(1007, Some(1493))];
+        assert_eq!(lines(Kind::Ass, &end, None), off("0:00:02.500"));
+        // A line 7 ms past with no duration, which a remux gives one.
+        let none = [block(1007, Some(1500)), block(3007, None)];
+        assert_eq!(
+            lines(Kind::Ass, &none, None),
+            reason("the line at 0:00:03.007 has no duration")
+        );
+        // Lines 7 ms past lasting a 23.976 fps frame.
+        assert_eq!(
+            verdict(Kind::Ass, block(1007, None), FRAME),
+            reason("its lines last the DefaultDuration, 41.708333 ms")
+        );
+    }
+
+    #[test]
+    fn a_track_most_of_whose_lines_start_no_one_whole_ms_offset_past_the_centisecond_keeps_its_reason()
+     {
+        let finer = |ext: &str, at: &str, precision: &str| {
+            Err(format!(
+                "track 1's .{ext} file cannot keep its times ({at} is finer than {precision})"
+            ))
+        };
+        // A first line on the centisecond, a later one 7 ms past: half each.
+        let later = [block(1000, Some(1000)), block(2007, Some(1000))];
+        assert_eq!(
+            lines(Kind::Ass, &later, None),
+            finer("ass", "0:00:02.007", "centiseconds")
+        );
+        // A first line 7 ms past, the rest on the centisecond.
+        let first = [
+            block(1007, Some(1000)),
+            block(2000, Some(1000)),
+            block(3000, Some(1000)),
+            block(4000, Some(1000)),
+        ];
+        assert_eq!(
+            lines(Kind::Ass, &first, None),
+            finer("ass", "0:00:01.007", "centiseconds")
+        );
+        // 7.4 ms past: `--sync` takes whole ms.
+        let blocks = [block(10_074, Some(15_000))];
+        let t = patch::Track {
+            scale: 100_000,
+            ..track(Kind::Ass, &blocks, None)
+        };
+        assert_eq!(
+            writable(&t, &BTreeMap::new(), Ok(()))
+                .map(|e| e.ms)
+                .map_err(|e| e.to_string()),
+            finer("ass", "0:00:01.0074", "centiseconds")
+        );
+        // SRT holds milliseconds: no whole-ms offset is any use to it.
+        assert_eq!(
+            verdict(Kind::Srt, block(1007, None), FRAME),
+            Err("track 1's .srt file cannot keep its times (its lines last the DefaultDuration, 41.708333 ms)".into())
+        );
+    }
+
+    #[test]
+    fn a_timing_fix_moving_some_lines_of_a_track_written_early_leaves_two_offsets() {
+        let blocks = [block(1007, Some(1000)), block(2007, Some(1000))];
+        let t = track(Kind::Ass, &blocks, None);
+        // Moved onto the centisecond, one line: the other is still 7 ms past.
+        let moved = BTreeMap::from([(1, (1960, Some(1000)))]);
+        assert!(matches!(
+            writable(&t, &moved, Ok(())),
+            Err(Unwritable::Times { .. })
+        ));
+        // Every line: none is past.
+        let moved = BTreeMap::from([(0, (960, Some(1000))), (1, (1960, Some(1000)))]);
+        assert_eq!(writable(&t, &moved, Ok(())), Ok(Early::NONE));
+        // Two of four: half are on it, so the track is held to no offset, judged at its moved times.
+        let blocks = [
+            block(1007, Some(1000)),
+            block(2007, Some(1000)),
+            block(3007, Some(1000)),
+            block(4007, Some(1000)),
+        ];
+        let t = track(Kind::Ass, &blocks, None);
+        let moved = BTreeMap::from([(2, (2460, Some(1000))), (3, (960, Some(1000)))]);
+        assert_eq!(
+            writable(&t, &moved, Ok(())).map_err(|e| e.to_string()),
+            Err(
+                "track 1's .ass file cannot keep its times (0:00:01.007 is finer than centiseconds)"
+                    .into()
+            )
+        );
+        // Three of four 7 ms past: held to that, the moved line breaks it.
+        let moved = BTreeMap::from([(3, (960, Some(1000)))]);
+        assert_eq!(
+            writable(&t, &moved, Ok(())).map_err(|e| e.to_string()),
+            Err("track 1's .ass file cannot keep its times (0:00:00.960 is not 7 ms past the centisecond, as most lines' starts are)".into())
+        );
     }
 }

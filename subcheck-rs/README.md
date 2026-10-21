@@ -189,7 +189,12 @@ the centisecond (ASS). Where that would change a time, a fix on that track is le
 before any remux, and the output names the first such time: an ASS track timed to the
 millisecond, say, or events that last a 23.976 fps default duration (41.708 ms, which a remux
 rounds to 42, SRT writes as 41 and ASS as 40). A timing fix that moves every such event onto the
-format's precision is made. The file's other fixes are made either way.
+format's precision is made. The file's other fixes are made either way. An ASS or SSA track whose
+every time is the same whole milliseconds past the centisecond (a mux 7 ms late, say) is made: its
+`.ass` (or `.ssa`) holds each time that much early, and the remux puts them back with `--sync`, which the
+output says. Where most of its lines start the same whole milliseconds past, the output names the
+first time that is not that far past (a start or an end), or whatever else first keeps the track
+from being written so.
 
 `--no-backup` keeps no original. `--dry-run` shows each changed event before and after, and writes
 nothing. Running apply again is safe: a fix already in its file is reported and left alone.

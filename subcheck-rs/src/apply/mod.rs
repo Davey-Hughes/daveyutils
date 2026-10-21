@@ -263,11 +263,13 @@ struct Original<'a> {
     read: &'a BTreeMap<usize, &'a [Block]>,
 }
 
-/// A track with fixes: the original's header, and its blocks as patched.
+/// A track with fixes: the original's header, its blocks as patched, and how early its written times
+/// come back ([`exact::writable`]).
 struct Fixed<'a> {
     track: &'a Track,
     kind: Kind,
     patched: Vec<Block>,
+    early: exact::Early,
 }
 
 impl Job<'_> {
@@ -327,7 +329,7 @@ impl Job<'_> {
                     scale: layout.timestamp_scale,
                     default_duration: t.default_duration,
                     timing: patch::Timing::AsScanned,
-                    writable: Ok(()),
+                    writable: Ok(exact::Early::NONE),
                 };
                 view.writable = exact::writable(&view, &BTreeMap::new(), file);
                 view
@@ -339,16 +341,21 @@ impl Job<'_> {
         note_tags(&r, &layout, &chosen, &plan, out)?;
         let fixed: Vec<Fixed> = chosen
             .iter()
-            .filter_map(|t| {
+            .zip(&views)
+            .filter_map(|(t, view)| {
                 let edits = plan.edits.get(&t.id)?;
                 let kind = Kind::of(t).expect("a text subtitle track");
                 Some(Fixed {
                     track: t,
                     kind,
                     patched: patch::edited(kind, read[&t.id], edits),
+                    early: view
+                        .writable
+                        .expect("a track is edited only where it can be written"),
                 })
             })
             .collect();
+        note_early(&fixed, out)?;
         let original = Original {
             r: &r,
             layout: &layout,
@@ -682,6 +689,7 @@ impl Job<'_> {
                 id: f.track.id,
                 file,
                 tags,
+                sync_ms: f.early.ms,
             });
         }
         Ok(files)
@@ -889,6 +897,23 @@ fn note_tags(
                 ),
             )?;
         }
+    }
+    Ok(())
+}
+
+/// In every mode, the dry run included: each fixed track written early, which the remux's `--sync`
+/// puts back.
+fn note_early(fixed: &[Fixed], out: &mut impl Write) -> Result<(), String> {
+    for f in fixed.iter().filter(|f| f.early != exact::Early::NONE) {
+        let ms = f.early.ms;
+        say(
+            out,
+            &format!(
+                "track {}: every time is {ms} ms past the centisecond: its .{} is written {ms} ms early and remuxed with --sync 0:{ms}",
+                f.track.id,
+                f.kind.extension()
+            ),
+        )?;
     }
     Ok(())
 }

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
-use super::exact::Unwritable;
+use super::exact::{Early, Unwritable};
 use super::karaoke::{self, Align, Letter, Widths};
 use super::shift::{self, Shifts};
 use crate::blocks::Block;
@@ -69,9 +69,9 @@ pub struct Track<'a> {
     pub default_duration: Option<u64>,
     /// Where its typos are, by its timing fix.
     pub timing: Timing<'a>,
-    /// Whether it can be written out exactly ([`exact::writable`](super::exact::writable)): where
-    /// it cannot, a fix on it is left for a hand fix.
-    pub writable: Result<(), Unwritable>,
+    /// Whether it can be written out exactly, and how ([`exact::writable`](super::exact::writable)):
+    /// where it cannot, a fix on it is left for a hand fix.
+    pub writable: Result<Early, Unwritable>,
 }
 
 /// Where a track's typos are, by its timing fix.
@@ -380,9 +380,10 @@ impl Context<'_> {
 
 /// Nothing, where `track` can be written out exactly; else its fixes' outcome, a hand fix.
 fn writable(track: &Track) -> Result<(), Outcome> {
-    track
-        .writable
-        .map_err(|why| Outcome::ByHand(why.to_string()))
+    match track.writable {
+        Ok(_) => Ok(()),
+        Err(why) => Err(Outcome::ByHand(why.to_string())),
+    }
 }
 
 /// The events of `track` at occurrence `o`'s time, in its fix's style: the line is among them. In a
@@ -982,7 +983,7 @@ mod tests {
             scale: 1_000_000,
             default_duration: None,
             timing: Timing::AsScanned,
-            writable: Ok(()),
+            writable: Ok(Early::NONE),
         }
     }
 

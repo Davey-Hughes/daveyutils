@@ -68,6 +68,7 @@ fn fix(original: &Path, dir: &Path, typos: &[(usize, &str, &str)]) -> (Fixed, Ve
             id,
             file,
             tags: None,
+            sync_ms: 0,
         });
     }
     (blocks, files)

@@ -15,13 +15,15 @@ use crate::ebml;
 use crate::group;
 use crate::mkv::{self, Encoding, Layout, Track};
 
-/// A track taken from a file of its own: its mkvmerge ID in the original, the patched file, and
-/// its own tags as mkvmerge's XML, if it has any (mkvmerge drops a left-out track's tags).
+/// A track taken from a file of its own: its mkvmerge ID in the original, the patched file, its own
+/// tags as mkvmerge's XML, if it has any (mkvmerge drops a left-out track's tags), and how many
+/// milliseconds early the file's times are, which `--sync` puts back (0: none).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Replacement {
     pub id: usize,
     pub file: PathBuf,
     pub tags: Option<PathBuf>,
+    pub sync_ms: i64,
 }
 
 /// mkvmerge's arguments for remuxing `original` (whose layout is `layout`) to `output`, with each
@@ -54,6 +56,10 @@ pub fn args(
         for (option, value) in track_options(track, languages.get(&track.uid)) {
             out.push(option.into());
             out.push(format!("0:{value}").into());
+        }
+        if r.sync_ms != 0 {
+            out.push("--sync".into());
+            out.push(format!("0:{}", r.sync_ms).into());
         }
         if let Some(tags) = &r.tags {
             out.push("--tags".into());
@@ -419,16 +425,19 @@ mod tests {
     #[test]
     fn replaced_tracks_keep_their_place_and_properties() {
         let (path, layout) = fixture();
+        // Track 3's file is 7 ms early, which `--sync` puts back.
         let replaced = [
             Replacement {
                 id: 3,
                 file: PathBuf::from("/t/3.ass"),
                 tags: Some(PathBuf::from("/t/3.tags.xml")),
+                sync_ms: 7,
             },
             Replacement {
                 id: 4,
                 file: PathBuf::from("/t/4.srt"),
                 tags: None,
+                sync_ms: 0,
             },
         ];
         let a: Vec<String> = args(
@@ -465,6 +474,8 @@ mod tests {
             "0:zlib",
             "--sub-charset",
             "0:UTF-8",
+            "--sync",
+            "0:7",
             "--tags",
             "0:/t/3.tags.xml",
             "/t/3.ass",
