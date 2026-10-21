@@ -9,7 +9,7 @@ pub mod remux;
 pub mod shift;
 pub mod verify;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
@@ -22,7 +22,7 @@ use crate::mkv::{self, Layout, Track};
 use crate::review::model::changed;
 use crate::store::{self, Applied, Finding, Record, RunWriter};
 use crate::subs::{self, Kind};
-use crate::text::timestamp;
+use crate::text::{timestamp, timestamp_ms};
 use patch::{Fix, Outcome};
 use remux::Replacement;
 use shift::{Grid, Lines, Shifts};
@@ -255,6 +255,70 @@ struct Done {
     remuxed: bool,
 }
 
+/// How far after its time a video frame may be stored: one shown before a keyframe can come after
+/// it, in the next Cluster.
+const REORDER_NS: i128 = 1_000_000_000;
+
+/// Frames less than this apart are read in one walk of the video's Clusters.
+const SPAN_GAP_NS: i128 = 10_000_000_000;
+
+/// The stored times of `frames`, each exactly between two stored times on `grid`, read from the
+/// first video track's Clusters around them: by frame, in frame order. A frame found at neither
+/// time is left out, and its moves stay unsure. Clusters that do not read are an error, as in the
+/// check's audio spans.
+fn stored(
+    r: &crate::ebml::Reader,
+    layout: &Layout,
+    grid: &Grid,
+    frames: &BTreeSet<i128>,
+) -> Result<Vec<(i128, i128)>, String> {
+    let mut found = Vec::new();
+    let Some(video) = layout
+        .tracks
+        .iter()
+        .find(|t| t.kind == mkv::TRACK_TYPE_VIDEO)
+    else {
+        return Ok(found);
+    };
+    // Each span, its frames with their two times, is walked once.
+    let mut spans: Vec<Vec<(i128, [i128; 2])>> = Vec::new();
+    for &n in frames {
+        let times = grid.either(n);
+        match spans.last_mut() {
+            Some(span)
+                if span
+                    .last()
+                    .is_some_and(|(_, t)| times[0] - t[1] < SPAN_GAP_NS) =>
+            {
+                span.push((n, times));
+            }
+            _ => spans.push(vec![(n, times)]),
+        }
+    }
+    for span in spans {
+        let (from, to) = (span[0].1[0], span[span.len() - 1].1[1]);
+        let read = blocks::frames_between(r, layout, from, to + REORDER_NS, &[video.number])
+            .map_err(|e| {
+                let at = timestamp_ms(i64::try_from(from / 1_000_000).unwrap_or(i64::MAX));
+                format!("the video's frames from {at}: {e}")
+            })?;
+        let times: HashSet<i128> = read
+            .get(&video.number)
+            .into_iter()
+            .flatten()
+            .filter_map(|f| f.time_ns)
+            .collect();
+        for (n, [earlier, later]) in span {
+            match (times.contains(&earlier), times.contains(&later)) {
+                (true, false) => found.push((n, earlier)),
+                (false, true) => found.push((n, later)),
+                _ => {}
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// The original file, and the blocks read of its `S_TEXT` tracks ([`exact::rewritten`]), by track
 /// ID.
 struct Original<'a> {
@@ -335,7 +399,8 @@ impl Job<'_> {
                 view
             })
             .collect();
-        let (plan, grid) = self.plan(&mut views, &layout, file);
+        let mut known = Vec::new();
+        let (plan, grid) = self.plan(&mut views, &r, &layout, file, &mut known)?;
         self.report(&plan, &views, grid.as_ref(), out)
             .map_err(|e| e.to_string())?;
         note_tags(&r, &layout, &chosen, &plan, out)?;
@@ -374,18 +439,43 @@ impl Job<'_> {
 
     /// Both kinds of fix: the timing fixes first, as a track remuxed with its timing fix has its
     /// typos at their times shifted. And the file's frame grid, where it has timing fixes and one.
-    /// `file`: whether the file can be remuxed as it is ([`exact::remuxable`]).
+    /// `file`: whether the file can be remuxed as it is ([`exact::remuxable`]). `known` holds the
+    /// stored times the file gives the frames the keyframes leave at either of two: the
+    /// keyframes' own, in the Cues, and those the fixes turn on, read from `r`.
     fn plan<'v>(
         &'v self,
         views: &mut [patch::Track<'v>],
+        r: &crate::ebml::Reader,
         layout: &Layout,
         file: Result<(), exact::Unwritable>,
-    ) -> (patch::Plan, Option<Grid>) {
+        known: &'v mut Vec<(i128, i128)>,
+    ) -> Result<(patch::Plan, Option<Grid<'v>>), String> {
         if self.timing.is_empty() {
-            return (patch::plan(views, self.fixes, self.karaoke), None);
+            return Ok((patch::plan(views, self.fixes, self.karaoke), None));
         }
-        let grid = crate::timing::video(layout).and_then(|v| Grid::fit(&v, layout.timestamp_scale));
-        let mut shifted = self.shift(views, &grid);
+        let video = crate::timing::video(layout);
+        let fit = video
+            .as_ref()
+            .map_err(String::clone)
+            .and_then(|v| Grid::fit(v, layout.timestamp_scale));
+        if let (Ok(video), Ok(grid)) = (&video, &fit) {
+            *known = grid.cued(video);
+        }
+        let cued = fit.clone().map(|g| g.knowing(known));
+        let mut shifted = self.shift(views, &cued);
+        let unsure = self.unsure(views, &cued, &shifted);
+        let read = match &cued {
+            Ok(grid) if !unsure.is_empty() => stored(r, layout, grid, &unsure)?,
+            _ => Vec::new(),
+        };
+        let again = !read.is_empty();
+        known.extend(read);
+        known.sort_unstable();
+        let known: &'v Vec<(i128, i128)> = known;
+        let grid = fit.map(|g| g.knowing(known));
+        if again {
+            shifted = self.shift(views, &grid);
+        }
         // A track its timing fix moves is written at the new times. One that cannot be written out
         // exactly so gets neither the shift nor (as its view says) its typo fixes.
         for (f, p) in self.timing.iter().zip(&mut shifted) {
@@ -423,7 +513,42 @@ impl Job<'_> {
             }
             plan.outcomes.push((f.id, p.outcome));
         }
-        (plan, grid.ok())
+        Ok((plan, grid.ok()))
+    }
+
+    /// The frames whose stored times, read from the file, may settle the timing fixes: those
+    /// their plans name, and those of the lines a typo is on, on a track its timing fix moved or
+    /// may read as moved once they are read, where it is looked for at the line's times shifted.
+    fn unsure(
+        &self,
+        views: &[patch::Track],
+        grid: &Result<Grid, String>,
+        shifted: &[shift::Plan],
+    ) -> BTreeSet<i128> {
+        let Ok(grid) = grid else {
+            return BTreeSet::new();
+        };
+        let mut frames: BTreeSet<i128> = shifted.iter().flat_map(|p| p.unsure.clone()).collect();
+        for (f, p) in self.timing.iter().zip(shifted) {
+            let fix = timing_fix(f);
+            let Some(view) = views.iter().find(|v| v.id == fix.track) else {
+                continue;
+            };
+            let moved = match p.lines {
+                Lines::Moved => true,
+                Lines::Unsure => !p.unsure.is_empty(),
+                Lines::AsScanned => false,
+            };
+            if !moved {
+                continue;
+            }
+            let shifts = Shifts::new(fix, *grid, view.kind);
+            let typos = self.fixes.iter().flat_map(|x| &x.finding.occurrences);
+            for o in typos.filter(|o| o.track == fix.track) {
+                frames.extend(shifts.times(o.start_ms, o.end_ms).err().unwrap_or_default());
+            }
+        }
+        frames
     }
 
     /// Each timing fix's plan on its track, on the file's frame grid (or why it has none).
@@ -433,6 +558,7 @@ impl Job<'_> {
             outcome,
             times: Vec::new(),
             lines: Lines::Unsure,
+            unsure: Vec::new(),
         };
         self.timing
             .iter()
@@ -566,7 +692,7 @@ impl Job<'_> {
                     .iter()
                     .flat_map(|s| s.first.iter().chain(&s.last));
                 for l in ends {
-                    let Some((start, end)) = shifts.times(l.start_ms, l.end_ms) else {
+                    let Ok(Some((start, end))) = shifts.times(l.start_ms, l.end_ms) else {
                         continue;
                     };
                     let t = |ms| time(view.kind, ms);

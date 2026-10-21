@@ -1224,6 +1224,82 @@ fn shifted_tracks_written_remuxed_elsewhere_then_checked() {
 }
 
 #[test]
+fn a_timing_fix_reads_the_frames_the_keyframes_leave_at_either_of_two_times() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // Every 24th frame half a millisecond past one, stored at the later early on and at the
+    // earlier later, keyframes among both: where five lines go turns on frames 29, 989 and 1469,
+    // which the file has at 1210, 41249 and 61269 ms.
+    let s = Setup::scanned("ties.mkv");
+    let o = s.apply(&[]);
+    let text = stdout(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(
+        text.contains("  track 1  1 frame late → shift 1 frame earlier  ok (33 events moved)\n"),
+        "{text}"
+    );
+    let now = track(&s.file, 1);
+    for line in [
+        "0:00:01.06,0:00:01.21,Default,,0,0,0,,Ends just after a frame.",
+        "0:00:41.21,0:00:41.45,Default,,0,0,0,,Starts on a frame stored early.",
+        "0:00:41.25,0:00:41.26,Default,,0,0,0,,Shown on no frame.",
+        "0:01:01.19,0:01:01.23,Default,,0,0,0,,Shown on a frame stored early.",
+        "0:01:01.21,0:01:01.26,Default,,0,0,0,,The last line.",
+    ] {
+        assert!(now.contains(&format!("Dialogue: 0,{line}\n")), "{now}");
+    }
+    let report = timing(&s.file);
+    assert!(
+        report.contains("track 1  Dialogue a frame late  in sync"),
+        "{report}"
+    );
+    // The last line, which says whether the fix is in, is where frame 1469's time put it.
+    let text = stdout(&s.apply(&[]));
+    assert!(
+        text.ends_with(
+            "applied 0, already applied 1, by hand 0, not found 0; 0 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+    // Typos found before the shift on two lines whose moves turn on frame 989: each is looked
+    // for where frame 989's time put its line, one moved and one left where it was.
+    s.add(&s.file, TIES_TYPOS, 2);
+    // No backup: the first remux's original is still there.
+    let o = s.apply(&["--no-backup"]);
+    let text = stdout(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(
+        text.ends_with(
+            "applied 2, already applied 1, by hand 0, not found 0; 1 remuxed, 0 failed\n"
+        ),
+        "{text}"
+    );
+    let now = track(&s.file, 1);
+    for line in [
+        "0:00:41.21,0:00:41.45,Default,,0,0,0,,Starts on a frame stored early!",
+        "0:00:41.25,0:00:41.26,Default,,0,0,0,,Shown on no frame!",
+    ] {
+        assert!(now.contains(&format!("Dialogue: 0,{line}\n")), "{now}");
+    }
+}
+
+const TIES_TYPOS: &[Line] = &[
+    (
+        "Default",
+        "Starts on a frame stored early.",
+        "Starts on a frame stored early!",
+        &[(1, 41_250, 41_500)],
+    ),
+    (
+        "Default",
+        "Shown on no frame.",
+        "Shown on no frame!",
+        &[(1, 41_250, 41_260)],
+    ),
+];
+
+#[test]
 fn a_timing_fix_that_cannot_be_made_is_left_for_a_hand_fix() {
     // A file whose video has too few keyframes to give the frame grid.
     let s = Setup::with("apply.mkv", &[], 0);

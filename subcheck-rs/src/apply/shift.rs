@@ -25,15 +25,20 @@ pub fn fixes(run: &Run) -> Vec<&Finding> {
 /// ms is stored a millisecond lower than its plain rounding, and a time a millisecond past it reads
 /// as the frame before. In ticks of `1/den` ns.
 #[derive(Debug, Clone, Copy)]
-pub struct Grid {
+pub struct Grid<'a> {
     phase: i128,
     frame: i128,
     den: i128,
     /// TimestampScale, in ns.
     scale: i128,
-    /// The phases that put every keyframe on a frame, `[lo, hi)`; `phase` is their middle.
+    /// The phases that put every keyframe on a frame, `[lo, hi)`; `phase` is their middle. Where
+    /// none does, `lo == hi`: the one phase that puts them all on frames if a frame exactly
+    /// between two stored times may be stored at either, as their stored times say it is.
     lo: i128,
     hi: i128,
+    /// Such frames' stored times as the file gives them, by frame (ns), in frame order: a
+    /// keyframe's in the Cues ([`Grid::cued`]), another's read from its Cluster.
+    known: &'a [(i128, i128)],
 }
 
 /// Frame rates whose frame duration is no whole number of nanoseconds, as (frames, seconds): a
@@ -54,10 +59,10 @@ const RATES: [(i128, i128); 13] = [
     (120, 1),
 ];
 
-impl Grid {
+impl Grid<'_> {
     /// The grid of `video`'s frames, timestamps at `scale`; an error when no phase puts every
     /// keyframe on a frame (the frames are on no one grid, or not at the DefaultDuration).
-    pub fn fit(video: &Video, scale: u64) -> Result<Grid, String> {
+    pub fn fit(video: &Video, scale: u64) -> Result<Grid<'static>, String> {
         let frame_ns = i128::from(video.frame_ns.max(1));
         let (frame, den) = RATES
             .iter()
@@ -66,7 +71,11 @@ impl Grid {
             .unwrap_or((frame_ns, 1));
         let scale = i128::from(scale.max(1));
         let first = video.keyframes_ns.first().map_or(0, |&k| i128::from(k));
-        // Each keyframe stored at `k` was at a time in [k - scale/2, k + scale/2).
+        // Each keyframe stored at `k` was at a time in [k - scale/2, k + scale/2). Or at k +
+        // scale/2, where the keyframes show the mux stores such a time either way: S;G 0's
+        // Valentine's special has every 24th frame exactly half a millisecond past one, stored at
+        // the later up to 21:43 and at the earlier after. Keyframes that fit a range of phases
+        // say nothing of that, and the frames are taken to be rounded half up, as mkvmerge does.
         let (mut lo, mut hi) = (i128::MIN, i128::MAX);
         for &k in &video.keyframes_ns {
             let k = i128::from(k);
@@ -74,7 +83,7 @@ impl Grid {
             lo = lo.max((k * 2 - scale) * den / 2 - n * frame);
             hi = hi.min((k * 2 + scale) * den / 2 - n * frame);
         }
-        if lo >= hi {
+        if lo > hi {
             return Err("the video's keyframes are on no one frame grid".into());
         }
         Ok(Grid {
@@ -84,14 +93,58 @@ impl Grid {
             scale,
             lo,
             hi,
+            known: &[],
         })
+    }
+
+    /// This grid, with `known` frames' stored times as the file gives them: each one exactly
+    /// between two stored times, at either ([`Grid::either`]). In frame order.
+    pub fn knowing<'k>(&self, known: &'k [(i128, i128)]) -> Grid<'k> {
+        Grid { known, ..*self }
+    }
+
+    /// `video`'s keyframes exactly between two stored times, with the times the Cues give them.
+    pub fn cued(&self, video: &Video) -> Vec<(i128, i128)> {
+        video
+            .keyframes_ns
+            .iter()
+            .map(|&k| (self.frame_of(i128::from(k)), i128::from(k)))
+            .filter(|&(n, k)| self.is_tie(n) && self.either(n).contains(&k))
+            .collect()
     }
 
     /// Frame `n`'s time, in ns.
     fn at(&self, n: i128) -> i128 {
+        self.given(n).unwrap_or_else(|| self.rounded(n))
+    }
+
+    /// Frame `n`'s time as the file gives it, if it does.
+    fn given(&self, n: i128) -> Option<i128> {
+        let i = self.known.binary_search_by_key(&n, |&(k, _)| k).ok()?;
+        Some(self.known[i].1)
+    }
+
+    /// Frame `n`'s time at the phase, rounded half up.
+    fn rounded(&self, n: i128) -> i128 {
         let t = self.phase + n * self.frame;
         let unit = self.den * self.scale;
         (t * 2 + unit).div_euclid(unit * 2) * self.scale
+    }
+
+    /// Whether frame `n` is exactly between two stored times at the one phase, so stored at
+    /// either, and not known from the file.
+    fn is_tie(&self, n: i128) -> bool {
+        let below = Grid {
+            phase: self.phase - 1,
+            ..*self
+        };
+        self.lo == self.hi && self.given(n).is_none() && below.rounded(n) != self.rounded(n)
+    }
+
+    /// The two times frame `n`, exactly between them, may be stored at: the earlier first.
+    pub fn either(&self, n: i128) -> [i128; 2] {
+        let later = self.rounded(n);
+        [later - self.scale, later]
     }
 
     /// The frame a line starting or ending at `x` starts or stops showing on: the first at or after
@@ -103,22 +156,50 @@ impl Grid {
         // rises, so the least such n is the frame, however many frames share one stored time.
         let ceil = |a: i128, b: i128| -(-a).div_euclid(b);
         let k = ceil(x, self.scale);
-        ceil(
+        let mut n = ceil(
             (2 * k - 1) * self.den * self.scale - 2 * self.phase,
             2 * self.frame,
-        )
+        );
+        // One read at the earlier of its two times may come before `x`.
+        while self.at(n) < x {
+            n += 1;
+        }
+        n
+    }
+
+    /// The frames `x` may be on ([`Grid::frame_of`]): the first with each frame exactly between
+    /// two stored times, and not read from the file, at the later; the second with them at the
+    /// earlier.
+    pub fn frames_of(&self, x: i128) -> [i128; 2] {
+        let first = self.frame_of(x);
+        let mut last = first;
+        while self.is_tie(last) && self.at(last) - self.scale < x {
+            last += 1;
+        }
+        [first, last]
     }
 
     /// `x` moved `frames` frames earlier (later when negative), to the same place in its new
     /// frame, rounded to `precision` and kept inside that frame: rounding never makes it another.
     /// Never before 0: a line at the very start stays there.
     pub fn moved(&self, x: i128, frames: i64, precision: i128) -> i128 {
-        let n = self.frame_of(x);
+        self.moved_with(&[], x, frames, precision)
+    }
+
+    /// [`Grid::moved`], with each frame in `down`, one exactly between two stored times, stored
+    /// at the earlier.
+    fn moved_with(&self, down: &[i128], x: i128, frames: i64, precision: i128) -> i128 {
+        let at = |n| self.at(n) - if down.contains(&n) { self.scale } else { 0 };
+        // A frame stored earlier may come before `x`, and the next be the first at or after it.
+        let mut n = self.frame_of(x);
+        while at(n) < x {
+            n += 1;
+        }
         let m = n - i128::from(frames);
-        let y = x - (self.at(n) - self.at(m));
+        let y = x - (at(n) - at(m));
         let rounded = (y + precision / 2).div_euclid(precision) * precision;
         // The multiples of `precision` in (T(m-1), T(m)]: none when a frame is shorter than that.
-        let (lo, hi) = (self.at(m - 1), self.at(m));
+        let (lo, hi) = (at(m - 1), at(m));
         let first = lo.div_euclid(precision) * precision + precision;
         let last = hi.div_euclid(precision) * precision;
         let kept = if first <= last {
@@ -129,18 +210,41 @@ impl Grid {
         kept.max(0)
     }
 
-    /// [`Grid::moved`], when every phase the keyframes allow moves `x` to the same time; `None`
-    /// when they leave it a millisecond apart. Keyframes that all sit at one place in a
-    /// millisecond (a fixed GOP's at 23.976 fps) pin the phase only to within one.
-    pub fn moved_surely(&self, x: i128, frames: i64, precision: i128) -> Option<i128> {
-        let moved = self.moved(x, frames, precision);
+    /// The frames moving `x` reads (n-1, n, m-1 and m), and those another phase, or a frame stored
+    /// at the earlier of two times, may make them instead.
+    fn read_by(&self, x: i128, frames: i64) -> Vec<i128> {
         let n = self.frame_of(x);
         let m = n - i128::from(frames);
-        // The move reads frames n-1, n, m-1 and m, each of which another phase may make a frame
-        // either way: one phase from each stretch where none of their stored times changes.
+        let mut read: Vec<i128> = (n - 2..=n + 1).chain(m - 2..=m + 1).collect();
+        read.sort_unstable();
+        read.dedup();
+        read
+    }
+
+    /// Of `frames`, those stored at either of two times ([`Grid::is_tie`]).
+    fn ties(&self, frames: &[i128]) -> Vec<i128> {
+        frames.iter().copied().filter(|&k| self.is_tie(k)).collect()
+    }
+
+    /// The frames whose stored times, read from the file, may settle where moving `x` takes it
+    /// when [`Grid::moved_surely`] cannot tell: those it reads exactly between two stored times.
+    pub fn unsure(&self, x: i128, frames: i64) -> Vec<i128> {
+        self.ties(&self.read_by(x, frames))
+    }
+
+    /// [`Grid::moved`], when every phase the keyframes allow moves `x` to the same time; `None`
+    /// when they leave it a millisecond apart. Keyframes that all sit at one place in a
+    /// millisecond (a fixed GOP's at 23.976 fps) pin the phase only to within one. Keyframes
+    /// stored either way from half a millisecond past pin it exactly, but leave any other frame
+    /// that far past stored at either, unless read from the file.
+    pub fn moved_surely(&self, x: i128, frames: i64, precision: i128) -> Option<i128> {
+        let moved = self.moved(x, frames, precision);
+        let read = self.read_by(x, frames);
+        // Another phase may make each frame read a frame either way: one phase from each stretch
+        // where none of their stored times changes.
         let unit = self.den * self.scale;
         let mut phases = vec![self.lo];
-        for k in (n - 2..=n + 1).chain(m - 2..=m + 1) {
+        for &k in &read {
             // Frame k's stored time steps up where phase + k * frame + unit / 2 is a multiple of
             // `unit`: the first such phase above `lo`.
             let base = k * self.frame + unit / 2;
@@ -149,10 +253,19 @@ impl Grid {
                 phases.push(step);
             }
         }
-        phases
+        let every_phase = phases
             .into_iter()
-            .all(|phase| Grid { phase, ..*self }.moved(x, frames, precision) == moved)
-            .then_some(moved)
+            .all(|phase| Grid { phase, ..*self }.moved(x, frames, precision) == moved);
+        // At the one phase, every choice of the frames stored at either to be at the earlier.
+        let ties = self.ties(&read);
+        let every_choice = (0..1_u32 << ties.len()).all(|choice| {
+            let down: Vec<i128> = (0..ties.len())
+                .filter(|i| choice >> i & 1 == 1)
+                .map(|i| ties[i])
+                .collect();
+            self.moved_with(&down, x, frames, precision) == moved
+        });
+        (every_phase && every_choice).then_some(moved)
     }
 }
 
@@ -230,13 +343,13 @@ pub fn moves(fix: &TimingFix, start_ms: i64, end_ms: i64) -> bool {
 #[derive(Debug, Clone, Copy)]
 pub struct Shifts<'a> {
     pub fix: &'a TimingFix,
-    pub grid: Grid,
+    pub grid: Grid<'a>,
     pub precision: i128,
 }
 
 impl<'a> Shifts<'a> {
     /// `fix` on a track of `kind`, on the file's frame grid.
-    pub fn new(fix: &'a TimingFix, grid: Grid, kind: Kind) -> Shifts<'a> {
+    pub fn new(fix: &'a TimingFix, grid: Grid<'a>, kind: Kind) -> Shifts<'a> {
         Shifts {
             fix,
             grid,
@@ -253,20 +366,38 @@ impl<'a> Shifts<'a> {
     }
 
     /// Whether a line of these times is shown on a frame, or has no time to show: one that moves.
+    /// Where a frame exactly between two stored times, not read from the file, leaves that
+    /// unsure, whether it may be: the time on that frame or the next moves into one or the other,
+    /// so its move is unsure, and reads the frame ([`Grid::unsure`]).
     fn shown(&self, start_ms: i64, end_ms: i64) -> bool {
-        let frame = |t: i64| self.grid.frame_of(i128::from(t) * 1_000_000);
-        start_ms == end_ms || frame(start_ms) < frame(end_ms)
+        let frames = |t: i64| self.grid.frames_of(i128::from(t) * 1_000_000);
+        start_ms == end_ms || frames(start_ms)[0] < frames(end_ms)[1]
     }
 
-    /// A line's times (ms) after the shift; `None` when it does not move.
-    pub fn times(&self, start_ms: i64, end_ms: i64) -> Option<(i64, i64)> {
-        let s = self.stretch(start_ms, end_ms)?;
-        let at = |t: i64| {
-            ms(self
-                .grid
-                .moved(i128::from(t) * 1_000_000, s.frames, self.precision))
+    /// A line's times (ms) after the shift; `None` when it does not move. Where frames the
+    /// keyframes leave at either of two stored times, and the file has not given, leave where it
+    /// goes unsure, an error: those frames, which read would settle it ([`Grid::unsure`]).
+    pub fn times(&self, start_ms: i64, end_ms: i64) -> Result<Option<(i64, i64)>, Vec<i128>> {
+        let Some(s) = self.stretch(start_ms, end_ms) else {
+            return Ok(None);
         };
-        Some((at(start_ms), at(end_ms)))
+        let mut unsure = Vec::new();
+        let [start, end] = [start_ms, end_ms].map(|t| {
+            let x = i128::from(t) * 1_000_000;
+            // A move only the range of phases leaves unsure, with no frame to read, takes the
+            // middle phase's: a guess, which `plan` never makes, but the in-already check and a
+            // typo's lookup on a track moved some other way do.
+            let moved = self.grid.moved_surely(x, s.frames, self.precision);
+            ms(moved.unwrap_or_else(|| {
+                unsure.extend(self.grid.unsure(x, s.frames));
+                self.grid.moved(x, s.frames, self.precision)
+            }))
+        });
+        if unsure.is_empty() {
+            Ok(Some((start, end)))
+        } else {
+            Err(unsure)
+        }
     }
 }
 
@@ -278,6 +409,10 @@ pub struct Plan {
     pub times: Vec<(usize, i64, Option<u64>)>,
     /// Where its lines are, which says where the track's typos are.
     pub lines: Lines,
+    /// Frames whose stored times, read from the file, may settle a move the keyframes leave
+    /// unsure ([`Grid::unsure`]): of a line it moves, or of a stretch's first or last line, which
+    /// say whether it is in already.
+    pub unsure: Vec<i128>,
 }
 
 /// Where a timing fix's lines read on their track.
@@ -317,7 +452,7 @@ fn ends(
         if at(l.start_ms, l.end_ms) {
             Found::AsRecorded
         } else if shifts
-            .and_then(|s| s.times(l.start_ms, l.end_ms))
+            .and_then(|s| s.times(l.start_ms, l.end_ms).ok().flatten())
             .is_some_and(|(s, e)| at(s, e))
         {
             Found::Shifted
@@ -403,10 +538,17 @@ pub fn plan(fix: &TimingFix, track: &Track, grid: &Grid) -> Plan {
         .map(|(raw, s, e)| key(track.kind, raw, *s, *e))
         .collect();
     let checks = ends(fix, &keys, track.kind, Some(&shifts));
+    let at_ends: Vec<i128> = fix
+        .stretches
+        .iter()
+        .flat_map(|s| s.first.iter().chain(&s.last))
+        .flat_map(|l| shifts.times(l.start_ms, l.end_ms).err().unwrap_or_default())
+        .collect();
     let none = |outcome, lines| Plan {
         outcome,
         times: Vec::new(),
         lines,
+        unsure: at_ends.clone(),
     };
     if checks.is_empty() || checks.contains(&Found::Missing) {
         return none(Outcome::NotFound, Lines::Unsure);
@@ -420,14 +562,22 @@ pub fn plan(fix: &TimingFix, track: &Track, grid: &Grid) -> Plan {
     let hand = |why: &str| none(Outcome::ByHand(why.into()), Lines::AsScanned);
     let each = stretches(fix, track, &keys);
     let mut times = Vec::new();
+    // Each unsure move's frames, which may settle it: looked for in every line, so that the file
+    // is read for them once.
+    let mut sure = true;
+    let mut settle = Vec::new();
     for (i, k) in keys.iter().enumerate() {
         let Some(s) = each[i].filter(|_| shifts.shown(k.1, k.2)) else {
             continue;
         };
         let (start, end) = (i128::from(k.1) * 1_000_000, i128::from(k.2) * 1_000_000);
-        let moved = |x| grid.moved_surely(x, s.frames, shifts.precision);
-        let (Some(new_start), Some(new_end)) = (moved(start), moved(end)) else {
-            return hand("the keyframes do not fix the frame grid to the millisecond");
+        let moved = [start, end].map(|x| (x, grid.moved_surely(x, s.frames, shifts.precision)));
+        let [(_, Some(new_start)), (_, Some(new_end))] = moved else {
+            sure = false;
+            for (x, _) in moved.into_iter().filter(|(_, new)| new.is_none()) {
+                settle.extend(grid.unsure(x, s.frames));
+            }
+            continue;
         };
         // Rounded to the track's precision, a time in a frame shorter than that may land in
         // another; one at the very start stays there.
@@ -453,12 +603,18 @@ pub fn plan(fix: &TimingFix, track: &Track, grid: &Grid) -> Plan {
         let has_end = track.blocks[i].duration.is_some() || track.default_duration.is_some();
         times.push((i, timestamp, has_end.then_some(length)));
     }
+    if !sure {
+        let mut p = hand("the keyframes do not fix the frame grid to the millisecond");
+        p.unsure.extend(settle);
+        return p;
+    }
     Plan {
         outcome: Outcome::Shifted {
             events: times.len(),
         },
         times,
         lines: Lines::AsScanned,
+        unsure: at_ends,
     }
 }
 
@@ -466,6 +622,7 @@ pub fn plan(fix: &TimingFix, track: &Track, grid: &Grid) -> Plan {
 mod tests {
     use super::*;
     use crate::blocks::Block;
+    use std::collections::BTreeSet;
 
     /// 23.976 fps from 0, stored as K-On!! E09's frames are: frames 12022, 26180 and 30005 are
     /// keyframes, the last stored at 20:51.458 where plain rounding of 30005 frames of 1001/24 ms
@@ -477,7 +634,7 @@ mod tests {
         }
     }
 
-    fn e09_grid() -> Grid {
+    fn e09_grid() -> Grid<'static> {
         Grid::fit(&e09(), 1_000_000).unwrap()
     }
 
@@ -541,6 +698,96 @@ mod tests {
         );
     }
 
+    /// 23.976 fps less 1/24 ms, as S;G 0's Valentine's special is: every 24th frame from frame 5
+    /// is exactly half a millisecond past one, and stored a millisecond later up to 21:43 (frame
+    /// 173, at 7215.5 ms, at 7216) and earlier after (frame 32933, at 1373580.5 ms, at 1373580).
+    fn valentine() -> Video {
+        Video {
+            frame_ns: 41_708_333,
+            keyframes_ns: vec![0, 7_216_000_000, 1_373_580_000_000],
+        }
+    }
+
+    #[test]
+    fn keyframes_stored_either_way_from_a_half_millisecond_fit_the_one_phase_between() {
+        let grid = Grid::fit(&valentine(), 1_000_000).unwrap();
+        // 1/24 ms early, in ticks of 1/24000 ns.
+        assert_eq!((grid.lo, grid.hi), (-1_000_000_000, -1_000_000_000));
+        assert_eq!(grid.at(5), 209_000_000);
+        assert_eq!(grid.at(6), 250_000_000);
+        // Either keyframe a millisecond further from its frame: no phase fits.
+        let mut late = valentine();
+        late.keyframes_ns[1] += 1_000_000;
+        let mut early = valentine();
+        early.keyframes_ns[2] -= 1_000_000;
+        for off in [late, early] {
+            assert_eq!(
+                Grid::fit(&off, 1_000_000).map(|_| ()),
+                Err("the video's keyframes are on no one frame grid".into())
+            );
+        }
+    }
+
+    #[test]
+    fn a_time_whose_move_reads_a_frame_stored_either_way_is_moved_only_where_both_agree() {
+        let grid = Grid::fit(&valentine(), 1_000_000).unwrap();
+        // From frame 32934 (stored at 1373622) to 32933, at 1373580 or 1373581: to the
+        // millisecond, a time keeps its place in the frame a millisecond apart; to the
+        // centisecond, both are 1373550.
+        let x = 1_373_590_000_000;
+        assert_eq!(grid.moved_surely(x, 1, 1_000_000), None);
+        assert_eq!(grid.moved_surely(x, 1, CS), Some(1_373_550_000_000));
+        // Frame 29 is at 1209.5 ms: 1210 ms is on it stored at 1210, and on frame 30 stored at
+        // 1209. To the millisecond, the move to frame 28's 1168 is to 29's (1169 to 1209) too.
+        assert_eq!(grid.moved_surely(1_210_000_000, 1, CS), None);
+        assert_eq!(grid.moved_surely(1_210_000_000, 1, 1_000_000), None);
+        // A move that reads no such frame: 350 ms, on frame 9, to frame 8.
+        assert_eq!(grid.moved_surely(350_000_000, 1, CS), Some(310_000_000));
+    }
+
+    #[test]
+    fn keyframes_half_a_millisecond_past_a_frame_are_known_from_the_cues() {
+        let grid = Grid::fit(&valentine(), 1_000_000).unwrap();
+        let cued = grid.cued(&valentine());
+        assert_eq!(cued, [(173, 7_216_000_000), (32_933, 1_373_580_000_000)]);
+        // From frame 32934 to 32933, which the Cues have at 1373580: sure to the millisecond.
+        let x = 1_373_590_000_000;
+        assert_eq!(grid.moved_surely(x, 1, 1_000_000), None);
+        assert_eq!(
+            grid.knowing(&cued).moved_surely(x, 1, 1_000_000),
+            Some(1_373_548_000_000)
+        );
+        // Keyframes that leave a range of phases: none is either way.
+        assert_eq!(e09_grid().cued(&e09()), []);
+    }
+
+    #[test]
+    fn a_frame_read_from_the_file_settles_the_times_on_it() {
+        let grid = Grid::fit(&valentine(), 1_000_000).unwrap();
+        assert_eq!(grid.either(29), [1_209_000_000, 1_210_000_000]);
+        // 1210 ms is on frame 29 or 30 until the file says which, and its move turns on it.
+        let x = 1_210_000_000;
+        assert_eq!(grid.frames_of(x), [29, 30]);
+        assert_eq!(grid.unsure(x, 1), [29]);
+        let later = [(29, 1_210_000_000)];
+        let earlier = [(29, 1_209_000_000)];
+        assert_eq!(grid.knowing(&later).frames_of(x), [29, 29]);
+        assert_eq!(grid.knowing(&earlier).frames_of(x), [30, 30]);
+        assert_eq!(grid.knowing(&later).unsure(x, 1), []);
+        assert_eq!(
+            grid.knowing(&later).moved_surely(x, 1, CS),
+            Some(1_160_000_000)
+        );
+        assert_eq!(
+            grid.knowing(&earlier).moved_surely(x, 1, CS),
+            Some(1_170_000_000)
+        );
+        // Keyframes that leave a range of phases leave no frame at either of two times.
+        let x = 1_091_950_000_000;
+        assert_eq!(e09_grid().frames_of(x), [26_181, 26_181]);
+        assert_eq!(e09_grid().unsure(x, 1), []);
+    }
+
     #[test]
     fn a_long_film_is_on_the_exact_rate_not_the_default_duration() {
         // Two hours in, 41708333 ns a frame has drifted 67 µs from 1001/24 ms: no one phase fits
@@ -561,7 +808,7 @@ mod tests {
     }
 
     /// 25 fps, a keyframe every 2 s.
-    fn grid() -> Grid {
+    fn grid() -> Grid<'static> {
         let video = Video {
             frame_ns: 40_000_000,
             keyframes_ns: (0..=100).map(|i| i * 2_000_000_000).collect(),
@@ -791,6 +1038,53 @@ mod tests {
     }
 
     #[test]
+    fn lines_on_a_frame_stored_at_either_time_move_once_it_is_read() {
+        // Frames 29 and 269 are each half a millisecond past one on the Valentine's grid (1209.5
+        // and 11219.5 ms): line one ends a millisecond past 29's later time, and line two at
+        // 269's, so is shown on frame 269 or on none.
+        let grid = Grid::fit(&valentine(), 1_000_000).unwrap();
+        let blocks = [
+            block(0, 1100, 1250, "One."),
+            block(1, 11_180, 11_220, "Two."),
+        ];
+        let ends = (line(1100, 1250, "One."), line(11_180, 11_220, "Two."));
+        let fix = fix(vec![stretch(None, None, 1, Some(ends))], vec![]);
+        let p = plan(&fix, &track(&blocks), &grid);
+        assert_eq!(
+            p.outcome,
+            Outcome::ByHand("the keyframes do not fix the frame grid to the millisecond".into())
+        );
+        let unsure: BTreeSet<i128> = p.unsure.into_iter().collect();
+        assert_eq!(unsure, BTreeSet::from([29, 269]));
+        // Both at the later: line two is shown on no frame, and stays.
+        let later = [(29, 1_210_000_000), (269, 11_220_000_000)];
+        let p = plan(&fix, &track(&blocks), &grid.knowing(&later));
+        assert_eq!(p.times, [(0, 1060, Some(150))]);
+        // Both at the earlier: it is shown on frame 269, and moves to 268.
+        let earlier = [(29, 1_209_000_000), (269, 11_219_000_000)];
+        let p = plan(&fix, &track(&blocks), &grid.knowing(&earlier));
+        assert_eq!(p.times, [(0, 1060, Some(140)), (1, 11_140, Some(40))]);
+        // Moved so, the track reads as in only once they are read.
+        let moved: Vec<Block> = blocks
+            .iter()
+            .zip(&p.times)
+            .map(|(b, &(_, timestamp, duration))| Block {
+                timestamp,
+                duration,
+                ..b.clone()
+            })
+            .collect();
+        let p = plan(&fix, &track(&moved), &grid);
+        assert_eq!(p.outcome, Outcome::NotFound);
+        let unsure: BTreeSet<i128> = p.unsure.into_iter().collect();
+        assert_eq!(unsure, BTreeSet::from([29, 269]));
+        assert_eq!(
+            plan(&fix, &track(&moved), &grid.knowing(&earlier)).outcome,
+            Outcome::AlreadyApplied
+        );
+    }
+
+    #[test]
     fn a_line_timed_by_the_default_duration_reads_as_in_after_its_shift() {
         // 41.708 ms of DefaultDuration from 2039 ms: the scan records its end at 2080 ms, on the
         // frame; moved as that (not as 2080.708, a frame later), the re-run finds it.
@@ -915,13 +1209,13 @@ mod tests {
             vec![],
         );
         let shifts = Shifts::new(&partial, grid(), Kind::Ass);
-        assert_eq!(shifts.times(6040, 8040), Some((6000, 8000)));
-        assert_eq!(shifts.times(10_040, 12_040), None);
+        assert_eq!(shifts.times(6040, 8040), Ok(Some((6000, 8000))));
+        assert_eq!(shifts.times(10_040, 12_040), Ok(None));
         // A line left where it is stays at its times.
         let kept = fix(partial.stretches.clone(), vec![line(6040, 8040, "Two.")]);
         let shifts = Shifts::new(&kept, grid(), Kind::Ass);
-        assert_eq!(shifts.times(6040, 8040), None);
-        assert_eq!(shifts.times(2040, 4040), Some((2000, 4000)));
+        assert_eq!(shifts.times(6040, 8040), Ok(None));
+        assert_eq!(shifts.times(2040, 4040), Ok(Some((2000, 4000))));
     }
 
     /// A drawing (`\p1`): a line the scan does not read, so no stretch starts or ends on it.

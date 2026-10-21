@@ -406,12 +406,17 @@ fn occurrence<'e>(
             .collect()
     };
     let recorded = (o.start_ms, o.end_ms);
+    let unknown = || {
+        let why = "its track's timing fix leaves its time unknown";
+        Err(Outcome::ByHand(why.into()))
+    };
     let (start, end) = match track.timing {
-        Timing::Moved(s) => s.times(o.start_ms, o.end_ms).unwrap_or(recorded),
-        Timing::Unsure(t) if shift::moves(t, o.start_ms, o.end_ms) => {
-            let why = "its track's timing fix leaves its time unknown";
-            return Err(Outcome::ByHand(why.into()));
-        }
+        Timing::Moved(s) => match s.times(o.start_ms, o.end_ms) {
+            Ok(times) => times.unwrap_or(recorded),
+            // Moved by frames the keyframes leave at either of two times, the file not saying.
+            Err(_) => return unknown(),
+        },
+        Timing::Unsure(t) if shift::moves(t, o.start_ms, o.end_ms) => return unknown(),
         Timing::AsScanned | Timing::Unsure(_) => recorded,
     };
     Ok(at(start, end))
@@ -1113,6 +1118,59 @@ mod tests {
         };
         let p = plan(&[unsure(&in_sync)], std::slice::from_ref(&fix), false);
         assert_eq!(p.outcomes, [(1, Outcome::Patched)]);
+    }
+
+    #[test]
+    fn a_typo_on_a_line_moved_by_a_frame_stored_at_either_time_is_looked_for_once_it_is_read() {
+        use crate::store::{Basis, FixStretch, TimingFix};
+        use crate::timing::Video;
+        // 23.976 fps less 1/24 ms, keyframes half a millisecond past a frame stored both ways:
+        // frames 29 and 53 are at 1209.5 and 2210.5 ms, so a line at 1.21 to 2.21 s moves to
+        // where the file has them.
+        let video = Video {
+            frame_ns: 41_708_333,
+            keyframes_ns: vec![0, 7_216_000_000, 1_373_580_000_000],
+        };
+        let grid = super::super::shift::Grid::fit(&video, 1_000_000).unwrap();
+        let shift = TimingFix {
+            track: 0,
+            frame_ns: 41_708_333,
+            stretches: vec![FixStretch {
+                from_ms: None,
+                to_ms: None,
+                frames: 1,
+                first: None,
+                last: None,
+                frame_ms: None,
+            }],
+            unshifted: vec![],
+            basis: Basis::Cuts {
+                times: 2,
+                agreeing: 0,
+                windows: 0,
+            },
+        };
+        let f = finding(1, "D", "teh end", &[(0, 1210)]);
+        let fix = Fix {
+            finding: &f,
+            text: "the end".into(),
+        };
+        let blocks = [block(1160, 0, "D", "teh end")];
+        let plan_on = |grid| {
+            let t = Track {
+                timing: Timing::Moved(Shifts::new(&shift, grid, Kind::Ass)),
+                ..track(0, &blocks)
+            };
+            plan(&[t], std::slice::from_ref(&fix), false)
+        };
+        let why = "its track's timing fix leaves its time unknown";
+        assert_eq!(plan_on(grid).outcomes, [(1, Outcome::ByHand(why.into()))]);
+        // Both at the later: the line is at 1.16 to 2.16 s.
+        let later = [(29, 1_210_000_000), (53, 2_211_000_000)];
+        assert_eq!(
+            plan_on(grid.knowing(&later)).outcomes,
+            [(1, Outcome::Patched)]
+        );
     }
 
     #[test]

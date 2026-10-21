@@ -5,16 +5,16 @@
 #   dev/make-subcheck-fixtures.sh            # writes subcheck-rs/tests/fixtures/
 #   dev/make-subcheck-fixtures.sh OUT_DIR
 #
-# Needs mkvmerge, mkvextract, ffmpeg and jq. The output is committed, so neither CI nor `make check`
-# needs any of them: run this only to add or change a fixture. Output is deterministic (mkvmerge
-# --deterministic, ffmpeg bitexact), so rerunning it unchanged leaves `git status` clean.
+# Needs mkvmerge, mkvextract, mkvpropedit, ffmpeg and jq. The output is committed, so neither CI nor
+# `make check` needs any of them: run this only to add or change a fixture. Output is deterministic
+# (mkvmerge --deterministic, ffmpeg bitexact), so rerunning it unchanged leaves `git status` clean.
 #
 # Synthetic text only. The repository is public, so no real fansub lines go in here.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 out=${1:-subcheck-rs/tests/fixtures}
-for tool in mkvmerge mkvextract ffmpeg jq; do
+for tool in mkvmerge mkvextract mkvpropedit ffmpeg jq; do
   command -v "$tool" >/dev/null || { echo "error: $tool not found" >&2; exit 1; }
 done
 
@@ -190,6 +190,47 @@ mux -o "$out/timing.mkv" "$src/video-2fps.mkv" \
   --language 0:eng --track-name '0:Dialogue a frame late' --default-track-flag 0:no --sync 0:500 "$src/timing.ass" \
   --language 0:eng --track-name '0:Karaoke and effects' --default-track-flag 0:no "$src/timing-karaoke.ass" \
   --language 0:eng --track-name '0:Signs a frame late' --default-track-flag 0:no --sync 0:500 "$src/timing-signs.ass"
+
+# What apply is tested on where the keyframes leave frames' stored times to the file: S;G 0's
+# Valentine's special's video, in small. 23.976 fps less 1/24 ms, so every 24th frame from frame 5
+# is exactly half a millisecond past one, stored at the later before frame 840 and at the earlier
+# from it; keyframes on frame 0 and every 48th from frame 5, so on some of each. Its dialogue is a
+# frame late: a line on each keyframe to the next, starting and ending on the frame after. The five
+# lines after those each start or end on, or just after, one of the frames between keyframes that
+# are half a millisecond past (29, 989 and 1469): the third is shown on no frame, and the fourth on
+# one only because frame 1469 is stored early.
+ties_ms() { # frame N's stored time
+  local num=$((1001 * $1 - 1)) q r
+  ((num < 0)) && { echo 0; return; }
+  q=$((num / 24)) r=$((num % 24))
+  if ((r > 12 || (r == 12 && $1 < 840))); then echo $((q + 1)); else echo "$q"; fi
+}
+{
+  echo '# timestamp format v2'
+  for n in $(seq 0 1677); do ties_ms "$n"; done
+} >"$src/ties-video.txt"
+ffmpeg -nostdin -loglevel error -y -f lavfi -i color=c=black:s=64x36:r=24000/1001 -frames:v 1678 \
+  -c:v libx264 -preset ultrafast -crf 51 -g 1000 -sc_threshold 0 -threads 1 \
+  -force_key_frames 'expr:eq(n,0)+eq(mod(n,48),5)' \
+  -fflags +bitexact -flags:v +bitexact "$src/video-ties.mkv"
+# The latest centisecond on frame N.
+on_frame() { echo $(($(ties_ms "$1") / 10)); }
+{
+  timing_header
+  for i in $(seq 0 28); do
+    start=$(on_frame $((48 * i + 6))) end=$(on_frame $((48 * i + 54)))
+    printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,Line %d on the cut.\n' "$(ass_time "$start")" "$(ass_time "$end")" "$i"
+  done
+  printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,Ends just after a frame.\n' "$(ass_time 110)" "$(ass_time 125)"
+  printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,Starts on a frame stored early.\n' "$(ass_time 4125)" "$(ass_time 4150)"
+  printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,Shown on no frame.\n' "$(ass_time 4125)" "$(ass_time 4126)"
+  printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,Shown on a frame stored early.\n' "$(ass_time 6123)" "$(ass_time 6127)"
+  printf 'Dialogue: 0,%s,%s,Default,,0,0,0,,The last line.\n' "$(ass_time 6125)" "$(ass_time 6131)"
+} >"$src/ties.ass"
+mux -o "$out/ties.mkv" --timestamps "0:$src/ties-video.txt" "$src/video-ties.mkv" \
+  --language 0:eng --track-name '0:Dialogue a frame late' "$src/ties.ass"
+# mkvmerge gives the video the 42 ms its timestamps step by, and not 1001/24 ms, even when told.
+mkvpropedit --quiet "$out/ties.mkv" --edit track:v1 --set default-duration=41708333
 
 # What `subcheck apply` is tested on: everything a remux must keep (a title, chapters, an attachment,
 # an audio track with the commentary flag, a forced zlib track, a hearing-impaired SRT track) and a

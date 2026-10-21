@@ -231,6 +231,13 @@ output says. Where most of its lines start the same whole milliseconds past, the
 first time that is not that far past (a start or an end), or whatever else first keeps the track
 from being written so.
 
+A timing fix moves each line by whole frames on the frame grid the video's keyframes (its Cues)
+give, each time to the same place in its new frame. Some muxes store a frame exactly half a
+millisecond past one at either millisecond, both ways in one file. Where a line's move turns on
+such a frame, apply takes its time from the Cues if it is a keyframe, and otherwise reads it from
+the video around it; video there that does not read fails the file. A line still left a
+millisecond unsure leaves its fix for a hand fix, and so does a typo on it once the fix is in.
+
 `--no-backup` keeps no original. `--dry-run` shows each changed event before and after, and writes
 nothing. Running apply again is safe: a fix already in its file is reported and left alone.
 
