@@ -3,8 +3,9 @@
 //! and codex print their reply as JSON, with what the call used.
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -277,6 +278,24 @@ struct CodexError {
     message: String,
 }
 
+impl CodexError {
+    /// Its message, or the API's own where codex passes the API's error on as JSON
+    /// (`{"type":"error","status":400,"error":{"message":...}}` for a model the account cannot use);
+    /// `None` when it says nothing.
+    fn said(self) -> Option<String> {
+        #[derive(Deserialize)]
+        struct Api {
+            error: CodexError,
+        }
+        let message = match serde_json::from_str::<Api>(&self.message) {
+            Ok(api) if !api.error.message.trim().is_empty() => api.error.message,
+            _ => self.message,
+        };
+        let message = message.trim();
+        (!message.is_empty()).then(|| message.to_string())
+    }
+}
+
 impl Output {
     /// The reply and what the call used, from what the backend printed.
     pub fn read(self, stdout: &str) -> Answer {
@@ -400,8 +419,8 @@ fn read_codex(stdout: &str) -> Option<Said> {
                 sum.cache_read_tokens = add(sum.cache_read_tokens, u.cached_input_tokens);
                 sum.cache_write_tokens = add(sum.cache_write_tokens, u.cache_write_input_tokens);
             }
-            CodexEvent::TurnFailed { error: e } => failed = Some(e.message),
-            CodexEvent::Error(e) => error = Some(e.message),
+            CodexEvent::TurnFailed { error: e } => failed = e.said().or(failed),
+            CodexEvent::Error(e) => error = e.said().or(error),
             CodexEvent::ItemCompleted { .. } | CodexEvent::Other => {}
         }
     }
@@ -690,8 +709,12 @@ fn strip_echo<'a>(s: &'a str, line: &Line) -> &'a str {
 
 /// After the command exits, how long its output may take to end. Something it left running in the
 /// background and holding stdout gets this long, then its process group is killed: the reply is
-/// already complete by then.
+/// already complete by then. Something that left the group, out of reach of the kill, is left
+/// holding its pipe: what came by then is the output.
 const GRACE: Duration = Duration::from_secs(2);
+
+/// After the group is killed, how long the readers have to take what it wrote before it went.
+const DRAIN: Duration = Duration::from_millis(200);
 
 /// Why a command gave no reply, and what it printed on stdout all the same.
 #[derive(Debug)]
@@ -739,15 +762,49 @@ fn run(argv: &[String], input: &str, timeout: Duration) -> Result<String, Failed
     let writer = thread::spawn(move || {
         let _ = stdin.write_all(input.as_bytes());
     });
+    // Each pipe is read into a buffer kept here, so that what came can be taken without waiting
+    // for the read to end, which something holding the pipe open puts off. Once `run` has
+    // returned, the buffer with it, what comes is read and dropped.
     let reader = |mut pipe: Box<dyn Read + Send>| {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).into_owned()
-        })
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let into: Weak<Mutex<Vec<u8>>> = Arc::downgrade(&got);
+        let reading = thread::spawn(move || {
+            let mut buf = [0; 8192];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Some(into) = into.upgrade() {
+                            into.lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .extend_from_slice(&buf[..n]);
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        (reading, got)
     };
-    let stdout = reader(Box::new(child.stdout.take().expect("stdout was piped")));
-    let stderr = reader(Box::new(child.stderr.take().expect("stderr was piped")));
+    let (stdout, out) = reader(Box::new(child.stdout.take().expect("stdout was piped")));
+    let (stderr, err) = reader(Box::new(child.stderr.take().expect("stderr was piped")));
+    let take = |got: &Mutex<Vec<u8>>| {
+        let got = std::mem::take(&mut *got.lock().unwrap_or_else(PoisonError::into_inner));
+        String::from_utf8_lossy(&got).into_owned()
+    };
+    // The last line it said on stderr, after `: `; nothing for nothing.
+    let said = |err: &Mutex<Vec<u8>>| {
+        let err = take(err);
+        let last = err.lines().rev().find(|l| !l.trim().is_empty());
+        last.map_or_else(String::new, |l| format!(": {:.200}", l.trim()))
+    };
+    let ended = || stdout.is_finished() && stderr.is_finished();
+    let wait = |until: Instant| {
+        while !ended() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
     let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child
@@ -759,41 +816,32 @@ fn run(argv: &[String], input: &str, timeout: Duration) -> Result<String, Failed
         if Instant::now() >= deadline {
             group::kill(&child);
             let _ = child.wait();
+            wait(Instant::now() + DRAIN);
             // The pipe threads finish on their own once the group is gone; not joined, in case
             // something left the group and still holds a pipe.
-            let message = format!("{program} timed out after {}s", timeout.as_secs());
+            let message = format!(
+                "{program} timed out after {}s{}",
+                timeout.as_secs(),
+                said(&err)
+            );
             return Err(Failed::with_nothing(message, true));
         }
         thread::sleep(Duration::from_millis(50));
     };
-    let grace_end = Instant::now() + GRACE;
-    while !(stdout.is_finished() && stderr.is_finished()) && Instant::now() < grace_end {
-        thread::sleep(Duration::from_millis(20));
-    }
-    if !(stdout.is_finished() && stderr.is_finished()) {
+    wait(Instant::now() + GRACE);
+    if !ended() {
         group::kill(&child);
+        wait(Instant::now() + DRAIN);
     }
-    let _ = writer.join();
-    let out = stdout.join().unwrap_or_default();
-    let err = stderr.join().unwrap_or_default();
-    let last_err = err
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    // Neither the readers nor the writer is waited for: one still going is held up by something
+    // out of the group, and ends with it.
+    drop(writer);
+    let out = take(&out);
     if status.success() {
         Ok(out)
     } else {
-        // With nothing on stderr, no `: ` before nothing.
-        let said = if last_err.is_empty() {
-            String::new()
-        } else {
-            format!(": {last_err:.200}")
-        };
         Err(Failed {
-            message: format!("{program} exited with {status}{said}"),
+            message: format!("{program} exited with {status}{}", said(&err)),
             stdout: out,
             started: true,
         })
@@ -925,6 +973,8 @@ mod tests {
     const CLAUDE: &str = include_str!("../tests/fixtures/llm/claude.json");
     /// A real reply of `codex exec --json` (0.163.0), whole.
     const CODEX: &str = include_str!("../tests/fixtures/llm/codex.jsonl");
+    /// A real failed call of `codex exec --json` (0.163.0), whole: a model the account cannot use.
+    const CODEX_ERROR: &str = include_str!("../tests/fixtures/llm/codex-error.jsonl");
 
     #[test]
     fn claudes_json_gives_the_reply_as_plain_claude_prints_it_and_what_the_call_used() {
@@ -1039,6 +1089,36 @@ mod tests {
             ..Backend::shell(&cmd)
         }
         .call("", TIMEOUT)
+    }
+
+    #[test]
+    fn codex_passing_on_the_apis_error_says_the_apis_message() {
+        // Its message is the API's error as JSON; the warning before it is an item, passed over.
+        let why = "The 'no-such-model-subcheck-test' model is not supported when using Codex with \
+                   a ChatGPT account.";
+        assert_eq!(
+            failing(Output::Codex, CODEX_ERROR, "").reply,
+            Err(format!("sh exited with exit status: 1; codex said: {why}"))
+        );
+        // Exiting 0 with no reply: the API's message, alone.
+        assert_eq!(
+            Output::Codex.read(CODEX_ERROR).reply,
+            Err(format!("codex: {why}"))
+        );
+        // One with no message of its own: codex's, whole.
+        let blank = r#"{"type":"error","status":500,"error":{"message":" "}}"#;
+        let event = serde_json::json!({"type": "turn.failed", "error": {"message": blank}});
+        assert_eq!(
+            Output::Codex.read(&event.to_string()).reply,
+            Err(format!("codex: {blank}"))
+        );
+        // Nothing at all: no reason, and the error before it stands.
+        let events = "{\"type\":\"error\",\"message\":\"stream disconnected\"}\n\
+                      {\"type\":\"turn.failed\",\"error\":{\"message\":\" \"}}\n";
+        assert_eq!(
+            Output::Codex.read(events).reply,
+            Err("codex: stream disconnected".into())
+        );
     }
 
     #[test]
@@ -1352,6 +1432,10 @@ mod tests {
             .message;
         assert!(err.contains("timed out"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(3));
+        // With what it said on stderr before.
+        let argv = Backend::shell("echo 'rate limited' >&2; sleep 5").argv;
+        let err = run(&argv, "", Duration::from_secs(1)).unwrap_err().message;
+        assert!(err.ends_with("timed out after 1s: rate limited"), "{err}");
     }
 
     #[test]
@@ -1362,6 +1446,18 @@ mod tests {
         assert_eq!(run(&argv, "", TIMEOUT).unwrap(), "done\n");
         let took = started.elapsed();
         assert!(took < Duration::from_secs(10), "{took:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_does_not_wait_for_a_process_out_of_its_group_holding_stdout() {
+        // `setsid` puts `sleep` in a session of its own, out of reach of the group's kill, and it
+        // keeps the stdout it inherited open until it ends.
+        let argv = Backend::shell("setsid sleep 6 & echo done").argv;
+        let started = Instant::now();
+        assert_eq!(run(&argv, "", TIMEOUT).unwrap(), "done\n");
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "{took:?}");
     }
 
     #[cfg(target_os = "linux")]
