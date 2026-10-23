@@ -1143,8 +1143,25 @@ fn dir_of(file: &Path) -> &Path {
 
 /// Bytes free to an ordinary user in the filesystem holding `dir`; `None` when it cannot be told.
 fn free_space(dir: &Path) -> Option<u64> {
-    let s = rustix::fs::statvfs(dir).ok()?;
-    Some(s.f_bavail.saturating_mul(s.f_frsize))
+    free_blocks(dir).map(|(blocks, size)| blocks.saturating_mul(size))
+}
+
+/// The blocks free to an ordinary user in the filesystem holding `dir`, and their size.
+///
+/// On macOS from statfs: its statvfs casts statfs's 64-bit block counts to 32 bits, so with 2^32
+/// blocks or more free (16 TiB at 4 KiB) it tells only the remainder.
+fn free_blocks(dir: &Path) -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    let free = {
+        let s = rustix::fs::statfs(dir).ok()?;
+        (s.f_bavail, u64::from(s.f_bsize))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let free = {
+        let s = rustix::fs::statvfs(dir).ok()?;
+        (s.f_bavail, s.f_frsize)
+    };
+    Some(free)
 }
 
 #[cfg(test)]
@@ -1165,6 +1182,34 @@ mod tests {
         // Some: a full filesystem has 0 bytes free, and that is told too.
         assert!(free_space(dir.path()).is_some());
         assert_eq!(free_space(&dir.path().join("missing")), None);
+    }
+
+    // Where rustix has statfs, to read the truth from.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[ignore = "needs SUBCHECK_BIG_VOLUME, a volume with 2^32 blocks or more free"]
+    fn free_blocks_past_2_to_the_32_are_told_whole() {
+        // Past 2^32 blocks free, macOS's statvfs tells only the remainder. No CI runner has such a
+        // volume (a sparse disk image tells its host's free space as its own), so run it by hand:
+        // SUBCHECK_BIG_VOLUME=<dir> cargo test --lib free_blocks_past -- --ignored
+        let dir = std::env::var_os("SUBCHECK_BIG_VOLUME")
+            .filter(|v| !v.is_empty())
+            .expect("SUBCHECK_BIG_VOLUME names no directory");
+        let dir = Path::new(&dir);
+        let s = rustix::fs::statfs(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        let told = s.f_bavail;
+        assert!(
+            told >= 1 << 32,
+            "{}: statfs tells {told} blocks of {} bytes free, fewer than 2^32",
+            dir.display(),
+            s.f_bsize
+        );
+        let (blocks, _) = free_blocks(dir).expect("free blocks");
+        assert!(
+            blocks >= 1 << 32,
+            "{}: {blocks} blocks free against statfs's {told}: truncated to 32 bits",
+            dir.display()
+        );
     }
 
     #[test]
