@@ -458,6 +458,9 @@ check "renew: request carries the refresh token" "yes" "$(logged '"refresh_token
 check "renew: request carries the client id" "yes" "$(logged '"client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e"')"
 check "renew: request carries the saved scopes" "yes" "$(logged '"scope":"user:inference user:profile"')"
 check "renew: refresh token off argv" "no" "$(grep -qF ref-old "$FIXTURES/curl.args" && echo yes || echo no)"
+# The token endpoint answers curl's own User-Agent with a 429.
+check "renew: sent as usage, not curl" "yes" \
+    "$(grep -F platform.claude.com/v1/oauth/token "$FIXTURES/curl.args" | grep -qF -- '-A usage ' && echo yes || echo no)"
 check "renew: new tokens written back" "tok-new ref-new $(( (NOW + 28800) * 1000 ))" \
     "$(jq -r '.claudeAiOauth | "\(.accessToken) \(.refreshToken) \(.expiresAt)"' "$C")"
 check "renew: other fields kept" "max" "$(jq -r .claudeAiOauth.subscriptionType "$C")"

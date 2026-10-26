@@ -233,7 +233,8 @@ claude_refresh() {
     [[ -n "$refresh" ]] || return 2
 
     # The refresh token goes through the environment, never jq's or curl's argv.
-    fetch "$CLAUDE_TOKEN_URL" -H 'Content-Type: application/json' \
+    # The endpoint answers curl's own User-Agent with a 429, whatever the rate.
+    fetch "$CLAUDE_TOKEN_URL" -A usage -H 'Content-Type: application/json' \
         --data-binary @<(REFRESH="$refresh" jq -cn --arg c "$CLAUDE_CLIENT_ID" \
             --arg s "$(jq -r '.claudeAiOauth.scopes // [] | join(" ")' <<<"$creds")" \
             '{grant_type: "refresh_token", refresh_token: env.REFRESH, client_id: $c}
