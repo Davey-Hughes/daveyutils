@@ -224,22 +224,6 @@ check "codex api-key login: no plan to show" "yes" "$(has 'Codex · current logi
 check "codex api-key login: no request made" "no" "$(logged 'wham/usage')"
 
 # --- API spend ----------------------------------------------------------------
-setup api-unset
-run_usage
-check "api: no section without keys" "no" "$(has 'API')"
-check "api: no hint without keys" "no" "$(has 'ADMIN')"
-check "api: last block is the last account" "  weekly" "$(printf '%s\n' "$OUT" | tail -1 | sed -E 's/^(  [a-z]+).*/\1/')"
-check "api: no section is not a failure" "0" "$RC"
-
-setup api-one-kind
-api_fixtures
-EXTRA_ENV=(ANTHROPIC_ADMIN_API_KEY=sk-ant-admin-x)
-run_usage
-EXTRA_ENV=()
-check "api: one kind set, section shown" "yes" "$(has 'API spend')"
-check "api: its line shown" "yes" "$(has 'Anthropic API · env')"
-check "api: no hint for the other kind" "no" "$(has 'OpenAI')"
-
 api_fixtures() {
     cat > "$FIXTURES/anthropic.json" <<'EOF'
 {"data":[{"starting_at":"2026-10-01T00:00:00Z","results":[{"amount":"123.45","currency":"USD"}]},
@@ -253,6 +237,22 @@ EOF
  "has_more":false,"next_page":null}
 EOF
 }
+
+setup api-unset
+run_usage
+check "api: no section without keys" "no" "$(has 'API')"
+check "api: no hint without keys" "no" "$(has 'ADMIN')"
+check "api: last block is the last account" "  weekly" "$(printf '%s\n' "$OUT" | tail -1 | sed -E 's/^(  [a-z]+).*/\1/')"
+check "api: no section is not a failure" "0" "$RC"
+
+setup api-one-kind
+api_fixtures
+EXTRA_ENV=(ANTHROPIC_ADMIN_API_KEY=sk-ant-admin-x)
+run_usage
+EXTRA_ENV=()
+check "api: one kind set, section shown" "yes" "$(has 'API spend')"
+check "api: its line shown" " Anthropic API · env \$2.24 spent this month" "$(line 'Anthropic API')"
+check "api: no hint for the other kind" "no" "$(has 'OpenAI')"
 
 setup api
 api_fixtures
