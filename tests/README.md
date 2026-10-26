@@ -13,9 +13,11 @@ GNU/BSD code paths are both exercised. That takes two forges: Forgejo has docker
 runners only and covers the Linux half (`.forgejo/workflows/ci.yml`), and the
 macOS half runs on GitHub (`.github/workflows/tests.yml`).
 
-The suite needs nothing but bash and coreutils. Tests that would otherwise
-shell out to a heavy dependency (`ffmpeg`, `img2pdf`, ImageMagick, …) stub it
-on `PATH` instead, so no test requires the real tool to be installed.
+The suite needs nothing but bash and coreutils, plus `jq` for `usage`'s tests,
+which skip without it unless `USAGE_NEED_JQ` is set (CI and `dev/check-all.sh`
+set it, so there a missing `jq` fails). Tests that would otherwise shell out to
+a heavy dependency (`ffmpeg`, `img2pdf`, ImageMagick, …) stub it on `PATH`
+instead, so no test requires the real tool to be installed.
 
 The Rust `nudge` and `subcheck` have their own tests in `nudge-rs/` and
 `subcheck-rs/` (`cargo test`); nudge's require `tmux`, subcheck's read committed
@@ -31,6 +33,7 @@ MKV fixtures and need nothing installed. `make check` runs all three suites.
 | `test_bisect_img.sh` | landscape detection and the left/right split geometry |
 | `test_cue2flac.sh` | CUE parsing and per-track FLAC splitting; drives the real script (it has no source guard, so it cannot be sourced) |
 | `test_mkvpropedit_set_name.sh` | deriving each MKV's title tag from its filename |
+| `test_usage.sh` | plan limits and API spend from canned API responses (a stub `curl`), saved keys and logins (stub `claude`/`codex`), renewing saved sign-ins (write-back, rejection, the lock across concurrent runs), and the no-`flock`/no-`jq` paths |
 | `test_video_pcm_to_flac.sh` | PCM⇄FLAC stream selection, output paths, and metadata handling (incl. the bash 4.3 nounset-safe array expansion) |
 | `assert.sh` | shared `check`/`finish` assertions; sourced by every file above |
 

@@ -43,7 +43,11 @@ jobs:
           for f in tests/*.sh; do bash -n "$f"; done
           for f in dev/*.sh; do bash -n "$f"; done
 
+      # jq is preinstalled on both runners; USAGE_NEED_JQ makes usage's tests
+      # fail rather than skip if that ever changes.
       - name: Run test-suite
+        env:
+          USAGE_NEED_JQ: "1"
         run: bash tests/run.sh
 
   # The Makefile is how every utility here gets onto a PATH, and until now no

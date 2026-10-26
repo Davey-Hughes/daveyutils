@@ -10,6 +10,7 @@ Random command-line utilities. Each one has a `--help`; run it for usage.
 | `video_pcm_to_flac` | Convert PCM⇄FLAC audio streams in MKVs | `fd`, `ffprobe`, `ffmpeg` |
 | `batch_makemkvcon` | Rip every Blu-ray/DVD disc image under a directory to MKV | `makemkvcon` |
 | `mkvpropedit_set_name` | Set each MKV's title tag from its filename | `mkvpropedit` |
+| `usage` | Show how much of the plan limits is used for every Claude and Codex account, and this month's Claude/OpenAI API spend per Admin key; `usage add` saves more accounts and keys | `curl`, `jq`; `flock` for saved accounts |
 | `nudge` | Rate-limit auto-resumer for AI CLIs in tmux (Rust — see `nudge-rs/`) | `tmux` |
 | `subcheck` | Proofread the text subtitles in MKVs with an LLM and review the fixes; find tracks shifted by whole frames; extract a track without reading the whole file (Rust — see `subcheck-rs/`) | `claude`, `codex` or `ollama` (for `scan`); `mpv` (for `review`) |
 

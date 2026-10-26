@@ -1,0 +1,924 @@
+#!/usr/bin/env bash
+#
+# usage - how much of your Claude and Codex plan limits is used, and this
+# month's API spend.
+#
+# Usage: usage
+#        usage add <kind> <name>
+#        usage remove <kind> <name>
+#        usage rename <kind> <old> <new>
+#
+#   Claude      the session and weekly limits of a Claude Pro/Max login, read
+#               with Claude Code's own login ($CLAUDE_CONFIG_DIR/.credentials.json,
+#               default ~/.claude; the login keychain on macOS)
+#   Codex       the 5-hour and weekly limits of a ChatGPT plan, read with
+#               Codex's own login ($CODEX_HOME/auth.json, default ~/.codex)
+#   API spend   month-to-date spend on the Claude Platform and the OpenAI API
+#               for each Admin key: ANTHROPIC_ADMIN_API_KEY / OPENAI_ADMIN_KEY,
+#               and any saved with `usage add anthropic-api|openai-api <name>`;
+#               shown only once there is a key
+#
+# Kinds: claude, codex (a separate sign-in, made by running the CLI's own
+# login; extra args go to `codex login`, e.g. --device-auth), anthropic-api,
+# openai-api (an Admin key, read from the terminal or stdin). Adding a name
+# again replaces it; removing a login signs it out; renaming keeps the login
+# or key as it is. Names: letters, digits, . _ -, starting with a letter,
+# digit or _. Saved under
+# ${XDG_DATA_HOME:-~/.local/share}/usage, readable only by you.
+#
+# Every saved account is shown, plus the CLI's current login unless that
+# account is saved too. A saved login is its own session, so usage renews it
+# when it expires, without signing the CLI out; the CLI's own login is only
+# read. Saved accounts need flock (util-linux), which macOS lacks; saved Claude
+# accounts are not supported on macOS at all.
+#
+# Neither API exposes the remaining prepaid balance; that is only in the
+# consoles. The plan limits come from the undocumented endpoints that Claude
+# Code's /usage and Codex's /status use, so they may change without notice.
+#
+# Use at your own risk. Anthropic's Claude Code usage policy says Claude
+# subscription sign-ins are for Claude Code and Anthropic's own apps, and that
+# third-party tools may not store Claude session tokens; Anthropic may act on
+# accounts without notice
+# (https://code.claude.com/docs/en/legal-and-compliance). usage reads Claude
+# Code's tokens to query usage, and saved Claude accounts are tokens it stores
+# and renews itself. The Codex side reads ChatGPT's internal endpoints the same
+# way.
+#
+# Exits 1 when a source that is set up could not be read.
+# Requires: curl, jq
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+usage() {
+    # The header comment, up to the first line that isn't one.
+    awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"
+}
+
+# Shared jq helpers: progress bars, durations and money.
+# shellcheck disable=SC2016  # jq variables, not shell ones
+JQ_DEFS='
+def pad2: tostring | if length < 2 then "0" + . else . end;
+def lpad($n): tostring | (" " * ($n - length)) + .;
+def rpad($n): tostring | . + (" " * ($n - length));
+def epoch: if type == "string"
+    then sub("\\.[0-9]+"; "") | sub("(\\+00:00|Z)$"; "Z") | fromdateiso8601
+    else . end;
+def dur:
+    floor as $s
+    | if $s <= 0 then "now"
+      elif $s >= 86400 then "\($s / 86400 | floor)d\($s % 86400 / 3600 | floor | pad2)h"
+      elif $s >= 3600 then "\($s / 3600 | floor)h\($s % 3600 / 60 | floor | pad2)m"
+      else "\($s / 60 | floor)m" end;
+# 20 whole cells, filled then a faint track; no partial blocks, which leave a
+# gap before the track. Any use shows a cell, and only 100% fills the bar.
+def bar($p): ($p / 5 | round) as $n
+    | (if $p <= 0 then 0 elif $p >= 100 then 20 else [[$n, 1] | max, 19] | min end) as $full
+    | ("█" * $full // "") + ("░" * (20 - $full) // "");
+# Plain up to half used, yellow past half, red when full.
+def paint($p): if $color != true or $p <= 50 then .
+    else (if $p >= 100 then "31" else "33" end) as $c
+    | "\u001b[\($c)m" + . + "\u001b[0m" end;
+def clean: if type == "string" then gsub("[[:cntrl:]]"; "") else . end;
+# reset_epoch: a reset time as epoch seconds, or null when there is none or it
+# cannot be read.
+def reset_epoch: if . == null then null else try (epoch | floor) catch null end;
+# A missing or non-numeric percentage counts as 0; an unreadable reset is left off.
+def row($name; $pct; $reset):
+    (try ($pct | numbers) catch null // 0) as $pct
+    | ($pct | round) as $p
+    | ($reset | reset_epoch) as $at
+    | "  \($name | clean | rpad(14)) " + ("\(bar($pct)) \($p | lpad(3))% used" | paint($p))
+    + (if $at == null then "" else "  resets in \($at - $now | dur)" end);
+def money: (. * 100 | round) as $c | "$\($c / 100 | floor).\($c % 100 | pad2)";
+'
+
+# fetch <url> <curl args...>: sets BODY and CODE (000 when curl itself failed).
+fetch() {
+    local url=$1 out err
+    shift
+    # In $JOBS when queued, so a killed run's cleanup takes it too.
+    err=$(mktemp "${JOBS:-${TMPDIR:-/tmp}}/curl.XXXXXX") || { BODY="cannot create a temp file" CODE=000; return; }
+    if ! out=$(curl -sS --max-time 20 -w '\n%{http_code}' "$@" "$url" 2>"$err"); then
+        # Only curl's own message: what arrived before it failed may hold tokens.
+        BODY=$(grep -m 1 '^curl: ' "$err") CODE=000
+        rm -f "$err"
+        [[ -n "$BODY" ]] || BODY="curl failed"
+        return
+    fi
+    rm -f "$err"
+    CODE=${out##*$'\n'}
+    BODY=${out%$'\n'*}
+}
+
+# http_error <name> [cli]: report a failed fetch; a 401/403 from a CLI login
+# means that login needs refreshing, which only the CLI itself should do.
+http_error() {
+    local name=$1 cli=${2:-} msg
+    if [[ -n "$cli" && ( "$CODE" == 401 || "$CODE" == 403 ) ]]; then
+        printf '%s: login expired; run %s to refresh it\n' "$name" "$cli"
+        return
+    fi
+    if [[ "$CODE" == 000 ]]; then
+        printf '%s: request failed: %s\n' "$name" "$BODY"
+        return
+    fi
+    msg=$(error_message)
+    printf '%s: HTTP %s%s\n' "$name" "$CODE" "${msg:+: $msg}"
+}
+
+# error_message: the server's explanation in $BODY, if it gave one.
+error_message() {
+    jq -r '(.error_description? // .error.message? // .error? // .detail? // empty)
+        | tostring | gsub("[[:cntrl:]]"; "")' <<<"$BODY" 2>/dev/null
+}
+
+CLAUDE_TOKEN_URL=https://platform.claude.com/v1/oauth/token
+CLAUDE_CLIENT_ID=9d1c250a-e61b-44d9-88ed-5944d1962f5e
+
+# claude_credentials <config dir> <current|saved>: the login's credentials;
+# the CLI's own login on macOS lives in the keychain.
+claude_credentials() {
+    local f="$1/.credentials.json"
+    if [[ -r "$f" ]]; then
+        cat "$f"
+    elif [[ "$2" == current && "$(uname)" == Darwin ]] && command -v security >/dev/null 2>&1; then
+        security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# claude_profile <config dir> <current|saved>: Claude Code's .claude.json,
+# which sits in $HOME rather than the config dir when CLAUDE_CONFIG_DIR is unset.
+claude_profile() {
+    if [[ "$2" == current && -z "${CLAUDE_CONFIG_DIR:-}" ]]; then
+        cat "$HOME/.claude.json" 2>/dev/null
+    else
+        cat "$1/.claude.json" 2>/dev/null
+    fi
+}
+
+# with_lock <dir> <command...>: run command holding <dir>/.usage.lock, so two
+# runs never renew one account at once (the second would spend a refresh
+# token the first had already rotated).
+with_lock() {
+    local dir=$1 rc
+    shift
+    if ! command -v flock >/dev/null 2>&1; then
+        REFRESH_ERROR="flock is required to renew saved accounts (util-linux)"
+        return 1
+    fi
+    if [[ ! -d "$dir" ]]; then
+        REFRESH_ERROR="account folder is gone"
+        return 1
+    fi
+    # Opened on its own, so a failure is reported here rather than by bash.
+    # `command` keeps a failed open from exiting bash in POSIX mode.
+    if ! { command exec 9>"$dir/.usage.lock"; } 2>/dev/null; then
+        REFRESH_ERROR="cannot lock $dir"
+        return 1
+    fi
+    # USAGE_LOCK_WAIT shortens the wait, for the tests.
+    # Quietly: a flock killed by a signal is reported here, not by bash.
+    { flock -w "${USAGE_LOCK_WAIT:-30}" 9; } 2>/dev/null
+    rc=$?
+    if (( rc != 0 )); then
+        exec 9>&-
+        if (( rc > 128 )); then
+            REFRESH_ERROR="interrupted"
+        elif (( rc == 1 )); then
+            REFRESH_ERROR="timed out waiting for another usage run"
+        else
+            REFRESH_ERROR="flock failed ($rc)"
+        fi
+        return 1
+    fi
+    "$@"
+    rc=$?
+    exec 9>&-
+    return "$rc"
+}
+
+# claude_refresh <config dir> [stale token]: renew a saved login, writing the
+# new tokens back in Claude Code's format. Under the lock, it first re-reads the
+# file: with no stale token, a login no longer near expiry is left alone; with
+# one, a login whose token has since changed is. 0 renewed or not needed,
+# 1 failed (REFRESH_ERROR says why), 2 rejected: the login must be made again.
+claude_refresh() {
+    local dir=$1 stale=${2:-} f creds expires refresh tmp
+    f="$dir/.credentials.json"
+    creds=$(cat "$f" 2>/dev/null) || return 2
+    if [[ -n "$stale" ]]; then
+        [[ "$(jq -r '.claudeAiOauth.accessToken // empty' <<<"$creds")" == "$stale" ]] || return 0
+    else
+        expires=$(jq -r '.claudeAiOauth.expiresAt // 0 | . / 1000 | floor' <<<"$creds")
+        (( expires - NOW < 300 )) || return 0
+    fi
+    refresh=$(jq -r '.claudeAiOauth.refreshToken // empty' <<<"$creds")
+    [[ -n "$refresh" ]] || return 2
+
+    # The refresh token goes through the environment, never jq's or curl's argv.
+    fetch "$CLAUDE_TOKEN_URL" -H 'Content-Type: application/json' \
+        --data-binary @<(REFRESH="$refresh" jq -cn --arg c "$CLAUDE_CLIENT_ID" \
+            --arg s "$(jq -r '.claudeAiOauth.scopes // [] | join(" ")' <<<"$creds")" \
+            '{grant_type: "refresh_token", refresh_token: env.REFRESH, client_id: $c}
+             + (if $s == "" then {} else {scope: $s} end)')
+    case "$CODE" in
+        200) ;;
+        401) return 2 ;;
+        400) [[ "$(jq -r '.error? | strings' <<<"$BODY" 2>/dev/null)" == invalid_grant ]] && return 2
+             REFRESH_ERROR="HTTP 400$(msg=$(error_message); echo "${msg:+: $msg}")"; return 1 ;;
+        000) REFRESH_ERROR="request failed: $BODY"; return 1 ;;
+        *) REFRESH_ERROR="HTTP $CODE$(msg=$(error_message); echo "${msg:+: $msg}")"; return 1 ;;
+    esac
+    if ! jq -e '.access_token | strings | length > 0' <<<"$BODY" >/dev/null 2>&1; then
+        REFRESH_ERROR="unexpected response"
+        return 1
+    fi
+    tmp=$(mktemp "$dir/.credentials.XXXXXX") || { REFRESH_ERROR="cannot write to $dir"; return 1; }
+    if ! printf '%s\n%s\n' "$creds" "$BODY" | jq --argjson now "$NOW" '
+            input as $r
+            | .claudeAiOauth.accessToken = $r.access_token
+            | .claudeAiOauth.refreshToken = ($r.refresh_token // .claudeAiOauth.refreshToken)
+            | .claudeAiOauth.expiresAt = (($now + ($r.expires_in // 3600)) * 1000)' > "$tmp" ||
+        ! mv -f "$tmp" "$f"; then
+        rm -f "$tmp"
+        REFRESH_ERROR="cannot write $f"
+        return 1
+    fi
+}
+
+# renew <claude|codex> <label> <dir> [stale token]: <kind>_refresh under the
+# lock, saying what went wrong when it fails.
+renew() {
+    local kind=$1 label=$2 dir=$3 rc
+    REFRESH_ERROR=""
+    with_lock "$dir" "${kind}_refresh" "$dir" "${4:-}"
+    rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        2) signed_out "$kind" "$label" ;;
+        *) echo "$(title "$kind") · $label: could not renew sign-in: $REFRESH_ERROR" ;;
+    esac
+    return 1
+}
+
+title() {
+    case "$1" in claude) echo Claude ;; codex) echo Codex ;; esac
+}
+
+signed_out() {
+    echo "$(title "$1") · $2: signed out; run usage add $1 $2 to sign in again"
+}
+
+claude_fetch() {
+    fetch https://api.anthropic.com/api/oauth/usage \
+        -H @<(printf 'Authorization: Bearer %s\nanthropic-beta: oauth-2025-04-20\n' "$1")
+}
+
+# claude_block <label> <config dir> <may_refresh: yes|no>
+#
+# The CLI's own login (no) is never renewed here: that would rotate its refresh
+# token out from under Claude Code. Saved accounts (yes) are usage's own.
+claude_block() {
+    local label=$1 dir=$2 may_refresh=$3 name="Claude · $1" whose creds token expires plan email sort_key rows
+    whose=$([[ "$may_refresh" == yes ]] && echo saved || echo current)
+    creds=$(claude_credentials "$dir" "$whose") || creds=""
+    token=$(jq -r '.claudeAiOauth.accessToken // empty' <<<"$creds" 2>/dev/null)
+    if [[ -z "$token" ]]; then
+        if [[ "$may_refresh" == yes ]]; then
+            signed_out claude "$label"
+            return 1
+        fi
+        echo "$name: not logged in"
+        return 0
+    fi
+    expires=$(jq -r '.claudeAiOauth.expiresAt // 0 | . / 1000 | floor' <<<"$creds")
+    if [[ "$may_refresh" == yes ]] && (( expires - NOW < 300 )); then
+        renew claude "$label" "$dir" || return 1
+        creds=$(claude_credentials "$dir" saved)
+        token=$(jq -r '.claudeAiOauth.accessToken // empty' <<<"$creds")
+    elif (( expires <= NOW )); then
+        echo "$name: login expired; run claude to refresh it"
+        return 1
+    fi
+    plan=$(jq -r "$JQ_DEFS"'.claudeAiOauth.subscriptionType // empty | tostring | clean' <<<"$creds")
+    email=$(claude_profile "$dir" "$whose" | jq -r "$JQ_DEFS"'.oauthAccount.emailAddress // empty | tostring | clean' 2>/dev/null)
+
+    claude_fetch "$token"
+    if [[ "$CODE" == 401 && "$may_refresh" == yes ]]; then
+        renew claude "$label" "$dir" "$token" || return 1
+        token=$(claude_credentials "$dir" saved | jq -r '.claudeAiOauth.accessToken // empty')
+        claude_fetch "$token"
+        if [[ "$CODE" == 401 ]]; then
+            signed_out claude "$label"
+            return 1
+        fi
+    fi
+    if [[ "$CODE" != 200 ]]; then
+        http_error "$name" claude
+        return 1
+    fi
+
+    # "#sort <weekly full: 0|1> <weekly reset|->" orders the accounts;
+    # print_blocks takes this line out.
+    if ! sort_key=$(jq -r "$JQ_DEFS"'
+            ([.limits[]? | select(.group == "weekly" and .scope == null)
+              | {used: .percent, reset: .resets_at}][0]
+             // (.seven_day | objects | {used: .utilization, reset: .resets_at}) // {})
+            | "\(if ((.used | numbers) // 0) >= 100 then 1 else 0 end) \(.reset | reset_epoch // "-")"' \
+            <<<"$BODY" 2>/dev/null) ||
+        ! rows=$(jq -r --argjson now "$NOW" --argjson color "$COLOR" "$JQ_DEFS"'
+            if (.limits | type) == "array" then
+                .limits[]
+                | (.scope.model.display_name? // (.scope.surface | if type == "object" then .display_name else . end)?) as $scope
+                | row(if .group == "session" then "session" else "weekly" + (if $scope then " \($scope)" else "" end) end;
+                      .percent; .resets_at)
+            else
+                ([["5-hour", "five_hour"], ["weekly", "seven_day"],
+                  ["weekly opus", "seven_day_opus"], ["weekly sonnet", "seven_day_sonnet"]][]) as [$name, $key]
+                | .[$key] // empty
+                | row($name; .utilization; .resets_at)
+            end,
+            (.extra_usage | objects | select(.is_enabled == true)
+                | (pow(10; .decimal_places // 2)) as $unit
+                | "  \("extra usage" | rpad(14)) \(.used_credits // 0 | . / $unit | money)"
+                  + (if .monthly_limit then " of \(.monthly_limit / $unit | money)" else "" end)
+                  + " this month")
+        ' <<<"$BODY" 2>/dev/null); then
+        echo "$name: unexpected response from the usage endpoint"
+        return 1
+    fi
+    echo "#sort $sort_key"
+    echo "$name${plan:+ ($plan)}${email:+ · $email}"
+    printf '%s\n' "$rows"
+}
+
+CODEX_TOKEN_URL=https://auth.openai.com/oauth/token
+CODEX_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann
+
+# jwt_claims <jwt>: its payload as JSON, {} when it isn't one.
+jwt_claims() {
+    printf '%s\n' "$1" | jq -R '
+        split(".")[1] // "" | gsub("-"; "+") | gsub("_"; "/")
+        | . + ("=" * ((4 - length % 4) % 4) // "")
+        | try (@base64d | fromjson | objects) catch {}
+        | . // {}' 2>/dev/null || echo '{}'
+}
+
+# codex_refresh <codex home> [stale token]: as claude_refresh, for auth.json.
+# Expiry is the access token's own exp; one that can't be read counts as expired.
+codex_refresh() {
+    local home=$1 stale=${2:-} f auth access expires refresh url code tmp
+    f="$home/auth.json"
+    auth=$(cat "$f" 2>/dev/null) || return 2
+    access=$(jq -r '.tokens.access_token // empty' <<<"$auth")
+    if [[ -n "$stale" ]]; then
+        [[ "$access" == "$stale" ]] || return 0
+    else
+        expires=$(jwt_claims "$access" | jq -r '.exp // 0 | floor')
+        (( expires - NOW < 300 )) || return 0
+    fi
+    refresh=$(jq -r '.tokens.refresh_token // empty' <<<"$auth")
+    [[ -n "$refresh" ]] || return 2
+    # A login made against another issuer refreshes there, as Codex does.
+    url=$(jq -r '.tokens.oauth_provenance.issuer // empty | sub("/+$"; "") + "/oauth/token"' <<<"$auth")
+
+    fetch "${url:-$CODEX_TOKEN_URL}" -H 'Content-Type: application/json' \
+        --data-binary @<(REFRESH="$refresh" jq -cn --arg c "$CODEX_CLIENT_ID" \
+            '{client_id: $c, grant_type: "refresh_token", refresh_token: env.REFRESH}')
+    code=$(jq -r '.error? | if type == "object" then .code else . end | strings' <<<"$BODY" 2>/dev/null)
+    case "$code" in
+        invalid_grant|refresh_token_expired|refresh_token_reused|refresh_token_invalidated) return 2 ;;
+    esac
+    case "$CODE" in
+        200) ;;
+        401) return 2 ;;
+        000) REFRESH_ERROR="request failed: $BODY"; return 1 ;;
+        *) REFRESH_ERROR="HTTP $CODE$(msg=$(error_message); echo "${msg:+: $msg}")"; return 1 ;;
+    esac
+    if ! jq -e '.access_token | strings | length > 0' <<<"$BODY" >/dev/null 2>&1; then
+        REFRESH_ERROR="unexpected response"
+        return 1
+    fi
+    tmp=$(mktemp "$home/.auth.XXXXXX") || { REFRESH_ERROR="cannot write to $home"; return 1; }
+    if ! printf '%s\n%s\n' "$auth" "$BODY" | jq --argjson now "$NOW" '
+            input as $r
+            | .tokens.access_token = $r.access_token
+            | .tokens.id_token = ($r.id_token // .tokens.id_token)
+            | .tokens.refresh_token = ($r.refresh_token // .tokens.refresh_token)
+            | .last_refresh = ($now | strftime("%Y-%m-%dT%H:%M:%SZ"))' > "$tmp" ||
+        ! mv -f "$tmp" "$f"; then
+        rm -f "$tmp"
+        REFRESH_ERROR="cannot write $f"
+        return 1
+    fi
+}
+
+codex_fetch() {
+    fetch https://chatgpt.com/backend-api/wham/usage \
+        -H @<(printf 'Authorization: Bearer %s\nChatGPT-Account-Id: %s\n' "$1" "$2")
+}
+
+# codex_block <label> <codex home> <may_refresh: yes|no>: as claude_block.
+codex_block() {
+    local label=$1 home=$2 may_refresh=$3 name="Codex · $1" auth token account expires plan email sort_key rows
+    auth="$home/auth.json"
+    token=$(jq -r '.tokens.access_token // empty' "$auth" 2>/dev/null)
+    if [[ -z "$token" ]]; then
+        if [[ "$may_refresh" == yes ]]; then
+            signed_out codex "$label"
+            return 1
+        elif [[ "$(jq -r '.auth_mode // empty' "$auth" 2>/dev/null)" == apikey ]]; then
+            echo "$name: signed in with an API key, not a ChatGPT plan"
+        else
+            echo "$name: not logged in"
+        fi
+        return 0
+    fi
+    if [[ "$may_refresh" == yes ]]; then
+        expires=$(jwt_claims "$token" | jq -r '.exp // 0 | floor')
+        if (( expires - NOW < 300 )); then
+            renew codex "$label" "$home" || return 1
+            token=$(jq -r '.tokens.access_token // empty' "$auth")
+        fi
+    fi
+    account=$(jq -r '.tokens.account_id // empty' "$auth")
+
+    codex_fetch "$token" "$account"
+    if [[ "$CODE" == 401 && "$may_refresh" == yes ]]; then
+        renew codex "$label" "$home" "$token" || return 1
+        token=$(jq -r '.tokens.access_token // empty' "$auth")
+        codex_fetch "$token" "$account"
+        if [[ "$CODE" == 401 ]]; then
+            signed_out codex "$label"
+            return 1
+        fi
+    fi
+    if [[ "$CODE" != 200 ]]; then
+        http_error "$name" codex
+        return 1
+    fi
+
+    if ! plan=$(jq -r "$JQ_DEFS"'.plan_type // empty | tostring | clean' <<<"$BODY" 2>/dev/null) ||
+        ! sort_key=$(jq -r "$JQ_DEFS"'
+            ([.rate_limit.primary_window, .rate_limit.secondary_window | objects
+              | select(.limit_window_seconds == 604800)][0] // .rate_limit.secondary_window // {})
+            | "\(if ((.used_percent | numbers) // 0) >= 100 then 1 else 0 end) \(.reset_at | reset_epoch // "-")"' \
+            <<<"$BODY" 2>/dev/null) ||
+        ! rows=$(jq -r --argjson now "$NOW" --argjson color "$COLOR" "$JQ_DEFS"'
+            (.rate_limit.primary_window, .rate_limit.secondary_window | objects
+                | .limit_window_seconds as $w
+                | row(if $w == 18000 then "5-hour" elif $w == 604800 then "weekly"
+                      else "\(($w | numbers) // 0 | . / 3600 | round)-hour" end;
+                      .used_percent; .reset_at)),
+            (.credits | objects | if .unlimited == true then "  \("credits" | rpad(14)) unlimited"
+                elif .has_credits == true then "  \("credits" | rpad(14)) \(.balance | clean) left"
+                else empty end)
+        ' <<<"$BODY" 2>/dev/null); then
+        echo "$name: unexpected response from the usage endpoint"
+        return 1
+    fi
+    email=$(jwt_claims "$(jq -r '.tokens.id_token // empty' "$auth")" | jq -r "$JQ_DEFS"'.email // empty | tostring | clean')
+    echo "#sort $sort_key"
+    echo "$name${plan:+ ($plan)}${email:+ · $email}"
+    printf '%s\n' "$rows"
+}
+
+# The start of this month in UTC: <iso> <epoch>
+month_start() {
+    jq -nr --argjson now "$NOW" \
+        '$now | strftime("%Y-%m-01T00:00:00Z") | "\(.) \(fromdateiso8601)"'
+}
+
+
+# anthropic_api_line <label> <admin key>
+anthropic_api_line() {
+    local label="Anthropic API · $1" key=$2 iso spend
+    read -r iso _ < <(month_start)
+    fetch "https://api.anthropic.com/v1/organizations/cost_report?starting_at=$iso&bucket_width=1d&limit=31" \
+        -H @<(printf 'x-api-key: %s\nanthropic-version: 2023-06-01\n' "$key")
+    if [[ "$CODE" != 200 ]]; then
+        printf '  '; http_error "$label"
+        return 1
+    fi
+    # Amounts are decimal strings in cents.
+    spend=$(jq -r "$JQ_DEFS"'[.data[].results[].amount | tonumber] | add // 0 | . / 100 | money' <<<"$BODY")
+    printf '  %-24s %s spent this month\n' "$label" "$spend"
+}
+
+# openai_api_line <label> <admin key>
+openai_api_line() {
+    local label="OpenAI API · $1" key=$2 start spend
+    read -r _ start < <(month_start)
+    fetch "https://api.openai.com/v1/organization/costs?start_time=$start&bucket_width=1d&limit=31" \
+        -H @<(printf 'Authorization: Bearer %s\n' "$key")
+    if [[ "$CODE" != 200 ]]; then
+        printf '  '; http_error "$label"
+        return 1
+    fi
+    spend=$(jq -r "$JQ_DEFS"'[.data[].results[].amount.value] | add // 0 | money' <<<"$BODY")
+    printf '  %-24s %s spent this month\n' "$label" "$spend"
+}
+
+data_dir() {
+    printf '%s/usage\n' "${XDG_DATA_HOME:-$HOME/.local/share}"
+}
+
+# A leading dot is refused too (staging dirs and lock files use dot names), and
+# a leading dash, which would read as an option.
+valid_name() {
+    [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]
+}
+
+# saved_names <dir> <dirs|files>: the valid names in dir, sorted; only folders
+# (accounts) or only files (keys), so a stray entry isn't taken for one.
+saved_names() {
+    local f
+    [[ -d "$1" ]] || return 0
+    for f in "$1"/*; do
+        [[ -e "$f" ]] || continue
+        case "$2" in
+            dirs) [[ -d "$f" ]] || continue ;;
+            files) [[ -f "$f" ]] || continue ;;
+        esac
+        f=${f##*/}
+        if valid_name "$f"; then printf '%s\n' "$f"; fi
+    done
+}
+
+# api_kind <kind> <env var> <line function>: a line per Admin key of a kind,
+# the env var's first; nothing when there are none.
+api_kind() {
+    local kind=$1 var=$2 line=$3 dir name rc=0
+    dir="$(data_dir)/keys/$kind"
+    if [[ -n "${!var:-}" ]]; then
+        "$line" env "${!var}" </dev/null || rc=1
+    fi
+    while IFS= read -r name; do
+        "$line" "$name" "$(cat "$dir/$name")" </dev/null || rc=1
+    done < <(saved_names "$dir" files)
+    return "$rc"
+}
+
+# api_section: month-to-date spend per Admin key, or nothing at all when none
+# are set up (--help says how).
+api_section() {
+    local lines rc
+    lines=$(
+        r=0
+        api_kind anthropic-api ANTHROPIC_ADMIN_API_KEY anthropic_api_line || r=1
+        api_kind openai-api OPENAI_ADMIN_KEY openai_api_line || r=1
+        exit "$r"
+    )
+    rc=$?
+    if [[ -n "$lines" ]]; then
+        echo "API spend"
+        printf '%s\n' "$lines"
+    fi
+    return "$rc"
+}
+
+usage_error() { printf '%s\n' "$*" >&2; exit 2; }
+
+# check_kind_name <kind> <name>: exits 2 unless both are acceptable.
+check_kind_name() {
+    case "$1" in
+        claude|codex|anthropic-api|openai-api) ;;
+        *) usage_error "unknown kind: $1 (claude, codex, anthropic-api or openai-api)" ;;
+    esac
+    if [[ "$2" == env && "$1" == *-api ]]; then
+        usage_error "env is reserved: it labels the key from the environment variable"
+    fi
+    valid_name "$2" || usage_error "bad name: '$2' (letters, digits, . _ -, starting with a letter, digit or _)"
+}
+
+# add_key <kind> <name>: one Admin key from the terminal (not echoed) or stdin.
+add_key() {
+    local file key tmp
+    file="$(data_dir)/keys/$1/$2"
+    if [[ -t 0 ]]; then
+        read -rsp "Admin key for $1 $2: " key
+        echo >&2
+    else
+        IFS= read -r key || true
+    fi
+    key=${key//[[:space:]]/}
+    [[ -n "$key" ]] || usage_error "no key given"
+    (
+        umask 077
+        mkdir -p "${file%/*}" && tmp=$(mktemp "${file%/*}/.key.XXXXXX") &&
+            printf '%s\n' "$key" > "$tmp" && mv -f "$tmp" "$file"
+    ) || die "could not save the key"
+    echo "saved $1 key $2"
+}
+
+account_dir() {
+    printf '%s/accounts/%s/%s\n' "$(data_dir)" "$1" "$2"
+}
+
+# run_login <claude|codex> <dir> [codex login args...]: the CLI's own login,
+# with its config in dir rather than the CLI's usual one.
+run_login() {
+    local kind=$1 dir=$2
+    shift 2
+    case "$kind" in
+        claude) CLAUDE_CONFIG_DIR="$dir" claude auth login --claudeai ;;
+        codex) CODEX_HOME="$dir" codex login -c 'cli_auth_credentials_store="file"' "$@" ;;
+    esac
+}
+
+run_logout() {
+    case "$1" in
+        claude) CLAUDE_CONFIG_DIR="$2" claude auth logout ;;
+        codex) CODEX_HOME="$2" codex logout -c 'cli_auth_credentials_store="file"' ;;
+    esac
+}
+
+# has_login <claude|codex> <dir>: dir holds a usable login.
+has_login() {
+    case "$1" in
+        claude) jq -e '.claudeAiOauth.accessToken | strings | length > 0' "$2/.credentials.json" ;;
+        codex) jq -e '.tokens.access_token | strings | length > 0' "$2/auth.json" ;;
+    esac >/dev/null 2>&1
+}
+
+# swap_login <dir> <new login> <where the old one goes>: put the new login in
+# place, putting the old one back if that fails. Judged by where things end up
+# rather than mv's status: a killed mv may already have renamed.
+swap_login() {
+    mv "$1" "$3" 2>/dev/null
+    if [[ -e "$1" || ! -d "$3" ]]; then
+        REFRESH_ERROR="could not move the old login aside"
+        return 1
+    fi
+    mv "$2" "$1" 2>/dev/null
+    if [[ ! -d "$1" ]]; then
+        mv "$3" "$1" 2>/dev/null
+        if [[ -d "$1" ]]; then
+            REFRESH_ERROR="could not move the new login in"
+        else
+            REFRESH_ERROR="could not move the new login in, nor the old one back; it is kept in $3"
+        fi
+        return 1
+    fi
+}
+
+# add_login <claude|codex> <name> [codex login args...]
+#
+# A new name logs in in place; an existing one logs in to a staging dir that
+# replaces it only once the login worked, so a failed re-add keeps the old one.
+# Either way a failed login leaves nothing behind.
+add_login() {
+    local kind=$1 name=$2 dir stage target
+    shift 2
+    if [[ "$kind" == claude && "$(uname)" == Darwin ]]; then
+        die "saved Claude accounts are not supported on macOS yet"
+    fi
+    command -v flock >/dev/null 2>&1 || die "flock is required for saved accounts (util-linux)."
+    command -v "$kind" >/dev/null 2>&1 || die "$kind is required to add a $kind login."
+    command -v jq >/dev/null 2>&1 || die "jq is required."
+    dir=$(account_dir "$kind" "$name")
+    (umask 077 && mkdir -p "${dir%/*}") || die "could not create ${dir%/*}"
+    if [[ -e "$dir" ]]; then
+        # One staging dir holds the new login and, after the swap, the old one,
+        # so a single cleanup covers every way this can end.
+        stage=$(mktemp -d "${dir%/*}/.add-$name.XXXXXX") || die "could not create a staging dir"
+        ADD_CLEANUP=$stage
+        trap 'rm -rf "$ADD_CLEANUP"' EXIT
+        target="$stage/new"
+        mkdir -m 700 "$target" || die "could not create a staging dir"
+    else
+        mkdir -m 700 "$dir" || die "could not create $dir"
+        target=$dir
+        ADD_CLEANUP=$dir
+        trap 'rm -rf "$ADD_CLEANUP"' EXIT
+    fi
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if ! run_login "$kind" "$target" "$@" || ! has_login "$kind" "$target"; then
+        die "$kind login did not finish; nothing saved"
+    fi
+    if [[ "$target" == "$dir" ]]; then
+        ADD_CLEANUP=
+        echo "saved $kind login $name"
+        return
+    fi
+    # Under the old login's lock: a renewal mid-flight would otherwise write the
+    # old account's tokens over the new login once it's in place. A signal
+    # between the two moves would leave the account half-swapped, so it waits
+    # until the swap is done (Ctrl-C reaches flock and mv as well; a killed flock
+    # just means no swap happened).
+    SIGNALLED=""
+    trap 'SIGNALLED=130' INT
+    trap 'SIGNALLED=143' TERM
+    REFRESH_ERROR=""
+    if ! with_lock "$dir" swap_login "$dir" "$target" "$stage/old"; then
+        # With the account gone from its place, the staging dir holds the only
+        # copy of the old login: keep it.
+        [[ -d "$dir" ]] || ADD_CLEANUP=
+        [[ -z "$SIGNALLED" ]] || exit "$SIGNALLED"
+        die "could not replace $dir${REFRESH_ERROR:+: $REFRESH_ERROR}"
+    fi
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # The replaced session is signed out so it doesn't linger, even when
+    # interrupted: the cleanup deletes its only copy.
+    run_logout "$kind" "$stage/old" >/dev/null 2>&1
+    [[ -z "$SIGNALLED" ]] || exit "$SIGNALLED"
+    echo "saved $kind login $name"
+}
+
+cmd_add() {
+    [[ $# -ge 2 ]] || usage_error "usage: usage add <kind> <name>"
+    local kind=$1 name=$2
+    shift 2
+    check_kind_name "$kind" "$name"
+    case "$kind" in
+        anthropic-api|openai-api)
+            [[ $# -eq 0 ]] || usage_error "usage: usage add $kind <name> (the key is read from the terminal or stdin)"
+            add_key "$kind" "$name"
+            ;;
+        claude|codex) add_login "$kind" "$name" "$@" ;;
+    esac
+}
+
+cmd_remove() {
+    [[ $# -eq 2 ]] || usage_error "usage: usage remove <kind> <name>"
+    local kind=$1 name=$2 path
+    check_kind_name "$kind" "$name"
+    case "$kind" in
+        anthropic-api|openai-api)
+            path="$(data_dir)/keys/$kind/$name"
+            [[ -e "$path" ]] || die "no saved $kind key named $name"
+            rm -f "$path"
+            ;;
+        claude|codex)
+            path=$(account_dir "$kind" "$name")
+            [[ -d "$path" ]] || die "no saved $kind login named $name"
+            if ! command -v "$kind" >/dev/null 2>&1 || ! run_logout "$kind" "$path"; then
+                echo "warning: could not sign $kind $name out; removing it anyway" >&2
+            fi
+            rm -rf "$path"
+            ;;
+    esac
+    echo "removed $kind $name"
+}
+
+# move_entry <from> <to>: under a login's lock, so it can't move mid-renewal.
+move_entry() {
+    if [[ -e "$2" ]]; then
+        REFRESH_ERROR="${2##*/} already exists"
+        return 1
+    fi
+    mv "$1" "$2" || { REFRESH_ERROR="mv failed"; return 1; }
+}
+
+cmd_rename() {
+    [[ $# -eq 3 ]] || usage_error "usage: usage rename <kind> <old> <new>"
+    local kind=$1 old=$2 new=$3 from to
+    check_kind_name "$kind" "$old"
+    check_kind_name "$kind" "$new"
+    case "$kind" in
+        anthropic-api|openai-api) from="$(data_dir)/keys/$kind/$old" to="$(data_dir)/keys/$kind/$new" ;;
+        claude|codex) from=$(account_dir "$kind" "$old") to=$(account_dir "$kind" "$new") ;;
+    esac
+    [[ -e "$from" ]] || die "no saved $kind named $old"
+    [[ ! -e "$to" ]] || die "a saved $kind named $new already exists"
+    REFRESH_ERROR=""
+    case "$kind" in
+        anthropic-api|openai-api) move_entry "$from" "$to" ;;
+        claude|codex)
+            command -v flock >/dev/null 2>&1 || die "flock is required for saved accounts (util-linux)."
+            with_lock "$from" move_entry "$from" "$to"
+            ;;
+    esac || die "could not rename $kind $old: $REFRESH_ERROR"
+    echo "renamed $kind $old to $new"
+}
+
+main() {
+    set -uo pipefail
+    # Everything usage writes holds or sits beside credentials: keep it private.
+    umask 077
+    case "${1:-}" in
+        -h|--help) usage; exit 0 ;;
+        add) shift; cmd_add "$@"; exit ;;
+        remove) shift; cmd_remove "$@"; exit ;;
+        rename) shift; cmd_rename "$@"; exit ;;
+        "") ;;
+        -*) usage_error "unknown option: $1" ;;
+        *) usage_error "unknown command: $1" ;;
+    esac
+    command -v curl >/dev/null 2>&1 || die "curl is required."
+    command -v jq >/dev/null 2>&1 || die "jq is required."
+
+    # USAGE_NOW pins the clock, for the tests.
+    NOW=${USAGE_NOW:-$(date +%s)}
+    # Every time here is UTC. jq 1.6's date functions apply local DST, an hour
+    # out for half the year; nothing is ever shown in local time.
+    export TZ=UTC
+    # Decided here: the blocks print into a capture, never a terminal.
+    COLOR=false
+    if [[ -z "${NO_COLOR:-}" ]] && { [[ -t 1 ]] || [[ "${CLICOLOR_FORCE:-0}" != 0 ]]; }; then
+        COLOR=true
+    fi
+
+    local rc=0
+    # Every account is queried at once; nothing prints until all have answered.
+    JOBS=$(mktemp -d "${TMPDIR:-/tmp}/usage.XXXXXX") || die "could not create a temp dir"
+    trap 'rm -rf "$JOBS"' EXIT
+    JOB_COUNT=0
+    show_tool 0 claude "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    show_tool 1 codex "${CODEX_HOME:-$HOME/.codex}"
+    queue 2 api_section
+    wait
+    print_blocks || rc=1
+    exit "$rc"
+}
+
+# claude_account_id <config dir> <current|saved>
+claude_account_id() {
+    claude_profile "$1" "$2" | jq -r '.oauthAccount.accountUuid // empty' 2>/dev/null
+}
+
+# codex_account_id <codex home>: the workspace account, from the id token when
+# auth.json doesn't say.
+codex_account_id() {
+    local auth="$1/auth.json" id
+    id=$(jq -r '.tokens.account_id // empty' "$auth" 2>/dev/null)
+    if [[ -z "$id" ]]; then
+        id=$(jwt_claims "$(jq -r '.tokens.id_token // empty' "$auth" 2>/dev/null)" |
+            jq -r '.["https://api.openai.com/auth"].chatgpt_account_id // empty')
+    fi
+    printf '%s\n' "$id"
+}
+
+# show_tool <group> <claude|codex> <the CLI's own config dir>: queue the CLI's
+# current login, unless the same account is saved, then every saved account by
+# name.
+show_tool() {
+    local group=$1 kind=$2 current=$3 id name names=()
+    while IFS= read -r name; do names+=("$name"); done < <(saved_names "$(data_dir)/accounts/$kind" dirs)
+    id=$("${kind}_account_id" "$current" current)
+    if [[ -n "$id" ]]; then
+        for name in ${names[@]+"${names[@]}"}; do
+            if [[ "$("${kind}_account_id" "$(account_dir "$kind" "$name")" saved)" == "$id" ]]; then
+                current=""
+                break
+            fi
+        done
+    fi
+    if [[ -n "$current" ]]; then
+        queue "$group" "${kind}_block" "current login" "$current" no
+    fi
+    for name in ${names[@]+"${names[@]}"}; do
+        queue "$group" "${kind}_block" "$name" "$(account_dir "$kind" "$name")" yes
+    done
+}
+
+# queue <group> <command...>: run command in the background, its output and
+# status kept in $JOBS for print_blocks.
+queue() {
+    local group=$1
+    shift
+    JOB_COUNT=$((JOB_COUNT + 1))
+    printf '%s\n' "$group" > "$JOBS/$JOB_COUNT.group"
+    { "$@" </dev/null > "$JOBS/$JOB_COUNT.out" 2>&1; echo $? > "$JOBS/$JOB_COUNT.rc"; } &
+}
+
+# print_blocks: every queued block, a blank line between each. Grouped as
+# queued; within a group, accounts with weekly room left before full ones, each
+# soonest weekly reset first and no reset pending after; errors (no #sort line)
+# last; ties in queue order. Fails if any block did.
+print_blocks() {
+    local n rc=0 first out full reset key group tier class shown=""
+    # A block with no status was lost (killed); that counts as a failure.
+    for (( n = 1; n <= JOB_COUNT; n++ )); do
+        [[ "$(cat "$JOBS/$n.rc" 2>/dev/null)" == 0 ]] || rc=1
+    done
+    for (( n = 1; n <= JOB_COUNT; n++ )); do
+        first=$(head -n 1 "$JOBS/$n.out" 2>/dev/null)
+        group=$(cat "$JOBS/$n.group")
+        tier=2 class=0 key=0
+        if [[ "$first" == "#sort "* ]]; then
+            read -r _ full reset <<<"$first"
+            tier=$full
+            if [[ "$reset" == - ]]; then class=1; else key=$reset; fi
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$group" "$tier" "$class" "$key" "$n"
+    done | sort -t "$(printf '\t')" -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n | {
+        while IFS=$'\t' read -r _ _ _ _ n; do
+            out=$(grep -v '^#sort ' "$JOBS/$n.out")
+            [[ -n "$out" ]] || continue
+            if [[ -n "$shown" ]]; then echo; fi
+            printf '%s\n' "$out"
+            shown=1
+        done
+    }
+    return "$rc"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

@@ -38,7 +38,8 @@ for f in tests/*.sh; do [ -f "$f" ] && bash -n "$f"; done
 for f in dev/*.sh; do [ -f "$f" ] && bash -n "$f"; done
 echo "    $(ls scripts | wc -l) scripts, $(ls tests/*.sh | wc -l) test files, $(ls dev/*.sh | wc -l) dev scripts — syntax clean"
 
-run bash tests/run.sh
+# As in CI: usage's tests fail, rather than skip, without jq.
+USAGE_NEED_JQ=1 run bash tests/run.sh
 
 # --- the `nudge-rs` and `subcheck-rs` jobs: the same four legs for each crate ---
 crates=(nudge-rs subcheck-rs)
