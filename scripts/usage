@@ -48,6 +48,23 @@
 # Exits 1 when a source that is set up could not be read.
 # Requires: curl, jq
 
+# Where saved logins are renewed. The client IDs are the CLIs' own, built into
+# every copy of each; they name the app and are not secrets. A refresh token
+# renews only under the client it was issued to, and saved logins are made by
+# the CLIs themselves, so these must match theirs. If a release changes one,
+# logins made with that release fail to renew; changing it here instead fails
+# the older ones, until each is added again.
+
+# Claude Code's: the CLIENT_ID beside this TOKEN_URL in its OAuth config, a
+# string in the CLI's binary.
+CLAUDE_TOKEN_URL=https://platform.claude.com/v1/oauth/token
+CLAUDE_CLIENT_ID=9d1c250a-e61b-44d9-88ed-5944d1962f5e
+
+# Codex's: also the client_id claim in a login's access token. The URL is the
+# default issuer's, for a login that names none.
+CODEX_TOKEN_URL=https://auth.openai.com/oauth/token
+CODEX_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann
+
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
 usage() {
@@ -132,9 +149,6 @@ error_message() {
     jq -r '(.error_description? // .error.message? // .error? // .detail? // empty)
         | tostring | gsub("[[:cntrl:]]"; "")' <<<"$BODY" 2>/dev/null
 }
-
-CLAUDE_TOKEN_URL=https://platform.claude.com/v1/oauth/token
-CLAUDE_CLIENT_ID=9d1c250a-e61b-44d9-88ed-5944d1962f5e
 
 # claude_credentials <config dir> <current|saved>: the login's credentials;
 # the CLI's own login on macOS lives in the keychain.
@@ -354,9 +368,6 @@ claude_block() {
     echo "$name${plan:+ ($plan)}${email:+ · $email}"
     printf '%s\n' "$rows"
 }
-
-CODEX_TOKEN_URL=https://auth.openai.com/oauth/token
-CODEX_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann
 
 # jwt_claims <jwt>: its payload as JSON, {} when it isn't one.
 jwt_claims() {
