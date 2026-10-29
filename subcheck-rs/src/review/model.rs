@@ -8,9 +8,10 @@ use jiff::Timestamp;
 use ratatui::layout::Rect;
 
 use super::layout::{self, EDIT_KEYS, HELP, Item};
+use super::progress::Progress;
 use crate::list::{self, Filter};
 use crate::llm::Spent;
-use crate::store::{Decision, Finding, Run, State, TrackRecord};
+use crate::store::{Decision, Finding, Record, Run, State, TrackRecord};
 use crate::timing::frame_count;
 
 /// Findings decided together, as one row. Repeats are common: typos with the same original and
@@ -43,6 +44,22 @@ impl Entry {
 pub enum FileNote {
     Changed,
     Missing,
+}
+
+/// Which list the left pane shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pane {
+    #[default]
+    Findings,
+    /// Each file of the run, with where the scan is with it (`Tab`).
+    Files,
+}
+
+/// A question on the status line, waiting for `y`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirm {
+    /// Quit, stopping the scan.
+    Quit,
 }
 
 /// The one-line editor that `e` opens.
@@ -88,6 +105,16 @@ pub struct Model {
     pub detail_scroll: u16,
     /// The last click on the list, while it could still be the first of a double-click.
     pub last_click: Option<(Entry, Timestamp)>,
+    /// The scan under way, or as it ended; with no scan, the run's files as recorded.
+    pub progress: Progress,
+    pub pane: Pane,
+    /// Index into `progress.files`.
+    pub file_selected: usize,
+    /// The files list's first shown line.
+    pub file_scroll: usize,
+    pub confirm: Option<Confirm>,
+    /// Why the screen ended early: a job's thread panicked, or the terminal could not be read.
+    pub fatal: Option<String>,
 }
 
 impl Model {
@@ -96,6 +123,7 @@ impl Model {
     pub fn new(run: Run, notes: HashMap<String, FileNote>) -> Model {
         let (rows, track_names) = group(&run);
         let labels = labels(&run);
+        let progress = Progress::of_run(&run);
         let mut m = Model {
             run,
             rows,
@@ -115,6 +143,12 @@ impl Model {
             scroll: 0,
             detail_scroll: 0,
             last_click: None,
+            progress,
+            pane: Pane::Findings,
+            file_selected: 0,
+            file_scroll: 0,
+            confirm: None,
+            fatal: None,
         };
         m.selected = m
             .entries()
@@ -122,6 +156,63 @@ impl Model {
             .position(|&e| m.has_pending(e))
             .unwrap_or(0);
         m
+    }
+
+    /// Take records a scan just appended to the run (as [`Run::add`] does), and rebuild the rows
+    /// around them. What the screen points at (the selection, the editor's entry, the last click,
+    /// the expanded rows) stays on the same findings: a row only ever gains members, so it is found
+    /// again by one it had. The selection keeps its place on screen, the list scrolled as far as
+    /// rows came in above it. On a list that was empty, the selection goes to the first row with a
+    /// pending finding, as on opening. Returns the new findings' indexes.
+    pub fn add(&mut self, records: Vec<Record>) -> Vec<usize> {
+        let from = self.run.findings.len();
+        let was_at = self.selected;
+        let selected = self.selected_entry();
+        for r in records {
+            self.run.add(r);
+        }
+        if self.run.findings.len() == from {
+            return Vec::new();
+        }
+        let (rows, names) = group(&self.run);
+        let old = std::mem::replace(&mut self.rows, rows);
+        self.track_names = names;
+        self.labels = labels(&self.run);
+        let row_of = |rows: &[Row], i: usize| {
+            rows.iter()
+                .position(|r| r.members.contains(&i))
+                .expect("a finding stays in its row")
+        };
+        let moved = |rows: &[Row], e: Entry| match e {
+            Entry::Row(r) => Entry::Row(row_of(rows, old[r].members[0])),
+            Entry::Member(_, i) => Entry::Member(row_of(rows, i), i),
+        };
+        let expanded: HashSet<usize> = self
+            .expanded
+            .iter()
+            .map(|&r| row_of(&self.rows, old[r].members[0]))
+            .collect();
+        self.expanded = expanded;
+        if let Some(ed) = &mut self.editor {
+            ed.entry = moved(&self.rows, ed.entry);
+        }
+        if let Some((e, _)) = &mut self.last_click {
+            *e = moved(&self.rows, *e);
+        }
+        let entries = self.entries();
+        self.selected = match selected {
+            Some(e) => {
+                let e = moved(&self.rows, e);
+                entries.iter().position(|&n| n == e).unwrap_or(0)
+            }
+            None => entries
+                .iter()
+                .position(|&e| self.has_pending(e))
+                .unwrap_or(0),
+        };
+        self.scroll += self.selected.saturating_sub(was_at);
+        self.scroll = self.list_scroll(self.area);
+        (from..self.run.findings.len()).collect()
     }
 
     /// Whether any finding an entry stands for is pending.
@@ -147,15 +238,15 @@ impl Model {
     }
 
     /// The buttons at the end of the status line `status`, when they show there: the editor's while
-    /// it is open, beside its prompt and [`layout::EDIT_FIELD`] columns of text; else `? help`,
-    /// beside the message.
+    /// it is open, beside its prompt and [`layout::EDIT_FIELD`] columns of text; else, or while a
+    /// question takes the line from the editor, `? help`, beside the message.
     pub fn buttons(&self, status: Rect) -> Option<&'static [Item]> {
         let (items, left) = match &self.editor {
-            Some(_) => (
+            Some(_) if self.confirm.is_none() => (
                 EDIT_KEYS,
                 layout::width(layout::PROMPT) + layout::EDIT_FIELD,
             ),
-            None => (
+            _ => (
                 HELP,
                 self.status_text(status).map_or(0, |s| layout::width(&s)),
             ),
@@ -163,14 +254,33 @@ impl Model {
         layout::right_shown(status, items, left).then_some(items)
     }
 
-    /// What the status line `status` says: its message, else what the run's LLM calls cost while
+    /// What the status line `status` says: the question waiting for `y`; else its message; else
+    /// how far the scan is, or how it ended; else what the run's LLM calls cost while
     /// [`Model::show_cost`] holds, as much of it as fits beside `? help`.
     pub fn status_text(&self, status: Rect) -> Option<String> {
+        if self.confirm.is_some() {
+            return Some(self.progress.quit_question());
+        }
         match &self.status {
             Some(message) => Some(message.clone()),
-            None if self.show_cost => cost_status(&self.run.spent, status),
-            None => None,
+            None => self.progress.line().or_else(|| {
+                self.show_cost
+                    .then(|| cost_status(&self.run.spent, status))
+                    .flatten()
+            }),
         }
+    }
+
+    /// The files list's scroll offset on a screen of `area`, as [`Model::list_scroll`] is the
+    /// findings'.
+    pub fn files_scroll(&self, area: Rect) -> usize {
+        let rows = layout::list_rows(&layout::panes(area)).height;
+        layout::keep_in_view(
+            self.file_scroll,
+            self.file_selected,
+            usize::from(rows),
+            self.progress.files.len(),
+        )
     }
 
     /// The name a file goes by in the list (see [`labels`]).
@@ -938,5 +1048,82 @@ mod tests {
             "K-On!! - E01"
         );
         assert_eq!(long_episode("/m/Show.S01E02.1080p.mkv"), "Show.S01E02");
+    }
+
+    #[test]
+    fn findings_added_to_an_empty_list_select_the_first_pending_row() {
+        let mut m = Model::new(
+            Run {
+                name: "r".into(),
+                ..Run::default()
+            },
+            HashMap::new(),
+        );
+        assert_eq!(m.entries().len(), 0);
+        let run = tests_support::run();
+        let mut records: Vec<Record> = run.files.into_iter().map(Record::File).collect();
+        records.extend(run.findings.into_iter().map(Record::Finding));
+        assert_eq!(m.add(records), [0, 1, 2, 3]);
+        assert_eq!(m.rows, tests_support::sample().rows);
+        assert_eq!(m.selected_entry(), Some(Entry::Row(0)));
+        assert_eq!(m.label(&tests_support::path(2)), "E02");
+    }
+
+    #[test]
+    fn what_the_screen_points_at_stays_on_its_findings_as_rows_come_in_above() {
+        let mut m = tests_support::sample();
+        // The lyric's row expanded, its E02 member selected; the editor open on the other row.
+        m.expanded.insert(0);
+        m.selected = 2;
+        assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)));
+        m.editor = Some(Editor {
+            entry: Entry::Row(1),
+            text: "x".into(),
+            cursor: 1,
+        });
+        // E01 gets a finding before the lyric, a row of its own and the first; E04 brings the
+        // lyric again.
+        let typo = "The beat gets trough to our mind";
+        let fixed = "The beat gets through to our mind";
+        let new = m.add(vec![
+            Record::Finding(tests_support::finding(
+                5,
+                1,
+                "An erly line.",
+                "An early line.",
+                1_000,
+            )),
+            Record::File(tests_support::file(4)),
+            Record::Finding(tests_support::finding(6, 4, typo, fixed, 165_060)),
+        ]);
+        assert_eq!(new, [4, 5]);
+        assert_eq!(
+            m.rows,
+            [
+                Row { members: vec![4] },
+                Row {
+                    members: vec![0, 1, 3, 5]
+                },
+                Row { members: vec![2] },
+            ]
+        );
+        assert_eq!(m.selected_entry(), Some(Entry::Member(1, 1)));
+        assert_eq!(m.expanded, HashSet::from([1]));
+        assert_eq!(m.editor.as_ref().map(|e| e.entry), Some(Entry::Row(2)));
+    }
+
+    #[test]
+    fn the_selection_keeps_its_place_on_screen_as_rows_come_in_above() {
+        let mut m = tests_support::many(20);
+        // 12 lines: the status line and the list's border leave 9 rows.
+        m.set_area(Rect::new(0, 0, 120, 12));
+        m.selected = 15;
+        m.scroll = m.list_scroll(m.area);
+        let on_screen = m.selected - m.scroll;
+        m.add(vec![Record::Finding(tests_support::finding(
+            100, 1, "Zero.", "Zero!", 500,
+        ))]);
+        assert_eq!(m.selected, 16);
+        assert_eq!(m.selected - m.scroll, on_screen);
     }
 }

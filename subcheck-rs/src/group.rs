@@ -12,7 +12,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, Once, PoisonError, RwLock, mpsc};
+use std::sync::{Mutex, MutexGuard, Once, PoisonError, RwLock, RwLockWriteGuard, mpsc};
 use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, kill_process_group};
@@ -59,6 +59,9 @@ static INSTALL: Once = Once::new();
 /// through this module (its child killed under it, say) waits for the end instead of acting on
 /// it.
 static ENDING: AtomicBool = AtomicBool::new(false);
+/// Set by [`end`]: the ending is a quit, not a signal, so [`finish`] lets subcheck end its own
+/// way.
+static QUIT: AtomicBool = AtomicBool::new(false);
 
 /// Wait for the end, should a signal be ending subcheck.
 fn wait_if_ending() {
@@ -138,9 +141,11 @@ pub fn create_removing(
 
 /// To call as subcheck's main returns. While a signal is ending subcheck, a run returning on the
 /// way would end it with a status of its own, and maybe before the cleanup is done: it waits for
-/// the signal to end it instead.
+/// the signal to end it instead. After [`end`], a quit, it returns at once.
 pub fn finish() {
-    wait_if_ending();
+    if !QUIT.load(Ordering::SeqCst) {
+        wait_if_ending();
+    }
 }
 
 /// Why [`output`] has no output: the command did not start, or could not be waited for.
@@ -188,8 +193,8 @@ fn install() {
                 let first = Instant::now();
                 // The cleanup on a thread of its own, or on this one should none start.
                 let ending = std::thread::Builder::new().name("ending".into());
-                if ending.spawn(move || end(sig)).is_err() {
-                    end(sig);
+                if ending.spawn(move || end_by_signal(sig)).is_err() {
+                    end_by_signal(sig);
                 }
                 // Should the cleanup wait on a stalled mount, a second SIGINT or SIGTERM (Ctrl-C
                 // again) ends subcheck as if there were no handler, once the first has had
@@ -217,11 +222,24 @@ fn ignored(sig: libc::c_int) -> bool {
 }
 
 /// Kill every registered group, then remove every registered file, then die of `sig` as if there
-/// were no handler. The groups running now are killed first, so a start stuck in exec does not
-/// keep them alive; then, once no start is under way and none can begin, any registered since.
-/// Nothing is let go of after, so no group starts and no file is made; and the files come last,
-/// so one stuck on a stalled mount does not keep the groups alive either.
-fn end(sig: libc::c_int) {
+/// were no handler.
+fn end_by_signal(sig: libc::c_int) {
+    let _held = end_all();
+    let _ = emulate_default_handler(sig);
+}
+
+/// The registry as [`end_all`] leaves it: held, so no group starts and no file is made.
+type Held = (
+    RwLockWriteGuard<'static, ()>,
+    MutexGuard<'static, List<Pid>>,
+    MutexGuard<'static, List<PathBuf>>,
+);
+
+/// Kill every registered group, then remove every registered file. The groups running now are
+/// killed first, so a start stuck in exec does not keep them alive; then, once no start is under
+/// way and none can begin, any registered since. The files come last, so one stuck on a stalled
+/// mount does not keep the groups alive either. Returns the registry, held.
+fn end_all() -> Held {
     ENDING.store(true, Ordering::SeqCst);
     let kill_all = |groups: &List<Pid>| {
         for &(_, pgid) in &groups.entries {
@@ -229,14 +247,27 @@ fn end(sig: libc::c_int) {
         }
     };
     kill_all(&lock(&GROUPS));
-    let _starting = STARTING.write().unwrap_or_else(PoisonError::into_inner);
+    let starting = STARTING.write().unwrap_or_else(PoisonError::into_inner);
     let groups = lock(&GROUPS);
     kill_all(&groups);
     let files = lock(&FILES);
     for (_, path) in &files.entries {
         let _ = std::fs::remove_file(path);
     }
-    let _ = emulate_default_handler(sig);
+    (starting, groups, files)
+}
+
+/// A signal's cleanup, for a quit that leaves work under way (review's screen quit mid-scan):
+/// every registered group killed and every registered file removed, and the registry held for
+/// good, so no group starts after. A thread that comes back through this module waits for the
+/// end, as under a signal: an LLM call killed under a worker is not recorded as a failure.
+/// Unlike a signal, it does not end subcheck: the caller says what it did and returns from main,
+/// where [`finish`] lets it.
+///
+/// Call it last: a guard of this module dropped after it (review's player) would wait forever.
+pub fn end() {
+    QUIT.store(true, Ordering::SeqCst);
+    std::mem::forget(end_all());
 }
 
 #[cfg(test)]
@@ -287,6 +318,7 @@ mod tests {
     /// $SUBCHECK_TEST_HOW says, writes `<path>.ready`, and waits.
     #[test]
     #[ignore = "the child of the signal tests"]
+    #[allow(clippy::too_many_lines)] // one arm per way the child registers
     fn child_that_registers_a_file_and_waits() {
         let Some(path) = std::env::var_os("SUBCHECK_TEST_REMOVE") else {
             return;
@@ -357,6 +389,27 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(100));
                 ready();
                 std::thread::sleep(Duration::from_secs(10));
+                return;
+            }
+            // A quit with work under way (review's screen quit mid-scan): a group running, which
+            // holds the test's pipe (stderr) until it ends, and a worker running a group to its end
+            // and then acting on how it ended. `end` kills both and removes the file; main returns
+            // its own way.
+            "quits" => {
+                let removing = remove_on_signal(&path);
+                let running = spawn(Command::new("sleep").arg("20")).unwrap();
+                let acted = path.with_extension("acted");
+                std::thread::spawn(move || {
+                    let _ = output(Command::new("sleep").arg("20"));
+                    std::fs::write(acted, "").unwrap();
+                });
+                std::thread::sleep(Duration::from_millis(100));
+                ready();
+                // Nothing of this module is dropped after `end`: review's screen drops its player
+                // before it.
+                std::mem::forget((removing, running));
+                end();
+                finish();
                 return;
             }
             // And a group running, which holds the test's pipe (stderr) until it ends.
@@ -578,6 +631,25 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{status}");
         assert!(!path.with_extension("acted").exists(), "the worker went on");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_quit_ends_the_groups_and_removes_the_files_then_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("half.mkv");
+        std::fs::write(&path, "half a remux").unwrap();
+        let mut child = start(&path, "quits");
+        let group_ended = pipe_ends(&mut child);
+        let returned = died_within(&mut child, DIES);
+        if !returned {
+            child.kill().unwrap();
+        }
+        let status = child.wait().unwrap();
+        assert!(returned, "the quit returns from main");
+        assert!(status.success(), "{status}");
+        assert!(ends_within(&group_ended, DIES), "the groups were killed");
+        assert!(!path.exists(), "the file was removed");
+        assert!(!path.with_extension("acted").exists(), "the worker went on");
     }
 
     #[test]

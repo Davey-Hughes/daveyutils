@@ -21,7 +21,7 @@ use crate::store::{
     RunHeader, RunWriter, TrackRecord,
 };
 use crate::subs::Kind;
-use crate::text::{self, Event, Line};
+use crate::text::{self, Line};
 use crate::timing::{self, record, shared};
 
 /// The subtitle languages a scan checks unless told otherwise.
@@ -39,7 +39,7 @@ pub struct Options {
     pub into: Option<PathBuf>,
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Summary {
     pub run: String,
     pub files: usize,
@@ -55,6 +55,56 @@ pub struct Summary {
     pub elsewhere: usize,
     /// What this scan's LLM calls used.
     pub spent: Spent,
+}
+
+/// What a scan tells the hook [`execute`] is given, as it goes: enough for review's screen to show
+/// each file's progress, and to take each record as the run file does.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    /// The files to check, in the order they are read: once, first.
+    Queued(Vec<PathBuf>),
+    /// The reader has started on a file.
+    Reading(PathBuf),
+    /// Of the LLM chunks that answer a file's lines, how many have answered: said once the file is
+    /// read, then as each answers. A line already sent for an earlier file counts that file's
+    /// chunk. Not said of a file with no lines for the LLM.
+    Asking {
+        path: PathBuf,
+        answered: usize,
+        chunks: usize,
+    },
+    /// Records just appended to the run, in order: an LLM call's usage, or a file's record and its
+    /// findings.
+    Appended(Vec<Record>),
+    /// A file done, after its records: why it failed, if it did; its findings; and the lines just
+    /// written to the log for it.
+    Finished {
+        path: PathBuf,
+        error: Option<String>,
+        findings: usize,
+        lines: Vec<String>,
+    },
+}
+
+/// What [`plan`] found.
+pub enum Planned {
+    /// Nothing to check; the summary says why (no files, every one unchanged since an earlier
+    /// scan, or with `--run`, nothing the run lacks).
+    Nothing(Summary),
+    Scan(Plan),
+}
+
+/// A scan ready to run: its run file made (or, with `--run`, taken) and locked.
+pub struct Plan {
+    start: Start,
+    summary: Summary,
+}
+
+impl Plan {
+    /// The run file the scan writes to.
+    pub fn run_path(&self) -> &Path {
+        &self.start.writer.path
+    }
 }
 
 /// `paths` expanded to MKV files: files as given, directories walked recursively for `*.mkv`
@@ -226,7 +276,7 @@ fn prepare(path: &Path, langs: &[String], checks: &[Check]) -> Prepared {
     let numbers: Vec<u64> = wanted.iter().map(|(t, _, _)| t.number).collect();
     let before = r.bytes_read();
     let reads = blocks::read_each(&r, &layout, &numbers);
-    let mut events: Vec<(usize, Vec<Event>)> = Vec::new();
+    let mut events: Vec<(usize, Vec<text::Event>)> = Vec::new();
     for ((track, kind, sid), read) in wanted.into_iter().zip(reads) {
         let named = format!("track {} {}", track.id, track.shown_name());
         let read = match read {
@@ -285,14 +335,14 @@ fn prepare(path: &Path, langs: &[String], checks: &[Check]) -> Prepared {
 fn timing_findings(
     path: &Path,
     layout: &Layout,
-    tracks: &[(usize, Vec<Event>)],
+    tracks: &[(usize, Vec<text::Event>)],
 ) -> Result<(Vec<Finding>, Vec<String>), String> {
     let video = timing::video(layout)?;
     let measured: Vec<timing::Analysis> = tracks
         .iter()
         .map(|(_, events)| timing::analyse(&video, events))
         .collect();
-    let analysed: Vec<(usize, &[Event], &timing::Analysis)> = tracks
+    let analysed: Vec<(usize, &[text::Event], &timing::Analysis)> = tracks
         .iter()
         .zip(&measured)
         .map(|((id, events), a)| (*id, events.as_slice(), a))
@@ -540,9 +590,16 @@ fn work(backend: &Backend, queue: &Mutex<mpsc::Receiver<Queued>>, out: &mpsc::Se
 }
 
 /// The reader: files in order, each one's new lines queued as chunks, then the file itself.
-fn read(todo: &[Todo], opts: &Options, queue: &mpsc::SyncSender<Queued>, out: &mpsc::Sender<Msg>) {
+fn read(
+    todo: &[Todo],
+    opts: &Options,
+    queue: &mpsc::SyncSender<Queued>,
+    out: &mpsc::Sender<Msg>,
+    report: &(dyn Fn(Event) + Sync),
+) {
     let mut chunker = Chunker::new(opts.chunk_lines);
     for (path, checks) in todo {
+        report(Event::Reading(path.clone()));
         let prepared = prepare(path, &opts.langs, checks);
         let (refs, chunks) = if prepared.error.is_none() {
             chunker.assign(&prepared.lines)
@@ -855,12 +912,15 @@ fn llm_records(path: &Path) -> io::Result<HashMap<String, (u64, Timestamp)>> {
     }
 }
 
-pub fn run(
+/// The files under `paths` and what each needs, and the run they go to: a new one, or with
+/// `--run` (`opts.into`) the run named, locked for this scan. Warnings, and with `--run` what is
+/// left out and why, go to `log`.
+pub fn plan(
     paths: &[PathBuf],
     opts: &Options,
     state: &Path,
     log: &mut dyn Write,
-) -> anyhow::Result<Summary> {
+) -> anyhow::Result<Planned> {
     let (all, warnings) = mkv_files(paths)?;
     for w in &warnings {
         writeln!(log, "warning: {w}")?;
@@ -873,20 +933,41 @@ pub fn run(
         None => start_new(all, opts, state, &mut summary)?,
         Some(path) => start_adding(path, all, opts, state, &mut summary, log)?,
     };
-    let Some(Start {
-        todo,
-        writer,
-        next_finding,
-        before,
-    }) = start
-    else {
-        return Ok(summary);
-    };
-    summary.run.clone_from(&writer.name);
+    Ok(match start {
+        None => Planned::Nothing(summary),
+        Some(start) => {
+            summary.run.clone_from(&start.writer.name);
+            Planned::Scan(Plan { start, summary })
+        }
+    })
+}
+
+/// Run `plan`: one reader thread, `-j` workers, and the collector on this thread, which appends
+/// each file's records the moment its lines are all answered. `report` hears each step (see
+/// [`Event`]), from the reader's thread and this one.
+pub fn execute(
+    plan: Plan,
+    opts: &Options,
+    state: &Path,
+    log: &mut dyn Write,
+    report: &(dyn Fn(Event) + Sync),
+) -> anyhow::Result<Summary> {
+    let Plan {
+        start:
+            Start {
+                todo,
+                writer,
+                next_finding,
+                before,
+            },
+        summary,
+    } = plan;
+    report(Event::Queued(todo.iter().map(|(p, _)| p.clone()).collect()));
     let mut collector = Collector {
         writer,
         state,
         opts,
+        report,
         summary,
         total: todo.len(),
         done: 0,
@@ -907,10 +988,94 @@ pub fn run(
             scope.spawn(move || work(&opts.backend, &queue_rx, &msg_tx));
         }
         let todo = &todo;
-        scope.spawn(move || read(todo, opts, &queue_tx, &msg_tx));
+        scope.spawn(move || read(todo, opts, &queue_tx, &msg_tx, report));
         collector.collect(&msg_rx, log)
     })?;
     Ok(collector.summary)
+}
+
+/// What `scan` says when it is done, line by line (each to stderr): of a new run, or with
+/// `adding` of what it added to one (`--run`).
+pub fn summary_lines(s: &Summary, adding: bool) -> Vec<String> {
+    if adding {
+        return added_lines(s);
+    }
+    if s.run.is_empty() {
+        return vec![if s.files == 0 {
+            "Nothing to check: no MKV files found".to_string()
+        } else {
+            format!(
+                "Nothing to check: {} unchanged since an earlier scan (--force to check again)",
+                files(s.cached)
+            )
+        }];
+    }
+    let mut lines = vec![format!(
+        "run {}: {} files, {} checked, {} failed, {} unchanged since an earlier scan; {} findings{}",
+        s.run,
+        s.files,
+        s.checked,
+        s.failed,
+        s.cached,
+        s.findings,
+        of_timing(s.timing)
+    )];
+    lines.extend(s.spent.line(", "));
+    lines.push(review_hint(&s.run));
+    lines
+}
+
+/// What `scan --run` says it did.
+fn added_lines(s: &Summary) -> Vec<String> {
+    let mut left = Vec::new();
+    if s.cached > 0 {
+        left.push(format!("{} with every check already", files(s.cached)));
+    }
+    if s.changed > 0 {
+        left.push(format!("{} changed since the run", files(s.changed)));
+    }
+    if s.elsewhere > 0 {
+        left.push(format!(
+            "{} with the LLM check in another run",
+            files(s.elsewhere)
+        ));
+    }
+    if s.checked + s.failed == 0 {
+        return vec![format!(
+            "Nothing to add to run {}: {}",
+            s.run,
+            left.join(", ")
+        )];
+    }
+    let left = if left.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} left out)", left.join(", "))
+    };
+    let mut lines = vec![format!(
+        "run {}: added to {}{left}, {} failed; {} findings{}",
+        s.run,
+        files(s.checked + s.failed),
+        s.failed,
+        s.findings,
+        of_timing(s.timing)
+    )];
+    lines.extend(s.spent.line(", "));
+    lines.push(review_hint(&s.run));
+    lines
+}
+
+/// ` (3 timing)`: how many of the findings are the timing check's; nothing when none are.
+fn of_timing(n: usize) -> String {
+    if n > 0 {
+        format!(" ({n} timing)")
+    } else {
+        String::new()
+    }
+}
+
+fn review_hint(run: &str) -> String {
+    format!("Review them with: subcheck review {run} (or print them: subcheck list {run})")
 }
 
 /// Writes each file's records the moment every one of its lines has an answer.
@@ -918,6 +1083,8 @@ struct Collector<'a> {
     writer: RunWriter,
     state: &'a Path,
     opts: &'a Options,
+    /// Told of each file's progress and of every record appended.
+    report: &'a (dyn Fn(Event) + Sync),
     summary: Summary,
     total: usize,
     done: usize,
@@ -933,17 +1100,39 @@ impl Collector<'_> {
     fn collect(&mut self, rx: &mpsc::Receiver<Msg>, log: &mut dyn Write) -> anyhow::Result<()> {
         while let Ok(msg) = rx.recv() {
             match msg {
-                Msg::File(job) => self.waiting.push(*job),
+                Msg::File(job) => {
+                    let (answered, chunks) = self.asked(&job.refs);
+                    if chunks > 0 {
+                        (self.report)(Event::Asking {
+                            path: job.prepared.path.clone(),
+                            answered,
+                            chunks,
+                        });
+                    }
+                    self.waiting.push(*job);
+                }
                 Msg::Chunk(c) => {
                     // Written as they come, so a scan cut short still says what it used.
                     if !c.calls.is_empty() {
                         for call in &c.calls {
                             self.summary.spent.add(call.usage.as_ref());
                         }
-                        let records: Vec<Record> = c.calls.into_iter().map(Record::Usage).collect();
-                        self.writer.append(&records)?;
+                        self.append(c.calls.into_iter().map(Record::Usage).collect())?;
                     }
-                    self.answers.insert(c.id, c.result);
+                    let id = c.id;
+                    self.answers.insert(id, c.result);
+                    for job in self
+                        .waiting
+                        .iter()
+                        .filter(|j| j.refs.iter().any(|&(chunk, _)| chunk == id))
+                    {
+                        let (answered, chunks) = self.asked(&job.refs);
+                        (self.report)(Event::Asking {
+                            path: job.prepared.path.clone(),
+                            answered,
+                            chunks,
+                        });
+                    }
                 }
             }
             while let Some(i) = self.waiting.iter().position(|j| {
@@ -952,19 +1141,21 @@ impl Collector<'_> {
                     .all(|(chunk, _)| self.answers.contains_key(chunk))
             }) {
                 let job = self.waiting.remove(i);
-                self.finish(job, log)?;
+                let done = self.finish(job, log)?;
+                (self.report)(done);
             }
         }
         for job in std::mem::take(&mut self.waiting) {
             let p = job.prepared;
+            let mut said = Vec::new();
             if let Some(t) = p.truncated {
-                writeln!(log, "{}", t.warning(&p.path))?;
+                say(log, &mut said, t.warning(&p.path))?;
             }
             self.summary.failed += 1;
             let error = "no answer for some lines".to_string();
             let path = p.path.to_string_lossy().into_owned();
             if self.earlier(&path).is_none() {
-                self.writer.append(&[Record::File(FileRecord {
+                self.append(vec![Record::File(FileRecord {
                     path,
                     size: p.size,
                     mtime: p.mtime,
@@ -975,12 +1166,25 @@ impl Collector<'_> {
                     checks: p.checks,
                 })])?;
             }
-            writeln!(log, "{}: FAILED: {error}", p.path.display())?;
+            say(
+                log,
+                &mut said,
+                format!("{}: FAILED: {error}", p.path.display()),
+            )?;
+            (self.report)(Event::Finished {
+                path: p.path,
+                error: Some(error),
+                findings: 0,
+                lines: said,
+            });
         }
         Ok(())
     }
 
-    fn finish(&mut self, job: FileJob, log: &mut dyn Write) -> anyhow::Result<()> {
+    /// A file whose lines all have their answers: its records appended and its lines logged, and
+    /// what it came to, for the hook.
+    #[allow(clippy::too_many_lines)] // one file's records, then its log, in the order written
+    fn finish(&mut self, job: FileJob, log: &mut dyn Write) -> anyhow::Result<Event> {
         let FileJob { prepared: p, refs } = job;
         self.done += 1;
         let name = p
@@ -990,8 +1194,9 @@ impl Collector<'_> {
             .unwrap_or_default();
         let progress = format!("[{}/{}] {name}", self.done, self.total);
         let path = p.path.to_string_lossy().into_owned();
+        let mut said = Vec::new();
         if let Some(t) = p.truncated {
-            writeln!(log, "{}", t.warning(&p.path))?;
+            say(log, &mut said, t.warning(&p.path))?;
         }
         let llm_error = refs
             .iter()
@@ -1020,12 +1225,13 @@ impl Collector<'_> {
             truncated: p.truncated,
             checks,
         });
-        if let Some(e) = error {
+        let mut found = 0;
+        if let Some(e) = &error {
             self.summary.failed += 1;
             if !keep {
-                self.writer.append(&[file])?;
+                self.append(vec![file])?;
             }
-            writeln!(log, "{progress}: FAILED: {e}")?;
+            say(log, &mut said, format!("{progress}: FAILED: {e}"))?;
         } else {
             let mut findings = findings(
                 &self.answers,
@@ -1042,40 +1248,41 @@ impl Collector<'_> {
                 });
                 self.next_finding += 1;
             }
-            let found = findings.len();
+            found = findings.len();
             let mut records = vec![file];
             records.extend(findings.into_iter().map(Record::Finding));
-            self.writer.append(&records)?;
+            self.append(records)?;
             if !p.skipped_tracks && p.truncated.is_none() {
                 self.cache(&path, p.size, p.mtime, &p.checks)?;
             }
             self.summary.checked += 1;
             self.summary.findings += found;
             self.summary.timing += timing;
-            let of_timing = if timing > 0 {
-                format!(" ({timing} timing)")
+            let line = if p.checks.contains(&Check::Llm) {
+                format!(
+                    "{progress}: {} lines, {found} findings{}",
+                    p.lines.len(),
+                    of_timing(timing)
+                )
             } else {
-                String::new()
+                format!("{progress}: timing only, {found} findings")
             };
-            if p.checks.contains(&Check::Llm) {
-                writeln!(
-                    log,
-                    "{progress}: {} lines, {found} findings{of_timing}",
-                    p.lines.len()
-                )?;
-            } else {
-                writeln!(log, "{progress}: timing only, {found} findings")?;
-            }
+            say(log, &mut said, line)?;
         }
         for note in &p.timing_notes {
-            writeln!(log, "    {note}")?;
+            say(log, &mut said, format!("    {note}"))?;
         }
         if self.opts.verbose {
             for note in &p.notes {
-                writeln!(log, "    {note}")?;
+                say(log, &mut said, format!("    {note}"))?;
             }
         }
-        Ok(())
+        Ok(Event::Finished {
+            path: p.path,
+            error,
+            findings: found,
+            lines: said,
+        })
     }
 }
 
@@ -1104,6 +1311,33 @@ impl Collector<'_> {
         }
         Ok(())
     }
+
+    /// Append `records` to the run, and tell the hook they are there.
+    fn append(&mut self, records: Vec<Record>) -> io::Result<()> {
+        self.writer.append(&records)?;
+        (self.report)(Event::Appended(records));
+        Ok(())
+    }
+
+    /// Of the chunks that answer a file's lines (`refs`), how many have answered, and how many
+    /// there are.
+    fn asked(&self, refs: &[(usize, usize)]) -> (usize, usize) {
+        let mut ids: Vec<usize> = refs.iter().map(|&(chunk, _)| chunk).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let answered = ids
+            .iter()
+            .filter(|id| self.answers.contains_key(id))
+            .count();
+        (answered, ids.len())
+    }
+}
+
+/// Write `line` to the log, and keep it for the file's [`Event::Finished`].
+fn say(log: &mut dyn Write, said: &mut Vec<String>, line: String) -> io::Result<()> {
+    writeln!(log, "{line}")?;
+    said.push(line);
+    Ok(())
 }
 
 /// One finding per distinct suggestion for each line, with up to two lines of context either side.

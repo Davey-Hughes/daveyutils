@@ -11,8 +11,9 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 
+use super::files;
 use super::layout;
-use super::model::{Entry, FileNote, Model, changed, fix_label};
+use super::model::{Entry, FileNote, Model, Pane, changed, fix_label};
 use crate::list::{self, Filter, label};
 use crate::llm::Spent;
 use crate::store::{State, TimingFix};
@@ -21,7 +22,10 @@ use crate::timing::shift_label;
 
 pub fn view(m: &Model, f: &mut Frame) {
     let p = layout::panes(f.area());
-    list_pane(m, f, p.list);
+    match m.pane {
+        Pane::Findings => list_pane(m, f, p.list),
+        Pane::Files => files::files_pane(m, f, p.list),
+    }
     detail_pane(m, f, p.detail);
     status_line(m, f, p.status);
     if m.help {
@@ -50,6 +54,7 @@ const KEY_GROUPS: [(&str, &[(&str, &str)]); 3] = [
             ("n p", "next, previous file"),
             ("⏎", "expand a group"),
             ("f", "filter"),
+            ("Tab", "findings, files"),
         ],
     ),
     (
@@ -57,9 +62,9 @@ const KEY_GROUPS: [(&str, &[(&str, &str)]); 3] = [
         &[
             ("o", "open the line"),
             ("␣", "pause"),
-            ("← →", "5 s back, on"),
-            (", .", "1 s back, on"),
-            ("[ ]", "a frame back, on"),
+            ("← →", "5 s back, forward"),
+            (", .", "1 s back, forward"),
+            ("[ ]", "a frame back, forward"),
         ],
     ),
 ];
@@ -183,19 +188,50 @@ fn keys_box(m: &Model, f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), at);
 }
 
+/// The two tab names that start the left pane's title, the one for `active` reversed. They sit in
+/// the same place in both views, so the title says which view is up before anything else does. The
+/// other one is only dimmed: it should read as a place to go, not as a gap.
+pub(super) fn tabs(active: Pane) -> Vec<Span<'static>> {
+    let tab = |pane, name: &'static str| {
+        let style = if pane == active {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        Span::styled(name, style)
+    };
+    vec![
+        Span::raw(" "),
+        tab(Pane::Findings, "findings"),
+        Span::raw("  "),
+        tab(Pane::Files, "files"),
+    ]
+}
+
 fn list_pane(m: &Model, f: &mut Frame, area: Rect) {
     let (pending, accepted, rejected) = m.counts();
     let showing = match m.filter {
         Filter::All => "all".to_string(),
         Filter::Only(state) => label(state).to_string(),
     };
-    let block = Block::default().borders(Borders::ALL).title(format!(
-        " findings ({pending} pending · {accepted} accepted · {rejected} rejected) · showing {showing} "
-    ));
+    let progress = m
+        .progress
+        .title()
+        .map_or_else(String::new, |t| format!(" · {t}"));
+    let mut title = tabs(Pane::Findings);
+    title.push(Span::raw(format!(
+        " · {pending} pending · {accepted} accepted · {rejected} rejected · showing {showing}{progress} "
+    )));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(title));
     let entries = m.entries();
     if entries.is_empty() {
         let hint = match m.filter {
-            Filter::All => "No findings.".to_string(),
+            Filter::All if m.progress.running() => {
+                "No findings yet · Tab shows the files".to_string()
+            }
+            Filter::All => "No findings · Tab shows the files".to_string(),
             Filter::Only(state) => format!("Nothing {} · f shows the others", label(state)),
         };
         f.render_widget(Paragraph::new(hint).block(block), area);
@@ -295,12 +331,19 @@ fn entry_text(m: &Model, e: Entry) -> Line<'static> {
 }
 
 fn detail_pane(m: &Model, f: &mut Frame, area: Rect) {
-    let Some(i) = m.focus() else {
+    let path = match m.pane {
+        Pane::Findings => m.focus().map(|i| m.finding(i).file.as_str()),
+        Pane::Files => m
+            .progress
+            .files
+            .get(m.file_selected)
+            .map(|file| file.path.as_str()),
+    };
+    let Some(path) = path else {
         f.render_widget(Block::default().borders(Borders::ALL), area);
         return;
     };
-    let finding = m.finding(i);
-    let name = finding.file.rsplit('/').next().unwrap_or(&finding.file);
+    let name = path.rsplit('/').next().unwrap_or(path);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {name} "));
@@ -323,6 +366,9 @@ pub fn detail_height(m: &Model, width: u16) -> usize {
 
 /// What the detail pane says about the selection; nothing when there is none.
 pub fn detail_lines(m: &Model) -> Vec<Line<'static>> {
+    if m.pane == Pane::Files {
+        return files::detail_lines(m);
+    }
     let Some(i) = m.focus() else {
         return Vec::new();
     };
@@ -506,7 +552,8 @@ fn marked(prefix: &'static str, text: &str, span: Range<usize>, color: Color) ->
 }
 
 /// The status line: the message, or the editor while it is open, with its buttons at the end
-/// while there is room (`? help`, or the editor's).
+/// while there is room (`? help`, or the editor's). A question waiting for `y` takes the line from
+/// the editor too, since the next key answers it.
 fn status_line(m: &Model, f: &mut Frame, area: Rect) {
     let buttons = m.buttons(area);
     // The text stops a column short of the buttons.
@@ -526,7 +573,7 @@ fn status_line(m: &Model, f: &mut Frame, area: Rect) {
         };
         f.render_widget(Paragraph::new(layout::bar_text(items)), at);
     }
-    if let Some(ed) = &m.editor {
+    if let Some(ed) = m.editor.as_ref().filter(|_| m.confirm.is_none()) {
         let prompt_len = layout::PROMPT.chars().count();
         // Scrolled so the cursor stays in view, with a column left for it after the text.
         let room = usize::from(text.width).saturating_sub(prompt_len).max(1);
@@ -572,11 +619,34 @@ mod tests {
     }
 
     #[test]
+    fn the_title_marks_the_tab_you_are_on() {
+        let mut m = sample();
+        // The cells of `name` on the top border: its modifier is what tells the tabs apart.
+        let reversed = |m: &Model, name: &str| {
+            let mut term = Terminal::new(TestBackend::new(200, 20)).unwrap();
+            term.draw(|f| view(m, f)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let row: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect();
+            let at = (0..row.len())
+                .find(|&i| row[i..].concat().starts_with(name))
+                .unwrap();
+            buf[(u16::try_from(at).unwrap(), 0)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        };
+        assert!(reversed(&m, "findings"));
+        assert!(!reversed(&m, "files"));
+        update::update(&mut m, Msg::Key(KeyCode::Tab), now());
+        assert!(!reversed(&m, "findings"));
+        assert!(reversed(&m, "files"));
+    }
+
+    #[test]
     fn the_list_groups_repeats_and_counts_findings() {
         let m = sample();
         let screen = render(&m, 160, 20);
         assert!(
-            screen.contains("findings (4 pending · 0 accepted · 0 rejected) · showing all"),
+            screen.contains("findings  files · 4 pending · 0 accepted · 0 rejected · showing all"),
             "{screen}"
         );
         assert!(
@@ -770,6 +840,59 @@ mod tests {
     }
 
     #[test]
+    fn the_files_view_shows_each_files_stage_and_the_selected_ones_log() {
+        use crate::review::model::tests_support::path;
+        use crate::scan::Event;
+        let mut m = sample();
+        let queued = vec![path(3).into(), path(4).into()];
+        update::update(&mut m, Msg::Scan(Event::Queued(queued)), now());
+        update::update(&mut m, Msg::Scan(Event::Reading(path(4).into())), now());
+        let done = Event::Finished {
+            path: path(3).into(),
+            error: None,
+            findings: 1,
+            lines: vec!["[1/2] K-On! - E03 - Episode.mkv: 400 lines, 1 findings".into()],
+        };
+        update::update(&mut m, Msg::Scan(done), now());
+        // Wide enough for the findings' whole title, progress and all.
+        let screen = render(&m, 200, 20);
+        assert!(screen.contains("showing all · scanning 1/2 ⠋ "), "{screen}");
+        update::update(&mut m, Msg::Key(KeyCode::Tab), now());
+        m.file_selected = 2;
+        let screen = render(&m, 160, 20);
+        assert!(
+            screen.contains(" findings  files · 4 files · scanning 1/2 ⠋ "),
+            "{screen}"
+        );
+        assert!(screen.contains("E01  ✓ 400 lines · 1 finding"), "{screen}");
+        assert!(screen.contains("E03  ✓ 1 finding"), "{screen}");
+        assert!(screen.contains("E04  ⠋ reading"), "{screen}");
+        assert!(
+            screen.contains("│[1/2] K-On! - E03 - Episode.mkv: 400 lines, 1 findings"),
+            "{screen}"
+        );
+        assert!(screen.contains("scan 1/2 · 1 finding"), "{screen}");
+    }
+
+    #[test]
+    fn an_empty_list_while_scanning_says_findings_are_coming() {
+        let mut m = Model::new(
+            crate::store::Run {
+                name: "r".into(),
+                ..crate::store::Run::default()
+            },
+            std::collections::HashMap::new(),
+        );
+        let queued = vec![crate::review::model::tests_support::path(1).into()];
+        update::update(&mut m, Msg::Scan(crate::scan::Event::Queued(queued)), now());
+        let screen = render(&m, 120, 12);
+        assert!(
+            screen.contains("No findings yet · Tab shows the files"),
+            "{screen}"
+        );
+    }
+
+    #[test]
     fn question_mark_shows_every_key_in_a_box_over_the_panes() {
         let mut m = sample();
         m.help = true;
@@ -780,8 +903,9 @@ mod tests {
             "a  accept",
             "x  clear: back to pending",
             "PgUp PgDn  page",
+            "Tab        findings, files",
             "␣    pause",
-            "[ ]  a frame back, on",
+            "[ ]  a frame back, forward",
             "└ q quits · any other key closes this ",
         ] {
             assert!(screen.contains(text), "{text}\n{screen}");
@@ -923,7 +1047,9 @@ mod tests {
             .position(|l| l.contains("1 call · 1.23M in / 31.2k out tokens · $3.21 at API prices"))
             .unwrap_or_else(|| panic!("{screen}"));
         // Under the last row of keys: a blank line, a heading, then the costs.
-        let last_key = lines.iter().position(|l| l.contains("f          filter"));
+        let last_key = lines
+            .iter()
+            .position(|l| l.contains("Tab        findings, files"));
         assert_eq!(last_key, Some(at - 3), "{screen}");
         assert!(lines[at - 1].contains("│ LLM "), "{screen}");
         // Too narrow for one line, it wraps between the parts.
@@ -1080,6 +1206,35 @@ mod tests {
             screen.contains("Nothing rejected · f shows the others"),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn the_quit_question_shows_over_the_editor() {
+        use crate::review::model::tests_support::path;
+        let mut m = sample();
+        let queued = vec![path(4).into(), path(5).into()];
+        update::update(&mut m, Msg::Scan(crate::scan::Event::Queued(queued)), now());
+        m.selected = 1;
+        update::update(&mut m, Msg::Key(KeyCode::Char('e')), now());
+        // Ctrl-C mid-edit: the next key answers the question, so it shows, as it does outside
+        // the editor.
+        update::update(&mut m, Msg::Quit, now());
+        let screen = render(&m, 160, 20);
+        let line = screen.lines().nth(19).unwrap();
+        assert!(
+            line.starts_with("scan is on 0/2 — stop it and quit? y/n "),
+            "{screen}"
+        );
+        assert!(line.ends_with(" ? help"), "{screen}");
+        // `n` lets it go, and the edit is as it was.
+        update::update(&mut m, Msg::Key(KeyCode::Char('n')), now());
+        let screen = render(&m, 160, 20);
+        let line = screen.lines().nth(19).unwrap();
+        assert!(
+            line.starts_with("wording: Let's have snacks together every day. "),
+            "{screen}"
+        );
+        assert!(line.ends_with(" ⏎ accept · Esc cancel"), "{screen}");
     }
 
     #[test]

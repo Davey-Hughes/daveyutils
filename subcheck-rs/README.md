@@ -8,7 +8,9 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
   under `~/.local/state/subcheck/`, with each track `timing` finds shifted, and what each LLM call
   used ([LLM costs](#llm-costs)). `--run <run>` adds to that run only the checks it lacks: the
   timing check, say, for a run made before it existed. An LLM check the cache has from another
-  run of the unchanged file is not made again.
+  run of the unchanged file is not made again. On a terminal it opens review's screen as it
+  starts, and each file's findings join the list when the file is done ([Review](#review));
+  `--no-tui` prints its log instead.
 - `subcheck review` steps through a run's fixes to accept, reject or reword each one.
 - `subcheck list` prints a run's fixes as text, under what its LLM calls cost; `--mpv` adds a
   command that opens each one.
@@ -23,6 +25,24 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
   steady lag. Needs ffmpeg; nothing recorded.
 
 ## Review
+
+`subcheck scan` opens this screen on the scan it starts, when stdout and stderr are a terminal
+(`--no-tui` keeps the log). Each file's findings join the list when the file is done, the
+selection staying on its row as rows come in above it. A typo that joins a row whose findings are
+all decided alike takes that decision, your wording too, and the status line says so; `u` takes it
+back. A timing finding that joins a row stays pending: each episode's fix can differ.
+
+`Tab` shows the files instead: each with where the scan is with it (`queued`, `reading`,
+`LLM 2/3`, `✓ 412 lines · 3 findings`, `✓ timing only · 1 finding`, `✗ FAILED: …`), and in the
+detail pane what the scan said of it. `⏎` on a file goes to its first finding, and `u` undoes there
+as it does in the list. While the scan runs, the list's title and the status line say how far it
+is; once it ends, the status line gives its summary. What the scan warns of as it starts (a folder
+it cannot read; with `--run`, a file changed since the run) stays on the terminal above the screen,
+and the first of it is on the status line as the screen opens.
+
+`q` while the scan runs asks first, then stops it: the run keeps every file that was done, and the
+terminal gets the command that finishes it (`subcheck scan --run <run> <paths>`, the run by its
+path when it is a run file outside the state directory).
 
 A fix repeated across episodes (an OP lyric, say) is one row; `⏎` expands it into its episodes. A
 season's timing findings on one track are one row too, whatever each episode's fix (`−1 frame ×23 ·
@@ -44,13 +64,14 @@ filter, to the next row).
 | `e` | reword, then accept |
 | `u` | undo this session's last decision or clear |
 | `f` | filter: all, pending, accepted, rejected |
+| `Tab` | the files, or back to the findings |
 | `o` | open the line in mpv, 2 s early, with its subtitle track; again on the same line replays it |
 | Space | pause or resume mpv |
 | ← → | mpv back or forward 5 s |
 | `,` `.` | mpv back or forward 1 s |
 | `[` `]` | mpv back or forward one frame (it stays paused) |
 | `?` | show every key, and what the run's LLM calls cost, in a box over the list; `q` quits from it, any other key closes it |
-| `q` | quit, closing the mpv window review started |
+| `q` | quit, closing the mpv window review started; while the scan runs, ask first, and stop it |
 
 The mouse works too. Click a row to select it, and double-click to open it in mpv. The wheel moves
 the selection over the list and scrolls the detail pane. `? help` at the end of the status line, and

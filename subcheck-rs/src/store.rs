@@ -476,6 +476,27 @@ pub struct Run {
 }
 
 impl Run {
+    /// Take one record as [`read_run`] does: the latest file record for a path replaces the
+    /// earlier one in its place; the latest decision for a finding wins.
+    pub fn add(&mut self, record: Record) {
+        match record {
+            Record::Run(h) => self.header = Some(h),
+            Record::File(f) => match self.files.iter().position(|r| r.path == f.path) {
+                Some(i) => self.files[i] = f,
+                None => self.files.push(f),
+            },
+            Record::Finding(f) => self.findings.push(f),
+            Record::Decision(d) => {
+                self.decisions.insert(d.finding, d);
+            }
+            Record::Applied(a) => {
+                self.applied.insert(a.finding);
+            }
+            Record::Usage(call) => self.spent.add(call.usage.as_ref()),
+            Record::Unknown => {}
+        }
+    }
+
     pub fn state_of(&self, finding: u64) -> State {
         self.decisions
             .get(&finding)
@@ -508,8 +529,8 @@ pub fn read_run(path: &Path) -> io::Result<Run> {
             continue;
         }
         match serde_json::from_str::<Record>(&line) {
-            Ok(Record::Run(h)) => run.header = Some(h),
-            // The latest record for a path wins, in the place of the first.
+            // The latest record for a path wins, in the place of the first: found by a map here,
+            // as a run of a whole library has thousands of files.
             Ok(Record::File(f)) => {
                 if let Some(&i) = at.get(&f.path) {
                     run.files[i] = f;
@@ -518,15 +539,7 @@ pub fn read_run(path: &Path) -> io::Result<Run> {
                     run.files.push(f);
                 }
             }
-            Ok(Record::Finding(f)) => run.findings.push(f),
-            Ok(Record::Decision(d)) => {
-                run.decisions.insert(d.finding, d);
-            }
-            Ok(Record::Applied(a)) => {
-                run.applied.insert(a.finding);
-            }
-            Ok(Record::Usage(call)) => run.spent.add(call.usage.as_ref()),
-            Ok(Record::Unknown) => {}
+            Ok(record) => run.add(record),
             Err(_) => run.bad_lines += 1,
         }
     }
@@ -1261,5 +1274,78 @@ mod tests {
         assert!(cache.is_fresh("/m/a.mkv", 10, t, &same));
         // The timing check of the same file is a check of its own.
         assert!(!cache.is_fresh("/m/a.mkv", 10, t, &CheckedWith::timing(&["eng".into()], 1)));
+    }
+
+    #[test]
+    fn records_added_one_at_a_time_read_as_the_run_file_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |path: &str, lines| FileRecord {
+            path: path.into(),
+            size: 1,
+            mtime: Timestamp::UNIX_EPOCH,
+            error: None,
+            tracks: vec![],
+            lines,
+            truncated: None,
+            checks: vec![Check::Llm],
+        };
+        let finding = |id| Finding {
+            id,
+            file: "/m/a.mkv".into(),
+            style: "Dialogue".into(),
+            original: "a".into(),
+            suggestion: "b".into(),
+            reason: "r".into(),
+            source: "llm".into(),
+            occurrences: vec![],
+            before: vec![],
+            after: vec![],
+            timing: None,
+        };
+        let records = vec![
+            Record::Run(RunHeader {
+                started: Timestamp::UNIX_EPOCH,
+                backend: "claude".into(),
+                command: vec![],
+                prompt_version: 1,
+                version: "0".into(),
+                langs: vec!["eng".into()],
+            }),
+            Record::File(file("/m/a.mkv", 1)),
+            Record::File(file("/m/b.mkv", 2)),
+            Record::Finding(finding(1)),
+            Record::Finding(finding(2)),
+            // A check added later: the newer record replaces the first, in its place.
+            Record::File(file("/m/a.mkv", 3)),
+            Record::Decision(Decision {
+                finding: 1,
+                state: State::Accepted,
+                edited: None,
+                at: Timestamp::UNIX_EPOCH,
+            }),
+            Record::Applied(Applied {
+                finding: 1,
+                at: Timestamp::UNIX_EPOCH,
+            }),
+            Record::Usage(LlmCall {
+                file: "/m/a.mkv".into(),
+                lines: 1,
+                usage: None,
+            }),
+        ];
+        let mut w = RunWriter::create(dir.path()).unwrap();
+        w.append(&records).unwrap();
+        let read = read_run(&w.path).unwrap();
+        let mut added = Run::default();
+        for r in records {
+            added.add(r);
+        }
+        assert_eq!(added.header, read.header);
+        assert_eq!(added.files, read.files);
+        assert_eq!(added.files[0].lines, 3);
+        assert_eq!(added.findings, read.findings);
+        assert_eq!(added.decisions, read.decisions);
+        assert_eq!(added.applied, read.applied);
+        assert_eq!(added.spent, read.spent);
     }
 }

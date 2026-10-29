@@ -6,10 +6,12 @@ use jiff::{SignedDuration, Timestamp};
 use ratatui::layout::{Position, Rect};
 
 use super::layout;
-use super::model::{Editor, Entry, FileNote, Model, UndoStep};
+use super::model::{Confirm, Editor, Entry, FileNote, Model, Pane, UndoStep};
+use super::progress::Scan;
 use super::view;
 use crate::list::{self, Filter, label};
 use crate::player::{Moment, PlayState, Playback};
+use crate::scan;
 use crate::store::{Decision, State};
 use crate::text::{timestamp, timestamp_ms};
 
@@ -33,6 +35,15 @@ pub enum Msg {
     Resize(u16, u16),
     /// A mouse action at a column and row of the screen.
     Mouse(Mouse, u16, u16),
+    /// What the scan under way just did.
+    Scan(scan::Event),
+    /// The scan ended: its summary, or why it failed.
+    ScanEnded(Result<scan::Summary, String>),
+    /// Something the screen cannot go on without failed (a job's thread panicked, the terminal
+    /// could not be read): it ends, with this error.
+    Fatal(String),
+    /// A quarter of a second passed while the scan runs: the spinner turns.
+    Tick,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +62,10 @@ pub enum Action {
         before: UndoStep,
     },
     Undo,
+    /// New findings taking their rows' decisions (see [`inherit`]).
+    Inherit {
+        before: UndoStep,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,18 +90,23 @@ const DOUBLE_CLICK: SignedDuration = SignedDuration::from_millis(500);
 const WHEEL_LINES: u16 = 3;
 
 pub fn update(m: &mut Model, msg: Msg, now: Timestamp) -> Vec<Effect> {
-    let before = m.selected_entry();
-    // A double-click is two clicks in a row: anything in between starts over.
-    let last_click = m.last_click.take();
-    let input = matches!(msg, Msg::Key(_) | Msg::KillLine | Msg::Mouse(..));
+    let before = (m.selected_entry(), m.pane, m.file_selected);
+    let input = matches!(
+        msg,
+        Msg::Key(_) | Msg::KillLine | Msg::Quit | Msg::Mouse(..)
+    );
+    // A double-click is two clicks with nothing the user did in between: a key or another click
+    // starts over. The scan's messages and the spinner's ticks come unasked, so they leave the
+    // first click be (`Model::add` keeps it on its entry as rows come in).
+    let last_click = if input { m.last_click.take() } else { None };
     let effects = apply(m, msg, last_click, now);
-    // The cost line review opened with ends at the first key (Ctrl-U too), click or turn of the
-    // wheel, the box of keys open or not: once the message is handled, so a click lands on the
-    // status line as it was drawn.
+    // The cost line review opened with ends at the first key (Ctrl-U and Ctrl-C too), click or
+    // turn of the wheel, the box of keys open or not: once the message is handled, so a click
+    // lands on the status line as it was drawn.
     if input {
         m.show_cost = false;
     }
-    if m.selected_entry() != before {
+    if (m.selected_entry(), m.pane, m.file_selected) != before {
         m.detail_scroll = 0;
     }
     // No further than the detail's last line, however that moved: the wheel, a wider screen, a
@@ -94,6 +114,7 @@ pub fn update(m: &mut Model, msg: Msg, now: Timestamp) -> Vec<Effect> {
     m.detail_scroll = m.detail_scroll.min(detail_last(m));
     // The list scrolls no further than it takes to keep the selection in view.
     m.scroll = m.list_scroll(m.area);
+    m.file_scroll = m.files_scroll(m.area);
     effects
 }
 
@@ -104,8 +125,14 @@ fn apply(
     now: Timestamp,
 ) -> Vec<Effect> {
     match msg {
+        // Ctrl-C or Ctrl-D: while the scan runs it asks first, as `q` does; a second one, with the
+        // question open, quits.
         Msg::Quit => {
-            m.should_quit = true;
+            if m.progress.running() && m.confirm.is_none() {
+                m.confirm = Some(Confirm::Quit);
+            } else {
+                m.should_quit = true;
+            }
             Vec::new()
         }
         Msg::KillLine => {
@@ -115,16 +142,27 @@ fn apply(
             }
             Vec::new()
         }
+        // The question takes the next key: `y` answers it, any other lets it go.
+        Msg::Key(key) if m.confirm.is_some() => {
+            m.confirm = None;
+            m.should_quit = key == KeyCode::Char('y');
+            Vec::new()
+        }
         Msg::Key(key) if m.editor.is_some() => edit_key(m, key, now),
         // Any key closes the box of keys and does nothing else; but `q` quits, as the box says.
         Msg::Key(key) if m.help => {
             m.help = false;
-            m.should_quit = key == KeyCode::Char('q');
+            if key == KeyCode::Char('q') {
+                quit_or_ask(m);
+            }
             Vec::new()
         }
         Msg::Key(key) => {
             m.status = None;
-            key_press(m, key, now)
+            match m.pane {
+                Pane::Findings => key_press(m, key, now),
+                Pane::Files => files_key(m, key, now),
+            }
         }
         Msg::Written {
             action,
@@ -157,6 +195,23 @@ fn apply(
             Vec::new()
         }
         Msg::Mouse(action, x, y) => mouse(m, action, Position::new(x, y), last_click, now),
+        Msg::Scan(event) => scanned(m, event, now),
+        Msg::ScanEnded(result) => {
+            m.progress.scan = Scan::Ended(result);
+            // A question to stop the scan has nothing left to ask of: it goes, so the line shows
+            // how the scan ended, and the next `q` quits at once.
+            m.confirm = None;
+            Vec::new()
+        }
+        Msg::Fatal(error) => {
+            m.fatal = Some(error);
+            m.should_quit = true;
+            Vec::new()
+        }
+        Msg::Tick => {
+            m.progress.ticks += 1;
+            Vec::new()
+        }
     }
 }
 
@@ -207,7 +262,16 @@ fn mouse(
         }
         Mouse::Click if layout::list_rows(&p).contains(at) => {
             let row = usize::from(at.y - layout::list_rows(&p).y);
-            click_row(m, m.scroll + row, last_click, now)
+            match m.pane {
+                Pane::Findings => click_row(m, m.scroll + row, last_click, now),
+                Pane::Files => {
+                    if m.file_scroll + row < m.progress.files.len() {
+                        m.status = None;
+                        m.file_selected = m.file_scroll + row;
+                    }
+                    Vec::new()
+                }
+            }
         }
         Mouse::Click => press(m, status_button(m, p.status, at)),
         _ => Vec::new(),
@@ -246,7 +310,8 @@ fn click_row(
 fn key_press(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
     let last = m.entries().len().saturating_sub(1);
     match key {
-        KeyCode::Char('q') => m.should_quit = true,
+        KeyCode::Char('q') => quit_or_ask(m),
+        KeyCode::Tab => m.pane = Pane::Files,
         KeyCode::Char('?') => m.help = true,
         KeyCode::Down | KeyCode::Char('j') => m.selected = (m.selected + 1).min(last),
         KeyCode::Up | KeyCode::Char('k') => m.selected = m.selected.saturating_sub(1),
@@ -489,9 +554,45 @@ fn written(m: &mut Model, action: Action, decisions: &[Decision], result: Result
             m.undo.push(before);
             advance(m, entry, old, &shown);
         }
+        Action::Inherit { before } => {
+            m.undo.push(before);
+            // The decision can hide a row the new member showed under the filter, or show the
+            // member under an expanded row: the selection stays on the entry it was on, wherever
+            // that is in the list now.
+            if let Some(at) = shown
+                .get(old)
+                .and_then(|e| m.entries().iter().position(|n| n == e))
+            {
+                // `Model::add` raised the scroll to hold the row's screen line; the hidden row
+                // took a line from above it, so the scroll gives one back, and the row stays
+                // where the user was looking.
+                m.scroll = (m.scroll + at).saturating_sub(old);
+                m.selected = at;
+            }
+            let first = &decisions[0];
+            let file = m
+                .run
+                .findings
+                .iter()
+                .find(|f| f.id == first.finding)
+                .map(|f| f.file.clone())
+                .unwrap_or_default();
+            let name = m.label(&file);
+            m.status = Some(if n == 1 {
+                format!(
+                    "{name}: a new finding took its row's decision: {} (u undoes)",
+                    label(first.state)
+                )
+            } else {
+                format!("{name}: {n} new findings took their rows' decisions (u undoes)")
+            });
+        }
         Action::Undo => {
             m.undo.pop();
-            m.status = Some(format!("undone: {what}"));
+            // Name the episodes taken back, since the undone step may be a late join in a file
+            // the user is not looking at.
+            let names = episodes(m, decisions);
+            m.status = Some(format!("undone: {what} · {names}"));
             // Select the row the undone decision was on, if the filter shows it.
             let first = m
                 .run
@@ -508,6 +609,25 @@ fn written(m: &mut Model, action: Action, decisions: &[Decision], result: Result
         }
     }
     m.clamp();
+}
+
+/// The episode labels of the files the decisions are on, each once, in order of first appearance.
+fn episodes(m: &Model, decisions: &[Decision]) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for d in decisions {
+        let file = m
+            .run
+            .findings
+            .iter()
+            .find(|f| f.id == d.finding)
+            .map(|f| f.file.clone())
+            .unwrap_or_default();
+        let name = m.label(&file);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.join(", ")
 }
 
 /// After a decision on `decided`, which was at `old` in `shown` (the list before it): select the
@@ -645,10 +765,124 @@ fn open(m: &mut Model) -> Vec<Effect> {
     vec![Effect::Open(moment)]
 }
 
+/// `q`: quit; while the scan runs, ask first.
+fn quit_or_ask(m: &mut Model) {
+    if m.progress.running() {
+        m.confirm = Some(Confirm::Quit);
+    } else {
+        m.should_quit = true;
+    }
+}
+
+/// A key in the files view: moving over the files, `⏎` to a file's findings, `Tab` back. The
+/// decision and mpv keys belong to the findings, except `u`: the status line of a late join
+/// says "u undoes" wherever the user is, so it undoes here too.
+fn files_key(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
+    let last = m.progress.files.len().saturating_sub(1);
+    match key {
+        KeyCode::Char('u') => return undo(m, now),
+        KeyCode::Char('q') => quit_or_ask(m),
+        KeyCode::Char('?') => m.help = true,
+        KeyCode::Tab => m.pane = Pane::Findings,
+        KeyCode::Down | KeyCode::Char('j') => m.file_selected = (m.file_selected + 1).min(last),
+        KeyCode::Up | KeyCode::Char('k') => m.file_selected = m.file_selected.saturating_sub(1),
+        KeyCode::PageDown => m.file_selected = (m.file_selected + PAGE).min(last),
+        KeyCode::PageUp => m.file_selected = m.file_selected.saturating_sub(PAGE),
+        KeyCode::Home | KeyCode::Char('g') => m.file_selected = 0,
+        KeyCode::End | KeyCode::Char('G') => m.file_selected = last,
+        KeyCode::Enter => file_findings(m),
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// `⏎` on a file: the findings, on the first entry with one of the file's, if the filter shows
+/// one.
+fn file_findings(m: &mut Model) {
+    let Some(path) = m
+        .progress
+        .files
+        .get(m.file_selected)
+        .map(|f| f.path.clone())
+    else {
+        return;
+    };
+    let first = m
+        .entries()
+        .into_iter()
+        .position(|e| m.targets(e).iter().any(|&i| m.finding(i).file == path));
+    match first {
+        Some(at) => {
+            m.selected = at;
+            m.pane = Pane::Findings;
+        }
+        None => m.status = Some(format!("no findings of {} shown", m.label(&path))),
+    }
+}
+
+/// A step of the scan: its progress, and the records it appended, whose findings join their rows
+/// (see [`inherit`]).
+fn scanned(m: &mut Model, event: scan::Event, now: Timestamp) -> Vec<Effect> {
+    m.progress.scan_event(&event);
+    let scan::Event::Appended(records) = event else {
+        return Vec::new();
+    };
+    let new = m.add(records);
+    inherit(m, &new, now)
+}
+
+/// The decision each of the `new` findings takes from its row: a typo finding whose row's other
+/// members are all decided alike (the same state, the same wording or none) takes theirs. A
+/// timing finding takes none: each episode's fix can differ. One undo step for them all.
+fn inherit(m: &Model, new: &[usize], now: Timestamp) -> Vec<Effect> {
+    let mut before = Vec::new();
+    let mut decisions = Vec::new();
+    for &i in new {
+        if m.finding(i).timing.is_some() {
+            continue;
+        }
+        let Some(row) = m.rows.iter().find(|r| r.members.contains(&i)) else {
+            continue;
+        };
+        let mut others = row
+            .members
+            .iter()
+            .filter(|j| !new.contains(j))
+            .map(|&j| m.run.decisions.get(&m.finding(j).id));
+        let Some(Some(first)) = others.next() else {
+            continue;
+        };
+        let alike =
+            others.all(|d| d.is_some_and(|d| d.state == first.state && d.edited == first.edited));
+        if first.state == State::Pending || !alike {
+            continue;
+        }
+        let id = m.finding(i).id;
+        before.push((id, None));
+        decisions.push(Decision {
+            finding: id,
+            state: first.state,
+            edited: first.edited.clone(),
+            at: now,
+        });
+    }
+    if decisions.is_empty() {
+        return Vec::new();
+    }
+    vec![Effect::Write {
+        action: Action::Inherit { before },
+        decisions,
+    }]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::review::model::tests_support::{path, sample};
+    use std::path::PathBuf;
+
+    use crate::review::model::tests_support::{self, finding, path, sample};
+    use crate::scan::Event;
+    use crate::store::Record;
 
     fn now() -> Timestamp {
         "2026-10-17T12:00:00Z".parse().unwrap()
@@ -687,6 +921,349 @@ mod tests {
                 .collect(),
             _ => panic!("expected one write: {effects:?}"),
         }
+    }
+
+    /// What `scan` appends for episode `ep`: its file record, then its findings.
+    fn appended(ep: u32, findings: Vec<crate::store::Finding>) -> Msg {
+        let mut records = vec![Record::File(tests_support::file(ep))];
+        records.extend(findings.into_iter().map(Record::Finding));
+        Msg::Scan(Event::Appended(records))
+    }
+
+    const TYPO: &str = "The beat gets trough to our mind";
+    const FIXED: &str = "The beat gets through to our mind";
+
+    fn decide_as(m: &mut Model, ids: &[u64], state: State, edited: Option<&str>) {
+        for &id in ids {
+            m.run.decisions.insert(
+                id,
+                Decision {
+                    finding: id,
+                    state,
+                    edited: edited.map(Into::into),
+                    at: now(),
+                },
+            );
+        }
+    }
+
+    /// The sample run with a scan of E04 and E05 under way.
+    fn scanning() -> Model {
+        let mut m = sample();
+        let queued = vec![PathBuf::from(path(4)), PathBuf::from(path(5))];
+        update(&mut m, Msg::Scan(Event::Queued(queued)), now());
+        m
+    }
+
+    #[test]
+    fn a_typo_joining_a_row_decided_one_way_takes_that_decision_and_u_takes_it_back() {
+        let mut m = sample();
+        let mine = "The beat gets through to our minds";
+        decide_as(&mut m, &[1, 2, 4], State::Accepted, Some(mine));
+        let effects = update(
+            &mut m,
+            appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)]),
+            now(),
+        );
+        assert_eq!(decided(&effects), [(5, State::Accepted, Some(mine))]);
+        written(&mut m, effects);
+        assert_eq!(m.run.state_of(5), State::Accepted);
+        assert_eq!(
+            m.status.as_deref(),
+            Some("E04: a new finding took its row's decision: accepted (u undoes)")
+        );
+        let effects = press(&mut m, 'u');
+        assert_eq!(decided(&effects), [(5, State::Pending, None)]);
+    }
+
+    #[test]
+    fn a_late_join_that_takes_its_rows_decision_leaves_the_selection_on_its_row() {
+        // A third row, E03's, below the snacks row: one for the selection to slip onto.
+        let mut m = sample();
+        m.add(vec![Record::Finding(finding(
+            5,
+            3,
+            "An erly line.",
+            "An early line.",
+            2_000_000,
+        ))]);
+        decide_as(&mut m, &[1, 2, 4], State::Accepted, None);
+        // Pending only: the lyric's row is hidden until E04's lyric shows it for a moment.
+        m.filter = Filter::Only(State::Pending);
+        m.selected = 0;
+        assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
+        let effects = update(
+            &mut m,
+            appended(4, vec![finding(6, 4, TYPO, FIXED, 165_060)]),
+            now(),
+        );
+        written(&mut m, effects);
+        assert_eq!(m.entries(), [Entry::Row(1), Entry::Row(2)]);
+        assert_eq!(m.selected_entry(), Some(Entry::Row(1)), "the snacks row");
+        // Accepted only, the lyric's row expanded and the snacks row selected: the decision shows
+        // the new member above it.
+        let mut m = sample();
+        decide_as(&mut m, &[1, 2, 3, 4], State::Accepted, None);
+        m.filter = Filter::Only(State::Accepted);
+        m.expanded.insert(0);
+        m.selected = 4;
+        assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
+        let effects = update(
+            &mut m,
+            appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)]),
+            now(),
+        );
+        written(&mut m, effects);
+        assert_eq!(m.entries().len(), 6);
+        assert_eq!(m.selected_entry(), Some(Entry::Row(1)), "the snacks row");
+    }
+
+    #[test]
+    fn a_late_join_that_hides_a_row_above_the_selection_keeps_its_row_on_the_same_screen_line() {
+        // Ten more rows, pending: the list is taller than the five rows the screen shows.
+        let mut m = sample();
+        let more: Vec<Record> = (0..10_u64)
+            .map(|n| {
+                let line = format!("Line {n} has an erly typo.");
+                Record::Finding(finding(
+                    10 + n,
+                    3,
+                    &line,
+                    "Fixed.",
+                    3_000_000 + 10_000 * i64::try_from(n).unwrap(),
+                ))
+            })
+            .collect();
+        m.add(more);
+        decide_as(&mut m, &[1, 2, 4], State::Accepted, None);
+        m.filter = Filter::Only(State::Pending);
+        m.selected = 8;
+        m.set_area(Rect::new(0, 0, 100, 8));
+        let line = |m: &Model| m.selected - m.list_scroll(m.area);
+        let selected = m.selected_entry();
+        assert_eq!(line(&m), 4, "scrolled to the bottom of the screen");
+        // E04's lyric joins the decided lyric row: the row shows above the selection for a
+        // moment, then the inherited decision hides it again.
+        let effects = update(
+            &mut m,
+            appended(4, vec![finding(30, 4, TYPO, FIXED, 165_060)]),
+            now(),
+        );
+        written(&mut m, effects);
+        assert_eq!(m.selected_entry(), selected);
+        assert_eq!(m.selected, 8);
+        assert_eq!(line(&m), 4, "the selected row did not move on screen");
+    }
+
+    #[test]
+    fn u_in_the_files_view_takes_a_late_join_back_and_names_its_episode() {
+        let mut m = sample();
+        decide_as(&mut m, &[1, 2, 4], State::Accepted, None);
+        let effects = update(
+            &mut m,
+            appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)]),
+            now(),
+        );
+        written(&mut m, effects);
+        m.pane = Pane::Files;
+        let effects = press(&mut m, 'u');
+        assert_eq!(decided(&effects), [(5, State::Pending, None)]);
+        written(&mut m, effects);
+        assert_eq!(m.run.state_of(5), State::Pending);
+        assert_eq!(m.status.as_deref(), Some("undone: 1 finding · E04"));
+        assert_eq!(m.pane, Pane::Files);
+    }
+
+    #[test]
+    fn an_undo_across_two_episodes_names_both_in_order_of_first_appearance() {
+        let mut m = sample();
+        decide_as(&mut m, &[1, 2, 4], State::Accepted, None);
+        let effects = update(
+            &mut m,
+            appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)]),
+            now(),
+        );
+        written(&mut m, effects);
+        let effects = update(
+            &mut m,
+            appended(5, vec![finding(6, 5, TYPO, FIXED, 165_060)]),
+            now(),
+        );
+        written(&mut m, effects);
+        // One step taking back findings of E05 and E04 at once.
+        m.undo.push(vec![(6, None), (5, None)]);
+        let effects = press(&mut m, 'u');
+        written(&mut m, effects);
+        assert_eq!(m.status.as_deref(), Some("undone: 2 findings · E05, E04"));
+    }
+
+    #[test]
+    fn a_new_finding_stays_pending_in_a_mixed_row_and_in_a_timing_row() {
+        let mut m = sample();
+        decide_as(&mut m, &[1], State::Accepted, None);
+        decide_as(&mut m, &[2], State::Rejected, None);
+        let effects = update(
+            &mut m,
+            appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)]),
+            now(),
+        );
+        assert_eq!(effects, []);
+        assert_eq!(m.run.state_of(5), State::Pending);
+        // A season's track accepted at −1 frame: E04's fix may differ, so it waits.
+        let mut m = tests_support::with_timing();
+        decide_as(&mut m, &[11, 12, 13], State::Accepted, None);
+        let effects = update(
+            &mut m,
+            appended(4, vec![tests_support::timing(14, 4, false)]),
+            now(),
+        );
+        assert_eq!(effects, []);
+        assert_eq!(m.run.state_of(14), State::Pending);
+    }
+
+    #[test]
+    fn a_new_finding_stays_pending_in_a_row_accepted_in_two_wordings_or_with_one_pending() {
+        let join = |m: &mut Model| {
+            update(
+                m,
+                appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)]),
+                now(),
+            )
+        };
+        // Every member accepted, E03's in words of the user's own: no one wording to take.
+        let mut m = sample();
+        decide_as(&mut m, &[1, 2], State::Accepted, None);
+        let mine = "The beat gets through to our minds";
+        decide_as(&mut m, &[4], State::Accepted, Some(mine));
+        assert_eq!(join(&mut m), []);
+        assert_eq!(m.run.state_of(5), State::Pending);
+        // E01 and E02 accepted, E03 not yet decided.
+        let mut m = sample();
+        decide_as(&mut m, &[1, 2], State::Accepted, None);
+        assert_eq!(join(&mut m), []);
+        assert_eq!(m.run.state_of(5), State::Pending);
+    }
+
+    #[test]
+    fn quitting_while_the_scan_runs_asks_first() {
+        let status = |m: &Model| m.status_text(Rect::new(0, 0, 160, 1));
+        let mut m = scanning();
+        press(&mut m, 'q');
+        assert!(!m.should_quit);
+        assert_eq!(
+            status(&m).as_deref(),
+            Some("scan is on 0/2 — stop it and quit? y/n")
+        );
+        press(&mut m, 'n');
+        assert!(!m.should_quit && m.confirm.is_none());
+        press(&mut m, 'q');
+        press(&mut m, 'y');
+        assert!(m.should_quit && m.progress.running());
+        // Ctrl-C asks too, and a second one quits.
+        let mut m = scanning();
+        update(&mut m, Msg::Quit, now());
+        assert!(!m.should_quit);
+        update(&mut m, Msg::Quit, now());
+        assert!(m.should_quit);
+        // Once the scan has ended, q quits at once.
+        let mut m = scanning();
+        update(
+            &mut m,
+            Msg::ScanEnded(Ok(crate::scan::Summary::default())),
+            now(),
+        );
+        press(&mut m, 'q');
+        assert!(m.should_quit);
+    }
+
+    #[test]
+    fn a_quit_question_goes_when_the_scan_ends() {
+        let status = |m: &Model| m.status_text(Rect::new(0, 0, 160, 1));
+        let mut m = scanning();
+        press(&mut m, 'q');
+        assert!(m.confirm.is_some());
+        let summary = crate::scan::Summary {
+            run: "r".into(),
+            files: 2,
+            checked: 2,
+            ..crate::scan::Summary::default()
+        };
+        update(&mut m, Msg::ScanEnded(Ok(summary)), now());
+        // Nothing left to stop: the line gives the summary, and `q` quits at once.
+        assert_eq!(m.confirm, None);
+        assert_eq!(
+            status(&m).as_deref(),
+            Some(
+                "run r: 2 files, 2 checked, 0 failed, 0 unchanged since an earlier scan; 0 findings"
+            )
+        );
+        press(&mut m, 'q');
+        assert!(m.should_quit);
+    }
+
+    #[test]
+    fn the_status_line_follows_the_scan_then_gives_its_summary() {
+        let status = |m: &Model| m.status_text(Rect::new(0, 0, 160, 1));
+        let mut m = scanning();
+        assert_eq!(status(&m).as_deref(), Some("scan 0/2 · 0 findings"));
+        let failed = Event::Finished {
+            path: path(4).into(),
+            error: Some("LLM: boom".into()),
+            findings: 0,
+            lines: vec![],
+        };
+        update(&mut m, Msg::Scan(failed), now());
+        assert_eq!(
+            status(&m).as_deref(),
+            Some("scan 1/2 · 0 findings · 1 failed")
+        );
+        // A message of its own takes the line until the next key.
+        m.status = Some("opened in mpv".into());
+        assert_eq!(status(&m).as_deref(), Some("opened in mpv"));
+        press(&mut m, 'j');
+        let summary = crate::scan::Summary {
+            run: "r".into(),
+            files: 2,
+            checked: 1,
+            failed: 1,
+            ..crate::scan::Summary::default()
+        };
+        update(&mut m, Msg::ScanEnded(Ok(summary)), now());
+        assert_eq!(
+            status(&m).as_deref(),
+            Some(
+                "run r: 2 files, 1 checked, 1 failed, 0 unchanged since an earlier scan; 0 findings"
+            )
+        );
+        update(&mut m, Msg::Tick, now());
+        assert_eq!(m.progress.ticks, 1);
+    }
+
+    #[test]
+    fn tab_shows_the_files_and_enter_goes_to_a_files_first_finding() {
+        let mut m = sample();
+        m.selected = 1;
+        key(&mut m, KeyCode::Tab);
+        assert_eq!(m.pane, Pane::Files);
+        press(&mut m, 'j');
+        assert_eq!(m.file_selected, 1);
+        // The decision and mpv keys belong to the findings.
+        assert_eq!(press(&mut m, 'a'), []);
+        assert_eq!(press(&mut m, 'o'), []);
+        // E02's first entry is the lyric's row, which has its finding.
+        key(&mut m, KeyCode::Enter);
+        assert_eq!((m.pane, m.selected), (Pane::Findings, 0));
+        key(&mut m, KeyCode::Tab);
+        key(&mut m, KeyCode::Tab);
+        assert_eq!(m.pane, Pane::Findings);
+    }
+
+    #[test]
+    fn a_fatal_message_ends_the_screen_with_it() {
+        let mut m = scanning();
+        update(&mut m, Msg::Fatal("the scan panicked: boom".into()), now());
+        assert!(m.should_quit);
+        assert_eq!(m.fatal.as_deref(), Some("the scan panicked: boom"));
     }
 
     fn states(m: &Model) -> Vec<State> {
@@ -863,7 +1440,10 @@ mod tests {
         written(&mut m, effects);
         assert_eq!(states(&m), [State::Pending; 4]);
         assert_eq!(m.selected_entry(), Some(Entry::Row(0)));
-        assert_eq!(m.status.as_deref(), Some("undone: 3 findings"));
+        assert_eq!(
+            m.status.as_deref(),
+            Some("undone: 3 findings · E01, E02, E03")
+        );
         assert_eq!(press(&mut m, 'u'), []);
         assert_eq!(m.status.as_deref(), Some("nothing to undo"));
     }
@@ -1371,6 +1951,30 @@ mod tests {
         // The clock stepped back between them (NTP, a resume): not a double-click.
         assert_eq!(click(&mut m, 5, 2, 8000), []);
         assert_eq!(click(&mut m, 5, 2, 7000), []);
+    }
+
+    #[test]
+    fn a_double_click_survives_the_scans_messages_between_its_clicks() {
+        let opens = |effects: Vec<Effect>| matches!(effects[..], [Effect::Open(_)]);
+        // The spinner's tick, which comes after 250 ms without a message.
+        let mut m = on_screen();
+        assert_eq!(click(&mut m, 5, 2, 0), []);
+        update(&mut m, Msg::Tick, now());
+        assert!(opens(click(&mut m, 5, 2, 300)), "a tick in between");
+        // A file's findings, a row of them above the snacks row, which moves down a line: the
+        // second click lands on it there.
+        let mut m = on_screen();
+        assert_eq!(click(&mut m, 5, 2, 0), []);
+        update(
+            &mut m,
+            appended(
+                1,
+                vec![finding(5, 1, "An erly line.", "An early line.", 1000)],
+            ),
+            now(),
+        );
+        assert_eq!(m.entries()[2], Entry::Row(2));
+        assert!(opens(click(&mut m, 5, 3, 300)), "a row in above it");
     }
 
     #[test]

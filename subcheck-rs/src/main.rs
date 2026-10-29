@@ -1,5 +1,5 @@
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -15,7 +15,7 @@ use subcheck::list::{self, Filter};
 use subcheck::llm::Backend;
 use subcheck::mkv::{self, Track};
 use subcheck::review;
-use subcheck::scan;
+use subcheck::scan::{self, Planned};
 use subcheck::store::{self, State};
 use subcheck::subs::{self, Kind};
 use subcheck::text;
@@ -92,6 +92,10 @@ enum Command {
         /// Show how each track was read.
         #[arg(short, long)]
         verbose: bool,
+        /// Print the scan's log instead of opening review's screen on it, as when stdout or stderr
+        /// is not a terminal.
+        #[arg(long)]
+        no_tui: bool,
     },
     /// Accept, reject or reword each finding of a run, with a key that opens it in mpv: the newest
     /// run, or the one named.
@@ -225,6 +229,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             force,
             dry_run,
             verbose,
+            no_tui,
         } => {
             let state = store::state_dir()?;
             let into = run
@@ -275,37 +280,31 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 )?;
                 return Ok(ExitCode::SUCCESS);
             }
-            let s = scan::run(&paths, &opts, &state, &mut std::io::stderr())?;
-            if into.is_some() {
-                return Ok(continued(&s));
-            }
-            if s.run.is_empty() {
-                if s.files == 0 {
-                    eprintln!("Nothing to check: no MKV files found");
-                } else {
-                    eprintln!(
-                        "Nothing to check: {} unchanged since an earlier scan (--force to check again)",
-                        scan::files(s.cached)
-                    );
+            let adding = into.is_some();
+            let screen =
+                !no_tui && std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
+            // What planning warns of goes to stderr as it comes, and is kept for the screen, which
+            // covers it once it opens.
+            let mut log = review::Tee::new(std::io::stderr());
+            let s = match scan::plan(&paths, &opts, &state, &mut log)? {
+                Planned::Nothing(s) => s,
+                Planned::Scan(plan) if screen => {
+                    let warnings = log.into_lines();
+                    let open = review::Open::Scan {
+                        plan,
+                        opts,
+                        paths,
+                        warnings,
+                    };
+                    return review::run(open, &state);
                 }
-                return Ok(ExitCode::SUCCESS);
-            }
-            let of_timing = if s.timing > 0 {
-                format!(" ({} timing)", s.timing)
-            } else {
-                String::new()
+                Planned::Scan(plan) => {
+                    scan::execute(plan, &opts, &state, &mut std::io::stderr(), &|_| {})?
+                }
             };
-            eprintln!(
-                "run {}: {} files, {} checked, {} failed, {} unchanged since an earlier scan; {} findings{of_timing}",
-                s.run, s.files, s.checked, s.failed, s.cached, s.findings
-            );
-            if let Some(spent) = s.spent.line(", ") {
-                eprintln!("{spent}");
+            for line in scan::summary_lines(&s, adding) {
+                eprintln!("{line}");
             }
-            eprintln!(
-                "Review them with: subcheck review {} (or print them: subcheck list {0})",
-                s.run
-            );
             Ok(if s.failed == 0 {
                 ExitCode::SUCCESS
             } else {
@@ -315,8 +314,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Review { run } => {
             let state = store::state_dir()?;
             let path = store::find_run(&state, run.as_deref())?;
-            review::run(&path, &state)?;
-            Ok(ExitCode::SUCCESS)
+            review::run(review::Open::Run(path), &state)
         }
         Command::Timing {
             paths,
@@ -348,59 +346,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
             print!("{}", list::render(&run, filter, mpv));
             Ok(ExitCode::SUCCESS)
         }
-    }
-}
-
-/// What `scan --run` did: exit status 1 when a file failed.
-fn continued(s: &scan::Summary) -> ExitCode {
-    let mut left = Vec::new();
-    if s.cached > 0 {
-        left.push(format!(
-            "{} with every check already",
-            scan::files(s.cached)
-        ));
-    }
-    if s.changed > 0 {
-        left.push(format!("{} changed since the run", scan::files(s.changed)));
-    }
-    if s.elsewhere > 0 {
-        left.push(format!(
-            "{} with the LLM check in another run",
-            scan::files(s.elsewhere)
-        ));
-    }
-    if s.checked + s.failed == 0 {
-        eprintln!("Nothing to add to run {}: {}", s.run, left.join(", "));
-        return ExitCode::SUCCESS;
-    }
-    let left = if left.is_empty() {
-        String::new()
-    } else {
-        format!(" ({} left out)", left.join(", "))
-    };
-    let of_timing = if s.timing > 0 {
-        format!(" ({} timing)", s.timing)
-    } else {
-        String::new()
-    };
-    eprintln!(
-        "run {}: added to {}{left}, {} failed; {} findings{of_timing}",
-        s.run,
-        scan::files(s.checked + s.failed),
-        s.failed,
-        s.findings
-    );
-    if let Some(spent) = s.spent.line(", ") {
-        eprintln!("{spent}");
-    }
-    eprintln!(
-        "Review them with: subcheck review {} (or print them: subcheck list {0})",
-        s.run
-    );
-    if s.failed == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
     }
 }
 
