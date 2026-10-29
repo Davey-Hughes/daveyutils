@@ -118,6 +118,7 @@ fn a_verify_skip_lands_in_the_daemon_log() {
         .add(JobSpec {
             target: TargetSpec::Tmux {
                 pane: session.clone(),
+                server: None,
             },
             messages: vec!["echo this_must_not_be_sent".into()],
             send_delay_secs: 0.0,

@@ -91,8 +91,12 @@ fn baseline_fields(b: Option<crate::verify::Baseline>) -> (Option<String>, Optio
 ///
 /// `baseline` is the pane snapshot the recency gate compares against at fire
 /// time; the caller takes it (only when `--verify` is on) so this stays pure.
+///
+/// `server` is the tmux server `pane`'s id was read from:
+/// [`PaneLocation::server`](crate::target::tmux::PaneLocation).
 pub fn build_spec(
     pane: &str,
+    server: Option<String>,
     fire_at: jiff::Timestamp,
     cli: &Cli,
     opts: &Toggles,
@@ -109,6 +113,7 @@ pub fn build_spec(
     JobSpec {
         target: TargetSpec::Tmux {
             pane: pane.to_string(),
+            server,
         },
         messages,
         send_delay_secs: cli.delay.unwrap_or(0.75),
@@ -369,14 +374,25 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
     // see `TmuxTarget::locate`.
     let loc = TmuxTarget::new(&pane).locate()?;
     let pane = loc.id.clone();
-    let positions = Positions::from([(loc.id, loc.position)]);
+    let server = loc.server.clone();
+    let positions = Positions {
+        server: server.clone(),
+        panes: std::collections::HashMap::from([(loc.id, loc.position)]),
+    };
     let opts = resolve_options(cli);
     let now = Zoned::now();
     let fire_at = fire_time(cli, &pane, &now)?;
     // Snapshot last, and only for --verify: this is the "before" the fire-time
     // gate compares against, so it wants to be as close to the user's actual
     // parked-at-the-banner pane as we can get it.
-    let spec = build_spec(&pane, fire_at, cli, &opts, snapshot_pane(&pane, &opts));
+    let spec = build_spec(
+        &pane,
+        server,
+        fire_at,
+        cli,
+        &opts,
+        snapshot_pane(&pane, &opts),
+    );
 
     // The clone is the summary's: the request takes the spec by value, and the
     // confirmation line needs it back once the daemon has answered with an id.
@@ -467,8 +483,7 @@ fn job_summary(
     tz: &jiff::tz::TimeZone,
     now: jiff::Timestamp,
 ) -> String {
-    let TargetSpec::Tmux { pane } = &spec.target;
-    let pane = label(pane, positions);
+    let pane = label(&spec.target, positions);
     let when = spec.fire_at.to_zoned(tz.clone());
     let countdown = human_countdown(spec.fire_at.duration_since(now).as_secs());
     let what = match spec.messages.len() {
@@ -571,9 +586,13 @@ pub fn cancel(id: u64) -> anyhow::Result<()> {
 /// *resolved* pane and toggles, because an edit may move the job to a new pane
 /// (`-p`) or turn `--verify` on, and the snapshot has to describe the pane the
 /// job will actually watch. Production passes [`snapshot_pane`].
+///
+/// `server` is the tmux server `cli.pane` was read from, for a job moved with
+/// `-p`. Without `-p` the job's own target is kept, stamp and all.
 pub fn merge_edit(
     job: &Job,
     cli: &Cli,
+    server: Option<String>,
     now: &Zoned,
     default_retries: i64,
     snapshot: &dyn Fn(&str, &Toggles) -> Option<crate::verify::Baseline>,
@@ -603,12 +622,17 @@ pub fn merge_edit(
         settle_secs: None,
     };
     let opts = crate::config::resolve(&base, &overrides);
-    let pane = if let Some(p) = &cli.pane {
-        p.clone()
-    } else {
-        let TargetSpec::Tmux { pane } = &job.target;
-        pane.clone()
+    // A pane kept from the job keeps the job's stamp. Re-read now, it would
+    // vouch for an id that may belong to a pane on a newer server.
+    let target = match &cli.pane {
+        Some(p) => TargetSpec::Tmux {
+            pane: p.clone(),
+            server,
+        },
+        None => job.target.clone(),
     };
+    let TargetSpec::Tmux { pane, .. } = &target;
+    let pane = pane.clone();
     let fire_at = match &cli.time {
         Some(_) => fire_time(cli, &pane, now)?,
         None => job.fire_at,
@@ -631,7 +655,7 @@ pub fn merge_edit(
     let (verify_fingerprint, verify_dims) =
         baseline_fields(snapshot(&pane, &opts).filter(|_| opts.verify));
     Ok(JobSpec {
-        target: TargetSpec::Tmux { pane },
+        target,
         messages,
         send_delay_secs: cli.delay.unwrap_or(job.send_delay_secs),
         fire_at,
@@ -670,13 +694,17 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
     // A job moved with `-p` stores the new pane's id, as `schedule` does.
     // Resolved here so `merge_edit` stays pure.
     let mut cli = cli.clone();
+    let mut server = None;
     if let Some(p) = &cli.pane {
-        cli.pane = Some(TmuxTarget::new(p).locate()?.id);
+        let loc = TmuxTarget::new(p).locate()?;
+        server = loc.server;
+        cli.pane = Some(loc.id);
     }
     let now = Zoned::now();
     let spec = merge_edit(
         &job,
         &cli,
+        server,
         &now,
         crate::cli::default_retries(),
         &snapshot_pane,
@@ -727,7 +755,7 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
 
 /// Interactively choose a tmux pane.
 pub fn pick_pane() -> anyhow::Result<String> {
-    let (panes, _default_idx) = crate::tmux_panes::list()?;
+    let (panes, _default_idx, _server) = crate::tmux_panes::list()?;
     if panes.is_empty() {
         anyhow::bail!("no tmux panes found; pass -p <pane>");
     }
@@ -773,6 +801,7 @@ mod tests {
         JobSpec {
             target: TargetSpec::Tmux {
                 pane: pane.to_string(),
+                server: None,
             },
             messages: messages.iter().map(ToString::to_string).collect(),
             send_delay_secs: 0.75,

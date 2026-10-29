@@ -138,6 +138,7 @@ fn daemon_fires_a_due_job_into_the_pane() {
         .add(JobSpec {
             target: TargetSpec::Tmux {
                 pane: session.pane(),
+                server: None,
             },
             messages: vec!["echo daemon_marker_$((6*7))".into()],
             send_delay_secs: 0.0,

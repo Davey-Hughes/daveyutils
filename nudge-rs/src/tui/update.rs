@@ -32,6 +32,8 @@ pub enum Msg {
     PanesLoaded {
         panes: Vec<Pane>,
         default_idx: usize,
+        /// The tmux server the panes were read from.
+        server: Option<String>,
     },
     PaneCaptured {
         screen: Option<String>,
@@ -105,8 +107,13 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             Tab::NewNudge if model.form.picker.is_none() => submit(model, AfterSubmit::Jobs),
             _ => vec![],
         },
-        Msg::PanesLoaded { panes, default_idx } => {
+        Msg::PanesLoaded {
+            panes,
+            default_idx,
+            server,
+        } => {
             model.form.panes = panes;
+            model.pane_server = server;
             // Pre-select the last-active pane of nudge's own window; fall back to
             // the first pane if the index is somehow out of range. This only ever
             // fires while `panes` is empty (startup / first Tab into the form), so
@@ -157,13 +164,16 @@ fn finish_submit(model: &mut Model, id: u64, verb: &str) -> Vec<Effect> {
         AfterSubmit::Quit => {
             // Where the pane sat in the list it was picked from, unless the
             // last poll of tmux has it somewhere newer.
-            let positions: Positions = model
-                .form
-                .panes
-                .iter()
-                .map(|p| (p.id.clone(), p.target.clone()))
-                .chain(model.positions.clone())
-                .collect();
+            let positions = Positions {
+                server: model.pane_server.clone(),
+                panes: model
+                    .form
+                    .panes
+                    .iter()
+                    .map(|p| (p.id.clone(), p.target.clone()))
+                    .chain(model.positions.panes.clone())
+                    .collect(),
+            };
             model.exit_summary = Some(match spec {
                 Some(s) => schedule_summary(id, &s, &positions, &model.defaults.tz, model.now),
                 // The spec is always stashed by `submit`; keep the exit line
@@ -217,7 +227,16 @@ fn jobs_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
         },
         KeyCode::Char('e') => {
             if let Some(j) = model.jobs.get(model.selected).cloned() {
-                enter_edit(model, &j);
+                // The form would open on some other pane and move the job
+                // there, which brings back a job that can no longer fire.
+                if j.target.from_earlier_server(current_server(model)) {
+                    model.status.set(format!(
+                        "job {}'s pane was on an earlier tmux server, so it will not fire: press c to cancel it, or move it with nudge --edit {} -p <pane>",
+                        j.id, j.id
+                    ));
+                } else {
+                    enter_edit(model, &j);
+                }
             }
             vec![]
         }
@@ -225,12 +244,25 @@ fn jobs_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
     }
 }
 
+/// The tmux server a job's pane id is compared against. The pane list's
+/// server comes first because the edit form offers panes from that list, so
+/// it is the server a kept or chosen id will be used on; the job poll's server
+/// is the fallback before the list has loaded.
+fn current_server(model: &Model) -> Option<&str> {
+    model
+        .pane_server
+        .as_deref()
+        .or(model.positions.server.as_deref())
+}
+
 /// Switch to the New-nudge form pre-filled from `job`, carrying through the
 /// fields the form does not show (mirrors `app::merge_edit`'s "unset stays put").
 fn enter_edit(model: &mut Model, job: &Job) {
-    let TargetSpec::Tmux { pane } = &job.target;
+    let TargetSpec::Tmux { pane, .. } = &job.target;
     let panes = std::mem::take(&mut model.form.panes);
-    // By id, or by position for a job stored before jobs kept ids.
+    // By id, or by position for a job stored before jobs kept ids. The `e`
+    // guard has already turned away every job from an earlier server, so an
+    // id here names the pane the job meant.
     let pane_idx = panes
         .iter()
         .position(|p| &p.id == pane || &p.target == pane)
@@ -265,6 +297,7 @@ fn enter_edit(model: &mut Model, job: &Job) {
             send_delay_secs: job.send_delay_secs,
             settle_secs: job.settle_secs,
             retries_left: job.retries_left,
+            target: job.target.clone(),
         }),
         preview: None,
         last_capture: None,
@@ -1012,15 +1045,25 @@ fn build_spec(model: &Model, pane: &str, fire_at: Timestamp) -> JobSpec {
             |c| c.messages.clone(),
         ),
     };
+    // A pane kept from the job keeps the job's stamp, as `nudge --edit` does.
+    // Stamped now, it would vouch for an id that may belong to a pane on a
+    // newer server.
+    let target = match &form.carried {
+        Some(c) if matches!(&c.target, TargetSpec::Tmux { pane: kept, .. } if kept == pane) => {
+            c.target.clone()
+        }
+        _ => TargetSpec::Tmux {
+            pane: pane.to_string(),
+            server: model.pane_server.clone(),
+        },
+    };
     let retry_base = form.retry_base(model.defaults.retries);
     let (send_delay_secs, settle_secs) = match &form.carried {
         Some(c) => (c.send_delay_secs, c.settle_secs),
         None => (model.defaults.send_delay_secs, model.defaults.settle_secs),
     };
     JobSpec {
-        target: TargetSpec::Tmux {
-            pane: pane.to_string(),
-        },
+        target,
         messages,
         send_delay_secs,
         fire_at,
@@ -1091,6 +1134,7 @@ mod tests {
             id,
             target: TargetSpec::Tmux {
                 pane: format!("s:0.{id}"),
+                server: None,
             },
             messages: vec!["please continue".into()],
             send_delay_secs: 0.75,
@@ -1146,6 +1190,7 @@ mod tests {
         update(
             &mut m,
             Msg::PanesLoaded {
+                server: None,
                 panes: vec![Pane {
                     id: "%9".into(),
                     target: "s:0.9".into(),
@@ -1164,6 +1209,7 @@ mod tests {
         update(
             &mut m,
             Msg::PanesLoaded {
+                server: None,
                 panes: vec![
                     Pane {
                         id: "%0".into(),
@@ -1696,7 +1742,7 @@ mod tests {
                 assert_eq!(spec.messages, vec!["please continue".to_string()]);
                 assert!(spec.verify);
                 assert_eq!(spec.fire_at.to_string(), "2026-07-16T15:00:00Z");
-                let TargetSpec::Tmux { pane } = &spec.target;
+                let TargetSpec::Tmux { pane, .. } = &spec.target;
                 assert_eq!(
                     pane, "%1",
                     "the job stores the pane's id, which no renumbering moves"
@@ -1884,17 +1930,160 @@ mod tests {
         let mut m = form_model();
         m.tab = Tab::Jobs;
         let mut j = job(4, 3600);
-        j.target = TargetSpec::Tmux { pane: "%2".into() };
+        j.target = TargetSpec::Tmux {
+            pane: "%2".into(),
+            server: None,
+        };
         m.jobs = vec![j];
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('e')));
         assert_eq!(m.form.selected_pane().unwrap().id, "%2");
     }
 
+    /// After a restart the job's `%2` is another pane, so the form must not
+    /// open on it as though it were the job's. Only the pane list's server is
+    /// known here, and it is enough to refuse.
+    #[test]
+    fn editing_a_job_from_an_earlier_pane_list_server_is_refused() {
+        let mut m = form_model();
+        m.pane_server = Some("200-2".into());
+        m.tab = Tab::Jobs;
+        let mut j = job(4, 3600);
+        j.target = TargetSpec::Tmux {
+            pane: "%2".into(),
+            server: Some("100-1".into()),
+        };
+        m.jobs = vec![j];
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('e')));
+        assert_eq!(fx.len(), 0);
+        assert_eq!(m.tab, Tab::Jobs);
+        assert_eq!(m.form.mode, Mode::New);
+        let status = m.status.0.as_ref().unwrap();
+        assert!(status.contains("earlier tmux server"), "{status}");
+    }
+
+    /// The form offers panes from the pane list, so when that list's server
+    /// is known it decides, even if the last job poll saw another server.
+    #[test]
+    fn the_pane_lists_server_decides_over_the_job_polls() {
+        let mut m = form_model();
+        m.pane_server = Some("200-2".into());
+        m.positions = crate::tmux_panes::Positions {
+            server: Some("300-3".into()),
+            panes: std::collections::HashMap::new(),
+        };
+        m.tab = Tab::Jobs;
+        let mut j = job(4, 3600);
+        j.target = TargetSpec::Tmux {
+            pane: "%2".into(),
+            server: Some("200-2".into()),
+        };
+        m.jobs = vec![j];
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('e')));
+        assert_eq!(m.tab, Tab::NewNudge);
+        assert_eq!(m.form.selected_pane().unwrap().id, "%2");
+    }
+
+    /// The job's pane id names some other pane now, so the form (which would
+    /// move the job onto whatever it opens on) is not offered.
+    #[test]
+    fn editing_a_job_the_jobs_tab_labels_as_earlier_server_is_refused() {
+        let mut m = form_model();
+        m.positions = crate::tmux_panes::Positions {
+            server: Some("200-2".into()),
+            panes: std::collections::HashMap::new(),
+        };
+        m.tab = Tab::Jobs;
+        let mut j = job(4, 3600);
+        j.target = TargetSpec::Tmux {
+            pane: "%2".into(),
+            server: Some("100-1".into()),
+        };
+        m.jobs = vec![j];
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('e')));
+        assert_eq!(fx.len(), 0);
+        assert_eq!(m.tab, Tab::Jobs);
+        assert_eq!(m.form.mode, Mode::New);
+        let status = m.status.0.as_ref().unwrap();
+        assert!(status.contains("earlier tmux server"), "{status}");
+        assert!(status.contains("job 4"), "{status}");
+    }
+
+    fn submit_edit_of_unstamped_job_on_pane_2(move_to_first: bool) -> JobSpec {
+        let mut m = form_model();
+        m.pane_server = Some("200-2".into());
+        m.tab = Tab::Jobs;
+        let mut j = job(4, 3600);
+        j.target = TargetSpec::Tmux {
+            pane: "%2".into(),
+            server: None,
+        };
+        m.jobs = vec![j];
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('e')));
+        assert_eq!(m.form.selected_pane().unwrap().id, "%2");
+        if move_to_first {
+            m.form.pane_idx = 0;
+        }
+        m.form.focus = FormField::Submit;
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
+        match fx.as_slice() {
+            [Effect::Replace { spec, .. }] => spec.clone(),
+            other => panic!("expected Replace, got {other:?}"),
+        }
+    }
+
+    /// `nudge --edit` without `-p` keeps the job's whole target, stamp
+    /// included, and so does the dashboard.
+    #[test]
+    fn an_edit_that_keeps_the_pane_keeps_the_jobs_stamp() {
+        let spec = submit_edit_of_unstamped_job_on_pane_2(false);
+        assert_eq!(
+            spec.target,
+            TargetSpec::Tmux {
+                pane: "%2".into(),
+                server: None
+            }
+        );
+    }
+
+    #[test]
+    fn an_edit_that_moves_the_pane_stamps_it_with_the_current_server() {
+        let spec = submit_edit_of_unstamped_job_on_pane_2(true);
+        assert_eq!(
+            spec.target,
+            TargetSpec::Tmux {
+                pane: "%1".into(),
+                server: Some("200-2".into())
+            }
+        );
+    }
+
+    #[test]
+    fn a_job_from_the_form_stores_the_server_its_panes_came_from() {
+        let mut m = form_model();
+        m.pane_server = Some("100-1".into());
+        m.form.detected = Some(Detection::Reset(
+            jiff::Timestamp::from_str("2026-07-16T15:00:00Z")
+                .unwrap()
+                .to_zoned(jiff::tz::TimeZone::UTC),
+        ));
+        m.form.focus = FormField::Submit;
+        let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
+        match fx.as_slice() {
+            [Effect::Schedule { spec, .. }] => {
+                let TargetSpec::Tmux { server, .. } = &spec.target;
+                assert_eq!(server.as_deref(), Some("100-1"));
+            }
+            other => panic!("expected Schedule, got {other:?}"),
+        }
+    }
+
     #[test]
     fn jobs_loaded_keeps_where_each_pane_sits() {
         let mut m = with_jobs(0);
-        let positions: crate::tmux_panes::Positions =
-            [("%1".to_string(), "s:0.1".to_string())].into();
+        let positions = Positions {
+            server: None,
+            panes: [("%1".to_string(), "s:0.1".to_string())].into(),
+        };
         update(
             &mut m,
             Msg::JobsLoaded(vec![job(1, 3600)], positions.clone()),
@@ -2036,6 +2225,7 @@ mod tests {
         let fx = update(
             &mut m,
             Msg::PanesLoaded {
+                server: None,
                 panes: vec![Pane {
                     id: "%1".into(),
                     target: "s:0.1".into(),

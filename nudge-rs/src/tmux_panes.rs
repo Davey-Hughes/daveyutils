@@ -2,6 +2,8 @@
 
 use anyhow::{Context, bail};
 
+use crate::target::tmux::SERVER_FORMAT;
+
 /// One selectable tmux pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane {
@@ -12,38 +14,53 @@ pub struct Pane {
     pub title: String,
 }
 
-/// Where each pane sits now, keyed by tmux's id for it: `%19` -> `main:12.0`.
-pub type Positions = std::collections::HashMap<String, String>;
+/// Where each pane sits now, keyed by tmux's id for it (`%19` -> `main:12.0`),
+/// and the server those ids were read from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Positions {
+    /// As [`SERVER_FORMAT`](crate::target::tmux::SERVER_FORMAT) reads it, or
+    /// `None` if tmux could not be asked.
+    pub server: Option<String>,
+    pub panes: std::collections::HashMap<String, String>,
+}
+
+impl Positions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// [`Positions`] for every pane on the server, or none if tmux cannot list
 /// them. It only ever labels a pane for a person, which is no reason to fail
 /// whatever is being labelled.
 pub fn positions() -> Positions {
     list_rows()
-        .map(|rows| rows.into_iter().map(|r| (r.pane_id, r.target)).collect())
+        .map(|rows| Positions {
+            server: rows.first().and_then(|r| r.server.clone()),
+            panes: rows.into_iter().map(|r| (r.pane_id, r.target)).collect(),
+        })
         .unwrap_or_default()
 }
 
 /// How to show a job's pane to a person: where it sits now, then the id the
 /// job stores, as `main:12.0 (%19)`. A pane tmux does not list (it closed, or
-/// the job predates ids and stores a position) shows as stored.
-pub fn label(pane: &str, positions: &Positions) -> String {
-    match positions.get(pane) {
+/// the job predates ids and stores a position) shows as stored. An id from an
+/// earlier tmux server says so, since the pane at that id now is another one.
+pub fn label(target: &crate::job::TargetSpec, positions: &Positions) -> String {
+    let crate::job::TargetSpec::Tmux { pane, .. } = target;
+    if target.from_earlier_server(positions.server.as_deref()) {
+        return format!("{pane} (earlier tmux server)");
+    }
+    match positions.panes.get(pane) {
         Some(position) => format!("{position} ({pane})"),
-        None => pane.to_string(),
+        None => pane.clone(),
     }
 }
 
 /// Each job's [`label`], in order, and the widest one's width in chars: what
 /// a PANE column needs to show every id whole.
 pub fn job_labels(jobs: &[crate::job::Job], positions: &Positions) -> (Vec<String>, usize) {
-    let labels: Vec<String> = jobs
-        .iter()
-        .map(|j| {
-            let crate::job::TargetSpec::Tmux { pane } = &j.target;
-            label(pane, positions)
-        })
-        .collect();
+    let labels: Vec<String> = jobs.iter().map(|j| label(&j.target, positions)).collect();
     let widest = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     (labels, widest)
 }
@@ -52,32 +69,41 @@ pub fn job_labels(jobs: &[crate::job::Job], positions: &Positions) -> (Vec<Strin
 /// fields used only to choose the default selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
-    pane_id: String,   // "%16"  — matches $TMUX_PANE
-    window_id: String, // "@15"  — groups panes per window
-    is_last: bool,     // pane_last == "1"
-    target: String,    // "main:4.0" — the existing Pane.target
+    server: Option<String>, // "1793226261-4820" — the same on every row
+    pane_id: String,        // "%16"  — matches $TMUX_PANE
+    window_id: String,      // "@15"  — groups panes per window
+    is_last: bool,          // pane_last == "1"
+    target: String,         // "main:4.0" — the existing Pane.target
     title: String,
 }
 
-/// The `-F` template: the three machine fields come first so a title containing
-/// a tab can never shift a machine field; the title (5th) keeps embedded tabs.
-const FORMAT: &str = "#{pane_id}\t#{window_id}\t#{pane_last}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_title}";
+/// The `-F` template: the machine fields come first so a title containing a
+/// tab can never shift one; the title (last) keeps embedded tabs. The first is
+/// [`SERVER_FORMAT`], the same on every row, read here so that it comes from
+/// the same answer as the ids.
+fn format() -> String {
+    format!(
+        "{SERVER_FORMAT}\t#{{pane_id}}\t#{{window_id}}\t#{{pane_last}}\t#{{session_name}}:#{{window_index}}.#{{pane_index}}\t#{{pane_title}}"
+    )
+}
 
 /// Parse the enriched `list-panes` output into [`Row`]s. Blank lines are
-/// skipped; the 5th field (title) keeps any embedded tabs.
+/// skipped; the last field (title) keeps any embedded tabs.
 fn parse_rows(output: &str) -> Vec<Row> {
     output
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| {
-            // splitn(5) keeps any tabs embedded in the title (the 5th field).
-            let mut fields = l.splitn(5, '\t');
+            // splitn(6) keeps any tabs embedded in the title (the last field).
+            let mut fields = l.splitn(6, '\t');
+            let server = fields.next()?;
             let pane_id = fields.next()?;
             let window_id = fields.next()?;
             let is_last = fields.next()?;
             let target = fields.next()?;
             let title = fields.next().unwrap_or("");
             Some(Row {
+                server: crate::target::tmux::parse_server(server),
                 pane_id: pane_id.to_string(),
                 window_id: window_id.to_string(),
                 is_last: is_last == "1",
@@ -162,12 +188,12 @@ fn default_idx(rows: &[Row], me: Option<&str>) -> usize {
 
 /// Run `tmux list-panes` and parse it.
 ///
-/// Shared by [`list`] and [`auto_target`] so the `-F FORMAT` invocation and its
+/// Shared by [`list`] and [`auto_target`] so the `-F` invocation and its
 /// error handling exist once; two copies would be free to drift into disagreeing
 /// about what a pane row even is.
 fn list_rows() -> anyhow::Result<Vec<Row>> {
     let out = std::process::Command::new("tmux")
-        .args(["list-panes", "-a", "-F", FORMAT])
+        .args(["list-panes", "-a", "-F", &format()])
         .output()
         .context("running tmux list-panes")?;
     if !out.status.success() {
@@ -193,9 +219,11 @@ pub fn auto_target() -> anyhow::Result<String> {
 }
 
 /// List all tmux panes across sessions, plus the index to pre-select (the
-/// last-active pane of nudge's own window; see [`default_idx`]).
-pub fn list() -> anyhow::Result<(Vec<Pane>, usize)> {
+/// last-active pane of nudge's own window; see [`default_idx`]) and the server
+/// they were read from.
+pub fn list() -> anyhow::Result<(Vec<Pane>, usize, Option<String>)> {
     let rows = list_rows()?;
+    let server = rows.first().and_then(|r| r.server.clone());
     // Impure edge: read which pane nudge itself runs in.
     let me = std::env::var("TMUX_PANE").ok();
     let idx = default_idx(&rows, me.as_deref());
@@ -207,7 +235,7 @@ pub fn list() -> anyhow::Result<(Vec<Pane>, usize)> {
             title: r.title,
         })
         .collect();
-    Ok((panes, idx))
+    Ok((panes, idx, server))
 }
 
 #[cfg(test)]
@@ -217,19 +245,75 @@ mod tests {
     /// A single enriched `list-panes` line.
     fn line(pane_id: &str, window_id: &str, last: bool, target: &str, title: &str) -> String {
         format!(
-            "{pane_id}\t{window_id}\t{}\t{target}\t{title}",
+            "1793226261-4820\t{pane_id}\t{window_id}\t{}\t{target}\t{title}",
             if last { "1" } else { "0" }
         )
     }
 
     fn row(pane_id: &str, window_id: &str, is_last: bool, target: &str) -> Row {
         Row {
+            server: None,
             pane_id: pane_id.into(),
             window_id: window_id.into(),
             is_last,
             target: target.into(),
             title: String::new(),
         }
+    }
+
+    fn tmux(pane: &str, server: Option<&str>) -> crate::job::TargetSpec {
+        crate::job::TargetSpec::Tmux {
+            pane: pane.into(),
+            server: server.map(Into::into),
+        }
+    }
+
+    fn on(server: Option<&str>, panes: &[(&str, &str)]) -> Positions {
+        Positions {
+            server: server.map(Into::into),
+            panes: panes
+                .iter()
+                .map(|(id, at)| ((*id).to_string(), (*at).to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_pane_is_labelled_where_it_sits_now() {
+        let p = on(Some("100-1"), &[("%19", "main:12.0")]);
+        assert_eq!(label(&tmux("%19", Some("100-1")), &p), "main:12.0 (%19)");
+        assert_eq!(label(&tmux("%19", None), &p), "main:12.0 (%19)");
+    }
+
+    /// After a restart `%19` is some new pane, and showing where that one
+    /// sits would point at the wrong session.
+    #[test]
+    fn an_id_from_an_earlier_server_is_not_given_the_new_panes_position() {
+        let p = on(Some("200-2"), &[("%19", "main:3.0")]);
+        assert_eq!(
+            label(&tmux("%19", Some("100-1")), &p),
+            "%19 (earlier tmux server)"
+        );
+    }
+
+    /// Not knowing the current server is no evidence either way.
+    #[test]
+    fn an_unknown_current_server_labels_as_before() {
+        let p = on(None, &[("%19", "main:12.0")]);
+        assert_eq!(label(&tmux("%19", Some("100-1")), &p), "main:12.0 (%19)");
+    }
+
+    #[test]
+    fn the_list_format_starts_with_the_server_stamp_and_has_six_fields() {
+        let f = format();
+        assert!(f.starts_with(SERVER_FORMAT), "{f}");
+        assert_eq!(f.split('\t').count(), 6, "{f}");
+    }
+
+    #[test]
+    fn every_row_carries_the_server_it_was_read_from() {
+        let rows = parse_rows(&line("%16", "@15", true, "main:4.0", "claude"));
+        assert_eq!(rows[0].server.as_deref(), Some("1793226261-4820"));
     }
 
     #[test]

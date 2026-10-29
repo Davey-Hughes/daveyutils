@@ -49,6 +49,7 @@ fn job() -> nudge::job::Job {
     JobSpec {
         target: TargetSpec::Tmux {
             pane: "bot:0.1".into(),
+            server: None,
         },
         messages: vec!["go".into()],
         send_delay_secs: 0.75,

@@ -45,10 +45,16 @@ A job stores tmux's id for its pane (`%19`), not the position you named
 (`main:12.0`). Positions move: closing a window renumbers the ones after it
 when `renumber-windows` is on, and swapping or rotating moves them too. A nudge
 stored by position fired into whichever pane took the slot. An id stays with
-its pane until the pane closes or the tmux server stops; a new server numbers
-its panes from `%0` again, so cancel jobs left over from before a reboot. The confirmation,
-`--list` and the dashboard show both, as `main:12.0 (%19)`, with the position
-read at that moment. A pane tmux doesn't have is refused when you schedule.
+its pane until the pane closes or the tmux server stops. A new server numbers
+its panes from `%0` again, so a job also remembers which server its pane was on
+(the server's start time and PID). One that comes due on a different server,
+after a reboot or a `kill-server`, types nothing: the log says
+`ServerRestarted`, `--notify` says so, `--list` shows its pane as
+`%19 (earlier tmux server)`, and the dashboard won't edit it. A job queued
+before 0.7.0 has no record of its server, so cancel any of those left over from
+before a reboot. The confirmation, `--list` and the dashboard show both, as
+`main:12.0 (%19)`, with the position read at that moment. A pane tmux doesn't
+have is refused when you schedule.
 
 ### `-a` / `--auto`
 
@@ -203,10 +209,13 @@ banner it recognises, the verify gate would skip it.
 
 If Codex's Vim keys are on and you left the composer in Normal mode, typed text
 would be read as commands: `please continue` arrives as `se continue`. nudge
-checks for a status line ending in `Vim: Normal` and presses `i` first. It looks
-only at the last two lines of the pane, where Codex draws that line, so a pane
-that merely mentions those words, or a draft that ends in them, is left alone.
-This relies on the Vim mode being shown in Codex's status line.
+checks for a status line ending in `Vim: Normal` and presses `A` first, which
+puts the message after a draft left in the composer rather than inside it. If
+the status line still says Normal after that (a remapped `A`, or a Codex
+without it), nudge presses `i`. It looks only at the last two lines of the
+pane, where Codex draws that line, so a pane that merely mentions those words,
+or a draft that ends in them, is left alone. This relies on the Vim mode being
+shown in Codex's status line.
 
 When a nudge fires, nudge waits half a second between typing the message and
 pressing Enter. Codex treats keystrokes that arrive faster than anyone types as

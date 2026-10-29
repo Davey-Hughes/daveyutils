@@ -54,7 +54,9 @@ pub fn apply_outcome(
         // the pane briefly unavailable) turned `-a -r -1` into zero retries.
         //
         // Ok(SkippedNoBanner) is deliberately excluded: the pane no longer shows
-        // a banner, so the job is done, not failed.
+        // a banner, so the job is done, not failed. ServerRestarted is final
+        // like Unsubmitted: the pane is gone for good, and a retry would find
+        // whichever pane took its id.
         //
         // Note the consequence of Err joining this arm: `-a -r -1` against a
         // pane that is permanently gone now retries forever, where before it
@@ -109,7 +111,10 @@ mod tests {
     // Build a Job at `fire_at` (an RFC3339 string) with the given retry config.
     fn job(id: u64, fire_at: &str, auto_retry: bool, retries_left: i64) -> Job {
         JobSpec {
-            target: TargetSpec::Tmux { pane: "p".into() },
+            target: TargetSpec::Tmux {
+                pane: "p".into(),
+                server: None,
+            },
             messages: vec!["go".into()],
             send_delay_secs: 0.0,
             fire_at: fire_at.parse().unwrap(),
@@ -338,6 +343,23 @@ mod tests {
             &mut q,
             &cur,
             &Ok(InjectOutcome::Unsubmitted { submitted: 0 }),
+            now().timestamp(),
+        )
+        .unwrap();
+        assert!(q.get(1).is_none());
+    }
+
+    /// The pane went with the server that issued its id, and a retry would
+    /// only find the new pane that took it. The job is done.
+    #[test]
+    fn apply_server_restarted_removes_even_with_retry() {
+        let j = job(1, "2026-07-13T11:59:00Z", true, -1);
+        let (_d, mut q) = q_with(&j);
+        let cur = q.get(1).unwrap().clone();
+        apply_outcome(
+            &mut q,
+            &cur,
+            &Ok(InjectOutcome::ServerRestarted),
             now().timestamp(),
         )
         .unwrap();

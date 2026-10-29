@@ -17,7 +17,11 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
             Err(e) => Msg::ActionFailed(format!("daemon request failed: {e}")),
         },
         Effect::ListPanes => match crate::tmux_panes::list() {
-            Ok((panes, default_idx)) => Msg::PanesLoaded { panes, default_idx },
+            Ok((panes, default_idx, server)) => Msg::PanesLoaded {
+                panes,
+                default_idx,
+                server,
+            },
             Err(e) => Msg::ActionFailed(format!("{e}")),
         },
         Effect::CapturePane { pane } => {
@@ -111,6 +115,7 @@ mod tests {
         JobSpec {
             target: TargetSpec::Tmux {
                 pane: "bot:0.1".into(),
+                server: None,
             },
             messages: vec!["go".into()],
             send_delay_secs: 0.75,

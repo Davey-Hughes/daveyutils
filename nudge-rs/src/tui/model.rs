@@ -174,6 +174,8 @@ pub struct CarriedEdit {
     pub send_delay_secs: f64,
     pub settle_secs: f64,
     pub retries_left: i64,
+    /// The job's target as it was, so a pane left alone keeps its stamp.
+    pub target: crate::job::TargetSpec,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -292,6 +294,9 @@ pub struct Model {
     /// Where each job's pane sits now, read with the jobs: a job names its
     /// pane by tmux's id, which says nothing to a person.
     pub positions: crate::tmux_panes::Positions,
+    /// The tmux server `form.panes` was read from: what a job scheduled from
+    /// the form stores, since its pane was picked from that list.
+    pub pane_server: Option<String>,
     pub selected: usize,
     pub form: Form,
     pub status: Status,
@@ -319,6 +324,7 @@ impl Model {
             tab: Tab::NewNudge,
             jobs: Vec::new(),
             positions: crate::tmux_panes::Positions::new(),
+            pane_server: None,
             selected: 0,
             form: Form::fresh(),
             status: Status::default(),

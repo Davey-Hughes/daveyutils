@@ -50,6 +50,7 @@ fn seed() -> JobSpec {
     JobSpec {
         target: TargetSpec::Tmux {
             pane: "bot:0.1".into(),
+            server: None,
         },
         messages: vec!["keep going".into()],
         send_delay_secs: 0.75,
@@ -123,7 +124,7 @@ fn queued(home: &Path) -> Vec<nudge::job::Job> {
 }
 
 fn pane_of(job: &nudge::job::Job) -> &str {
-    let TargetSpec::Tmux { pane } = &job.target;
+    let TargetSpec::Tmux { pane, .. } = &job.target;
     pane
 }
 

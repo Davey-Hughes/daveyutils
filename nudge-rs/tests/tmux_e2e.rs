@@ -26,7 +26,76 @@ fn tmux_available() -> bool {
 struct Server {
     socket: String,
 }
+
+/// Start a detached 80x24 session `s` running a plain shell on `socket`,
+/// returning tmux's answer so that a failure can say what tmux said.
+fn new_session(socket: &str) -> std::process::Output {
+    Command::new("tmux")
+        .args([
+            "-f",
+            "/dev/null",
+            "-L",
+            socket,
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sh",
+        ])
+        .output()
+        .expect("spawn tmux")
+}
+
+/// Fail with what tmux said if `out` is not a success.
+fn assert_started(out: &std::process::Output, what: &str) {
+    assert!(
+        out.status.success(),
+        "failed to {what} private tmux session: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+}
+
 impl Server {
+    /// Stop this server and wait until a client is refused outright.
+    ///
+    /// Refused, with tmux's `no server running on` or `error connecting to`,
+    /// because that is what both callers need: a new server can start on the
+    /// socket, and `server_restarted` sees no server at all. Weaker conditions
+    /// were not enough. `list-sessions` merely failing let a restart's
+    /// `new-session` fail under load. Even after the server's process had
+    /// exited, a client asking straight away twice connected and was then
+    /// told `server exited unexpectedly`.
+    fn stop(&self) {
+        let _ = Command::new("tmux")
+            .args(["-L", &self.socket, "kill-server"])
+            .status();
+        wait_until(
+            || {
+                Command::new("tmux")
+                    .args(["-L", &self.socket, "list-sessions"])
+                    .output()
+                    .is_ok_and(|o| {
+                        let said = String::from_utf8_lossy(&o.stderr);
+                        !o.status.success()
+                            && (said.contains("no server running")
+                                || said.contains("error connecting to"))
+                    })
+            },
+            "a client to find no server",
+        );
+    }
+
+    /// Stop this server and start a new one on the same socket, as a reboot
+    /// would. Its first pane gets the id the old server's first pane had.
+    fn restart(&self) {
+        self.stop();
+        assert_started(&new_session(&self.socket), "restart");
+    }
+
     /// Start a detached 80x24 session named `s` running a plain shell.
     fn start() -> Self {
         // `line!()` alone is constant for every call site inside this function
@@ -42,34 +111,15 @@ impl Server {
         let server = Server {
             socket: socket.clone(),
         };
-        let ok = Command::new("tmux")
-            .args([
-                // `-L` gives us a private *server*; `-f /dev/null` gives us a
-                // private *config*, and the second is not optional. Without it a
-                // new server still sources the developer's ~/.tmux.conf, so what
-                // these tests capture depends on their personal settings -- the
-                // exact coupling the header promises is absent. It is also what
-                // made these the slowest tests in the suite: sourcing one real
-                // config (plugin manager, shell-outs) measured 5.3s per server,
-                // against 0.02s for a bare one, and every test starts one.
-                "-f",
-                "/dev/null",
-                "-L",
-                &socket,
-                "new-session",
-                "-d",
-                "-s",
-                "s",
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sh",
-            ])
-            .status()
-            .expect("spawn tmux")
-            .success();
-        assert!(ok, "failed to start private tmux session");
+        // `-L` gives us a private *server*; `-f /dev/null` gives us a
+        // private *config*, and the second is not optional. Without it a
+        // new server still sources the developer's ~/.tmux.conf, so what
+        // these tests capture depends on their personal settings -- the
+        // exact coupling the header promises is absent. It is also what
+        // made these the slowest tests in the suite: sourcing one real
+        // config (plugin manager, shell-outs) measured 5.3s per server,
+        // against 0.02s for a bare one, and every test starts one.
+        assert_started(&new_session(&socket), "start");
         server
     }
     fn target(&self) -> TmuxTarget {
@@ -376,7 +426,10 @@ fn end_to_end_injection_verifies_then_sends() {
 
     let job = Job {
         id: 1,
-        target: TargetSpec::Tmux { pane: "s".into() },
+        target: TargetSpec::Tmux {
+            pane: "s".into(),
+            server: None,
+        },
         messages: vec!["echo nudge_done_$((6*7))".into()],
         send_delay_secs: 0.0,
         fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
@@ -519,7 +572,10 @@ fn end_to_end_verify_skips_a_pane_that_moved_after_the_snapshot() {
 
     let job = Job {
         id: 1,
-        target: TargetSpec::Tmux { pane: "s".into() },
+        target: TargetSpec::Tmux {
+            pane: "s".into(),
+            server: None,
+        },
         messages: vec!["echo nudge_should_not_appear_$((6*7))".into()],
         send_delay_secs: 0.0,
         fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
@@ -578,7 +634,10 @@ fn end_to_end_verify_still_fires_into_a_pane_nobody_touched() {
 
     let job = Job {
         id: 1,
-        target: TargetSpec::Tmux { pane: "s".into() },
+        target: TargetSpec::Tmux {
+            pane: "s".into(),
+            server: None,
+        },
         messages: vec!["echo nudge_fired_$((6*7))".into()],
         send_delay_secs: 0.0,
         fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
@@ -657,6 +716,94 @@ fn locate_refuses_a_pane_id_that_does_not_exist() {
             .locate()
             .is_err()
     );
+}
+
+/// The stamp a job keeps is read along with the id, from the same server.
+#[test]
+fn locate_reads_which_server_the_pane_is_on() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let loc = server.target().locate().unwrap();
+    let stamp = server.tmux(&["display-message", "-p", nudge::target::tmux::SERVER_FORMAT]);
+    assert!(loc.server.is_some(), "tmux answered {stamp:?}");
+    assert_eq!(loc.server.as_deref(), Some(stamp.as_str()));
+}
+
+/// The control for the guard: on the server it was read from, a stamped pane
+/// has not restarted. Were tmux's answer misread, every stamped job would stop
+/// firing.
+#[test]
+fn a_pane_on_the_server_it_was_read_from_has_not_restarted() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let loc = server.target().locate().unwrap();
+    let target = TmuxTarget::with_socket(&loc.id, &server.socket).expecting_server(loc.server);
+    assert!(!target.server_restarted().unwrap());
+}
+
+/// After a reboot and before tmux is started again there is no server at all,
+/// which proves the one that issued the id is gone. It is not an unreachable
+/// pane, so the job is refused as restarted rather than dropped with an error.
+#[test]
+fn a_pane_id_with_no_tmux_server_running_counts_as_restarted() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let loc = server.target().locate().unwrap();
+
+    server.stop();
+
+    let target = TmuxTarget::with_socket(&loc.id, &server.socket).expecting_server(loc.server);
+    assert!(target.server_restarted().unwrap());
+}
+
+/// The bug: a new server numbers its panes from `%0` again, so a job kept
+/// across a restart holds an id that now names some other pane.
+#[test]
+fn a_pane_id_from_a_restarted_server_is_refused() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let loc = server.target().locate().unwrap();
+
+    server.restart();
+    let fresh = server.target().locate().unwrap();
+    assert_eq!(fresh.id, loc.id, "the new server hands out the same id");
+    assert_ne!(fresh.server, loc.server);
+
+    let job = Job {
+        id: 1,
+        target: TargetSpec::Tmux {
+            pane: loc.id.clone(),
+            server: loc.server.clone(),
+        },
+        messages: vec!["echo stale_$((6*7))".into()],
+        send_delay_secs: 0.0,
+        fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
+        notify: false,
+        verify: false,
+        auto_retry: false,
+        retries_left: 0,
+        settle_secs: 5.0,
+        verify_fingerprint: None,
+        verify_dims: None,
+    };
+    let target = TmuxTarget::with_socket(&loc.id, &server.socket).expecting_server(loc.server);
+    let out = run_injection(&target, &job, &fixed_now(), None, None, None).unwrap();
+    assert_eq!(out, InjectOutcome::ServerRestarted);
+    // Nothing to wait for if nothing was sent, so a short look is the check.
+    thread::sleep(Duration::from_millis(200));
+    assert!(!target.capture().unwrap().contains("stale_"));
 }
 
 /// The bug itself: the windows renumber between scheduling and firing.

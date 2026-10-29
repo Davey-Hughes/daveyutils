@@ -21,7 +21,10 @@ name = "nudge"
 # Claude Code box left in Vim Normal mode as it is, so the nudge arrives as
 # commands, and logs a message stuck unsent in the box as Sent. (It fires the
 # pane ids this build stores without trouble.)
-version = "0.6.0"
+# 0.7.0 is load-bearing the same way: a 0.6.0 daemon drops a Schedule's
+# `server` stamp silently, so it would fire a job into whichever pane took its
+# id after a tmux restart. It also presses `i` for Codex's Normal mode, not `A`.
+version = "0.7.0"
 edition = "2024"
 description = "Rate-limit auto-resumer for AI CLIs in tmux"
 license = "GPL-3.0-or-later"

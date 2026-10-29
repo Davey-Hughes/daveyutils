@@ -591,6 +591,7 @@ mod tests {
             id: 12,
             target: TargetSpec::Tmux {
                 pane: "bot:0.1".into(),
+                server: None,
             },
             messages: vec!["please continue".into()],
             send_delay_secs: 0.75,
@@ -618,7 +619,10 @@ mod tests {
         m.tab = Tab::Jobs;
         m.jobs = vec![crate::job::Job {
             id: 12,
-            target: TargetSpec::Tmux { pane: "%19".into() },
+            target: TargetSpec::Tmux {
+                pane: "%19".into(),
+                server: None,
+            },
             messages: vec!["please continue".into()],
             send_delay_secs: 0.75,
             fire_at: "2026-07-16T14:14:00Z".parse().unwrap(),
@@ -630,7 +634,7 @@ mod tests {
             verify_fingerprint: None,
             verify_dims: None,
         }];
-        m.positions = [("%19".to_string(), "main:11.0".to_string())].into();
+        m.positions.panes = [("%19".to_string(), "main:11.0".to_string())].into();
         let out = render(&m);
         assert!(out.contains("main:11.0 (%19)"), "{out}");
     }
@@ -645,6 +649,7 @@ mod tests {
             id: 12,
             target: TargetSpec::Tmux {
                 pane: "%142".into(),
+                server: None,
             },
             messages: vec!["please continue".into()],
             send_delay_secs: 0.75,
@@ -657,7 +662,7 @@ mod tests {
             verify_fingerprint: None,
             verify_dims: None,
         }];
-        m.positions = [("%142".to_string(), "subcheck-review:3.0".to_string())].into();
+        m.positions.panes = [("%142".to_string(), "subcheck-review:3.0".to_string())].into();
         let out = render(&m);
         assert!(out.contains("subcheck-review:3.0 (%142)"), "{out}");
     }
@@ -670,7 +675,10 @@ mod tests {
         m.tab = Tab::Jobs;
         m.jobs = vec![crate::job::Job {
             id: 12,
-            target: TargetSpec::Tmux { pane: "%1".into() },
+            target: TargetSpec::Tmux {
+                pane: "%1".into(),
+                server: None,
+            },
             messages: vec!["please continue".into()],
             send_delay_secs: 0.75,
             fire_at: "2026-07-16T14:14:00Z".parse().unwrap(),
@@ -682,7 +690,7 @@ mod tests {
             verify_fingerprint: None,
             verify_dims: None,
         }];
-        m.positions = [("%1".to_string(), format!("{}:1.0", "x".repeat(60)))].into();
+        m.positions.panes = [("%1".to_string(), format!("{}:1.0", "x".repeat(60)))].into();
         let out = render(&m);
         assert!(out.contains("2h 14m"), "{out}");
         assert!(out.contains("FLAGS"), "{out}");

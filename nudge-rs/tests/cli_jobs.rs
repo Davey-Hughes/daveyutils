@@ -22,7 +22,10 @@ fn no_snapshot(_pane: &str, _opts: &Toggles) -> Option<Baseline> {
 
 fn spec(pane: &str) -> JobSpec {
     JobSpec {
-        target: TargetSpec::Tmux { pane: pane.into() },
+        target: TargetSpec::Tmux {
+            pane: pane.into(),
+            server: None,
+        },
         messages: vec!["go".into()],
         send_delay_secs: 0.75,
         fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
@@ -76,11 +79,14 @@ fn format_jobs_shows_id_pane_and_count() {
 fn format_jobs_keeps_its_columns_aligned_around_a_long_pane_label() {
     let out = format_jobs(
         &[spec("%142").into_job(1), spec("%2").into_job(2)],
-        &[
-            ("%142".to_string(), "subcheck-review:3.0".to_string()),
-            ("%2".to_string(), "s:0.1".to_string()),
-        ]
-        .into(),
+        &Positions {
+            server: None,
+            panes: [
+                ("%142".to_string(), "subcheck-review:3.0".to_string()),
+                ("%2".to_string(), "s:0.1".to_string()),
+            ]
+            .into(),
+        },
     );
     let lines: Vec<&str> = out.lines().collect();
     let fire = lines[0].find("FIRE").unwrap();
@@ -95,7 +101,10 @@ fn format_jobs_keeps_its_columns_aligned_around_a_long_pane_label() {
 fn format_jobs_shows_where_each_pane_sits_now() {
     let out = format_jobs(
         &[spec("%19").into_job(1)],
-        &[("%19".to_string(), "main:11.0".to_string())].into(),
+        &Positions {
+            server: None,
+            panes: [("%19".to_string(), "main:11.0".to_string())].into(),
+        },
     );
     assert!(out.contains("main:11.0 (%19)"), "{out}");
 }
@@ -152,6 +161,7 @@ fn edit_turning_on_auto_retry_gets_the_default_budget() {
     let spec = nudge::app::merge_edit(
         &no_retry_job(5),
         &cli(&["nudge", "--edit", "5", "--auto-retry"]),
+        None,
         &noon(),
         2,
         &no_snapshot,
@@ -171,6 +181,7 @@ fn edit_auto_retry_with_an_explicit_count_uses_that_count() {
     let spec = nudge::app::merge_edit(
         &no_retry_job(5),
         &cli(&["nudge", "--edit", "5", "--auto-retry", "-r", "7"]),
+        None,
         &noon(),
         2,
         &no_snapshot,
@@ -186,6 +197,7 @@ fn edit_without_auto_retry_keeps_a_no_retry_job_at_zero() {
     let spec = nudge::app::merge_edit(
         &no_retry_job(5),
         &cli(&["nudge", "--edit", "5", "-m", "6pm"]),
+        None,
         &noon(),
         2,
         &no_snapshot,
@@ -207,6 +219,7 @@ fn merge_edit_preserves_options_not_passed() {
     let job = JobSpec {
         target: TargetSpec::Tmux {
             pane: "bot:0.1".into(),
+            server: None,
         },
         messages: vec!["go".into()],
         send_delay_secs: 0.5,
@@ -226,7 +239,7 @@ fn merge_edit_preserves_options_not_passed() {
         <nudge::cli::Cli as clap::Parser>::try_parse_from(["nudge", "--edit", "1", "-m", "6pm"])
             .unwrap();
 
-    let spec = nudge::app::merge_edit(&job, &cli, &now, 2, &no_snapshot).unwrap();
+    let spec = nudge::app::merge_edit(&job, &cli, None, &now, 2, &no_snapshot).unwrap();
 
     assert!(spec.verify, "verify must be preserved");
     assert!(spec.notify, "notify must be preserved");
@@ -247,7 +260,10 @@ fn dims(width: u16) -> PaneDims {
 /// A job carrying a snapshot from when it was first scheduled.
 fn verify_job_snapshotted_at(pane: &str, screen: &str) -> nudge::job::Job {
     JobSpec {
-        target: TargetSpec::Tmux { pane: pane.into() },
+        target: TargetSpec::Tmux {
+            pane: pane.into(),
+            server: None,
+        },
         messages: vec!["go".into()],
         send_delay_secs: 0.75,
         fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
@@ -278,7 +294,7 @@ fn edit_resnapshots_the_pane_instead_of_inheriting_the_old_baseline() {
             dims: dims(80),
         })
     };
-    let spec = nudge::app::merge_edit(&job, &cli, &noon(), 2, &fresh).unwrap();
+    let spec = nudge::app::merge_edit(&job, &cli, None, &noon(), 2, &fresh).unwrap();
     assert_eq!(
         spec.verify_fingerprint,
         Some(nudge::verify::fingerprint("the pane at edit time")),
@@ -308,7 +324,7 @@ fn edit_snapshots_the_new_pane_when_the_job_is_moved() {
         seen.borrow_mut().push(p.to_string());
         None
     };
-    nudge::app::merge_edit(&job, &cli, &noon(), 2, &record).unwrap();
+    nudge::app::merge_edit(&job, &cli, None, &noon(), 2, &record).unwrap();
     assert_eq!(
         *seen.borrow(),
         vec!["other:0.2".to_string()],
@@ -338,7 +354,7 @@ fn edit_with_no_verify_drops_the_snapshot() {
             dims: dims(80),
         })
     };
-    let spec = nudge::app::merge_edit(&job, &cli, &noon(), 2, &always_snapshots).unwrap();
+    let spec = nudge::app::merge_edit(&job, &cli, None, &noon(), 2, &always_snapshots).unwrap();
     assert!(!spec.verify);
     assert_eq!(
         spec.verify_fingerprint, None,
@@ -356,10 +372,51 @@ fn edit_keeps_the_job_when_the_pane_cannot_be_snapshotted() {
     let cli =
         <nudge::cli::Cli as clap::Parser>::try_parse_from(["nudge", "--edit", "1", "-m", "6pm"])
             .unwrap();
-    let spec = nudge::app::merge_edit(&job, &cli, &noon(), 2, &no_snapshot).unwrap();
+    let spec = nudge::app::merge_edit(&job, &cli, None, &noon(), 2, &no_snapshot).unwrap();
     assert!(
         spec.verify,
         "--verify stays on; it just fails open at fire time"
     );
     assert_eq!(spec.verify_fingerprint, None);
+}
+
+/// An edit that keeps the pane keeps the server it was read from. Re-read
+/// now, a stale job's id would pass for a pane on the new server.
+#[test]
+fn edit_without_a_pane_keeps_the_jobs_server() {
+    let mut job = no_retry_job(5);
+    job.target = TargetSpec::Tmux {
+        pane: "%19".into(),
+        server: Some("100-1".into()),
+    };
+    let spec = nudge::app::merge_edit(
+        &job,
+        &cli(&["nudge", "--edit", "5", "-m", "6pm"]),
+        None,
+        &noon(),
+        2,
+        &no_snapshot,
+    )
+    .unwrap();
+    assert_eq!(spec.target, job.target);
+}
+
+#[test]
+fn edit_moving_the_job_stores_the_new_panes_server() {
+    let spec = nudge::app::merge_edit(
+        &no_retry_job(5),
+        &cli(&["nudge", "--edit", "5", "-p", "%7"]),
+        Some("200-2".into()),
+        &noon(),
+        2,
+        &no_snapshot,
+    )
+    .unwrap();
+    assert_eq!(
+        spec.target,
+        TargetSpec::Tmux {
+            pane: "%7".into(),
+            server: Some("200-2".into())
+        }
+    );
 }

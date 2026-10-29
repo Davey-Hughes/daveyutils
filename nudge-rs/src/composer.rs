@@ -21,6 +21,13 @@ const VIM_MODES: [&str; 3] = ["Normal", "Insert", "Replace"];
 /// leaving "se continue". The lowest line that ends in a mode is the status
 /// line, and it alone decides.
 pub fn vim_normal(screen: &str) -> bool {
+    vim_mode(screen) == Some("Normal")
+}
+
+/// The Vim mode Codex's status line names, if it names one: `Normal`,
+/// `Insert` or `Replace`. The lowest line that ends in a mode is the status
+/// line, and it alone decides.
+pub fn vim_mode(screen: &str) -> Option<&'static str> {
     let captured = read_styled(screen);
     let lines: Vec<&str> = captured.all.iter().map(|l| l.trim_end()).collect();
     let end = lines
@@ -37,7 +44,7 @@ pub fn vim_normal(screen: &str) -> bool {
                     .is_some_and(|before| before.is_empty() || before.ends_with(' '))
             })
         })
-        .is_some_and(|mode| *mode == "Normal")
+        .copied()
 }
 
 /// A CLI's input box, read off a pane captured with its styling
@@ -251,6 +258,16 @@ mod tests {
 ";
 
     #[test]
+    fn names_the_mode_on_the_status_line() {
+        assert_eq!(vim_mode(NORMAL), Some("Normal"));
+        assert_eq!(
+            vim_mode(&NORMAL.replace("Vim: Normal", "Vim: Insert")),
+            Some("Insert")
+        );
+        assert_eq!(vim_mode("❯ \n\n  ? for shortcuts\n"), None);
+    }
+
+    #[test]
     fn reads_vim_normal_off_the_captured_codex_status_line() {
         assert!(vim_normal(NORMAL));
     }
@@ -279,7 +296,7 @@ mod tests {
     }
 
     /// The words alone prove nothing. A pane can be *about* Vim Normal mode --
-    /// a transcript discussing this very check is -- and typing an "i" into it
+    /// a transcript discussing this very check is -- and typing an "A" into it
     /// would put a stray letter in front of the nudge.
     #[test]
     fn the_words_higher_up_the_pane_are_conversation_not_state() {

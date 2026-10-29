@@ -7,16 +7,32 @@ use crate::target::PaneDims;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind")]
 pub enum TargetSpec {
-    Tmux { pane: String },
+    Tmux {
+        pane: String,
+        /// The tmux server `pane`'s id was read from, as
+        /// [`SERVER_FORMAT`](crate::target::tmux::SERVER_FORMAT) reads it. A
+        /// job queued before jobs kept it has none, and fires as it always did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
+    },
 }
 
 impl TargetSpec {
+    /// Whether this target's pane id was read from a tmux server other than
+    /// `current`, the one running now. Only when both are known: a job queued
+    /// before jobs kept their server, or a server tmux would not name, is no
+    /// evidence either way.
+    pub fn from_earlier_server(&self, current: Option<&str>) -> bool {
+        let TargetSpec::Tmux { server, .. } = self;
+        matches!((server.as_deref(), current), (Some(then), Some(now)) if then != now)
+    }
+
     /// Build the live, connectable target this descriptor names.
     pub fn connect(&self) -> Box<dyn crate::target::Target> {
         match self {
-            TargetSpec::Tmux { pane } => {
-                Box::new(crate::target::tmux::TmuxTarget::new(pane.clone()))
-            }
+            TargetSpec::Tmux { pane, server } => Box::new(
+                crate::target::tmux::TmuxTarget::new(pane.clone()).expecting_server(server.clone()),
+            ),
         }
     }
 }
@@ -93,12 +109,39 @@ impl JobSpec {
 mod tests {
     use super::*;
 
+    /// A job queued by 0.6.0 has no `server`, and a target with none writes
+    /// none, so a queue.json from before the stamp reads back as it was.
+    #[test]
+    fn a_tmux_target_without_a_server_reads_and_writes_as_before() {
+        let json = r#"{"kind":"Tmux","pane":"%19"}"#;
+        let t: TargetSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            t,
+            TargetSpec::Tmux {
+                pane: "%19".into(),
+                server: None
+            }
+        );
+        assert_eq!(serde_json::to_string(&t).unwrap(), json);
+    }
+
+    #[test]
+    fn a_tmux_target_keeps_its_server() {
+        let t = TargetSpec::Tmux {
+            pane: "%19".into(),
+            server: Some("1793226261-4820".into()),
+        };
+        let back: TargetSpec = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back, t);
+    }
+
     #[test]
     fn job_roundtrips_through_json() {
         let job = Job {
             id: 7,
             target: TargetSpec::Tmux {
                 pane: "bot:0.1".into(),
+                server: None,
             },
             messages: vec!["please continue".into()],
             send_delay_secs: 0.75,
@@ -165,7 +208,10 @@ mod tests {
     fn half_a_baseline_is_no_baseline() {
         let mut j = Job {
             id: 1,
-            target: TargetSpec::Tmux { pane: "p".into() },
+            target: TargetSpec::Tmux {
+                pane: "p".into(),
+                server: None,
+            },
             messages: vec!["go".into()],
             send_delay_secs: 0.0,
             fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
@@ -184,5 +230,21 @@ mod tests {
             height: 24,
         });
         assert_eq!(j.verify_baseline(), None, "dims without fingerprint");
+    }
+
+    fn target(server: Option<&str>) -> TargetSpec {
+        TargetSpec::Tmux {
+            pane: "%1".into(),
+            server: server.map(String::from),
+        }
+    }
+
+    #[test]
+    fn only_two_known_and_different_servers_are_an_earlier_one() {
+        assert!(target(Some("100-1")).from_earlier_server(Some("200-2")));
+        assert!(!target(Some("100-1")).from_earlier_server(Some("100-1")));
+        assert!(!target(None).from_earlier_server(Some("200-2")));
+        assert!(!target(Some("100-1")).from_earlier_server(None));
+        assert!(!target(None).from_earlier_server(None));
     }
 }

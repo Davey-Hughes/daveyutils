@@ -34,7 +34,7 @@ fn build_spec_stores_the_pane_snapshot_when_verify_is_on() {
     let c = cli(&["nudge", "-p", "bot:0.1", "-v"]);
     let opts = resolve_options(&c);
     let ts = "2026-07-13T15:00:00Z".parse().unwrap();
-    let spec = build_spec("bot:0.1", ts, &c, &opts, Some(a_baseline()));
+    let spec = build_spec("bot:0.1", None, ts, &c, &opts, Some(a_baseline()));
     assert!(spec.verify);
     assert_eq!(spec.verify_fingerprint, Some(a_baseline().fingerprint));
     assert_eq!(spec.verify_dims, Some(a_baseline().dims));
@@ -47,7 +47,7 @@ fn build_spec_schedules_the_job_anyway_when_the_pane_cannot_be_snapshotted() {
     let c = cli(&["nudge", "-p", "bot:0.1", "-v"]);
     let opts = resolve_options(&c);
     let ts = "2026-07-13T15:00:00Z".parse().unwrap();
-    let spec = build_spec("bot:0.1", ts, &c, &opts, None);
+    let spec = build_spec("bot:0.1", None, ts, &c, &opts, None);
     assert!(spec.verify, "--verify stays on; it just fails open at fire");
     assert_eq!(spec.verify_fingerprint, None);
     assert_eq!(spec.verify_dims, None);
@@ -60,7 +60,7 @@ fn build_spec_stores_no_snapshot_without_verify() {
     let c = cli(&["nudge", "-p", "bot:0.1"]);
     let opts = resolve_options(&c);
     let ts = "2026-07-13T15:00:00Z".parse().unwrap();
-    let spec = build_spec("bot:0.1", ts, &c, &opts, Some(a_baseline()));
+    let spec = build_spec("bot:0.1", None, ts, &c, &opts, Some(a_baseline()));
     assert!(!spec.verify);
     assert_eq!(spec.verify_fingerprint, None);
     assert_eq!(spec.verify_dims, None);
@@ -75,11 +75,12 @@ fn build_spec_defaults_message_and_delay() {
     let c = cli(&["nudge", "-p", "bot:0.1"]);
     let opts = resolve_options(&c);
     let ts = "2026-07-13T15:00:00Z".parse().unwrap();
-    let spec = build_spec("bot:0.1", ts, &c, &opts, None);
+    let spec = build_spec("bot:0.1", None, ts, &c, &opts, None);
     assert_eq!(
         spec.target,
         TargetSpec::Tmux {
-            pane: "bot:0.1".into()
+            pane: "bot:0.1".into(),
+            server: None,
         }
     );
     assert_eq!(spec.messages, vec!["please continue".to_string()]);
@@ -98,7 +99,7 @@ fn build_spec_takes_custom_messages_and_delay() {
     ]);
     let opts = resolve_options(&c);
     let ts = "2026-07-13T15:00:00Z".parse().unwrap();
-    let spec = build_spec("x", ts, &c, &opts, None);
+    let spec = build_spec("x", None, ts, &c, &opts, None);
     assert_eq!(
         spec.messages,
         vec!["npm test".to_string(), "yes".to_string()]
@@ -119,7 +120,7 @@ fn scheduling_a_spec_over_ipc_reaches_the_queue() {
     let c = cli(&["nudge", "-p", "bot:0.1"]);
     let opts = resolve_options(&c);
     let ts = "2026-07-13T15:00:00Z".parse().unwrap();
-    let spec = build_spec("bot:0.1", ts, &c, &opts, None);
+    let spec = build_spec("bot:0.1", None, ts, &c, &opts, None);
 
     let resp = client::request(&socket, &Request::Schedule(spec)).unwrap();
     h.join().unwrap();
@@ -147,7 +148,7 @@ fn the_pane_snapshot_survives_the_schedule_request_and_queue_json() {
     let c = cli(&["nudge", "-p", "bot:0.1", "-v"]);
     let opts = resolve_options(&c);
     let ts = "2026-07-13T15:00:00Z".parse().unwrap();
-    let spec = build_spec("bot:0.1", ts, &c, &opts, Some(a_baseline()));
+    let spec = build_spec("bot:0.1", None, ts, &c, &opts, Some(a_baseline()));
 
     client::request(&socket, &Request::Schedule(spec)).unwrap();
     h.join().unwrap();
@@ -163,5 +164,22 @@ fn the_pane_snapshot_survives_the_schedule_request_and_queue_json() {
         reloaded.all()[0].verify_baseline(),
         Some((a_baseline().fingerprint, a_baseline().dims)),
         "a daemon restarted between schedule and fire must still hold the baseline"
+    );
+}
+
+/// The job keeps the server its pane's id was read from, so that firing
+/// can tell that id from the same one on a server started since.
+#[test]
+fn build_spec_stores_the_server_the_pane_was_read_from() {
+    let c = cli(&["nudge", "-p", "%19"]);
+    let opts = resolve_options(&c);
+    let ts = "2026-07-13T15:00:00Z".parse().unwrap();
+    let spec = build_spec("%19", Some("1793226261-4820".into()), ts, &c, &opts, None);
+    assert_eq!(
+        spec.target,
+        TargetSpec::Tmux {
+            pane: "%19".into(),
+            server: Some("1793226261-4820".into())
+        }
     );
 }

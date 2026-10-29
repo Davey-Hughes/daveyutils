@@ -21,7 +21,10 @@ use nudge::queue::Queue;
 
 fn spec(pane: &str) -> JobSpec {
     JobSpec {
-        target: TargetSpec::Tmux { pane: pane.into() },
+        target: TargetSpec::Tmux {
+            pane: pane.into(),
+            server: None,
+        },
         messages: vec!["go".into()],
         send_delay_secs: 0.75,
         fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
@@ -100,7 +103,8 @@ fn replace_swaps_the_job_in_one_request() {
     assert_eq!(
         q.all()[0].target,
         TargetSpec::Tmux {
-            pane: "new:0.0".into()
+            pane: "new:0.0".into(),
+            server: None,
         },
         "the replacement's spec must be the one we sent"
     );

@@ -216,8 +216,12 @@ fn log_outcome(
     outcome: &anyhow::Result<crate::inject::InjectOutcome>,
 ) {
     match outcome {
-        // Typed but never sent: the nudge did not go out.
-        Ok(o @ crate::inject::InjectOutcome::Unsubmitted { .. }) => {
+        // Typed but never sent, or never typed because the pane is gone with
+        // the server that issued its id: either way the nudge did not go out.
+        Ok(
+            o @ (crate::inject::InjectOutcome::Unsubmitted { .. }
+            | crate::inject::InjectOutcome::ServerRestarted),
+        ) => {
             tracing::warn!("nudge: job {} -> {o:?} in {pane}", job.id);
         }
         // Not "fired": two of the three outcomes deliberately send
@@ -231,9 +235,7 @@ fn log_outcome(
 /// A short human-readable description of a job's target, for the log and
 /// notification text: where its pane sits now, and the id the job stores.
 fn describe_pane(job: &crate::job::Job, positions: &Positions) -> String {
-    match &job.target {
-        crate::job::TargetSpec::Tmux { pane } => crate::tmux_panes::label(pane, positions),
-    }
+    crate::tmux_panes::label(&job.target, positions)
 }
 
 /// What to tell the user about firing `job`, or `None` for nothing.
@@ -256,7 +258,9 @@ pub fn notification(
     pane: &str,
     outcome: &anyhow::Result<crate::inject::InjectOutcome>,
 ) -> Option<String> {
-    use crate::inject::InjectOutcome::{Sent, SkippedNoBanner, SkippedResumed, Unsubmitted};
+    use crate::inject::InjectOutcome::{
+        Sent, ServerRestarted, SkippedNoBanner, SkippedResumed, Unsubmitted,
+    };
     if !job.notify {
         return None;
     }
@@ -273,6 +277,11 @@ pub fn notification(
         Ok(Unsubmitted { .. }) => Some(format!(
             "nudge typed into {pane}, but the message is still in its input box, unsent"
         )),
+        Ok(ServerRestarted) => Some(format!(
+            "nudge sent nothing to {pane}: that pane was on a tmux server that is not \
+             the one running now (tmux restarted since you scheduled it, or the pane is \
+             on another tmux socket)"
+        )),
         Err(_) => None,
     }
 }
@@ -286,7 +295,10 @@ mod tests {
 
     fn spec(notify: bool) -> JobSpec {
         JobSpec {
-            target: TargetSpec::Tmux { pane: "p".into() },
+            target: TargetSpec::Tmux {
+                pane: "p".into(),
+                server: None,
+            },
             messages: vec!["go".into()],
             send_delay_secs: 0.0,
             fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
@@ -512,5 +524,20 @@ mod tests {
             .expect("a nudge that did not go out must not be silent");
         assert!(msg.contains("main:12.0 (%19)"), "{msg}");
         assert!(msg.contains("input box"), "{msg}");
+    }
+
+    /// A nudge refused because tmux restarted did not go out either, and is
+    /// said out loud the same way.
+    #[test]
+    fn a_pane_from_a_restarted_server_is_a_warning_and_a_notification() {
+        let gone = Ok(InjectOutcome::ServerRestarted);
+        let log = logs_from(|| log_outcome(&job(false), "%19 (earlier tmux server)", &gone));
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains("ServerRestarted"), "{log}");
+
+        let msg = notification(&job(true), "%19 (earlier tmux server)", &gone)
+            .expect("a nudge that did not go out must not be silent");
+        assert!(msg.contains("%19"), "{msg}");
+        assert!(msg.contains("not the one running now"), "{msg}");
     }
 }

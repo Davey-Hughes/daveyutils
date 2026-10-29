@@ -30,6 +30,10 @@ pub enum InjectOutcome {
     /// box afterwards. `submitted` messages went before it; none were typed
     /// after it, since they would only have joined it in the box.
     Unsubmitted { submitted: usize },
+    /// The job's pane id was read from a tmux server that has since
+    /// restarted, so the id now names some other pane, or none. Nothing was
+    /// typed.
+    ServerRestarted,
 }
 
 /// Execute `job`'s injection against `target`.
@@ -37,7 +41,8 @@ pub enum InjectOutcome {
 /// With `job.verify`, the pane is gated twice before anything is typed: it must
 /// not have moved since the job was scheduled (the recency gate), and it must
 /// still show a rate-limit banner. Otherwise each message is typed and
-/// submitted, pausing `job.send_delay_secs` between messages.
+/// submitted, pausing `job.send_delay_secs` between messages. A pane from a
+/// tmux server that has since restarted gets nothing (`ServerRestarted`).
 pub fn run_injection(
     target: &dyn Target,
     job: &Job,
@@ -46,6 +51,13 @@ pub fn run_injection(
     dur_ext: Option<&str>,
     weekly_ext: Option<&str>,
 ) -> Result<InjectOutcome> {
+    // First, before the gate below reads some other pane's screen. A new tmux
+    // server hands out pane ids from `%0` again, so after a reboot the id a job
+    // stored names whichever new pane took it. A check that cannot be made is
+    // an Err like any unreachable pane, retried or reported by the caller.
+    if target.server_restarted()? {
+        return Ok(InjectOutcome::ServerRestarted);
+    }
     if job.verify {
         // Dims either side of the capture, believed only when they agree.
         //
@@ -118,7 +130,7 @@ pub fn run_injection(
         // below is what will say so.
         if let Ok(screen) = target.capture_styled() {
             if crate::composer::vim_normal(&screen) {
-                target.send_key("i")?;
+                codex_insert_mode(target)?;
             } else if let Some(before) = crate::composer::input_box(&screen)
                 && let BoxKind::Claude {
                     mode: mode @ (ClaudeMode::Visual | ClaudeMode::Unlabelled),
@@ -157,26 +169,61 @@ pub fn run_injection(
 /// redraw.
 const REREADS: usize = 4;
 
-/// Read the pane's input box up to `1 + REREADS` times, a settle apart, until
-/// `decide` has an answer. `None` from `decide` means look again; a read that
-/// fails, or shows no box nudge can read, is handed to it as `None`.
-fn reread<T>(
+/// Read the pane up to `1 + REREADS` times, a settle apart, until `decide`
+/// has an answer. `None` from `decide` means look again; a read that fails is
+/// handed to it as `None`.
+fn reread_screen<T>(
     target: &dyn Target,
-    mut decide: impl FnMut(Option<InputBox>) -> Option<T>,
+    mut decide: impl FnMut(Option<&str>) -> Option<T>,
 ) -> Option<T> {
     for read in 0..=REREADS {
         if read > 0 {
             target.settle();
         }
-        let input = target
-            .capture_styled()
-            .ok()
-            .and_then(|screen| crate::composer::input_box(&screen));
-        if let Some(answer) = decide(input) {
+        let screen = target.capture_styled().ok();
+        if let Some(answer) = decide(screen.as_deref()) {
             return Some(answer);
         }
     }
     None
+}
+
+/// [`reread_screen`] for the pane's input box. A read that shows no box nudge
+/// can read is handed to `decide` as `None` too.
+fn reread<T>(
+    target: &dyn Target,
+    mut decide: impl FnMut(Option<InputBox>) -> Option<T>,
+) -> Option<T> {
+    reread_screen(target, |screen| {
+        decide(screen.and_then(crate::composer::input_box))
+    })
+}
+
+/// Put a Codex composer waiting in Vim Normal mode into Insert mode.
+///
+/// `A`, as for Claude, because a draft in the composer puts Normal mode's
+/// cursor on its last character, and `i` would insert the nudge in front of
+/// it. Codex binds `A` by default (`tui.keymap.vim_normal.append_line_end`,
+/// seen in 0.165.0), but the keymap can be changed and an older Codex may not
+/// have it. So the status line is read again, and a composer still showing
+/// Normal mode at the last read gets the `i` that was checked live on
+/// 2026-10-12. A read that shows no mode leaves the question open, and an `i`
+/// pressed on it could be typed as text, so one stale Normal frame followed by
+/// such reads earns no `i`.
+fn codex_insert_mode(target: &dyn Target) -> Result<()> {
+    target.send_key("A")?;
+    let mut last = None;
+    let left = reread_screen(target, |screen| {
+        last = screen.and_then(crate::composer::vim_mode);
+        match last {
+            Some("Normal") | None => None,
+            Some(_) => Some(()),
+        }
+    });
+    if left.is_none() && last == Some("Normal") {
+        target.send_key("i")?;
+    }
+    Ok(())
 }
 
 /// Put a Claude Code box drawn without `-- INSERT --` into Insert mode, if it
@@ -249,6 +296,8 @@ mod tests {
         keys: RefCell<Vec<(usize, String)>>,
         /// Whether `capture()` fails, as it does for a pane tmux cannot read.
         capture_fails: bool,
+        /// What `server_restarted()` answers.
+        server_restarted: bool,
     }
     impl FakeTarget {
         fn new(screen: &str) -> Self {
@@ -258,6 +307,7 @@ mod tests {
                 sent: RefCell::new(Vec::new()),
                 keys: RefCell::new(Vec::new()),
                 capture_fails: false,
+                server_restarted: false,
             }
         }
         /// A pane that shows each of `screens` in turn, one per capture.
@@ -334,6 +384,9 @@ mod tests {
             self.keys.borrow_mut().push((lines_before, key.to_string()));
             Ok(())
         }
+        fn server_restarted(&self) -> anyhow::Result<bool> {
+            Ok(self.server_restarted)
+        }
         fn dims(&self) -> Option<crate::target::PaneDims> {
             let mut reads = self.dims_reads.borrow_mut();
             if reads.len() > 1 {
@@ -347,7 +400,10 @@ mod tests {
     fn job(verify: bool, messages: &[&str]) -> Job {
         Job {
             id: 1,
-            target: TargetSpec::Tmux { pane: "x".into() },
+            target: TargetSpec::Tmux {
+                pane: "x".into(),
+                server: None,
+            },
             messages: messages.iter().map(ToString::to_string).collect(),
             send_delay_secs: 0.0,
             fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
@@ -428,18 +484,64 @@ mod tests {
   ← for agents · ? for shortcuts
 ";
 
-    /// Typed into Normal mode, "go" is two commands, not a message. An `i`
-    /// first is what a person would press, and it has to come before the text.
+    /// The same pane once its composer has gone into Insert mode.
+    fn vim_insert() -> String {
+        VIM_NORMAL.replace("Vim: Normal", "Vim: Insert")
+    }
+
+    /// Typed into Normal mode, "go" is two commands, not a message. An `A`
+    /// first is what a person would press: it puts the nudge after a draft,
+    /// where `i` would put it before the draft's last character. It has to
+    /// come before the text.
     #[test]
-    fn a_composer_in_vim_normal_mode_is_put_in_insert_mode_before_the_message() {
-        let t = FakeTarget::new(VIM_NORMAL);
+    fn a_composer_in_vim_normal_mode_gets_an_a_before_the_message() {
+        let t = FakeTarget::showing(&[VIM_NORMAL, &vim_insert()]);
         let out = run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
         assert_eq!(out, InjectOutcome::Sent(1));
-        assert_eq!(*t.keys.borrow(), vec![(0, "i".to_string())]);
+        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
         assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
     }
 
-    /// Everywhere else an `i` is a stray letter on the front of the message.
+    /// A Codex with `A` remapped, or one too old to have it, stays in Normal
+    /// mode. `i` is the key seen working live on 2026-10-12.
+    #[test]
+    fn a_composer_that_stays_in_normal_mode_after_a_gets_an_i() {
+        let t = FakeTarget::new(VIM_NORMAL);
+        run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(
+            *t.keys.borrow(),
+            vec![(0, "A".to_string()), (0, "i".to_string())]
+        );
+    }
+
+    /// A pane slow to redraw still shows Normal mode just after the `A`. An
+    /// `i` pressed then would be typed as text.
+    #[test]
+    fn a_composer_slow_to_leave_normal_mode_gets_no_i() {
+        let t = FakeTarget::showing(&[VIM_NORMAL, VIM_NORMAL, &vim_insert()]);
+        run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+    }
+
+    /// Reads that show no mode at all are no evidence the `A` failed, so they
+    /// earn no `i` either.
+    #[test]
+    fn a_composer_whose_mode_disappears_after_a_gets_no_i() {
+        let t = FakeTarget::showing(&[VIM_NORMAL, "mid-redraw, no status line"]);
+        run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+    }
+
+    /// One stale frame showing Normal mode, followed by reads with no mode,
+    /// does not say the composer is still in Normal mode now.
+    #[test]
+    fn a_stale_normal_read_followed_by_no_mode_gets_no_i() {
+        let t = FakeTarget::showing(&[VIM_NORMAL, VIM_NORMAL, "mid-redraw, no status line"]);
+        run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+    }
+
+    /// Everywhere else an `A` is a stray letter on the front of the message.
     #[test]
     fn a_composer_already_taking_text_gets_no_extra_key() {
         for screen in [
@@ -458,12 +560,11 @@ mod tests {
     #[test]
     fn the_composer_mode_is_checked_before_each_message() {
         // Codex is back in Insert mode once the first message is submitted, and
-        // a second `i` pressed on the strength of the first reading would be
-        // typed: "itwo".
-        let insert = VIM_NORMAL.replace("Vim: Normal", "Vim: Insert");
-        let t = FakeTarget::showing(&[VIM_NORMAL, &insert]);
+        // a second `A` pressed on the strength of the first reading would be
+        // typed: "Atwo".
+        let t = FakeTarget::showing(&[VIM_NORMAL, &vim_insert()]);
         run_injection(&t, &job(false, &["one", "two"]), &now(), None, None, None).unwrap();
-        assert_eq!(*t.keys.borrow(), vec![(0, "i".to_string())]);
+        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
         assert_eq!(*t.sent.borrow(), vec!["one".to_string(), "two".to_string()]);
     }
 
@@ -476,6 +577,20 @@ mod tests {
         assert_eq!(out, InjectOutcome::Sent(1));
         assert!(t.keys.borrow().is_empty());
         assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
+    }
+
+    /// After a reboot the id names whichever new pane took it. Nothing is
+    /// read or typed there, not even a key for its Vim mode.
+    #[test]
+    fn a_pane_from_a_restarted_server_gets_nothing() {
+        let t = FakeTarget {
+            server_restarted: true,
+            ..FakeTarget::new(VIM_NORMAL)
+        };
+        let out = run_injection(&t, &job(true, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::ServerRestarted);
+        assert!(t.sent.borrow().is_empty());
+        assert!(t.keys.borrow().is_empty());
     }
 
     // ---- a Claude Code box in Vim Normal mode ----

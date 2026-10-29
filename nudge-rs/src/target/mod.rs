@@ -54,6 +54,14 @@ pub trait Target {
     /// tmux key name: `A`, `BSpace`.
     fn send_key(&self, key: &str) -> Result<()>;
 
+    /// Whether the server that gave the target its name has since been
+    /// replaced, so that the name now belongs to something else: every new
+    /// tmux server hands out pane ids from `%0` again. No server running at all
+    /// counts as restarted, since the one that gave the name is gone. `Err`
+    /// when this cannot be checked, which says the target is unreachable, not
+    /// that it moved.
+    fn server_restarted(&self) -> Result<bool>;
+
     /// Wait a moment, for a pane slow to redraw to catch up before it is read
     /// again.
     fn settle(&self);
