@@ -8,7 +8,6 @@ use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs, Wrap};
 
 use super::model::{FormField, MessageField, Model, Tab, VimMode, WhenMode};
 use crate::app::human_countdown;
-use crate::job::TargetSpec;
 
 /// How many terminal rows `s` needs at `width`, greedily wrapping on spaces the
 /// way `Paragraph`'s `Wrap` does. The footer sizes itself from this so a key
@@ -128,31 +127,38 @@ fn jobs_view(model: &Model, f: &mut Frame, area: Rect) {
         f.render_widget(Paragraph::new("no pending nudge jobs").block(block), area);
         return;
     }
-    let rows = model.jobs.iter().enumerate().map(|(i, j)| {
-        let TargetSpec::Tmux { pane } = &j.target;
-        let delta = j.fire_at.duration_since(model.now).as_secs();
-        let flags: String = [(j.verify, 'v'), (j.notify, 'n'), (j.auto_retry, 'a')]
-            .iter()
-            .filter(|(on, _)| *on)
-            .map(|(_, c)| *c)
-            .collect();
-        let style = if i == model.selected {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        Row::new(vec![
-            j.id.to_string(),
-            pane.clone(),
-            human_countdown(delta),
-            j.messages.len().to_string(),
-            flags,
-        ])
-        .style(style)
-    });
+    // As wide as the longest label, so the id at the end of one is not cut.
+    let (labels, widest) = crate::tmux_panes::job_labels(&model.jobs, &model.positions);
+    let pane_width = u16::try_from(widest + 1).unwrap_or(u16::MAX).max(22);
+    let rows = model
+        .jobs
+        .iter()
+        .zip(labels)
+        .enumerate()
+        .map(|(i, (j, label))| {
+            let delta = j.fire_at.duration_since(model.now).as_secs();
+            let flags: String = [(j.verify, 'v'), (j.notify, 'n'), (j.auto_retry, 'a')]
+                .iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, c)| *c)
+                .collect();
+            let style = if i == model.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
+                j.id.to_string(),
+                label,
+                human_countdown(delta),
+                j.messages.len().to_string(),
+                flags,
+            ])
+            .style(style)
+        });
     let widths = [
         Constraint::Length(5),
-        Constraint::Length(22),
+        Constraint::Length(pane_width),
         Constraint::Length(12),
         Constraint::Length(5),
         Constraint::Length(6),
@@ -482,6 +488,8 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use crate::job::TargetSpec;
+
     use super::super::model::{Model, ScheduleDefaults, VimMode, WhenMode};
 
     fn render(model: &Model) -> String {
@@ -602,6 +610,84 @@ mod tests {
         assert!(out.contains("2h 14m"), "{out}");
     }
 
+    /// A job names its pane by tmux's id, and the row says where that pane
+    /// sits now: after a renumber, that is not where it sat when scheduled.
+    #[test]
+    fn a_job_row_shows_where_its_pane_sits_now() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::Jobs;
+        m.jobs = vec![crate::job::Job {
+            id: 12,
+            target: TargetSpec::Tmux { pane: "%19".into() },
+            messages: vec!["please continue".into()],
+            send_delay_secs: 0.75,
+            fire_at: "2026-07-16T14:14:00Z".parse().unwrap(),
+            notify: false,
+            verify: false,
+            auto_retry: false,
+            retries_left: 0,
+            settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
+        }];
+        m.positions = [("%19".to_string(), "main:11.0".to_string())].into();
+        let out = render(&m);
+        assert!(out.contains("main:11.0 (%19)"), "{out}");
+    }
+
+    /// The PANE column fits its longest label, so the id at the end of one is
+    /// not cut off.
+    #[test]
+    fn a_long_pane_label_is_shown_whole() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::Jobs;
+        m.jobs = vec![crate::job::Job {
+            id: 12,
+            target: TargetSpec::Tmux {
+                pane: "%142".into(),
+            },
+            messages: vec!["please continue".into()],
+            send_delay_secs: 0.75,
+            fire_at: "2026-07-16T14:14:00Z".parse().unwrap(),
+            notify: false,
+            verify: false,
+            auto_retry: false,
+            retries_left: 0,
+            settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
+        }];
+        m.positions = [("%142".to_string(), "subcheck-review:3.0".to_string())].into();
+        let out = render(&m);
+        assert!(out.contains("subcheck-review:3.0 (%142)"), "{out}");
+    }
+
+    /// One very long session name must not push the other columns off a
+    /// normal terminal.
+    #[test]
+    fn a_very_long_pane_label_leaves_room_for_the_other_columns() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::Jobs;
+        m.jobs = vec![crate::job::Job {
+            id: 12,
+            target: TargetSpec::Tmux { pane: "%1".into() },
+            messages: vec!["please continue".into()],
+            send_delay_secs: 0.75,
+            fire_at: "2026-07-16T14:14:00Z".parse().unwrap(),
+            notify: false,
+            verify: true,
+            auto_retry: false,
+            retries_left: 0,
+            settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
+        }];
+        m.positions = [("%1".to_string(), format!("{}:1.0", "x".repeat(60)))].into();
+        let out = render(&m);
+        assert!(out.contains("2h 14m"), "{out}");
+        assert!(out.contains("FLAGS"), "{out}");
+    }
+
     #[test]
     fn new_nudge_tab_shows_the_form_fields() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
@@ -632,6 +718,7 @@ mod tests {
     fn the_form_shows_a_pane_preview_on_top() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
         m.form.panes = vec![crate::tmux_panes::Pane {
+            id: "%1".into(),
             target: "bot:0.1".into(),
             title: String::new(),
         }];
@@ -655,6 +742,7 @@ mod tests {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
         m.form.panes = (0..30)
             .map(|i| crate::tmux_panes::Pane {
+                id: format!("%{i}"),
                 target: format!("s:0.{i}"),
                 title: format!("pane{i}"),
             })
@@ -690,6 +778,7 @@ mod tests {
     fn the_picker_renders_the_query_and_matches() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
         m.form.panes = vec![crate::tmux_panes::Pane {
+            id: "%1".into(),
             target: "bot:0.1".into(),
             title: "claude".into(),
         }];
@@ -730,6 +819,7 @@ mod tests {
     fn the_picker_puts_the_cursor_after_the_query() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
         m.form.panes = vec![crate::tmux_panes::Pane {
+            id: "%1".into(),
             target: "bot:0.1".into(),
             title: "claude".into(),
         }];

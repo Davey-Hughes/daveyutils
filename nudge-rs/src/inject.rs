@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 
+use crate::composer::{BoxKind, ClaudeMode, InputBox};
 use crate::detect::detect_reset;
 use crate::job::Job;
 use crate::target::Target;
@@ -25,6 +26,10 @@ pub enum InjectOutcome {
     /// `--verify` was on and the pane had changed since the job was scheduled,
     /// so the user has resumed this session themselves.
     SkippedResumed,
+    /// A message was typed and Enter pressed, and it was still in the input
+    /// box afterwards. `submitted` messages went before it; none were typed
+    /// after it, since they would only have joined it in the box.
+    Unsubmitted { submitted: usize },
 }
 
 /// Execute `job`'s injection against `target`.
@@ -111,15 +116,109 @@ pub fn run_injection(
         // A capture that fails here is not an error: not knowing the mode is no
         // reason to withhold the nudge, and if the pane is truly gone the send
         // below is what will say so.
-        if target
-            .capture()
-            .is_ok_and(|screen| crate::composer::vim_normal(&screen))
-        {
-            target.send_key("i")?;
+        if let Ok(screen) = target.capture_styled() {
+            if crate::composer::vim_normal(&screen) {
+                target.send_key("i")?;
+            } else if let Some(before) = crate::composer::input_box(&screen)
+                && let BoxKind::Claude {
+                    mode: mode @ (ClaudeMode::Visual | ClaudeMode::Unlabelled),
+                } = before.kind
+            {
+                claude_insert_mode(target, &before, mode)?;
+            }
         }
         target.send_line(msg)?;
+        // Enter that does not submit leaves the message where it was typed, as
+        // Codex once did by reading it as a newline inside a paste. Said
+        // outright, that is a nudge that did not go out; read as `Sent`, it is
+        // one that did. The evidence either way is the box: a read showing it
+        // without the message says it went, and one showing it holding the
+        // message says it has not yet. A read that shows no box says nothing.
+        // Stuck means seen held and never seen clear; a pane no read shows a
+        // box in counts as sent, since nothing says otherwise.
+        let mut seen_held = false;
+        let cleared = reread(target, |input| match input {
+            Some(b) if b.holds(msg) => {
+                seen_held = true;
+                None
+            }
+            Some(_) => Some(()),
+            None => None,
+        });
+        if cleared.is_none() && seen_held {
+            return Ok(InjectOutcome::Unsubmitted { submitted: i });
+        }
     }
     Ok(InjectOutcome::Sent(job.messages.len()))
+}
+
+/// How many more times a box is read, [`Target::settle`] apart, before what it
+/// shows is taken as final: a long transcript or a busy machine can be slow to
+/// redraw.
+const REREADS: usize = 4;
+
+/// Read the pane's input box up to `1 + REREADS` times, a settle apart, until
+/// `decide` has an answer. `None` from `decide` means look again; a read that
+/// fails, or shows no box nudge can read, is handed to it as `None`.
+fn reread<T>(
+    target: &dyn Target,
+    mut decide: impl FnMut(Option<InputBox>) -> Option<T>,
+) -> Option<T> {
+    for read in 0..=REREADS {
+        if read > 0 {
+            target.settle();
+        }
+        let input = target
+            .capture_styled()
+            .ok()
+            .and_then(|screen| crate::composer::input_box(&screen));
+        if let Some(answer) = decide(input) {
+            return Some(answer);
+        }
+    }
+    None
+}
+
+/// Put a Claude Code box drawn without `-- INSERT --` into Insert mode, if it
+/// has Vim keys at all.
+///
+/// Claude labels Insert mode and leaves Normal mode unlabelled, which is also
+/// how a box with its Vim keys off looks, so the missing label cannot say
+/// which this is. An `A` can. Normal mode takes it as the command to append,
+/// draws the label, and leaves the box's text alone. A box without Vim keys
+/// types it, and gets a Backspace to take it out again. Seen live on
+/// 2026-10-27: two nudges typed into Normal mode arrived as "se continue".
+///
+/// `A` rather than `i` because a draft in the box puts Normal mode's cursor on
+/// its last character, and `i` would insert the nudge in front of that. Visual
+/// mode is escaped from first, since an `A` there is no way into Insert mode.
+fn claude_insert_mode(target: &dyn Target, before: &InputBox, mode: ClaudeMode) -> Result<()> {
+    if mode == ClaudeMode::Visual {
+        target.send_key("Escape")?;
+    }
+    target.send_key("A")?;
+    // Only the `A` itself is taken back: typed, it is one more `A` than the
+    // box held, wherever the cursor put it. A box whose text changed some
+    // other way keeps every character. Nothing changing at all is Normal mode
+    // with its label hidden (`hideVimModeIndicator`), which took the `A` as a
+    // command.
+    let a_count = |text: &str| text.matches('A').count();
+    let typed = reread(target, |input| {
+        let after = input?;
+        match after.kind {
+            BoxKind::Claude {
+                mode: ClaudeMode::Insert,
+            } => Some(false),
+            BoxKind::Claude {
+                mode: ClaudeMode::Unlabelled,
+            } if a_count(&after.text) == a_count(&before.text) + 1 => Some(true),
+            _ => None,
+        }
+    });
+    if typed == Some(true) {
+        target.send_key("BSpace")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -226,6 +325,10 @@ mod tests {
             self.sent.borrow_mut().push(text.to_string());
             Ok(())
         }
+        fn capture_styled(&self) -> anyhow::Result<String> {
+            self.capture()
+        }
+        fn settle(&self) {}
         fn send_key(&self, key: &str) -> anyhow::Result<()> {
             let lines_before = self.sent.borrow().len();
             self.keys.borrow_mut().push((lines_before, key.to_string()));
@@ -375,6 +478,230 @@ mod tests {
         assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
     }
 
+    // ---- a Claude Code box in Vim Normal mode ----
+
+    /// The bottom of an idle Claude Code pane in Insert mode, as captured live
+    /// on 2026-10-28 (the rules shortened).
+    const CLAUDE_INSERT: &str = "\
+✻ Brewed for 27s · done 10:29 PM
+
+────────────────────────────────────────
+❯\u{a0}
+────────────────────────────────────────
+  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle) · ← 2 agents
+";
+
+    /// The same pane with no `-- INSERT --` under the box, holding `typed`.
+    /// That is Normal mode, or a box with its Vim keys off: Claude draws the
+    /// two alike.
+    fn claude_unlabelled(typed: &str) -> String {
+        CLAUDE_INSERT
+            .replace("-- INSERT -- ", "")
+            .replace("❯\u{a0}", &format!("❯\u{a0}{typed}"))
+    }
+
+    /// Seen live on 2026-10-27: two nudges typed into Claude boxes left in
+    /// Normal mode arrived as "se continue". An `A` puts the box in Insert
+    /// mode at the end of what it holds, and the label it then draws says
+    /// that is what happened.
+    #[test]
+    fn a_claude_box_in_vim_normal_mode_is_put_in_insert_mode_first() {
+        let t = FakeTarget::showing(&[&claude_unlabelled(""), CLAUDE_INSERT]);
+        let out = run_injection(
+            &t,
+            &job(false, &["please continue"]),
+            &now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, InjectOutcome::Sent(1));
+        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+        assert_eq!(*t.sent.borrow(), vec!["please continue".to_string()]);
+    }
+
+    /// A box with no Vim keys types the `A`, which then has to come out
+    /// again, or the nudge arrives as "Aplease continue".
+    #[test]
+    fn a_claude_box_without_vim_keys_gets_the_typed_key_taken_back() {
+        let t = FakeTarget::showing(&[
+            &claude_unlabelled(""),
+            &claude_unlabelled("A"),
+            &claude_unlabelled(""),
+        ]);
+        run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(
+            *t.keys.borrow(),
+            vec![(0, "A".to_string()), (0, "BSpace".to_string())]
+        );
+        assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
+    }
+
+    /// A pane slow to redraw shows nothing for the key at first. Read once,
+    /// that looks like Normal mode, and the typed `A` stays in the nudge.
+    #[test]
+    fn a_box_slow_to_show_the_typed_key_still_gets_it_taken_back() {
+        let t = FakeTarget::showing(&[
+            &claude_unlabelled(""),
+            &claude_unlabelled(""),
+            &claude_unlabelled(""),
+            &claude_unlabelled("A"),
+            &claude_unlabelled(""),
+        ]);
+        run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(
+            *t.keys.borrow(),
+            vec![(0, "A".to_string()), (0, "BSpace".to_string())]
+        );
+    }
+
+    /// So is a pane slow to draw the label, and that box needs nothing more.
+    #[test]
+    fn a_box_slow_to_show_the_label_gets_nothing_taken_back() {
+        let t = FakeTarget::showing(&[
+            &claude_unlabelled(""),
+            &claude_unlabelled(""),
+            CLAUDE_INSERT,
+        ]);
+        run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+    }
+
+    /// Only the `A` itself, typed at the end of what the box held, is taken
+    /// back. A box whose text changed some other way (a stale first read, a
+    /// redraw) keeps every character.
+    #[test]
+    fn a_box_that_changed_some_other_way_keeps_its_text() {
+        let t = FakeTarget::showing(&[&claude_unlabelled("draft"), &claude_unlabelled("drafts")]);
+        run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+    }
+
+    /// A box with no Vim keys types the `A` wherever its cursor is, which is
+    /// not always the end of the draft.
+    #[test]
+    fn a_typed_a_inside_the_draft_is_taken_back() {
+        let t = FakeTarget::showing(&[&claude_unlabelled("draft"), &claude_unlabelled("drAaft")]);
+        run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(
+            *t.keys.borrow(),
+            vec![(0, "A".to_string()), (0, "BSpace".to_string())]
+        );
+    }
+
+    /// With its label hidden (`hideVimModeIndicator`), Normal mode takes the
+    /// `A` and shows nothing for it. There is nothing to take back, and a
+    /// Backspace would eat whatever the box held.
+    #[test]
+    fn a_key_that_changes_nothing_on_screen_is_not_taken_back() {
+        let t = FakeTarget::new(&claude_unlabelled("draft"));
+        run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+    }
+
+    /// In Visual mode an `A` is no way into Insert mode. Escape first goes
+    /// back to Normal mode, where it is.
+    #[test]
+    fn a_claude_box_in_visual_mode_is_escaped_first() {
+        let visual = CLAUDE_INSERT.replace("-- INSERT --", "-- VISUAL --");
+        let t = FakeTarget::showing(&[&visual, CLAUDE_INSERT]);
+        run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(
+            *t.keys.borrow(),
+            vec![(0, "Escape".to_string()), (0, "A".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_claude_box_labelled_insert_gets_no_key() {
+        let t = FakeTarget::new(CLAUDE_INSERT);
+        run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert!(t.keys.borrow().is_empty());
+    }
+
+    // ---- a message that stays in the box ----
+
+    fn claude_holding(typed: &str) -> String {
+        CLAUDE_INSERT.replace("❯\u{a0}", &format!("❯\u{a0}{typed}"))
+    }
+
+    /// Enter that does not submit leaves the message in the box: Codex once
+    /// took it as a newline in a paste. That is not a nudge sent, and the log
+    /// must not say it was.
+    #[test]
+    fn a_message_still_in_the_box_after_enter_is_reported_unsubmitted() {
+        let t = FakeTarget::showing(&[CLAUDE_INSERT, &claude_holding("go")]);
+        let out = run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Unsubmitted { submitted: 0 });
+    }
+
+    /// A pane slow to redraw still shows the message just after Enter, and
+    /// clears it a moment later. That message went out.
+    #[test]
+    fn a_box_slow_to_clear_is_not_unsubmitted() {
+        let t = FakeTarget::showing(&[CLAUDE_INSERT, &claude_holding("go"), CLAUDE_INSERT]);
+        let out = run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Sent(1));
+    }
+
+    /// A read that shows no box says nothing either way. Only a box seen
+    /// clear says the message went.
+    #[test]
+    fn an_unreadable_read_does_not_make_a_stuck_message_sent() {
+        let t = FakeTarget::showing(&[
+            CLAUDE_INSERT,
+            &claude_holding("go"),
+            "mid-redraw, no box on screen",
+            &claude_holding("go"),
+        ]);
+        let out = run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Unsubmitted { submitted: 0 });
+    }
+
+    /// Nor does a first read taken mid-redraw.
+    #[test]
+    fn a_first_read_with_no_box_does_not_make_a_stuck_message_sent() {
+        let t = FakeTarget::showing(&[
+            CLAUDE_INSERT,
+            "mid-redraw, no box on screen",
+            &claude_holding("go"),
+        ]);
+        let out = run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Unsubmitted { submitted: 0 });
+    }
+
+    /// The next message would only be typed in behind it.
+    #[test]
+    fn no_message_is_typed_behind_one_that_stuck() {
+        let t = FakeTarget::showing(&[CLAUDE_INSERT, &claude_holding("one")]);
+        let out =
+            run_injection(&t, &job(false, &["one", "two"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Unsubmitted { submitted: 0 });
+        assert_eq!(*t.sent.borrow(), vec!["one".to_string()]);
+    }
+
+    #[test]
+    fn a_message_that_left_the_box_is_sent() {
+        let t = FakeTarget::new(CLAUDE_INSERT);
+        let out =
+            run_injection(&t, &job(false, &["one", "two"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Sent(2));
+    }
+
+    #[test]
+    fn the_second_message_sticking_counts_the_first_as_submitted() {
+        let t = FakeTarget::showing(&[
+            CLAUDE_INSERT,
+            CLAUDE_INSERT,
+            CLAUDE_INSERT,
+            &claude_holding("two"),
+        ]);
+        let out =
+            run_injection(&t, &job(false, &["one", "two"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Unsubmitted { submitted: 1 });
+    }
+
     // ---- the recency gate (finding I19) ----
 
     /// The pane as it looked when the user scheduled: parked at the banner.
@@ -395,7 +722,7 @@ mod tests {
     }
 
     /// Finding I19 itself. 23:00: Claude prints the banner, the user schedules
-    /// for 03:03. 03:01: the user resumes by hand and Claude answers. 03:03: the
+    /// for 03:02. 03:01: the user resumes by hand and Claude answers. 03:02: the
     /// 03:00 banner is *still on screen* a few lines up, so the banner check
     /// passes and nudge types "please continue" into the session the user is
     /// actively using -- the exact outcome `--verify` advertises it prevents.

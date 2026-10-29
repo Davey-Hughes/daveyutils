@@ -11,6 +11,7 @@ use nudge::ipc::{Request, Response, client, server};
 use nudge::job::{JobSpec, TargetSpec};
 use nudge::queue::Queue;
 use nudge::target::PaneDims;
+use nudge::tmux_panes::Positions;
 use nudge::verify::Baseline;
 
 /// A pane that yields no snapshot: the stand-in for `snapshot_pane` in tests
@@ -52,7 +53,7 @@ fn spec(pane: &str) -> JobSpec {
 fn format_jobs_shows_id_pane_and_count() {
     let mut s = spec("bot:0.1");
     s.messages = vec!["go".into(); 11];
-    let out = format_jobs(&[s.into_job(4242)]);
+    let out = format_jobs(&[s.into_job(4242)], &Positions::new());
 
     let row = out
         .lines()
@@ -67,6 +68,36 @@ fn format_jobs_shows_id_pane_and_count() {
         cols[3], "11",
         "MSGS column must be the message count, got:\n{out}"
     );
+}
+
+/// A label longer than the column's usual width widens the column, so the
+/// times after it still line up under their header.
+#[test]
+fn format_jobs_keeps_its_columns_aligned_around_a_long_pane_label() {
+    let out = format_jobs(
+        &[spec("%142").into_job(1), spec("%2").into_job(2)],
+        &[
+            ("%142".to_string(), "subcheck-review:3.0".to_string()),
+            ("%2".to_string(), "s:0.1".to_string()),
+        ]
+        .into(),
+    );
+    let lines: Vec<&str> = out.lines().collect();
+    let fire = lines[0].find("FIRE").unwrap();
+    for row in &lines[1..] {
+        assert_eq!(row.find("2026-"), Some(fire), "{out}");
+    }
+}
+
+/// A job names its pane by tmux's id, and the list says where that pane sits
+/// now as well, since the id alone means nothing to a person.
+#[test]
+fn format_jobs_shows_where_each_pane_sits_now() {
+    let out = format_jobs(
+        &[spec("%19").into_job(1)],
+        &[("%19".to_string(), "main:11.0".to_string())].into(),
+    );
+    assert!(out.contains("main:11.0 (%19)"), "{out}");
 }
 
 #[test]

@@ -35,10 +35,12 @@ mod tests {
         let mut form = Form::fresh();
         form.panes = vec![
             Pane {
+                id: "%1".into(),
                 target: "s:0.1".into(),
                 title: "claude".into(),
             },
             Pane {
+                id: "%2".into(),
                 target: "s:0.2".into(),
                 title: "vim".into(),
             },
@@ -287,6 +289,9 @@ impl Form {
 pub struct Model {
     pub tab: Tab,
     pub jobs: Vec<Job>,
+    /// Where each job's pane sits now, read with the jobs: a job names its
+    /// pane by tmux's id, which says nothing to a person.
+    pub positions: crate::tmux_panes::Positions,
     pub selected: usize,
     pub form: Form,
     pub status: Status,
@@ -313,6 +318,7 @@ impl Model {
         Model {
             tab: Tab::NewNudge,
             jobs: Vec::new(),
+            positions: crate::tmux_panes::Positions::new(),
             selected: 0,
             form: Form::fresh(),
             status: Status::default(),

@@ -10,6 +10,7 @@ use crate::inject::run_injection;
 use crate::paths::Paths;
 use crate::queue::Queue;
 use crate::scheduler::{MAX_POLL, apply_outcome, next_wake, plan};
+use crate::tmux_panes::Positions;
 
 /// A retry never lands sooner than this, so a sub-second `settle_secs` can't
 /// create a fire-storm (esp. with infinite retries).
@@ -133,7 +134,14 @@ pub fn run_with(
         }
 
         // 3. Fire each due job WITHOUT the lock, applying results under it.
+        // Where each pane sits is read once, before any of them fires.
+        let positions = if plan_now.fire.is_empty() {
+            Positions::new()
+        } else {
+            crate::tmux_panes::positions()
+        };
         for job in &plan_now.fire {
+            let pane = describe_pane(job, &positions);
             let outcome = run_injection(
                 &*job.target.connect(),
                 job,
@@ -142,14 +150,8 @@ pub fn run_with(
                 dur_ext,
                 weekly_ext,
             );
-            match &outcome {
-                // Not "fired": two of the three outcomes deliberately send
-                // nothing, and a log that calls a skip a fire is how you spend
-                // an evening looking for an injection that never happened.
-                Ok(o) => tracing::info!("nudge: job {} -> {:?}", job.id, o),
-                Err(e) => tracing::warn!("nudge: job {} failed: {e}", job.id),
-            }
-            if let Some(body) = notification(job, &outcome) {
+            log_outcome(job, &pane, &outcome);
+            if let Some(body) = notification(job, &pane, &outcome) {
                 crate::notify::send(&body);
             }
             let retry_secs = job.settle_secs.max(MIN_RETRY_SECS);
@@ -203,10 +205,34 @@ fn drop_stale(q: &mut Queue, ids: &[u64]) {
     }
 }
 
-/// A short human-readable description of a job's target, for notification text.
-fn describe_pane(job: &crate::job::Job) -> String {
+/// Log what firing `job` into `pane` came to.
+///
+/// Split out of `run`'s loop to be reachable, like [`drop_stale`]. The pane is
+/// in the line because a job id alone cannot say where a nudge went, and
+/// "where did it go" is the first question about one that never arrived.
+fn log_outcome(
+    job: &crate::job::Job,
+    pane: &str,
+    outcome: &anyhow::Result<crate::inject::InjectOutcome>,
+) {
+    match outcome {
+        // Typed but never sent: the nudge did not go out.
+        Ok(o @ crate::inject::InjectOutcome::Unsubmitted { .. }) => {
+            tracing::warn!("nudge: job {} -> {o:?} in {pane}", job.id);
+        }
+        // Not "fired": two of the three outcomes deliberately send
+        // nothing, and a log that calls a skip a fire is how you spend
+        // an evening looking for an injection that never happened.
+        Ok(o) => tracing::info!("nudge: job {} -> {o:?} in {pane}", job.id),
+        Err(e) => tracing::warn!("nudge: job {} in {pane} failed: {e}", job.id),
+    }
+}
+
+/// A short human-readable description of a job's target, for the log and
+/// notification text: where its pane sits now, and the id the job stores.
+fn describe_pane(job: &crate::job::Job, positions: &Positions) -> String {
     match &job.target {
-        crate::job::TargetSpec::Tmux { pane } => pane.clone(),
+        crate::job::TargetSpec::Tmux { pane } => crate::tmux_panes::label(pane, positions),
     }
 }
 
@@ -223,15 +249,17 @@ fn describe_pane(job: &crate::job::Job) -> String {
 ///
 /// An `Err` stays silent: it is logged at warn, it may still be retried, and a
 /// notification would announce a job as finished when it is not.
+///
+/// `pane` is how to name the job's pane, from [`describe_pane`].
 pub fn notification(
     job: &crate::job::Job,
+    pane: &str,
     outcome: &anyhow::Result<crate::inject::InjectOutcome>,
 ) -> Option<String> {
-    use crate::inject::InjectOutcome::{Sent, SkippedNoBanner, SkippedResumed};
+    use crate::inject::InjectOutcome::{Sent, SkippedNoBanner, SkippedResumed, Unsubmitted};
     if !job.notify {
         return None;
     }
-    let pane = describe_pane(job);
     match outcome {
         Ok(Sent(_)) => Some(format!("nudge fired for {pane}")),
         Ok(SkippedNoBanner) => Some(format!(
@@ -242,13 +270,16 @@ pub fn notification(
             "nudge skipped {pane}: the pane changed since you scheduled, so you had \
              already resumed this session"
         )),
+        Ok(Unsubmitted { .. }) => Some(format!(
+            "nudge typed into {pane}, but the message is still in its input box, unsent"
+        )),
         Err(_) => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{drop_stale, notification};
+    use super::{drop_stale, log_outcome, notification};
     use crate::inject::InjectOutcome;
     use crate::job::{JobSpec, TargetSpec};
     use crate::queue::Queue;
@@ -378,13 +409,16 @@ mod tests {
     #[test]
     fn notifies_on_sent_when_opted_in_and_never_when_not() {
         assert!(
-            notification(&job(true), &Ok(InjectOutcome::Sent(1)))
+            notification(&job(true), "p", &Ok(InjectOutcome::Sent(1)))
                 .unwrap()
                 .contains("fired")
         );
-        assert_eq!(notification(&job(false), &Ok(InjectOutcome::Sent(1))), None);
         assert_eq!(
-            notification(&job(false), &Ok(InjectOutcome::SkippedResumed)),
+            notification(&job(false), "p", &Ok(InjectOutcome::Sent(1))),
+            None
+        );
+        assert_eq!(
+            notification(&job(false), "p", &Ok(InjectOutcome::SkippedResumed)),
             None,
             "--notify is still the opt-in: a skip does not create a notification \
              the user never asked for"
@@ -396,11 +430,11 @@ mod tests {
     /// built to avoid, so it is the one outcome that most needs saying out loud.
     #[test]
     fn a_skip_is_reported_and_names_which_skip_it_was() {
-        let banner = notification(&job(true), &Ok(InjectOutcome::SkippedNoBanner)).expect(
+        let banner = notification(&job(true), "p", &Ok(InjectOutcome::SkippedNoBanner)).expect(
             "a skip must be visible: silence here reads exactly like the nudge \
              never firing at all",
         );
-        let resumed = notification(&job(true), &Ok(InjectOutcome::SkippedResumed)).expect(
+        let resumed = notification(&job(true), "p", &Ok(InjectOutcome::SkippedResumed)).expect(
             "a skip must be visible: silence here reads exactly like the nudge \
              never firing at all",
         );
@@ -431,8 +465,52 @@ mod tests {
     #[test]
     fn a_failure_is_not_notified() {
         assert_eq!(
-            notification(&job(true), &Err(anyhow::anyhow!("boom"))),
+            notification(&job(true), "p", &Err(anyhow::anyhow!("boom"))),
             None
         );
+    }
+
+    /// The log is where to look when a nudge did not arrive, and a job id alone
+    /// cannot say where it went. Each line names the pane: where it sat when
+    /// the job fired, and its id.
+    #[test]
+    fn the_log_names_the_pane_each_fire_went_to() {
+        let sent = logs_from(|| {
+            log_outcome(&job(false), "main:12.0 (%19)", &Ok(InjectOutcome::Sent(1)));
+        });
+        assert!(sent.contains("job 1"), "{sent}");
+        assert!(sent.contains("Sent(1)"), "{sent}");
+        assert!(sent.contains("main:12.0 (%19)"), "{sent}");
+
+        let failed = logs_from(|| {
+            log_outcome(
+                &job(false),
+                "main:12.0 (%19)",
+                &Err(anyhow::anyhow!("boom")),
+            );
+        });
+        assert!(failed.contains("main:12.0 (%19)"), "{failed}");
+        assert!(failed.contains("boom"), "{failed}");
+    }
+
+    #[test]
+    fn a_notification_names_the_pane_it_was_given() {
+        let msg = notification(&job(true), "main:12.0 (%19)", &Ok(InjectOutcome::Sent(1)));
+        assert!(msg.unwrap().contains("main:12.0 (%19)"));
+    }
+
+    /// A message left in the box is a nudge that did not go out. It is
+    /// logged as a warning, and --notify says so.
+    #[test]
+    fn a_message_left_in_the_box_is_a_warning_and_a_notification() {
+        let stuck = Ok(InjectOutcome::Unsubmitted { submitted: 0 });
+        let log = logs_from(|| log_outcome(&job(false), "main:12.0 (%19)", &stuck));
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains("Unsubmitted"), "{log}");
+
+        let msg = notification(&job(true), "main:12.0 (%19)", &stuck)
+            .expect("a nudge that did not go out must not be silent");
+        assert!(msg.contains("main:12.0 (%19)"), "{msg}");
+        assert!(msg.contains("input box"), "{msg}");
     }
 }

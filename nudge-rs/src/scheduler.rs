@@ -326,4 +326,21 @@ mod tests {
         .unwrap();
         assert!(q.get(1).is_none());
     }
+
+    /// The message is still in the box, so a retry would type a second one in
+    /// behind it. The job is done, and the log and --notify say how it ended.
+    #[test]
+    fn apply_unsubmitted_removes_even_with_retry() {
+        let j = job(1, "2026-07-13T11:59:00Z", true, -1);
+        let (_d, mut q) = q_with(&j);
+        let cur = q.get(1).unwrap().clone();
+        apply_outcome(
+            &mut q,
+            &cur,
+            &Ok(InjectOutcome::Unsubmitted { submitted: 0 }),
+            now().timestamp(),
+        )
+        .unwrap();
+        assert!(q.get(1).is_none());
+    }
 }

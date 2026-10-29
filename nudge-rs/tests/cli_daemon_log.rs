@@ -26,13 +26,15 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use nudge::job::{JobSpec, TargetSpec};
 use nudge::paths::{Os, Paths, resolve_from};
 use nudge::queue::Queue;
+
+use common::TmuxServer as Server;
 
 fn tmux_available() -> bool {
     Command::new("tmux")
@@ -46,55 +48,6 @@ fn os() -> Os {
         Os::Macos
     } else {
         Os::Linux
-    }
-}
-
-/// A tmux server private to this test, living under its own `TMUX_TMPDIR`.
-///
-/// Every command carries the env explicitly rather than trusting the process
-/// env: a `kill-server` that leaked to the default socket would take down the
-/// developer's entire tmux, so it must not be possible for one to.
-struct Server {
-    tmpdir: PathBuf,
-}
-
-impl Server {
-    fn start(tmpdir: &Path, session: &str) -> Self {
-        let server = Server {
-            tmpdir: tmpdir.to_path_buf(),
-        };
-        let ok = server
-            .tmux()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                session,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sh",
-            ])
-            .status()
-            .expect("spawn tmux")
-            .success();
-        assert!(ok, "failed to start the private tmux session");
-        server
-    }
-
-    fn tmux(&self) -> Command {
-        let mut c = Command::new("tmux");
-        c.env("TMUX_TMPDIR", &self.tmpdir).env_remove("TMUX");
-        c
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        // Safe only because of the explicit TMUX_TMPDIR + TMUX removal above:
-        // this can address nothing but the server we started in our own tempdir.
-        let _ = self.tmux().arg("kill-server").status();
     }
 }
 

@@ -5,8 +5,47 @@ use anyhow::{Context, bail};
 /// One selectable tmux pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane {
+    /// tmux's id for the pane (`%16`): what a job stores, since `target` is a
+    /// position that renumbering hands to another pane.
+    pub id: String,
     pub target: String,
     pub title: String,
+}
+
+/// Where each pane sits now, keyed by tmux's id for it: `%19` -> `main:12.0`.
+pub type Positions = std::collections::HashMap<String, String>;
+
+/// [`Positions`] for every pane on the server, or none if tmux cannot list
+/// them. It only ever labels a pane for a person, which is no reason to fail
+/// whatever is being labelled.
+pub fn positions() -> Positions {
+    list_rows()
+        .map(|rows| rows.into_iter().map(|r| (r.pane_id, r.target)).collect())
+        .unwrap_or_default()
+}
+
+/// How to show a job's pane to a person: where it sits now, then the id the
+/// job stores, as `main:12.0 (%19)`. A pane tmux does not list (it closed, or
+/// the job predates ids and stores a position) shows as stored.
+pub fn label(pane: &str, positions: &Positions) -> String {
+    match positions.get(pane) {
+        Some(position) => format!("{position} ({pane})"),
+        None => pane.to_string(),
+    }
+}
+
+/// Each job's [`label`], in order, and the widest one's width in chars: what
+/// a PANE column needs to show every id whole.
+pub fn job_labels(jobs: &[crate::job::Job], positions: &Positions) -> (Vec<String>, usize) {
+    let labels: Vec<String> = jobs
+        .iter()
+        .map(|j| {
+            let crate::job::TargetSpec::Tmux { pane } = &j.target;
+            label(pane, positions)
+        })
+        .collect();
+    let widest = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    (labels, widest)
 }
 
 /// A parsed `list-panes` row: the human-facing [`Pane`] fields plus the machine
@@ -163,6 +202,7 @@ pub fn list() -> anyhow::Result<(Vec<Pane>, usize)> {
     let panes = rows
         .into_iter()
         .map(|r| Pane {
+            id: r.pane_id,
             target: r.target,
             title: r.title,
         })

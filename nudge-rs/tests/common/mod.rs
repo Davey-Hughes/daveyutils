@@ -75,3 +75,85 @@ pub fn assert_socket_path_fits(socket: &Path) {
          common::short_tempdir() instead of tempfile::tempdir()."
     );
 }
+
+/// A tmux server private to one test, living under its own `TMUX_TMPDIR`.
+///
+/// `TMUX_TMPDIR` rather than `-L`, because the point is usually a child `nudge`
+/// that has to reach this server with no socket flag of its own: give it
+/// [`TmuxServer::env`]. `-f /dev/null` keeps the developer's ~/.tmux.conf out,
+/// so `base-index` and the like are tmux's defaults.
+///
+/// Every command carries the env explicitly rather than trusting the process
+/// env: a `kill-server` that leaked to the default socket would take down the
+/// developer's entire tmux, so it must not be possible for one to.
+pub struct TmuxServer {
+    tmpdir: std::path::PathBuf,
+}
+
+impl TmuxServer {
+    /// Start a detached 80x24 session named `session` running `sh`.
+    pub fn start(tmpdir: &Path, session: &str) -> Self {
+        std::fs::create_dir_all(tmpdir).unwrap();
+        let server = TmuxServer {
+            tmpdir: tmpdir.to_path_buf(),
+        };
+        let ok = server
+            .tmux()
+            .args([
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sh",
+            ])
+            .status()
+            .expect("spawn tmux")
+            .success();
+        assert!(ok, "failed to start the private tmux session");
+        server
+    }
+
+    /// A `tmux` command aimed at this server and nothing else.
+    pub fn tmux(&self) -> std::process::Command {
+        let mut c = std::process::Command::new("tmux");
+        self.env(&mut c);
+        c
+    }
+
+    /// Run a tmux command on this server and return what it printed.
+    pub fn run(&self, args: &[&str]) -> String {
+        let out = self.tmux().args(args).output().expect("spawn tmux");
+        assert!(out.status.success(), "tmux {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Point `cmd`'s tmux calls at this server. `TMUX` names the socket of the
+    /// session running the test, and tmux prefers it, so it goes.
+    pub fn env(&self, cmd: &mut std::process::Command) {
+        cmd.env("TMUX_TMPDIR", &self.tmpdir)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE");
+    }
+}
+
+impl Drop for TmuxServer {
+    fn drop(&mut self) {
+        // Safe only because of the explicit TMUX_TMPDIR + TMUX removal above:
+        // this can address nothing but the server we started in our own tempdir.
+        let _ = self.tmux().arg("kill-server").status();
+    }
+}
+
+/// Whether tmux is installed. Tests that need a real server skip without it.
+pub fn tmux_available() -> bool {
+    std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}

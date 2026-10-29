@@ -7,7 +7,7 @@ use regex::Regex;
 use crate::timespec::{DayWords, parse_timespec};
 
 /// Padding added to every detected reset time to absorb scheduler latency.
-const PADDING_MINUTES: i64 = 3;
+const PADDING_MINUTES: i64 = 2;
 
 /// The built-in clock-shape banner alternation.
 const CLOCK_BASE: &str = r"(?:session limit|current session).*resets";
@@ -537,23 +537,23 @@ mod tests {
     fn detects_claude_clock_banner_with_padding() {
         let pane = "Approaching usage limit — current session resets 3:00pm";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        // 15:00 + 3 minutes padding.
-        assert_eq!((z.hour(), z.minute()), (15, 3));
+        // 15:00 + 2 minutes padding.
+        assert_eq!((z.hour(), z.minute()), (15, 2));
     }
 
     #[test]
     fn detects_agy_duration_banner_with_padding() {
         let pane = "quota reached. Resets in 1h30m";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        // now 10:00 + 1h30m + 3m padding = 11:33.
-        assert_eq!((z.hour(), z.minute()), (11, 33));
+        // now 10:00 + 1h30m + 2m padding = 11:32.
+        assert_eq!((z.hour(), z.minute()), (11, 32));
     }
 
     #[test]
     fn duration_is_case_insensitive() {
         let pane = "QUOTA REACHED — RESETS IN 45M";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        assert_eq!((z.hour(), z.minute()), (10, 48));
+        assert_eq!((z.hour(), z.minute()), (10, 47));
     }
 
     #[test]
@@ -612,8 +612,8 @@ mod tests {
         // must not hijack the reset time.
         let pane = "commit abc123 16 minutes ago\nquota reached. Resets in 45m";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        // now 10:00 + 45m + 3m padding = 10:48, NOT 10:00 + 16m + 3m.
-        assert_eq!((z.hour(), z.minute()), (10, 48));
+        // now 10:00 + 45m + 2m padding = 10:47, NOT 10:00 + 16m + 2m.
+        assert_eq!((z.hour(), z.minute()), (10, 47));
     }
 
     #[test]
@@ -622,8 +622,8 @@ mod tests {
         // reset time either.
         let pane = "started at 9:15\ncurrent session resets 3:00pm";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        // 15:00 + 3m padding = 15:03, NOT derived from the 9:15 scrollback time.
-        assert_eq!((z.hour(), z.minute()), (15, 3));
+        // 15:00 + 2m padding = 15:02, NOT derived from the 9:15 scrollback time.
+        assert_eq!((z.hour(), z.minute()), (15, 2));
     }
 
     #[test]
@@ -674,7 +674,7 @@ mod tests {
             ));
             assert_eq!(
                 (z.hour(), z.minute()),
-                (15, 3),
+                (15, 2),
                 "clock ext {bad:?} must fall back to the built-in banner"
             );
 
@@ -687,7 +687,7 @@ mod tests {
             ));
             assert_eq!(
                 (d.hour(), d.minute()),
-                (10, 48),
+                (10, 47),
                 "duration ext {bad:?} must fall back to the built-in banner"
             );
         }
@@ -700,8 +700,8 @@ mod tests {
         let pane =
             "quota reached. Resets in 45m\n... hours of work ...\nquota reached. Resets in 3h";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        // now 10:00 + 3h + 3m padding = 13:03, NOT the stale banner's 10:48.
-        assert_eq!((z.hour(), z.minute()), (13, 3));
+        // now 10:00 + 3h + 2m padding = 13:02, NOT the stale banner's 10:47.
+        assert_eq!((z.hour(), z.minute()), (13, 2));
     }
 
     #[test]
@@ -711,8 +711,8 @@ mod tests {
         // run first unconditionally.
         let pane = "quota reached. Resets in 45m\nlater output\ncurrent session resets 3:00pm";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        // 15:00 + 3m padding = 15:03, NOT the stale duration banner's 10:48.
-        assert_eq!((z.hour(), z.minute()), (15, 3));
+        // 15:00 + 2m padding = 15:02, NOT the stale duration banner's 10:47.
+        assert_eq!((z.hour(), z.minute()), (15, 2));
     }
 
     #[test]
@@ -721,19 +721,19 @@ mod tests {
         // by simply flipping the hardcoded branch order.
         let pane = "current session resets 3:00pm\nlater output\nquota reached. Resets in 45m";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        // now 10:00 + 45m + 3m padding = 10:48, NOT the stale clock banner's 15:03.
-        assert_eq!((z.hour(), z.minute()), (10, 48));
+        // now 10:00 + 45m + 2m padding = 10:47, NOT the stale clock banner's 15:02.
+        assert_eq!((z.hour(), z.minute()), (10, 47));
     }
 
     /// A banner naming a zone must resolve in THAT zone, not the machine's.
     /// `now()` is 10:00 UTC; 3pm in New York is 19:00 UTC, so a local-zone reading
-    /// would say 15:03 and be four hours wrong.
+    /// would say 15:02 and be four hours wrong.
     #[test]
     fn a_stated_zone_is_honored_over_the_local_one() {
         let pane = "current session resets 3:00pm (America/New_York)";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        // 15:00 New York + 3m padding == 19:03 UTC.
-        assert_eq!(z.timestamp().to_string(), "2026-07-13T19:03:00Z");
+        // 15:00 New York + 2m padding == 19:02 UTC.
+        assert_eq!(z.timestamp().to_string(), "2026-07-13T19:02:00Z");
     }
 
     /// No zone in the banner: unchanged behavior, resolved in `now()`'s zone.
@@ -746,7 +746,7 @@ mod tests {
             None,
             None,
         ));
-        assert_eq!((z.hour(), z.minute()), (15, 3));
+        assert_eq!((z.hour(), z.minute()), (15, 2));
     }
 
     /// An unresolvable zone must degrade to local, never panic: this runs on the
@@ -755,7 +755,7 @@ mod tests {
     fn an_unknown_zone_falls_back_to_local_without_panicking() {
         let pane = "current session resets 3:00pm (Mars/Olympus_Mons)";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        assert_eq!((z.hour(), z.minute()), (15, 3));
+        assert_eq!((z.hour(), z.minute()), (15, 2));
     }
 
     /// The zone must come from the banner's own line, not from anywhere in the
@@ -764,7 +764,7 @@ mod tests {
     fn a_zone_on_a_later_line_is_not_the_banners() {
         let pane = "current session resets 3:00pm\nTZ set to (America/New_York)";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        assert_eq!((z.hour(), z.minute()), (15, 3));
+        assert_eq!((z.hour(), z.minute()), (15, 2));
     }
 
     /// The enum's whole point: "no banner" and "a banner I can't read" are
@@ -791,8 +791,8 @@ mod tests {
     fn detects_the_captured_weekly_banner() {
         let pane = "You've hit your weekly limit · resets 8am (America/Los_Angeles)";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        // 08:00 America/Los_Angeles + 3m padding == 15:03 UTC.
-        assert_eq!(z.timestamp().to_string(), "2026-07-13T15:03:00Z");
+        // 08:00 America/Los_Angeles + 2m padding == 15:02 UTC.
+        assert_eq!(z.timestamp().to_string(), "2026-07-13T15:02:00Z");
     }
 
     /// The captured banner, verbatim, from a live pane on 2026-07-25 -- the
@@ -802,8 +802,8 @@ mod tests {
     fn detects_the_captured_dated_weekly_banner() {
         let pane = "You've hit your weekly limit · resets Jul 28 at 8am (America/Los_Angeles)";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        // 08:00 America/Los_Angeles on Jul 28 + 3m padding == 15:03 UTC.
-        assert_eq!(z.timestamp().to_string(), "2026-07-28T15:03:00Z");
+        // 08:00 America/Los_Angeles on Jul 28 + 2m padding == 15:02 UTC.
+        assert_eq!(z.timestamp().to_string(), "2026-07-28T15:02:00Z");
     }
 
     /// The banner's wording is not a stable interface -- it has already moved
@@ -832,7 +832,7 @@ mod tests {
             let z = reset_of(detect_reset(&pane, &now(), None, None, None));
             assert_eq!(
                 (z.date(), z.hour(), z.minute()),
-                (jiff::civil::date(2026, 7, 28), 8, 3),
+                (jiff::civil::date(2026, 7, 28), 8, 2),
                 "{tail:?} names Jul 28 at 8am"
             );
         }
@@ -849,7 +849,7 @@ mod tests {
         ] {
             let pane = format!("You've hit your weekly limit · resets {tail}");
             let z = reset_of(detect_reset(&pane, &now(), None, None, None));
-            assert_eq!((z.date(), z.hour(), z.minute()), (want, 8, 3), "{tail:?}");
+            assert_eq!((z.date(), z.hour(), z.minute()), (want, 8, 2), "{tail:?}");
         }
     }
 
@@ -868,7 +868,7 @@ mod tests {
             let z = reset_of(detect_reset(&pane, &now(), None, None, None));
             assert_eq!(
                 (z.date(), z.hour(), z.minute()),
-                (jiff::civil::date(2026, 7, 16), 8, 3),
+                (jiff::civil::date(2026, 7, 16), 8, 2),
                 "{tail:?}"
             );
         }
@@ -882,8 +882,8 @@ mod tests {
         let pane = "You've hit your weekly limit · resets 8am (America/Los_Angeles) \
                     · /upgrade to increase your limits";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        // The bare form, in the stated zone: 08:00 LA + 3m == 15:03 UTC.
-        assert_eq!(z.timestamp().to_string(), "2026-07-13T15:03:00Z");
+        // The bare form, in the stated zone: 08:00 LA + 2m == 15:02 UTC.
+        assert_eq!(z.timestamp().to_string(), "2026-07-13T15:02:00Z");
     }
 
     /// The segment cut earns its keep here: a day word in a *later* segment
@@ -895,7 +895,7 @@ mod tests {
         // now() is Monday 10:00, so a bare 8am is tomorrow -- NOT next Monday,
         // which is what reading the trailing sentence would have produced.
         assert_eq!(z.date(), jiff::civil::date(2026, 7, 14));
-        assert_eq!((z.hour(), z.minute()), (8, 3));
+        assert_eq!((z.hour(), z.minute()), (8, 2));
     }
 
     /// Every separator a banner segments itself with must cut the trailing
@@ -956,7 +956,7 @@ mod tests {
     fn a_zone_parenthetical_before_the_time_is_not_a_day_word() {
         let pane = "You've hit your weekly limit · resets (America/Los_Angeles) Jul 28 at 8am";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        assert_eq!(z.timestamp().to_string(), "2026-07-28T15:03:00Z");
+        assert_eq!(z.timestamp().to_string(), "2026-07-28T15:02:00Z");
     }
 
     /// A bare gap, and gaps that carry only filler, all mean "the next such
@@ -972,7 +972,7 @@ mod tests {
             let z = reset_of(detect_reset(pane, &now(), None, None, None));
             assert_eq!(
                 (z.hour(), z.minute()),
-                (15, 3),
+                (15, 2),
                 "{pane:?} has no day in its gap and must read as the bare form"
             );
         }
@@ -985,7 +985,7 @@ mod tests {
         let pane = "You've hit your weekly limit · resets Wed 3:00pm";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
         assert_eq!(z.date(), jiff::civil::date(2026, 7, 15));
-        assert_eq!((z.hour(), z.minute()), (15, 3));
+        assert_eq!((z.hour(), z.minute()), (15, 2));
 
         let pane = "You've hit your weekly limit · resets Wednesday at 3:00pm";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
@@ -1048,7 +1048,7 @@ mod tests {
     fn a_newer_session_banner_below_a_weekly_one_still_wins() {
         let pane = "You've hit your weekly limit · resets Jul 16, 8am\nlater\ncurrent session resets 3:00pm";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        assert_eq!((z.hour(), z.minute()), (15, 3));
+        assert_eq!((z.hour(), z.minute()), (15, 2));
     }
 
     /// A weekly banner whose own line carries no clock token is not a refusal --
@@ -1061,7 +1061,7 @@ mod tests {
     fn a_weekly_banner_without_a_clock_token_falls_back_to_an_older_banner() {
         let pane = "current session resets 3:00pm\nYou've hit your weekly limit · resets";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        assert_eq!((z.hour(), z.minute()), (15, 3));
+        assert_eq!((z.hour(), z.minute()), (15, 2));
     }
 
     /// Weekly is pushed before Clock so it wins an exact-offset tie. A user
@@ -1125,10 +1125,10 @@ mod tests {
             "wrapped() does not reproduce the live capture at the live width"
         );
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        // 18:26 + 3 minutes padding.
+        // 18:26 + 2 minutes padding.
         assert_eq!(
             (z.date(), z.hour(), z.minute()),
-            (jiff::civil::date(2026, 7, 13), 18, 29)
+            (jiff::civil::date(2026, 7, 13), 18, 28)
         );
     }
 
@@ -1147,7 +1147,7 @@ mod tests {
             let z = reset_of(detect_reset(&pane, &now(), None, None, None));
             assert_eq!(
                 (z.date(), z.hour(), z.minute()),
-                (jiff::civil::date(2026, 7, 13), 18, 29),
+                (jiff::civil::date(2026, 7, 13), 18, 28),
                 "wrapped to {width} columns:\n{pane}"
             );
         }
@@ -1167,10 +1167,10 @@ mod tests {
             .to_zoned(TimeZone::fixed(jiff::tz::offset(-7)))
             .unwrap();
         let z = reset_of(detect_reset(pane, &now, None, None, None));
-        // 01:40 the next morning + 3 minutes padding.
+        // 01:40 the next morning + 2 minutes padding.
         assert_eq!(
             (z.date(), z.hour(), z.minute()),
-            (jiff::civil::date(2026, 10, 13), 1, 43)
+            (jiff::civil::date(2026, 10, 13), 1, 42)
         );
     }
 
@@ -1187,7 +1187,7 @@ mod tests {
             let z = reset_of(detect_reset(&pane, &now(), None, None, None));
             assert_eq!(
                 (z.date(), z.hour(), z.minute()),
-                (jiff::civil::date(2026, 7, 16), 18, 29),
+                (jiff::civil::date(2026, 7, 16), 18, 28),
                 "wrapped to {width} columns:\n{pane}"
             );
         }
@@ -1204,7 +1204,7 @@ mod tests {
         ] {
             let pane = format!("■ You’ve hit your usage limit. {lead} 6:26 PM.{CODEX_COMPOSER}");
             let z = reset_of(detect_reset(&pane, &now(), None, None, None));
-            assert_eq!((z.hour(), z.minute()), (18, 29), "{lead:?}");
+            assert_eq!((z.hour(), z.minute()), (18, 28), "{lead:?}");
         }
     }
 
@@ -1296,7 +1296,7 @@ mod tests {
         let pane = "current session resets 3:00pm\n\n\
                     notes on the usage limit\nwe could try again at 9:00 PM";
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
-        assert_eq!((z.hour(), z.minute()), (15, 3));
+        assert_eq!((z.hour(), z.minute()), (15, 2));
     }
 
     /// Codex's sentence ends at its time. A line that happens to sit directly
@@ -1312,7 +1312,7 @@ mod tests {
             let z = reset_of(detect_reset(&pane, &now(), None, None, None));
             assert_eq!(
                 z.timestamp().to_string(),
-                "2026-07-13T18:29:00Z",
+                "2026-07-13T18:28:00Z",
                 "{under:?}"
             );
         }
@@ -1333,7 +1333,7 @@ mod tests {
         let z = reset_of(detect_reset(&pane, &now(), None, None, None));
         assert_eq!(
             (z.date(), z.hour(), z.minute()),
-            (jiff::civil::date(2026, 7, 13), 18, 29)
+            (jiff::civil::date(2026, 7, 13), 18, 28)
         );
     }
 

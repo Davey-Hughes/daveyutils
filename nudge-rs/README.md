@@ -41,6 +41,15 @@ nudge --list                     # pending jobs
 nudge --cancel 3 / --edit 3      # manage a job
 ```
 
+A job stores tmux's id for its pane (`%19`), not the position you named
+(`main:12.0`). Positions move: closing a window renumbers the ones after it
+when `renumber-windows` is on, and swapping or rotating moves them too. A nudge
+stored by position fired into whichever pane took the slot. An id stays with
+its pane until the pane closes or the tmux server stops; a new server numbers
+its panes from `%0` again, so cancel jobs left over from before a reboot. The confirmation,
+`--list` and the dashboard show both, as `main:12.0 (%19)`, with the position
+read at that moment. A pane tmux doesn't have is refused when you schedule.
+
 ### `-a` / `--auto`
 
 `nudge -a` schedules without asking anything. It targets the pane you were last
@@ -203,6 +212,23 @@ When a nudge fires, nudge waits half a second between typing the message and
 pressing Enter. Codex treats keystrokes that arrive faster than anyone types as
 a paste, and an Enter within 120ms of one as a newline inside it, so an Enter
 sent straight after the text left the message sitting in the composer, unsent.
+
+After Enter, nudge reads the input box again (Claude's or Codex's). If the
+message is still there, the job ends as `Unsubmitted`: a warning in the daemon
+log rather than `Sent`, and a notification with `--notify`. Nothing more is
+typed in behind it, neither later messages nor a retry.
+
+### Vim mode in Claude Code
+
+Claude Code's Vim keys (`editorMode: "vim"`) have the same problem as Codex's:
+typed into Normal mode, `please continue` arrives as `se continue`. Claude
+draws `-- INSERT --` under its input box in Insert mode and nothing in Normal
+mode, which is also how the box looks with Vim keys off. So when the label is
+missing, nudge presses `A` and looks again. If the `A` showed up as text, the
+box has no Vim keys, and nudge presses Backspace to take it out. Either way the
+box is taking text when the message is typed. `A` rather than `i` puts the
+message after a draft left in the box rather than inside it, and a box left in
+Visual mode (`-- VISUAL --`) gets Escape first.
 
 ### `--verify`
 

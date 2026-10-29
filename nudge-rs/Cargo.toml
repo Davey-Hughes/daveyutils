@@ -17,7 +17,11 @@ name = "nudge"
 # daemon does not know that banner either, and under --verify would skip it. It
 # also presses Enter too soon after the text for Codex, which leaves the
 # message sitting in the composer, unsent.
-version = "0.5.0"
+# 0.6.0 is load-bearing for the daemon's behavior: a 0.5.0 daemon types into a
+# Claude Code box left in Vim Normal mode as it is, so the nudge arrives as
+# commands, and logs a message stuck unsent in the box as Sent. (It fires the
+# pane ids this build stores without trouble.)
+version = "0.6.0"
 edition = "2024"
 description = "Rate-limit auto-resumer for AI CLIs in tmux"
 license = "GPL-3.0-or-later"

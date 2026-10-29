@@ -41,12 +41,22 @@ pub trait Target {
     /// Capture the target's current visible screen text.
     fn capture(&self) -> Result<String>;
 
-    /// Type `text` into the target and submit it (as if Enter were pressed).
+    /// The same capture with its SGR styling left in, for telling what is
+    /// typed in an input box from what is drawn dim there.
+    fn capture_styled(&self) -> Result<String>;
+
+    /// Type `text` into the target and submit it (as if Enter were pressed),
+    /// returning once the target has had time to act on the Enter.
     fn send_line(&self, text: &str) -> Result<()>;
 
     /// Press `key` by itself, as a person would: a keypress the target reads on
-    /// its own, not the first character of whatever is typed next.
+    /// its own, not the first character of whatever is typed next. `key` is a
+    /// tmux key name: `A`, `BSpace`.
     fn send_key(&self, key: &str) -> Result<()>;
+
+    /// Wait a moment, for a pane slow to redraw to catch up before it is read
+    /// again.
+    fn settle(&self);
 
     /// The target's current geometry, or `None` if it cannot be determined.
     ///

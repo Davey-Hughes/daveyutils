@@ -75,6 +75,16 @@ impl Server {
     fn target(&self) -> TmuxTarget {
         TmuxTarget::with_socket("s", &self.socket)
     }
+    /// Run a tmux command on this server and return what it printed.
+    fn tmux(&self, args: &[&str]) -> String {
+        let out = Command::new("tmux")
+            .args(["-L", &self.socket])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "tmux {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
     /// Type a raw line straight into the pane via tmux (bypassing `TmuxTarget`),
     /// used only to stage pane contents for a test.
     fn stage(&self, line: &str) {
@@ -307,6 +317,24 @@ impl KeyLog {
         }
         keys
     }
+}
+
+/// `send_key` takes tmux's key names, which is how it presses Backspace to
+/// take back an `i` that a Claude box with no Vim keys typed as text.
+#[test]
+fn send_key_presses_a_named_key() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let log = KeyLog::attach(&server);
+    let target = server.target();
+
+    target.send_key("BSpace").unwrap();
+    target.send_line("go").unwrap();
+
+    assert_eq!(text_of(&log.until(b'\r')), "\x7fgo\r");
 }
 
 fn text_of(keys: &[(Instant, u8)]) -> String {
@@ -573,5 +601,88 @@ fn end_to_end_verify_still_fires_into_a_pane_nobody_touched() {
         &target,
         "nudge_fired_42",
         "the message must reach a pane the gate cleared to fire into",
+    );
+}
+
+// ---- naming a pane by its id ----
+
+/// A job stores tmux's id for its pane (`%3`), not the pane's position
+/// (`s:2.0`). The position is an index, and with `renumber-windows` on,
+/// closing any window before it hands the index to the next window along, so
+/// a nudge scheduled for one session landed in another. The id stays with the
+/// pane until it closes.
+#[test]
+fn locate_names_a_pane_by_its_id_and_where_it_sits_now() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    server.tmux(&["split-window", "-t", "s:0", "sh"]);
+    let id = server.tmux(&["display-message", "-p", "-t", "s:0.1", "#{pane_id}"]);
+
+    let loc = TmuxTarget::with_socket("s:0.1", &server.socket)
+        .locate()
+        .unwrap();
+    assert_eq!(loc.id, id);
+    assert_eq!(loc.position, "s:0.1");
+}
+
+/// The trap in asking tmux for a pane's id. `display-message -t` falls back
+/// to the current pane when its window is gone, prints that pane's id, and
+/// exits 0, so a typo'd or vanished window would have been stored as some
+/// other pane.
+#[test]
+fn locate_refuses_a_window_that_does_not_exist() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let err = TmuxTarget::with_socket("s:9.0", &server.socket)
+        .locate()
+        .expect_err("there is no window 9, so there is no pane to name");
+    assert!(err.to_string().contains("s:9.0"), "{err:#}");
+}
+
+#[test]
+fn locate_refuses_a_pane_id_that_does_not_exist() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    assert!(
+        TmuxTarget::with_socket("%999", &server.socket)
+            .locate()
+            .is_err()
+    );
+}
+
+/// The bug itself: the windows renumber between scheduling and firing.
+#[test]
+fn a_pane_id_still_reaches_its_pane_after_the_windows_renumber() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    server.tmux(&["set-option", "-g", "renumber-windows", "on"]);
+    server.tmux(&["new-window", "-t", "s:1", "sh"]);
+    server.tmux(&["new-window", "-t", "s:2", "sh"]);
+    let id = TmuxTarget::with_socket("s:2.0", &server.socket)
+        .locate()
+        .unwrap()
+        .id;
+
+    server.tmux(&["kill-window", "-t", "s:1"]);
+
+    let target = TmuxTarget::with_socket(&id, &server.socket);
+    assert_eq!(target.locate().unwrap().position, "s:1.0");
+    target.send_line("echo landed_$((6*7))").unwrap();
+    wait_for_text(
+        &target,
+        "landed_42",
+        "the id must still name the pane that was window 2",
     );
 }

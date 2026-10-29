@@ -5,7 +5,7 @@ use clap::Parser;
 use crate::config::{FlagOverrides, Toggles, env_bool, resolve};
 
 /// nudge — inject messages into a tmux pane at a rate-limit reset.
-#[derive(Parser, Debug, Default)]
+#[derive(Parser, Debug, Default, Clone)]
 #[command(
     name = "nudge",
     version,

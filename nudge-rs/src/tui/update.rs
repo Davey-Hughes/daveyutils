@@ -10,7 +10,7 @@ use crate::app::schedule_summary;
 use crate::detect::Detection;
 use crate::job::{Job, JobSpec, TargetSpec};
 use crate::timespec::parse_timespec;
-use crate::tmux_panes::Pane;
+use crate::tmux_panes::{Pane, Positions};
 
 /// How stale the job set may get before a Tick triggers a refresh.
 const POLL_SECS: i64 = 2;
@@ -28,7 +28,7 @@ pub enum Msg {
     SubmitStay,
     Quit,
     Tick(Timestamp),
-    JobsLoaded(Vec<Job>),
+    JobsLoaded(Vec<Job>, Positions),
     PanesLoaded {
         panes: Vec<Pane>,
         default_idx: usize,
@@ -89,8 +89,9 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             effects
         }
-        Msg::JobsLoaded(jobs) => {
+        Msg::JobsLoaded(jobs, positions) => {
             model.jobs = jobs;
+            model.positions = positions;
             model.clamp_selection();
             vec![]
         }
@@ -154,8 +155,17 @@ fn finish_submit(model: &mut Model, id: u64, verb: &str) -> Vec<Effect> {
     let spec = model.pending_spec.take();
     match model.after_submit {
         AfterSubmit::Quit => {
+            // Where the pane sat in the list it was picked from, unless the
+            // last poll of tmux has it somewhere newer.
+            let positions: Positions = model
+                .form
+                .panes
+                .iter()
+                .map(|p| (p.id.clone(), p.target.clone()))
+                .chain(model.positions.clone())
+                .collect();
             model.exit_summary = Some(match spec {
-                Some(s) => schedule_summary(id, &s, &model.defaults.tz, model.now),
+                Some(s) => schedule_summary(id, &s, &positions, &model.defaults.tz, model.now),
                 // The spec is always stashed by `submit`; keep the exit line
                 // informative rather than empty if that ever stops being true.
                 None => format!("nudge: {verb} {id}"),
@@ -220,7 +230,11 @@ fn jobs_key(model: &mut Model, code: KeyCode) -> Vec<Effect> {
 fn enter_edit(model: &mut Model, job: &Job) {
     let TargetSpec::Tmux { pane } = &job.target;
     let panes = std::mem::take(&mut model.form.panes);
-    let pane_idx = panes.iter().position(|p| &p.target == pane).unwrap_or(0);
+    // By id, or by position for a job stored before jobs kept ids.
+    let pane_idx = panes
+        .iter()
+        .position(|p| &p.id == pane || &p.target == pane)
+        .unwrap_or(0);
     let message = match job.messages.len() {
         0 | 1 => MessageField::Editable(
             job.messages
@@ -911,7 +925,7 @@ fn prev_word(chars: &[char], i: usize) -> usize {
 /// reached it from, whichever key saved it.
 fn submit(model: &mut Model, after: AfterSubmit) -> Vec<Effect> {
     let now_zoned = model.now.to_zoned(model.defaults.tz.clone());
-    let Some(pane) = model.form.selected_pane().map(|p| p.target.clone()) else {
+    let Some(pane) = model.form.selected_pane().map(|p| p.id.clone()) else {
         model
             .status
             .set("no tmux pane selected (none found — schedule from the CLI with -p)");
@@ -1103,10 +1117,12 @@ mod tests {
         m.tab = Tab::NewNudge;
         m.form.panes = vec![
             Pane {
+                id: "%1".into(),
                 target: "s:0.1".into(),
                 title: "claude".into(),
             },
             Pane {
+                id: "%2".into(),
                 target: "s:0.2".into(),
                 title: "agy".into(),
             },
@@ -1131,6 +1147,7 @@ mod tests {
             &mut m,
             Msg::PanesLoaded {
                 panes: vec![Pane {
+                    id: "%9".into(),
                     target: "s:0.9".into(),
                     title: String::new(),
                 }],
@@ -1149,14 +1166,17 @@ mod tests {
             Msg::PanesLoaded {
                 panes: vec![
                     Pane {
+                        id: "%0".into(),
                         target: "s:0.0".into(),
                         title: String::new(),
                     },
                     Pane {
+                        id: "%1".into(),
                         target: "s:0.1".into(),
                         title: String::new(),
                     },
                     Pane {
+                        id: "%2".into(),
                         target: "s:0.2".into(),
                         title: String::new(),
                     },
@@ -1676,9 +1696,14 @@ mod tests {
                 assert_eq!(spec.messages, vec!["please continue".to_string()]);
                 assert!(spec.verify);
                 assert_eq!(spec.fire_at.to_string(), "2026-07-16T15:00:00Z");
+                let TargetSpec::Tmux { pane } = &spec.target;
+                assert_eq!(
+                    pane, "%1",
+                    "the job stores the pane's id, which no renumbering moves"
+                );
                 assert_eq!(
                     snapshot_pane.as_deref(),
-                    Some("s:0.1"),
+                    Some("%1"),
                     "verify wants a baseline"
                 );
             }
@@ -1755,6 +1780,7 @@ mod tests {
         assert!(matches!(fx.as_slice(), [Effect::ListPanes]));
         // Already have panes -> no second fetch.
         m.form.panes = vec![crate::tmux_panes::Pane {
+            id: "%1".into(),
             target: "s:0.1".into(),
             title: String::new(),
         }];
@@ -1793,7 +1819,10 @@ mod tests {
     fn jobs_loaded_replaces_the_set_and_clamps_selection() {
         let mut m = with_jobs(3);
         m.selected = 2;
-        update(&mut m, Msg::JobsLoaded(vec![job(1, 3600)]));
+        update(
+            &mut m,
+            Msg::JobsLoaded(vec![job(1, 3600)], Positions::new()),
+        );
         assert_eq!(m.jobs.len(), 1);
         assert_eq!(m.selected, 0, "selection clamps into the shorter list");
     }
@@ -1806,6 +1835,7 @@ mod tests {
         let mut m = with_jobs(0);
         m.jobs = vec![multi_msg_job()];
         m.form.panes = vec![Pane {
+            id: "%7".into(),
             target: "s:0.7".into(),
             title: String::new(),
         }];
@@ -1847,6 +1877,31 @@ mod tests {
         }
     }
 
+    /// The job names its pane by id, and the form opens on that pane, not on
+    /// whichever pane happens to sort first.
+    #[test]
+    fn editing_a_job_selects_its_pane_by_id() {
+        let mut m = form_model();
+        m.tab = Tab::Jobs;
+        let mut j = job(4, 3600);
+        j.target = TargetSpec::Tmux { pane: "%2".into() };
+        m.jobs = vec![j];
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('e')));
+        assert_eq!(m.form.selected_pane().unwrap().id, "%2");
+    }
+
+    #[test]
+    fn jobs_loaded_keeps_where_each_pane_sits() {
+        let mut m = with_jobs(0);
+        let positions: crate::tmux_panes::Positions =
+            [("%1".to_string(), "s:0.1".to_string())].into();
+        update(
+            &mut m,
+            Msg::JobsLoaded(vec![job(1, 3600)], positions.clone()),
+        );
+        assert_eq!(m.positions, positions);
+    }
+
     #[test]
     fn c_cancels_the_selected_job() {
         let mut m = with_jobs(2);
@@ -1872,7 +1927,7 @@ mod tests {
         assert!(fx.is_empty(), "nothing left to poll for — we're leaving");
         let summary = m.exit_summary.as_ref().expect("a summary to print");
         assert!(summary.contains("job 12"), "{summary}");
-        assert!(summary.contains("s:0.1"), "{summary}");
+        assert!(summary.contains("s:0.1 (%1)"), "{summary}");
         assert!(summary.contains("in 2h 0m"), "{summary}");
     }
 
@@ -1917,6 +1972,7 @@ mod tests {
         let mut m = with_jobs(1);
         m.jobs = vec![multi_msg_job()];
         m.form.panes = vec![Pane {
+            id: "%7".into(),
             target: "s:0.7".into(),
             title: String::new(),
         }];
@@ -1981,6 +2037,7 @@ mod tests {
             &mut m,
             Msg::PanesLoaded {
                 panes: vec![Pane {
+                    id: "%1".into(),
                     target: "s:0.1".into(),
                     title: String::new(),
                 }],
@@ -2148,10 +2205,12 @@ mod tests {
         let mut m = form_model();
         m.form.panes = vec![
             Pane {
+                id: "%1".into(),
                 target: "s:0.1".into(),
                 title: "claude".into(),
             },
             Pane {
+                id: "%2".into(),
                 target: "s:0.2".into(),
                 title: "vim".into(),
             },
@@ -2169,14 +2228,17 @@ mod tests {
         let mut m = form_model();
         m.form.panes = vec![
             Pane {
+                id: "%1".into(),
                 target: "s:0.1".into(),
                 title: "a".into(),
             },
             Pane {
+                id: "%2".into(),
                 target: "s:0.2".into(),
                 title: "b".into(),
             },
             Pane {
+                id: "%3".into(),
                 target: "s:0.3".into(),
                 title: "c".into(),
             },
@@ -2202,10 +2264,12 @@ mod tests {
         let mut m = form_model();
         m.form.panes = vec![
             Pane {
+                id: "%1".into(),
                 target: "s:0.1".into(),
                 title: "claude".into(),
             },
             Pane {
+                id: "%2".into(),
                 target: "s:0.2".into(),
                 title: "vim".into(),
             },
@@ -2249,10 +2313,12 @@ mod tests {
         let mut m = form_model();
         m.form.panes = vec![
             Pane {
+                id: "%1".into(),
                 target: "s:0.1".into(),
                 title: "claude".into(),
             },
             Pane {
+                id: "%2".into(),
                 target: "s:0.2".into(),
                 title: "vim".into(),
             },
@@ -2311,10 +2377,12 @@ mod tests {
         let mut m = form_model();
         m.form.panes = vec![
             Pane {
+                id: "%1".into(),
                 target: "s:0.1".into(),
                 title: "claude".into(),
             },
             Pane {
+                id: "%2".into(),
                 target: "s:0.2".into(),
                 title: "vim".into(),
             },

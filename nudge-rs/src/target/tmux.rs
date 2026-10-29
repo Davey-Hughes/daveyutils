@@ -18,6 +18,15 @@ use super::{PaneDims, Target};
 /// waiting on a rate limit would notice.
 const KEYPRESS_PAUSE: Duration = Duration::from_millis(500);
 
+/// What [`TmuxTarget::locate`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneLocation {
+    /// tmux's id for the pane, e.g. `%19`.
+    pub id: String,
+    /// Where it sits now, as `session:window.pane`.
+    pub position: String,
+}
+
 /// A specific tmux pane, addressed by tmux's target syntax (e.g. "bot:0.1").
 /// An optional server socket (`tmux -L <socket>`) supports non-default servers
 /// and test isolation.
@@ -38,6 +47,37 @@ impl TmuxTarget {
         Self {
             pane: pane.into(),
             socket: Some(socket.into()),
+        }
+    }
+
+    /// tmux's id for this pane, and where the pane sits right now.
+    ///
+    /// The id (`%19`) is what a job stores. A position (`main:12.0`) is an
+    /// index, and closing a window renumbers every window after it (with
+    /// `renumber-windows` on), so a stored position goes on to name whichever
+    /// pane moves into the slot. The id stays with the pane until it closes.
+    ///
+    /// `display-message -t` cannot be asked first. When the window it names
+    /// is gone it answers for the current pane and exits 0, so a typo'd
+    /// window would be stored as the id of whatever pane you happen to be in.
+    /// `capture-pane` fails on the same target, so it checks the pane exists.
+    pub fn locate(&self) -> Result<PaneLocation> {
+        self.run(&["capture-pane", "-p", "-t", &self.pane, "-S", "0", "-E", "0"])
+            .with_context(|| format!("no tmux pane {}", self.pane))?;
+        let out = self.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &self.pane,
+            "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}",
+        ])?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        match text.trim_end_matches('\n').split_once('\t') {
+            Some((id, position)) if id.starts_with('%') => Ok(PaneLocation {
+                id: id.to_string(),
+                position: position.to_string(),
+            }),
+            _ => bail!("no tmux pane {}", self.pane),
         }
     }
 
@@ -75,19 +115,30 @@ impl Target for TmuxTarget {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    fn capture_styled(&self) -> Result<String> {
+        self.capture_escaped()
+    }
+
     fn send_line(&self, text: &str) -> Result<()> {
         // `-l` sends the text literally so tmux doesn't interpret key names;
         // a separate `Enter`, after KEYPRESS_PAUSE, submits it.
         self.run(&["send-keys", "-t", &self.pane, "-l", "--", text])?;
         std::thread::sleep(KEYPRESS_PAUSE);
         self.run(&["send-keys", "-t", &self.pane, "Enter"])?;
+        // And after it, so a capture taken next shows what the Enter did.
+        std::thread::sleep(KEYPRESS_PAUSE);
         Ok(())
     }
 
+    fn settle(&self) {
+        std::thread::sleep(KEYPRESS_PAUSE);
+    }
+
     fn send_key(&self, key: &str) -> Result<()> {
+        // A key name, so no `-l`: `BSpace` is Backspace, not seven letters.
         // The pause comes after the key, so that the caller's next send cannot
         // run into it.
-        self.run(&["send-keys", "-t", &self.pane, "-l", "--", key])?;
+        self.run(&["send-keys", "-t", &self.pane, "--", key])?;
         std::thread::sleep(KEYPRESS_PAUSE);
         Ok(())
     }

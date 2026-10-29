@@ -18,6 +18,7 @@ use crate::job::{Job, JobSpec, TargetSpec};
 use crate::paths;
 use crate::target::{PaneDims, Target, tmux::TmuxTarget};
 use crate::timespec::parse_timespec;
+use crate::tmux_panes::{Positions, label};
 
 /// The mode `dispatch` resolves a parsed CLI + TTY state into.
 #[derive(Debug, PartialEq, Eq)]
@@ -364,6 +365,11 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
         None if cli.auto => crate::tmux_panes::auto_target()?,
         None => crate::app::pick_pane()?,
     };
+    // From here on the pane is tmux's id for it, which is what the job stores:
+    // see `TmuxTarget::locate`.
+    let loc = TmuxTarget::new(&pane).locate()?;
+    let pane = loc.id.clone();
+    let positions = Positions::from([(loc.id, loc.position)]);
     let opts = resolve_options(cli);
     let now = Zoned::now();
     let fire_at = fire_time(cli, &pane, &now)?;
@@ -378,7 +384,7 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
         Response::Scheduled(id) => {
             println!(
                 "{}",
-                schedule_summary(id, &spec, now.time_zone(), now.timestamp())
+                schedule_summary(id, &spec, &positions, now.time_zone(), now.timestamp())
             );
             Ok(())
         }
@@ -417,14 +423,16 @@ pub fn human_countdown(delta_secs: i64) -> String {
 /// about which pane it had picked or what it would send there.
 ///
 /// `now` is the caller's clock (the model's, from the dashboard), so the
-/// countdown matches whatever the user was just looking at.
+/// countdown matches whatever the user was just looking at. `positions` says
+/// where the job's pane sits, since the job names it only by tmux's id.
 pub fn schedule_summary(
     id: u64,
     spec: &JobSpec,
+    positions: &Positions,
     tz: &jiff::tz::TimeZone,
     now: jiff::Timestamp,
 ) -> String {
-    job_summary(&format!("scheduled job {id}"), spec, tz, now)
+    job_summary(&format!("scheduled job {id}"), spec, positions, tz, now)
 }
 
 /// The same confirmation for [`edit`], which replaces a job rather than adding
@@ -437,10 +445,17 @@ pub fn edit_summary(
     old_id: u64,
     new_id: u64,
     spec: &JobSpec,
+    positions: &Positions,
     tz: &jiff::tz::TimeZone,
     now: jiff::Timestamp,
 ) -> String {
-    job_summary(&format!("edited job {old_id} -> {new_id}"), spec, tz, now)
+    job_summary(
+        &format!("edited job {old_id} -> {new_id}"),
+        spec,
+        positions,
+        tz,
+        now,
+    )
 }
 
 /// The shared body: `lead` names what happened to the job, the rest describes
@@ -448,10 +463,12 @@ pub fn edit_summary(
 fn job_summary(
     lead: &str,
     spec: &JobSpec,
+    positions: &Positions,
     tz: &jiff::tz::TimeZone,
     now: jiff::Timestamp,
 ) -> String {
     let TargetSpec::Tmux { pane } = &spec.target;
+    let pane = label(pane, positions);
     let when = spec.fire_at.to_zoned(tz.clone());
     let countdown = human_countdown(spec.fire_at.duration_since(now).as_secs());
     let what = match spec.messages.len() {
@@ -479,22 +496,24 @@ fn job_summary(
     )
 }
 
-/// Render pending jobs as a plain table.
-pub fn format_jobs(jobs: &[Job]) -> String {
+/// Render pending jobs as a plain table, each pane labelled from `positions`.
+pub fn format_jobs(jobs: &[Job], positions: &Positions) -> String {
     if jobs.is_empty() {
         return "no pending nudge jobs".to_string();
     }
-    let mut out = String::from("ID   PANE                 FIRE (UTC)            MSGS\n");
-    for j in jobs {
-        let TargetSpec::Tmux { pane } = &j.target;
-        // `writeln!` formats straight into `out`; `push_str(&format!(..))` would
-        // allocate a String per row first. Writing to a String cannot fail.
+    // As wide as the longest label, so the columns after it stay aligned.
+    let (labels, widest) = crate::tmux_panes::job_labels(jobs, positions);
+    let w = widest.max(20);
+    // `writeln!` formats straight into `out`; `push_str(&format!(..))` would
+    // allocate a String per row first. Writing to a String cannot fail.
+    let mut out = String::new();
+    let _ = writeln!(out, "{:<4} {:<w$} {:<20} MSGS", "ID", "PANE", "FIRE (UTC)");
+    for (j, pane) in jobs.iter().zip(&labels) {
         let _ = writeln!(
             out,
-            "{:<4} {:<20} {:<20} {}",
+            "{:<4} {pane:<w$} {:<20} {}",
             j.id,
-            pane,
-            j.fire_at,
+            j.fire_at.to_string(),
             j.messages.len()
         );
     }
@@ -524,7 +543,7 @@ fn live_socket() -> anyhow::Result<std::path::PathBuf> {
 pub fn list() -> anyhow::Result<()> {
     match request(&live_socket()?, &Request::List)? {
         Response::Jobs(jobs) => {
-            print!("{}", format_jobs(&jobs));
+            print!("{}", format_jobs(&jobs, &crate::tmux_panes::positions()));
             Ok(())
         }
         other => bail!("unexpected response: {other:?}"),
@@ -648,10 +667,16 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
         .find(|j| j.id == id)
         .ok_or_else(|| anyhow::anyhow!("no pending job with id {id}"))?;
 
+    // A job moved with `-p` stores the new pane's id, as `schedule` does.
+    // Resolved here so `merge_edit` stays pure.
+    let mut cli = cli.clone();
+    if let Some(p) = &cli.pane {
+        cli.pane = Some(TmuxTarget::new(p).locate()?.id);
+    }
     let now = Zoned::now();
     let spec = merge_edit(
         &job,
-        cli,
+        &cli,
         &now,
         crate::cli::default_retries(),
         &snapshot_pane,
@@ -669,7 +694,14 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
         Response::Replaced(Some(new_id)) => {
             println!(
                 "{}",
-                edit_summary(id, new_id, &spec, now.time_zone(), now.timestamp())
+                edit_summary(
+                    id,
+                    new_id,
+                    &spec,
+                    &crate::tmux_panes::positions(),
+                    now.time_zone(),
+                    now.timestamp()
+                )
             );
             Ok(())
         }
@@ -778,6 +810,7 @@ mod tests {
         let s = schedule_summary(
             7,
             &spec,
+            &Positions::new(),
             &jiff::tz::TimeZone::UTC,
             "2026-07-16T12:00:00Z".parse().unwrap(),
         );
@@ -795,6 +828,7 @@ mod tests {
         let s = schedule_summary(
             3,
             &spec,
+            &Positions::new(),
             &jiff::tz::TimeZone::UTC,
             "2026-07-16T12:00:00Z".parse().unwrap(),
         );
@@ -811,6 +845,7 @@ mod tests {
             1,
             2,
             &spec,
+            &Positions::new(),
             &jiff::tz::TimeZone::UTC,
             "2026-07-16T12:00:00Z".parse().unwrap(),
         );
@@ -830,6 +865,7 @@ mod tests {
         let s = schedule_summary(
             1,
             &spec,
+            &Positions::new(),
             &jiff::tz::TimeZone::get("America/New_York").unwrap(),
             "2026-07-16T12:00:00Z".parse().unwrap(),
         );

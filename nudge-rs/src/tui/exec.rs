@@ -12,7 +12,7 @@ use crate::target::tmux::TmuxTarget;
 pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
     match effect {
         Effect::PollJobs => match client::request(socket, &Request::List) {
-            Ok(Response::Jobs(jobs)) => Msg::JobsLoaded(jobs),
+            Ok(Response::Jobs(jobs)) => Msg::JobsLoaded(jobs, crate::tmux_panes::positions()),
             Ok(other) => Msg::ActionFailed(format!("unexpected response: {other:?}")),
             Err(e) => Msg::ActionFailed(format!("daemon request failed: {e}")),
         },
@@ -150,7 +150,7 @@ mod tests {
     fn poll_jobs_returns_the_served_queue() {
         let (socket, _tmp) = serving_queue(true);
         match run_effect(Effect::PollJobs, &socket) {
-            Msg::JobsLoaded(jobs) => assert_eq!(jobs.len(), 1),
+            Msg::JobsLoaded(jobs, _) => assert_eq!(jobs.len(), 1),
             other => panic!("expected JobsLoaded, got {other:?}"),
         }
     }
