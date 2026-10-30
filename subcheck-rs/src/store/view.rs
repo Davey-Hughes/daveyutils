@@ -16,8 +16,10 @@ use crate::list::shell_quote;
 /// What `review`, `list` and `apply` are given: `[run | paths…]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
-    /// No argument: the run that started last.
+    /// The run that started last.
     Newest,
+    /// No argument: the folders that hold the files the run that started last named.
+    NewestFolders,
     /// A run, by name.
     Run(String),
     /// Files and directories, absolute: every file with a check that is one, or under one.
@@ -25,11 +27,11 @@ pub enum Selector {
 }
 
 impl Selector {
-    /// `[run | paths…]`: nothing is the newest run; an argument that exists on disk is a path, and
-    /// anything else a run name, which goes alone.
+    /// `[run | paths…]`: nothing is the newest run's folders; an argument that exists on disk is a
+    /// path, and anything else a run name, which goes alone.
     pub fn parse(args: &[String]) -> anyhow::Result<Selector> {
         match args {
-            [] => Ok(Selector::Newest),
+            [] => Ok(Selector::NewestFolders),
             [one] if !Path::new(one).exists() => Ok(Selector::Run(one.clone())),
             many => {
                 let mut paths = Vec::new();
@@ -52,6 +54,10 @@ impl Store {
         match s {
             Selector::Newest => match self.newest_scan()? {
                 Some(scan) => Ok(self.run_view(&scan)?),
+                None => bail!("no runs yet"),
+            },
+            Selector::NewestFolders => match self.newest_scan()? {
+                Some(scan) => self.folders_view(&scan),
                 None => bail!("no runs yet"),
             },
             Selector::Run(name) => match self.scan_named(name)? {
@@ -102,11 +108,32 @@ impl Store {
     /// under one that is a directory, by path. Its cost is those files' LLM calls in the scans that
     /// made their current LLM checks. Named by the paths, quoted, as `subcheck` takes them back.
     pub fn paths_view(&self, paths: &[PathBuf]) -> anyhow::Result<Run> {
+        let shown: Vec<(PathBuf, bool)> = paths.iter().map(|p| (p.clone(), p.is_dir())).collect();
+        self.shown_paths(&shown)
+    }
+
+    /// The folders that hold the files `scan` named, as a paths view: every file recorded under
+    /// them, whichever runs checked them. They are folders whether or not they are on disk now.
+    pub fn folders_view(&self, scan: &ScanRow) -> anyhow::Result<Run> {
+        let files = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT path FROM scan_files WHERE scan = ?1 ORDER BY rowid")?;
+            stmt.query_map([scan.id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let shown: Vec<(PathBuf, bool)> = folders(&files).into_iter().map(|f| (f, true)).collect();
+        self.shown_paths(&shown)
+    }
+
+    /// The paths view of `paths`, each with whether it is a folder (every file recorded under it)
+    /// or a file (that file alone).
+    fn shown_paths(&self, paths: &[(PathBuf, bool)]) -> anyhow::Result<Run> {
         let tx = self.conn.unchecked_transaction()?;
         start_showing(&tx)?;
-        for p in paths {
+        for (p, folder) in paths {
             let text = p.to_string_lossy();
-            if p.is_dir() {
+            if *folder {
                 // Every path that starts `dir/`: from `dir/` up to `dir0`, `0` being the
                 // character after `/`. (`LIKE` would take a `_` in the path for any character.)
                 let dir = text.trim_end_matches('/');
@@ -125,7 +152,7 @@ impl Store {
         }
         let named: Vec<String> = paths
             .iter()
-            .map(|p| shell_quote(&p.to_string_lossy()))
+            .map(|(p, _)| shell_quote(&p.to_string_lossy()))
             .collect();
         let named = named.join(" ");
         let any: i64 = tx.query_row("SELECT COUNT(*) FROM temp.shown", [], |r| r.get(0))?;
@@ -135,6 +162,7 @@ impl Store {
         let mut run = shown(&tx)?;
         run.name = named;
         run.of_paths = true;
+        run.paths = paths.iter().map(|(p, _)| p.clone()).collect();
         add_calls(
             &tx,
             &mut run,
@@ -151,6 +179,23 @@ impl Store {
         tx.commit()?;
         Ok(run)
     }
+}
+
+/// The folders that hold `files`, in the order of the files, each once; a folder inside another of
+/// them is left out, as that one covers it.
+fn folders(files: &[String]) -> Vec<PathBuf> {
+    let mut all: Vec<PathBuf> = Vec::new();
+    for f in files {
+        if let Some(dir) = Path::new(f).parent()
+            && !all.iter().any(|d| d == dir)
+        {
+            all.push(dir.to_path_buf());
+        }
+    }
+    all.iter()
+        .filter(|d| !all.iter().any(|o| o != *d && d.starts_with(o)))
+        .cloned()
+        .collect()
 }
 
 /// An empty `temp.shown`: the paths a view shows, with the order to show them in.
@@ -404,6 +449,8 @@ mod tests {
         assert_eq!(view.header, None);
         assert_eq!(view.name, shell_quote(&show.to_string_lossy()));
         assert_eq!(view.called(), view.name);
+        assert_eq!(view.paths, std::slice::from_ref(&show));
+        assert_eq!(view.shown_name(), "Show");
         assert_eq!(
             store.run_view(&scan).unwrap().called(),
             format!("run {}", scan.name)
@@ -626,12 +673,64 @@ mod tests {
     }
 
     #[test]
+    fn the_newest_runs_folders_are_every_file_recorded_where_its_files_sit() {
+        let (_db, mut store) = store();
+        assert_eq!(
+            store
+                .view(&Selector::NewestFolders)
+                .unwrap_err()
+                .to_string(),
+            "no runs yet"
+        );
+        let (e01, e02, sp, s2) = (
+            "/m/S1/E01.mkv",
+            "/m/S1/E02.mkv",
+            "/m/S1/Specials/SP1.mkv",
+            "/m/S2/E01.mkv",
+        );
+        let first = store
+            .begin_scan(
+                &header("2026-10-17T10:00:00Z"),
+                &[e01.into(), e02.into(), sp.into(), s2.into()],
+            )
+            .unwrap();
+        for p in [e01, e02, sp, s2] {
+            checked(&mut store, &first, p, &[("befor", "before")]);
+        }
+        // The newest run names a file in S1's Specials and one in S1: S1 covers both. Its folders
+        // are not on disk, and are folders all the same.
+        let second = store
+            .begin_scan(&header("2026-10-17T11:00:00Z"), &[sp.into(), e02.into()])
+            .unwrap();
+        checked(&mut store, &second, e02, &[("trough", "through")]);
+        let view = store.view(&Selector::NewestFolders).unwrap();
+        assert!(view.of_paths);
+        assert_eq!(view.paths, [PathBuf::from("/m/S1")]);
+        assert_eq!(view.name, "'/m/S1'");
+        assert_eq!(view.shown_name(), "S1");
+        // Every file recorded under S1, the first run's E01 too.
+        assert_eq!(paths(&view), [e01, e02, sp]);
+        // The newest run itself is still there.
+        let newest = store.view(&Selector::Newest).unwrap();
+        assert_eq!(paths(&newest), [sp, e02]);
+        assert_eq!(newest.shown_name(), format!("run {}", second.name));
+        // Two folders, in the order the run named their files.
+        store
+            .begin_scan(&header("2026-10-17T12:00:00Z"), &[s2.into(), e01.into()])
+            .unwrap();
+        let view = store.view(&Selector::NewestFolders).unwrap();
+        assert_eq!(view.paths, [PathBuf::from("/m/S2"), PathBuf::from("/m/S1")]);
+        assert_eq!(view.shown_name(), "S2 +1");
+        assert_eq!(view.files.len(), 4);
+    }
+
+    #[test]
     fn an_argument_on_disk_is_a_path_and_anything_else_a_run_name() {
         let dir = tempfile::tempdir().unwrap();
         let show = dir.path().join("Show");
         std::fs::create_dir(&show).unwrap();
         let arg = |p: &Path| p.to_string_lossy().into_owned();
-        assert_eq!(Selector::parse(&[]).unwrap(), Selector::Newest);
+        assert_eq!(Selector::parse(&[]).unwrap(), Selector::NewestFolders);
         assert_eq!(
             Selector::parse(&["2026-10-17T14-03-22".into()]).unwrap(),
             Selector::Run("2026-10-17T14-03-22".into())

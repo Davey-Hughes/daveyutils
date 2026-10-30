@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use common::fixture;
+use subcheck::list::shell_quote;
 use subcheck::llm::Usage;
 use subcheck::store::{self, Check, LlmCall, Selector, State, Store};
 
@@ -1124,4 +1125,35 @@ fn a_relative_subcheck_db_is_refused_and_a_later_ones_database_named() {
             env.db().display()
         )
     );
+}
+
+#[test]
+fn a_bare_list_shows_the_newest_runs_folders() {
+    let env = Env::new();
+    let (timing, typos) = (path("timing.mkv"), path("typos.mkv"));
+    assert!(
+        env.subcheck(&["scan", &timing, &typos], &[])
+            .status
+            .success()
+    );
+    assert!(
+        env.subcheck(&["scan", &typos, "--force"], &[])
+            .status
+            .success()
+    );
+    // The newest run is typos.mkv alone; the folder it sits in holds both.
+    assert_eq!(env.newest_run().files.len(), 1);
+    let shown = env.store().view(&Selector::NewestFolders).unwrap();
+    let files: Vec<&str> = shown.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(files, [timing.as_str(), typos.as_str()]);
+    let folder = fixture("typos.mkv")
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let list = env.subcheck(&["list"], &[]);
+    let text = String::from_utf8_lossy(&list.stdout);
+    // The heading is the folder, quoted, then its counts.
+    let heading = text.lines().next().unwrap_or_default();
+    assert!(heading.starts_with(&shell_quote(&folder)), "{text}");
 }

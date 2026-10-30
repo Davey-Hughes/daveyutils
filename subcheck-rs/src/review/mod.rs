@@ -38,7 +38,7 @@ use crate::scan::{self, file_stamp};
 use crate::store::{Run, Selector, Store};
 use model::{FileNote, Model};
 use progress::Scan;
-use update::{Effect, Job, Mouse, Msg};
+use update::{Effect, Job, Mouse, Msg, Switch};
 
 /// A terminal event as a `Msg`. Ctrl and Alt chords never reach the plain-key handlers, so Ctrl-C
 /// quits instead of reading as `c` (the lesson of nudge-rs's `map_event`); with the mouse they are
@@ -156,8 +156,34 @@ pub fn run_effect(effect: Effect, store: &mut Store, player: &mut Player, tx: &S
                 paths,
             }
         }
+        Effect::Switch(to) => Msg::Switched(
+            other_view(store, &to)
+                .map(|run| {
+                    let notes = file_notes(&run);
+                    (run, notes)
+                })
+                .map_err(|e| format!("{e:#}")),
+        ),
         Effect::Open(moment) => Msg::Opened(player.open(&moment)),
         Effect::Playback(p) => Msg::Played(player.playback(p)),
+    }
+}
+
+/// The view `v` opens, read from the store: a run's folders, or the newest run that named a file.
+fn other_view(store: &Store, to: &Switch) -> anyhow::Result<Run> {
+    match to {
+        Switch::FoldersOf(name) => {
+            let scan = store
+                .scan_named(name)?
+                .with_context(|| format!("no run named {name}"))?;
+            store.folders_view(&scan)
+        }
+        Switch::RunNaming(path) => {
+            let scan = store
+                .newest_scan_naming(path)?
+                .with_context(|| format!("{}: no run named it", model::episode(path)))?;
+            Ok(store.run_view(&scan)?)
+        }
     }
 }
 

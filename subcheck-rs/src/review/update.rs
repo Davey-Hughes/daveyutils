@@ -1,6 +1,8 @@
 //! Keys to state changes, and the effects the event loop runs for them. Pure: the store and mpv are
 //! touched only by the effects, so every rule here is tested without a terminal.
 
+use std::collections::HashMap;
+
 use crossterm::event::KeyCode;
 use jiff::{SignedDuration, Timestamp};
 use ratatui::layout::{Position, Rect};
@@ -46,6 +48,8 @@ pub enum Msg {
         missing: Vec<String>,
         paths: Vec<String>,
     },
+    /// A `Switch` effect finished: the view and its files' notes, or why it could not be read.
+    Switched(Result<(Run, HashMap<String, FileNote>), String>),
     /// An `Open` effect finished.
     Opened(Result<(), String>),
     /// A `Playback` effect finished: where mpv is now.
@@ -95,6 +99,15 @@ pub struct Job {
     pub resume: String,
 }
 
+/// The view `v` opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Switch {
+    /// The folders of the run of this name.
+    FoldersOf(String),
+    /// The newest run that named the file at this path.
+    RunNaming(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     /// Record these decisions in the store.
@@ -116,6 +129,9 @@ pub enum Effect {
         run: String,
         paths: Vec<String>,
     },
+    /// Open the other view of the screen's findings (`v`), read from the store with each file's
+    /// note ([`Msg::Switched`]).
+    Switch(Switch),
     Open(Moment),
     /// Pause or seek the open mpv.
     Playback(Playback),
@@ -225,6 +241,7 @@ fn apply(
             missing,
             paths: p,
         } => started(m, job, &missing, &p),
+        Msg::Switched(result) => switched(m, result),
         Msg::Opened(result) => {
             m.status = Some(match result {
                 Ok(()) => "opened in mpv".into(),
@@ -364,6 +381,7 @@ fn key_press(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
     match key {
         KeyCode::Char('q') => quit_or_ask(m),
         KeyCode::Tab => m.pane = Pane::Files,
+        KeyCode::Char('v') => return switch_view(m),
         KeyCode::Char('?') => m.help = true,
         KeyCode::Down | KeyCode::Char('j') => m.selected = (m.selected + 1).min(last),
         KeyCode::Up | KeyCode::Char('k') => m.selected = m.selected.saturating_sub(1),
@@ -874,6 +892,7 @@ fn files_key(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
         KeyCode::Char('q') => quit_or_ask(m),
         KeyCode::Char('?') => m.help = true,
         KeyCode::Tab => m.pane = Pane::Findings,
+        KeyCode::Char('v') => return switch_view(m),
         KeyCode::Down | KeyCode::Char('j') => m.file_selected = (m.file_selected + 1).min(last),
         KeyCode::Up | KeyCode::Char('k') => m.file_selected = m.file_selected.saturating_sub(1),
         KeyCode::PageDown => m.file_selected = (m.file_selected + PAGE).min(last),
@@ -885,6 +904,53 @@ fn files_key(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
         _ => {}
     }
     Vec::new()
+}
+
+/// The other view `v` asked for has been read, or could not be: take it, or say why the screen is
+/// as it was.
+fn switched(
+    m: &mut Model,
+    result: Result<(Run, HashMap<String, FileNote>), String>,
+) -> Vec<Effect> {
+    match result {
+        Ok((run, notes)) => m.switch(run, notes),
+        Err(e) => m.status = Some(format!("could not switch views: {e}")),
+    }
+    Vec::new()
+}
+
+/// `v`: the other view of the screen's findings. From a run's view, the run's folders; from a paths
+/// view, the newest run that named the selected file: the selected entry's (a row's first
+/// member's), or in the files view, or with nothing selected in the list, the selected file's. Not
+/// while a scan runs: its progress belongs to the view it started in.
+fn switch_view(m: &mut Model) -> Vec<Effect> {
+    if m.progress.running() {
+        m.status = Some("the scan is still running".into());
+        return Vec::new();
+    }
+    if !m.run.of_paths {
+        return vec![Effect::Switch(Switch::FoldersOf(m.run.name.clone()))];
+    }
+    let in_list = match m.pane {
+        Pane::Findings => m.selected_entry().map(|e| {
+            let i = match e {
+                Entry::Row(r) => m.rows[r].members[0],
+                Entry::Member(_, i) => i,
+            };
+            m.run.findings[i].file.clone()
+        }),
+        Pane::Files => None,
+    };
+    in_list
+        .or_else(|| {
+            m.progress
+                .files
+                .get(m.file_selected)
+                .map(|f| f.path.clone())
+        })
+        .map(|p| Effect::Switch(Switch::RunNaming(p)))
+        .into_iter()
+        .collect()
 }
 
 /// `c` on the selected file: find the run it is checked again into, then ask. A file the scan is
@@ -2690,5 +2756,61 @@ mod tests {
         assert_eq!(m.confirm, Some(Confirm::Quit));
         update(&mut m, Msg::Quit, now());
         assert!(m.should_quit);
+    }
+
+    #[test]
+    fn v_asks_for_a_runs_folders_or_the_run_that_named_the_selected_file() {
+        let mut m = sample();
+        assert_eq!(
+            press(&mut m, 'v'),
+            [Effect::Switch(Switch::FoldersOf(m.run.name.clone()))]
+        );
+        // In a paths view, the selected row's first member's file.
+        m.run.of_paths = true;
+        m.selected = 0;
+        assert_eq!(
+            press(&mut m, 'v'),
+            [Effect::Switch(Switch::RunNaming(path(1)))]
+        );
+        // In the files view, the selected file.
+        update(&mut m, Msg::Key(KeyCode::Tab), now());
+        m.file_selected = 2;
+        assert_eq!(
+            press(&mut m, 'v'),
+            [Effect::Switch(Switch::RunNaming(path(3)))]
+        );
+    }
+
+    #[test]
+    fn v_with_nothing_selected_in_the_list_follows_the_files_selected_file() {
+        let mut m = sample();
+        m.run.of_paths = true;
+        // Nothing in the sample is rejected: under that filter the list is empty.
+        m.filter = Filter::Only(State::Rejected);
+        m.file_selected = 1;
+        assert_eq!(m.selected_entry(), None);
+        assert_eq!(
+            press(&mut m, 'v'),
+            [Effect::Switch(Switch::RunNaming(path(2)))]
+        );
+    }
+
+    #[test]
+    fn v_while_a_scan_runs_says_so_and_asks_for_nothing() {
+        let mut m = scanning();
+        assert_eq!(press(&mut m, 'v'), []);
+        assert_eq!(m.status.as_deref(), Some("the scan is still running"));
+    }
+
+    #[test]
+    fn a_view_that_cannot_be_read_leaves_the_screen_as_it_was() {
+        let mut m = sample();
+        let before = m.run.clone();
+        update(&mut m, Msg::Switched(Err("disk I/O error".into())), now());
+        assert_eq!(m.run, before);
+        assert_eq!(
+            m.status.as_deref(),
+            Some("could not switch views: disk I/O error")
+        );
     }
 }

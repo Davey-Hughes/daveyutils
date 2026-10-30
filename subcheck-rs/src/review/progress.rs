@@ -251,6 +251,20 @@ impl Progress {
         }
     }
 
+    /// The files of another view (`v`), and no scan: what the screen's scans ended with is kept,
+    /// for the outro and the exit status.
+    pub fn show(&mut self, run: &Run) {
+        debug_assert!(!self.running(), "`v` waits for the scan to end");
+        let earlier = self.ended();
+        let earlier_failed =
+            self.earlier_failed || self.failed > 0 || matches!(self.scan, Scan::Ended(Err(_)));
+        *self = Progress {
+            earlier,
+            earlier_failed,
+            ..Progress::of_run(run)
+        };
+    }
+
     pub fn running(&self) -> bool {
         self.scan == Scan::Running
     }
@@ -881,5 +895,25 @@ mod tests {
         );
         assert_eq!(p.next_batch(), None);
         assert!(!p.outro().iter().any(|l| l.starts_with("Not checked again")));
+    }
+
+    #[test]
+    fn another_view_keeps_what_the_screens_scans_ended_with() {
+        let mut p = Progress::of_run(&Run::default());
+        p.start("r", "subcheck scan --run r /m".into(), false);
+        p.scan_event(&Event::Queued(vec!["/m/E01.mkv".into()]));
+        p.scan_event(&Event::Finished {
+            path: "/m/E01.mkv".into(),
+            error: Some("LLM: boom".into()),
+            findings: 0,
+            lines: vec![],
+        });
+        p.scan = Scan::Ended(Ok(crate::scan::Summary::default()));
+        let outro = p.outro();
+        p.show(&Run::default());
+        assert_eq!(p.scan, Scan::None);
+        assert_eq!(p.files.len(), 0);
+        assert_eq!(p.outro(), outro);
+        assert!(p.earlier_failed);
     }
 }

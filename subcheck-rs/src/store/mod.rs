@@ -369,6 +369,8 @@ pub struct Run {
     pub spent: Spent,
     /// The files under some paths, not a run's: `name` is the paths, quoted for the shell.
     pub of_paths: bool,
+    /// For a paths view, the paths it shows, as given: review's screen names the view by them.
+    pub paths: Vec<PathBuf>,
 }
 
 impl Run {
@@ -394,6 +396,25 @@ impl Run {
             self.name.clone()
         } else {
             format!("run {}", self.name)
+        }
+    }
+
+    /// What review's screen calls the view, on the list pane's top border: `run <name>`; for a
+    /// paths view, the last part of its first path, with `+N` for the others.
+    pub fn shown_name(&self) -> String {
+        if !self.of_paths {
+            return format!("run {}", self.name);
+        }
+        let Some(first) = self.paths.first() else {
+            return self.name.clone();
+        };
+        let name = first
+            .file_name()
+            .map_or_else(|| first.to_string_lossy(), |n| n.to_string_lossy())
+            .into_owned();
+        match self.paths.len() {
+            1 => name,
+            n => format!("{name} +{}", n - 1),
         }
     }
 

@@ -56,6 +56,7 @@ const KEY_GROUPS: [(&str, &[(&str, &str)]); 3] = [
             ("⏎", "expand a group"),
             ("f", "filter"),
             ("Tab", "findings, files"),
+            ("v", "a run, its folders"),
         ],
     ),
     (
@@ -210,22 +211,22 @@ fn tabs(active: Pane) -> Vec<Span<'static>> {
     ]
 }
 
-/// The left pane's block, in either view: the tabs on the left of its top border and, while a scan
-/// runs, how far it is on the right. The top border says where you are and whether a scan runs;
-/// each view puts what its list holds on the bottom one. `area` is the pane's: when the tabs, the
-/// progress and a column of border between them do not fit inside its corners, the progress is
-/// left off rather than drawn over the tabs, and the status line still says how far the scan is.
+/// The left pane's block, in either view: the tabs on the left of its top border and, on the
+/// right, how far a scan is while one runs, else the view's name (`Run::shown_name`). Each view
+/// puts what its list holds on the bottom border. `area` is the pane's: when the tabs, the right
+/// part and a column of border between them do not fit inside its corners, the right part is left
+/// off rather than drawn over the tabs, and the status line still says how far the scan is.
 pub(super) fn pane_block(m: &Model, active: Pane, area: Rect) -> Block<'static> {
     let tab_line = Line::from(tabs(active));
     let mut block = Block::default()
         .borders(Borders::ALL)
         .title_top(tab_line.clone());
-    if let Some(progress) = m.progress.title() {
-        let progress = Line::from(format!(" {progress} ")).right_aligned();
-        let needed = tab_line.width() + 1 + progress.width();
-        if needed <= usize::from(block.inner(area).width) {
-            block = block.title_top(progress);
-        }
+    // While a scan runs, how far it is; else the view's name.
+    let right = m.progress.title().unwrap_or_else(|| m.run.shown_name());
+    let right = Line::from(format!(" {right} ")).right_aligned();
+    let needed = tab_line.width() + 1 + right.width();
+    if needed <= usize::from(block.inner(area).width) {
+        block = block.title_top(right);
     }
     block
 }
@@ -729,11 +730,11 @@ mod tests {
     fn the_list_groups_repeats_and_counts_findings() {
         let m = sample();
         let screen = render(&m, 160, 20);
-        // The top border: the tabs, and nothing else with no scan running.
+        // The top border: the tabs, and the view's name at the right.
         let top: String = screen.lines().next().unwrap().chars().take(80).collect();
         let rest = top
             .strip_prefix("┌ findings  files ")
-            .and_then(|r| r.strip_suffix('┐'))
+            .and_then(|r| r.strip_suffix(" run 2026-10-17T04-39-18 ┐"))
             .unwrap_or_else(|| panic!("{top}"));
         assert!(rest.chars().all(|c| c == '─'), "{top}");
         // The bottom border: the counts and the filter, right-aligned.
@@ -963,6 +964,24 @@ mod tests {
     }
 
     #[test]
+    fn the_top_border_names_the_view_while_no_scan_runs() {
+        let mut m = sample();
+        m.run.of_paths = true;
+        m.run.paths = vec!["/m/K-On!".into()];
+        let screen = render(&m, 160, 20);
+        assert!(screen.contains("─ K-On! ┐"), "{screen}");
+        m.run.paths.push("/m/Other".into());
+        let screen = render(&m, 160, 20);
+        assert!(screen.contains("─ K-On! +1 ┐"), "{screen}");
+        // Too narrow for the tabs, a column of border and the name: 50 columns leave 23 inside the
+        // list pane's corners, and ` findings  files ` and ` K-On! +1 ` take 17 and 10.
+        let screen = render(&m, 50, 20);
+        let top: String = screen.lines().next().unwrap().chars().take(25).collect();
+        assert!(top.starts_with("┌ findings  files ─"), "{top}");
+        assert!(!top.contains("K-On"), "{top}");
+    }
+
+    #[test]
     fn the_files_view_shows_each_files_stage_and_the_selected_ones_log() {
         use crate::review::model::tests_support::path;
         use crate::scan::Event;
@@ -1002,7 +1021,7 @@ mod tests {
             "{screen}"
         );
         assert!(screen.contains("scan 1/2 · 1 finding"), "{screen}");
-        // Once the scan ends, its progress leaves the border.
+        // Once the scan ends, the view's name takes the progress's place.
         update::update(
             &mut m,
             Msg::ScanEnded(Ok(crate::scan::Summary::default())),
@@ -1012,7 +1031,7 @@ mod tests {
         let top: String = screen.lines().next().unwrap().chars().take(80).collect();
         let rest = top
             .strip_prefix("┌ findings  files ")
-            .and_then(|r| r.strip_suffix('┐'))
+            .and_then(|r| r.strip_suffix(" run 2026-10-17T04-39-18 ┐"))
             .unwrap_or_else(|| panic!("{top}"));
         assert!(rest.chars().all(|c| c == '─'), "{top}");
         assert!(screen.contains("─ 4 files ┘"), "{screen}");
@@ -1243,7 +1262,7 @@ mod tests {
         // Under the last row of keys: a blank line, a heading, then the costs.
         let last_key = lines
             .iter()
-            .position(|l| l.contains("Tab        findings, files"));
+            .position(|l| l.contains("v          a run, its folders"));
         assert_eq!(last_key, Some(at - 3), "{screen}");
         assert!(lines[at - 1].contains("│ LLM "), "{screen}");
         // Too narrow for one line, it wraps between the parts.

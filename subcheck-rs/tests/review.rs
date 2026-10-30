@@ -202,3 +202,65 @@ fn a_decision_on_a_finding_checked_again_follows_it_through_the_loop() {
     let run = store.run_view(&scan).unwrap();
     assert_eq!(run.state_of(new), State::Pending);
 }
+
+#[test]
+fn v_switches_between_a_run_and_its_folders_through_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open_at(&dir.path().join("subcheck.db")).unwrap();
+    let header = |started: &str| RunHeader {
+        started: started.parse().unwrap(),
+        backend: "claude".into(),
+        command: vec![],
+        prompt_version: 1,
+        version: "0".into(),
+        langs: vec!["eng".into()],
+    };
+    // A season's scan of both files, then a forced one of FILE alone.
+    let season = store
+        .begin_scan(
+            &header("2026-10-17T10:00:00Z"),
+            &[FILE.into(), OTHER.into()],
+        )
+        .unwrap();
+    checked(
+        &mut store,
+        &season,
+        FILE,
+        vec![finding(FILE, "gets trough", "gets through")],
+    );
+    checked(
+        &mut store,
+        &season,
+        OTHER,
+        vec![finding(OTHER, "befor it", "before it")],
+    );
+    let forced = store
+        .begin_scan(&header("2026-10-17T11:00:00Z"), &[FILE.into()])
+        .unwrap();
+    checked(
+        &mut store,
+        &forced,
+        FILE,
+        vec![finding(FILE, "gets trough", "gets through")],
+    );
+    let mut model = Model::new(store.run_view(&forced).unwrap(), HashMap::new());
+    let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
+    let key = |c| Msg::Key(KeyCode::Char(c));
+
+    // The forced run shows FILE alone; `v` opens its folder, OTHER's finding with it.
+    assert_eq!(model.run.files.len(), 1);
+    send(&mut model, key('v'), &mut store, &mut player);
+    assert!(model.run.of_paths, "{:?}", model.status);
+    assert_eq!(model.run.shown_name(), "K-On!");
+    let files: Vec<&str> = model.run.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(files, [FILE, OTHER]);
+    // On OTHER's finding, `v` opens the newest run that named OTHER: the season's.
+    model.selected = model
+        .entries()
+        .iter()
+        .position(|&e| model.run.findings[model.rows[e.row()].members[0]].file == OTHER)
+        .unwrap();
+    send(&mut model, key('v'), &mut store, &mut player);
+    assert!(!model.run.of_paths, "{:?}", model.status);
+    assert_eq!(model.run.name, season.name);
+}

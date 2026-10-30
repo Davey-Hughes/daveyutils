@@ -12,7 +12,8 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
   starts, and each file's findings join the list when the file is done ([Review](#review));
   `--no-tui` prints its log instead.
 - `subcheck review` steps through a run's fixes, or those of the files under some paths, to
-  accept, reject or reword each one.
+  accept, reject or reword each one. With no argument it opens the folders that hold the newest
+  run's files.
 - `subcheck list` prints a run's fixes (or those of the files under some paths) as text, under
   what their LLM calls cost; `--mpv` adds a command that opens each one.
 - `subcheck apply` makes a run's accepted fixes in the MKV files, keeping each original as
@@ -58,6 +59,12 @@ terminal gets the command that finishes it (`subcheck scan --run <run> <paths>`;
 Files `c` queued for after the scan are left unchecked: the question counts them, and the terminal
 gets the command that checks them (`Not checked again: subcheck scan --run <run> --force <files>`).
 
+A bare `subcheck review` opens on the folders that hold the newest run's files: every file
+recorded there, whichever run checked it. The list's top border names what is shown
+(`run 2026-10-29T21-30-49`, or `Spy x Family (2023)`), and `v` switches: from a run to its folders,
+or from folders to the newest run that named the selected file. The selection, the filter and what
+you can undo come along where the other view shows them.
+
 A fix repeated across episodes (an OP lyric, say) is one row; `⏎` expands it into its episodes. A
 season's timing findings on one track are one row too, whatever each episode's fix (`−1 frame ×23 ·
 partial ×1`): `o` opens one paused on the frame that shows the error, `[` `]` step from there, and
@@ -79,6 +86,7 @@ filter, to the next row).
 | `u` | undo this session's last decision or clear |
 | `f` | filter: all, pending, accepted, rejected |
 | `Tab` | the files, or back to the findings |
+| `v` | a run's folders, or from folders, the newest run that named the selected file (not while a scan runs) |
 | `c` | in the files view: check the file again (asks first; while a scan runs, once it ends) |
 | `o` | open the line in mpv, 2 s early, with its subtitle track; again on the same line replays it |
 | Space | pause or resume mpv |
@@ -147,6 +155,9 @@ directories instead, for every file recorded under them:
 subcheck list ~/Videos/K-On!
 subcheck review 2026-10-28T19-04-11
 ```
+
+With neither, they take the folders that hold the newest run's files: after
+`subcheck scan --force E04.mkv`, the whole season E04 is in.
 
 A scan with nothing to check makes no run. On a terminal it opens the screen on its files; in a
 pipe it says how to (`Nothing to check: 12 unchanged (subcheck review '/m/K-On!')`).
@@ -257,8 +268,9 @@ a window cannot be read; `--ffmpeg` names the program.
 
 ## Apply
 
-`subcheck apply` takes the newest run's accepted fixes (or those of the run named, or of the files
-under some paths), with your wording where you reworded one, and makes them in each file:
+`subcheck apply` takes the accepted fixes of the newest run's folders (or those of the run named,
+or of the files under some paths), with your wording where you reworded one, and makes them in each
+file:
 
 1. It finds the events each fix was made from and changes just the words that differ, keeping the
    tags around them (`{\i1}Ihave{\i0}` becomes `{\i1}I have{\i0}`).

@@ -259,27 +259,13 @@ impl Model {
                 .or_else(|| index.get(moved.get(&id)?.first()?))
                 .copied()
         };
-        let find = |m: &Model, held: &Held| -> Option<Entry> {
-            let row_of = |i: usize| m.rows.iter().position(|r| r.members.contains(&i));
-            match held {
-                Held::Member(id) => {
-                    let i = now_at(*id)?;
-                    Some(Entry::Member(row_of(i)?, i))
-                }
-                Held::Row(ids) => ids
-                    .iter()
-                    .find_map(|&id| now_at(id))
-                    .and_then(row_of)
-                    .map(Entry::Row),
-            }
-        };
         self.expanded = expanded
             .iter()
-            .filter_map(|h| find(self, h))
+            .filter_map(|h| self.find(h, &now_at))
             .map(Entry::row)
             .collect();
-        self.last_click = last_click.and_then(|(h, at)| Some((find(self, &h)?, at)));
-        match editor.map(|h| find(self, &h)) {
+        self.last_click = last_click.and_then(|(h, at)| Some((self.find(&h, &now_at)?, at)));
+        match editor.map(|h| self.find(&h, &now_at)) {
             Some(Some(e)) => {
                 if let Some(ed) = &mut self.editor {
                     ed.entry = e;
@@ -309,7 +295,8 @@ impl Model {
         let shown = |e: Entry| entries.iter().position(|&n| n == e);
         self.selected = match selected {
             // A member whose row no longer expands is found by its row.
-            Some(h) => find(self, &h)
+            Some(h) => self
+                .find(&h, &now_at)
                 .and_then(|e| shown(e).or_else(|| shown(Entry::Row(e.row()))))
                 .unwrap_or_else(|| was_at.min(entries.len().saturating_sub(1))),
             None => entries
@@ -324,6 +311,70 @@ impl Model {
             .collect()
     }
 
+    /// Take `view`, the other view of the screen's findings (`v`), with its files' `notes`. What
+    /// pointed at a finding carries over by its ID, which both views share: the selection, else the
+    /// first row with a pending finding, as on opening; the expanded rows; and the undo steps, less
+    /// the findings this view does not show (a step left empty goes). The filter and the pane stay.
+    /// The files view shows the new view's files, the selected file kept where it is one of them.
+    pub fn switch(&mut self, view: Run, notes: HashMap<String, FileNote>) {
+        let selected = self.selected_entry().map(|e| self.hold(e));
+        let expanded: Vec<Held> = self
+            .expanded
+            .iter()
+            .map(|&r| self.hold(Entry::Row(r)))
+            .collect();
+        let file = self
+            .progress
+            .files
+            .get(self.file_selected)
+            .map(|f| f.path.clone());
+        let (rows, names) = group(&view);
+        self.rows = rows;
+        self.track_names = names;
+        self.labels = labels(&view);
+        self.progress.show(&view);
+        self.run = view;
+        self.notes = notes;
+        self.editor = None;
+        self.last_click = None;
+        self.detail_scroll = 0;
+
+        let index: HashMap<u64, usize> = self
+            .run
+            .findings
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.id, i))
+            .collect();
+        let at = |id: u64| index.get(&id).copied();
+        self.expanded = expanded
+            .iter()
+            .filter_map(|h| self.find(h, &at))
+            .map(Entry::row)
+            .collect();
+        for step in &mut self.undo {
+            step.retain(|(id, _)| index.contains_key(id));
+        }
+        self.undo.retain(|step| !step.is_empty());
+        let entries = self.entries();
+        let shown = |e: Entry| entries.iter().position(|&n| n == e);
+        self.selected = selected
+            .and_then(|h| self.find(&h, &at))
+            .and_then(|e| shown(e).or_else(|| shown(Entry::Row(e.row()))))
+            .unwrap_or_else(|| {
+                entries
+                    .iter()
+                    .position(|&e| self.has_pending(e))
+                    .unwrap_or(0)
+            });
+        self.scroll = 0;
+        self.scroll = self.list_scroll(self.area);
+        self.file_selected = file
+            .and_then(|p| self.progress.files.iter().position(|f| f.path == p))
+            .unwrap_or(0);
+        self.file_scroll = 0;
+    }
+
     /// Entry `e` by its findings' IDs ([`Held`]).
     fn hold(&self, e: Entry) -> Held {
         match e {
@@ -335,6 +386,23 @@ impl Model {
                     .collect(),
             ),
             Entry::Member(_, i) => Held::Member(self.finding(i).id),
+        }
+    }
+
+    /// Where `held` is among the rows as they are now; `at` gives a finding's index by its ID, or
+    /// `None` for one that went.
+    fn find(&self, held: &Held, at: &dyn Fn(u64) -> Option<usize>) -> Option<Entry> {
+        let row_of = |i: usize| self.rows.iter().position(|r| r.members.contains(&i));
+        match held {
+            Held::Member(id) => {
+                let i = at(*id)?;
+                Some(Entry::Member(row_of(i)?, i))
+            }
+            Held::Row(ids) => ids
+                .iter()
+                .find_map(|&id| at(id))
+                .and_then(row_of)
+                .map(Entry::Row),
         }
     }
 
@@ -1342,5 +1410,56 @@ mod tests {
         m.refresh(&e01, without);
         assert_eq!(m.selected, 15);
         assert_eq!(m.selected - m.scroll, on_screen);
+    }
+
+    #[test]
+    fn switching_views_keeps_what_points_at_findings_both_show() {
+        use tests_support::{path, sample};
+        // The other view: the sample without E02.
+        let without_e02 = |m: &Model| {
+            let mut other = m.run.clone();
+            other.of_paths = true;
+            other.paths = vec!["/m/K-On!".into()];
+            other.findings.retain(|f| f.file != path(2));
+            other.files.retain(|f| f.path != path(2));
+            other
+        };
+        let mut m = sample();
+        // The lyric row (findings 1, 2 and 4) expanded, the selection on its E03 member, a filter,
+        // and undo steps on findings 3 and 4, and on 2.
+        m.expanded.insert(0);
+        m.filter = Filter::Only(State::Pending);
+        m.selected = m
+            .entries()
+            .iter()
+            .position(|&e| e == Entry::Member(0, 3))
+            .unwrap();
+        m.undo = vec![vec![(3, None), (4, None)], vec![(2, None)]];
+        let other = without_e02(&m);
+        m.switch(other, HashMap::new());
+        assert!(m.run.of_paths);
+        // Findings 1 and 4, still one row, still expanded; the selection on finding 4.
+        assert_eq!(
+            m.rows,
+            [Row {
+                members: vec![0, 1]
+            }]
+        );
+        assert!(m.expanded.contains(&0));
+        assert_eq!(m.selected_entry(), Some(Entry::Member(0, 1)));
+        assert_eq!(m.filter, Filter::Only(State::Pending));
+        assert_eq!(m.undo, [vec![(4, None)]]);
+        assert_eq!(m.progress.files.len(), 2);
+        // A selection whose finding the view does not show goes to the first row with a pending
+        // finding.
+        let mut m = sample();
+        m.selected = m
+            .entries()
+            .iter()
+            .position(|&e| e == Entry::Row(1))
+            .unwrap();
+        let other = without_e02(&m);
+        m.switch(other, HashMap::new());
+        assert_eq!(m.selected, 0);
     }
 }

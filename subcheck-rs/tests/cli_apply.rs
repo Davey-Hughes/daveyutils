@@ -909,7 +909,8 @@ fn tracks_only_then_a_remux_elsewhere_then_check_then_apply_records() {
     }
     let s = Setup::new();
     let out = s.root.join("tracks");
-    let o = s.apply(&["--tracks-only", out.to_str().unwrap()]);
+    let name = s.run().name;
+    let o = s.apply(&[&name, "--tracks-only", out.to_str().unwrap()]);
     let text = stdout(&o);
     assert!(o.status.success(), "{text}");
     for (id, ext) in [(2, "ass"), (3, "ass"), (4, "srt")] {
@@ -923,7 +924,6 @@ fn tracks_only_then_a_remux_elsewhere_then_check_then_apply_records() {
         std::fs::read(&s.file).unwrap(),
         std::fs::read(fixture("apply.mkv")).unwrap()
     );
-    let name = s.run().name;
     assert!(
         text.ends_with(&format!(
             "\nOnce they are remuxed, check them with: subcheck apply {name} --check\n"
@@ -1029,7 +1029,8 @@ fn a_run_with_nothing_accepted_has_nothing_to_do() {
         .map(|finding| decided(finding, State::Rejected))
         .collect();
     s.store().decide(&rejected).unwrap();
-    let o = s.apply(&["--dry-run"]);
+    let name = s.run().name;
+    let o = s.apply(&[&name, "--dry-run"]);
     assert!(o.status.success());
     assert!(
         stdout(&o).starts_with("No accepted fixes in run "),

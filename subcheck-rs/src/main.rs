@@ -98,10 +98,10 @@ enum Command {
         no_tui: bool,
     },
     /// Accept, reject or reword each finding of a run, with a key that opens it in mpv: the newest
-    /// run, the one named, or the files under some paths.
+    /// run's folders, the run named, or the files under some paths.
     Review {
         /// A run name, as `scan` prints it; or MKV files and directories, for every file under them
-        /// as it is now. Default: the newest run.
+        /// as it is now. Default: the newest run's folders.
         #[arg(value_name = "RUN | PATHS")]
         run: Vec<String>,
     },
@@ -142,17 +142,17 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Make a run's accepted fixes in its MKV files: the newest run, the one named, or those of the
-    /// files under some paths.
+    /// Make a run's accepted fixes in its MKV files: those of the newest run's folders, the run
+    /// named, or the files under some paths.
     ///
     /// Each file is remuxed with mkvmerge beside the original, checked against it, and swapped
     /// in; the original is kept as <name>.mkv.orig.
     Apply(ApplyArgs),
-    /// Show a run's findings as text: the newest run, the one named, or those of the files under
+    /// Show a run's findings as text: the newest run's folders, the run named, or the files under
     /// some paths.
     List {
         /// A run name, as `scan` prints it; or MKV files and directories, for every file under them
-        /// as it is now. Default: the newest run.
+        /// as it is now. Default: the newest run's folders.
         #[arg(value_name = "RUN | PATHS")]
         run: Vec<String>,
         /// Only findings you accepted.
@@ -174,7 +174,7 @@ enum Command {
 #[allow(clippy::struct_excessive_bools)] // command-line flags
 struct ApplyArgs {
     /// A run name, as `scan` prints it; or MKV files and directories, for every file under them as
-    /// it is now. Default: the newest run.
+    /// it is now. Default: the newest run's folders.
     #[arg(value_name = "RUN | PATHS")]
     run: Vec<String>,
     /// Show what would change, event by event; write nothing.
