@@ -9,19 +9,23 @@ use crate::timespec::{DayWords, parse_timespec};
 /// Padding added to every detected reset time to absorb scheduler latency.
 const PADDING_MINUTES: i64 = 2;
 
-/// The built-in clock-shape banner alternation.
-const CLOCK_BASE: &str = r"(?:session limit|current session).*resets";
+/// The built-in clock-shape banner alternation. Claude Code 2.1.312 renamed
+/// its session limit the 5-hour limit, and older builds still print the first.
+/// No colon may come between the two halves, for the reason given at
+/// [`WEEKLY_BASE`]: "5-hour limit: 40% used · resets 3pm" is a usage report.
+const CLOCK_BASE: &str = r"(?:session limit|5-hour limit|current session)[^:\n]*resets";
 
 /// The built-in duration-shape banner alternation.
 const DURATION_BASE: &str = r"quota reached";
 
-/// The built-in weekly-shape banner alternation.
+/// The built-in weekly-shape banner alternation. Claude Code's per-model
+/// limits (Opus, Sonnet) are seven-day windows, dated like the weekly one.
 ///
 /// No colon may come between the two halves. Claude's banner has none, and the
 /// weekly row of Codex's `/status` card — "Weekly limit:  [███░░] 21% left
 /// (resets 09:12 on 18 Oct)" — has one. That row is a usage report, not a limit
 /// anyone has hit, and it is drawn under the banner that is.
-const WEEKLY_BASE: &str = r"weekly limit[^:\n]*resets";
+const WEEKLY_BASE: &str = r"(?:weekly|opus|sonnet) limit[^:\n]*resets";
 
 /// The built-in Codex banner: "You've hit your usage limit. <a sentence that
 /// depends on the plan> try again at". Matched against [`unwrap_paragraphs`]'
@@ -541,6 +545,40 @@ mod tests {
         assert_eq!((z.hour(), z.minute()), (15, 2));
     }
 
+    /// Claude Code 2.1.312 calls the session limit the 5-hour limit. Both are
+    /// captured verbatim: the older from transcripts up to 2026-10-28, the
+    /// newer from a live pane on 2026-10-30. `now()` is 10:00 UTC == 03:00 in
+    /// Los Angeles, so 3:20am there is 10:20 UTC.
+    #[test]
+    fn detects_the_captured_session_banner_under_both_names() {
+        for name in ["session limit", "5-hour limit"] {
+            let pane = format!("  ⎿  You've hit your {name} · resets 3:20am (America/Los_Angeles)");
+            let z = reset_of(detect_reset(&pane, &now(), None, None, None));
+            assert_eq!(
+                z.timestamp().to_string(),
+                "2026-07-13T10:22:00Z",
+                "{name:?}"
+            );
+        }
+    }
+
+    /// A usage report, like the weekly row of Codex's `/status` card, is not
+    /// a limit anyone has hit.
+    #[test]
+    fn a_session_usage_row_is_not_a_banner() {
+        for pane in [
+            "5-hour limit: 40% used · resets 3pm",
+            "Session limit: 40% used · resets 3pm",
+            "Current session: 40% used · resets 3pm",
+        ] {
+            assert_eq!(
+                detect_reset(pane, &now(), None, None, None),
+                Detection::None,
+                "{pane:?}"
+            );
+        }
+    }
+
     #[test]
     fn detects_agy_duration_banner_with_padding() {
         let pane = "quota reached. Resets in 1h30m";
@@ -804,6 +842,22 @@ mod tests {
         let z = reset_of(detect_reset(pane, &now(), None, None, None));
         // 08:00 America/Los_Angeles on Jul 28 + 2m padding == 15:02 UTC.
         assert_eq!(z.timestamp().to_string(), "2026-07-28T15:02:00Z");
+    }
+
+    /// Claude Code's per-model limits are weekly windows too, and print the
+    /// weekly banner with the model's name in it. Read as a session banner,
+    /// "8am" at 10:00 on Monday the 13th would be tomorrow, not Thursday.
+    #[test]
+    fn a_model_limit_is_a_weekly_banner() {
+        for name in ["Opus limit", "Sonnet limit"] {
+            let pane = format!("You've hit your {name} · resets Jul 16, 8am");
+            let z = reset_of(detect_reset(&pane, &now(), None, None, None));
+            assert_eq!(
+                (z.date(), z.hour(), z.minute()),
+                (jiff::civil::date(2026, 7, 16), 8, 2),
+                "{name:?}"
+            );
+        }
     }
 
     /// The banner's wording is not a stable interface -- it has already moved

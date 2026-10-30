@@ -29,6 +29,11 @@ const KEYPRESS_PAUSE: Duration = Duration::from_millis(500);
 /// started within the same second.
 pub const SERVER_FORMAT: &str = "#{start_time}-#{pid}";
 
+/// A pane's title, or nothing if tmux left it at its default, the host name.
+/// What a program puts there (Claude Code its session's name, a shell its
+/// directory) says which pane it is. The host name says the same of them all.
+pub const TITLE_FORMAT: &str = "#{?#{==:#{pane_title},#{host}},,#{pane_title}}";
+
 /// [`SERVER_FORMAT`]'s answer, or `None` if it is not one: a tmux too old to
 /// know `start_time` answers `-4820`.
 pub fn parse_server(s: &str) -> Option<String> {
@@ -48,6 +53,9 @@ pub struct PaneLocation {
     /// The server the id belongs to, as [`SERVER_FORMAT`] reads it, or `None`
     /// if tmux would not say.
     pub server: Option<String>,
+    /// The session in the pane, as
+    /// [`session_name`](crate::tmux_panes::session_name) reads its title.
+    pub name: Option<String>,
 }
 
 /// A specific tmux pane, addressed by tmux's target syntax (e.g. "bot:0.1").
@@ -106,17 +114,19 @@ impl TmuxTarget {
             "-t",
             &self.pane,
             // The server first, from the same answer as the id it vouches for.
+            // The title last, where a tab in it cannot shift the others.
             &format!(
-                "{SERVER_FORMAT}\t#{{pane_id}}\t#{{session_name}}:#{{window_index}}.#{{pane_index}}"
+                "{SERVER_FORMAT}\t#{{pane_id}}\t#{{session_name}}:#{{window_index}}.#{{pane_index}}\t{TITLE_FORMAT}"
             ),
         ])?;
         let text = String::from_utf8_lossy(&out.stdout);
-        let mut fields = text.trim_end_matches('\n').splitn(3, '\t');
+        let mut fields = text.trim_end_matches('\n').splitn(4, '\t');
         match (fields.next(), fields.next(), fields.next()) {
             (Some(server), Some(id), Some(position)) if id.starts_with('%') => Ok(PaneLocation {
                 id: id.to_string(),
                 position: position.to_string(),
                 server: parse_server(server),
+                name: fields.next().and_then(crate::tmux_panes::session_name),
             }),
             _ => bail!("no tmux pane {}", self.pane),
         }

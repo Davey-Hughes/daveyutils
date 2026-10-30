@@ -86,6 +86,7 @@ fn format_jobs_keeps_its_columns_aligned_around_a_long_pane_label() {
                 ("%2".to_string(), "s:0.1".to_string()),
             ]
             .into(),
+            names: std::collections::HashMap::new(),
         },
     );
     let lines: Vec<&str> = out.lines().collect();
@@ -104,9 +105,35 @@ fn format_jobs_shows_where_each_pane_sits_now() {
         &Positions {
             server: None,
             panes: [("%19".to_string(), "main:11.0".to_string())].into(),
+            names: std::collections::HashMap::new(),
         },
     );
     assert!(out.contains("main:11.0 (%19)"), "{out}");
+    assert!(!out.contains("NAME"), "no job has a name: {out}");
+}
+
+/// The session in each pane is named in a column of its own, and a pane
+/// whose title gives no name leaves it blank without shifting the rest.
+#[test]
+fn format_jobs_names_the_session_in_each_pane() {
+    let out = format_jobs(
+        &[spec("%13").into_job(1), spec("%2").into_job(2)],
+        &Positions {
+            server: None,
+            panes: [
+                ("%13".to_string(), "main:5.0".to_string()),
+                ("%2".to_string(), "s:0.1".to_string()),
+            ]
+            .into(),
+            names: [("%13".to_string(), "warmer-sessions".to_string())].into(),
+        },
+    );
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("ID   NAME"), "{out}");
+    assert!(lines[1].contains("warmer-sessions main:5.0 (%13)"), "{out}");
+    let pane = lines[0].find("PANE").unwrap();
+    assert!(lines[1][pane..].starts_with("main:5.0"), "{out}");
+    assert!(lines[2][pane..].starts_with("s:0.1"), "{out}");
 }
 
 #[test]

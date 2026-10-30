@@ -18,7 +18,7 @@ use crate::job::{Job, JobSpec, TargetSpec};
 use crate::paths;
 use crate::target::{PaneDims, Target, tmux::TmuxTarget};
 use crate::timespec::parse_timespec;
-use crate::tmux_panes::{Positions, label};
+use crate::tmux_panes::{Positions, named_label};
 
 /// The mode `dispatch` resolves a parsed CLI + TTY state into.
 #[derive(Debug, PartialEq, Eq)]
@@ -377,6 +377,7 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
     let server = loc.server.clone();
     let positions = Positions {
         server: server.clone(),
+        names: loc.name.map(|n| (loc.id.clone(), n)).into_iter().collect(),
         panes: std::collections::HashMap::from([(loc.id, loc.position)]),
     };
     let opts = resolve_options(cli);
@@ -483,7 +484,7 @@ fn job_summary(
     tz: &jiff::tz::TimeZone,
     now: jiff::Timestamp,
 ) -> String {
-    let pane = label(&spec.target, positions);
+    let pane = named_label(&spec.target, positions);
     let when = spec.fire_at.to_zoned(tz.clone());
     let countdown = human_countdown(spec.fire_at.duration_since(now).as_secs());
     let what = match spec.messages.len() {
@@ -511,23 +512,34 @@ fn job_summary(
     )
 }
 
-/// Render pending jobs as a plain table, each pane labelled from `positions`.
+/// Render pending jobs as a plain table, each named and labelled from
+/// `positions`.
 pub fn format_jobs(jobs: &[Job], positions: &Positions) -> String {
     if jobs.is_empty() {
         return "no pending nudge jobs".to_string();
     }
-    // As wide as the longest label, so the columns after it stay aligned.
+    // As wide as the longest name and label, so the columns after them stay
+    // aligned. No NAME column when no job has a name.
+    let (names, widest_name) = crate::tmux_panes::job_names(jobs, positions);
     let (labels, widest) = crate::tmux_panes::job_labels(jobs, positions);
+    let n = widest_name.max(4);
     let w = widest.max(20);
-    // `writeln!` formats straight into `out`; `push_str(&format!(..))` would
+    // `write!` formats straight into `out`; `push_str(&format!(..))` would
     // allocate a String per row first. Writing to a String cannot fail.
     let mut out = String::new();
-    let _ = writeln!(out, "{:<4} {:<w$} {:<20} MSGS", "ID", "PANE", "FIRE (UTC)");
-    for (j, pane) in jobs.iter().zip(&labels) {
+    let _ = write!(out, "{:<4} ", "ID");
+    if widest_name > 0 {
+        let _ = write!(out, "{:<n$} ", "NAME");
+    }
+    let _ = writeln!(out, "{:<w$} {:<20} MSGS", "PANE", "FIRE (UTC)");
+    for ((j, name), pane) in jobs.iter().zip(&names).zip(&labels) {
+        let _ = write!(out, "{:<4} ", j.id);
+        if widest_name > 0 {
+            let _ = write!(out, "{name:<n$} ");
+        }
         let _ = writeln!(
             out,
-            "{:<4} {pane:<w$} {:<20} {}",
-            j.id,
+            "{pane:<w$} {:<20} {}",
             j.fire_at.to_string(),
             j.messages.len()
         );

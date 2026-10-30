@@ -24,7 +24,9 @@ name = "nudge"
 # 0.7.0 is load-bearing the same way: a 0.6.0 daemon drops a Schedule's
 # `server` stamp silently, so it would fire a job into whichever pane took its
 # id after a tmux restart. It also presses `i` for Codex's Normal mode, not `A`.
-version = "0.7.0"
+# 0.8.0 is load-bearing the way 0.5.0 was: a 0.7.0 daemon does not know Claude
+# Code's "5-hour limit" banner, and under --verify would skip it.
+version = "0.8.0"
 edition = "2024"
 description = "Rate-limit auto-resumer for AI CLIs in tmux"
 license = "GPL-3.0-or-later"

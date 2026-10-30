@@ -231,6 +231,43 @@ fn a_scheduled_job_stores_its_panes_id_not_its_position() {
     );
 }
 
+/// The confirmation and the list name the session in the pane, from the
+/// title Claude Code gives it, and say nothing of the host name tmux gives a
+/// pane nothing has titled.
+#[test]
+fn the_confirmation_and_the_list_name_the_session_in_the_pane() {
+    if !common::tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let f = fixture(&[]);
+    let tmux = two_panes(&f.home);
+    tmux.run(&["select-pane", "-t", "bot:0.1", "-T", "✳ warmer-sessions"]);
+    let id = tmux.run(&["display-message", "-p", "-t", "bot:0.1", "#{pane_id}"]);
+    let host = tmux.run(&["display-message", "-p", "-t", "bot:0.0", "#{host}"]);
+
+    let named = stdout_of(
+        "schedule",
+        &run_nudge(&f.home, &["-p", "bot:0.1", "-m", "now + 2 hours"]),
+    );
+    let unnamed = stdout_of(
+        "schedule",
+        &run_nudge(&f.home, &["-p", "bot:0.0", "-m", "now + 2 hours"]),
+    );
+
+    assert!(
+        named.contains(&format!("warmer-sessions · bot:0.1 ({id})")),
+        "{named}"
+    );
+    assert!(!unnamed.contains(&host), "{unnamed}");
+    let list = stdout_of("list", &run_nudge(&f.home, &["--list"]));
+    assert!(
+        list.contains(&format!("warmer-sessions bot:0.1 ({id})")),
+        "{list}"
+    );
+    assert!(!list.contains(&host), "{list}");
+}
+
 /// The bug end to end: the windows renumber after scheduling, and the job
 /// still names the pane it was given, now at its new position.
 #[test]

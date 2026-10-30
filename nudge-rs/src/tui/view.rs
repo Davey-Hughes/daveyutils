@@ -130,41 +130,74 @@ fn jobs_view(model: &Model, f: &mut Frame, area: Rect) {
     // As wide as the longest label, so the id at the end of one is not cut.
     let (labels, widest) = crate::tmux_panes::job_labels(&model.jobs, &model.positions);
     let pane_width = u16::try_from(widest + 1).unwrap_or(u16::MAX).max(22);
-    let rows = model
-        .jobs
-        .iter()
-        .zip(labels)
-        .enumerate()
-        .map(|(i, (j, label))| {
-            let delta = j.fire_at.duration_since(model.now).as_secs();
-            let flags: String = [(j.verify, 'v'), (j.notify, 'n'), (j.auto_retry, 'a')]
-                .iter()
-                .filter(|(on, _)| *on)
-                .map(|(_, c)| *c)
-                .collect();
-            let style = if i == model.selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            Row::new(vec![
-                j.id.to_string(),
-                label,
-                human_countdown(delta),
-                j.messages.len().to_string(),
-                flags,
-            ])
-            .style(style)
-        });
-    let widths = [
-        Constraint::Length(5),
-        Constraint::Length(pane_width),
-        Constraint::Length(12),
-        Constraint::Length(5),
-        Constraint::Length(6),
+    // The names get what the other columns leave, up to the longest one. They
+    // get no column when no job has one, or when fewer cells are left than
+    // the header needs. A name cut short still says which session it is; a
+    // pane id cut short names another pane.
+    let (names, widest_name) = crate::tmux_panes::job_names(&model.jobs, &model.positions);
+    // Which columns show, and how wide: one list for the header, the widths
+    // and every row. NAME's width is worked out from the others.
+    let mut columns = [
+        ("ID", 5, true),
+        ("NAME", 0, false),
+        ("PANE", pane_width, true),
+        ("FIRES IN", 12, true),
+        ("MSGS", 5, true),
+        ("FLAGS", 6, true),
     ];
+    // What the other columns take: each one and the space after it, and the
+    // two borders less the last column's space.
+    let others = columns
+        .iter()
+        .filter(|(.., on)| *on)
+        .fold(1, |sum: u16, &(_, width, _)| {
+            sum.saturating_add(width).saturating_add(1)
+        });
+    let name_width =
+        cols(widest_name.max(4)).min(area.width.saturating_sub(others).saturating_sub(1));
+    columns[1] = ("NAME", name_width, widest_name > 0 && name_width >= 4);
+    let shown = |cells: [String; 6]| {
+        cells
+            .into_iter()
+            .zip(columns)
+            .filter_map(|(cell, (.., on))| on.then_some(cell))
+    };
+    let rows =
+        model
+            .jobs
+            .iter()
+            .zip(names)
+            .zip(labels)
+            .enumerate()
+            .map(|(i, ((j, name), label))| {
+                let delta = j.fire_at.duration_since(model.now).as_secs();
+                let flags: String = [(j.verify, 'v'), (j.notify, 'n'), (j.auto_retry, 'a')]
+                    .iter()
+                    .filter(|(on, _)| *on)
+                    .map(|(_, c)| *c)
+                    .collect();
+                let style = if i == model.selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                Row::new(shown([
+                    j.id.to_string(),
+                    name.to_string(),
+                    label,
+                    human_countdown(delta),
+                    j.messages.len().to_string(),
+                    flags,
+                ]))
+                .style(style)
+            });
+    let header = shown(columns.map(|(title, ..)| title.to_string()));
+    let widths = columns
+        .iter()
+        .filter(|(.., on)| *on)
+        .map(|&(_, width, _)| Constraint::Length(width));
     let table = Table::new(rows, widths)
-        .header(Row::new(vec!["ID", "PANE", "FIRES IN", "MSGS", "FLAGS"]))
+        .header(Row::new(header))
         .block(block);
     f.render_widget(table, area);
 }
@@ -242,22 +275,64 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     } else {
         "auto-retry".to_string()
     };
+    // The focused text field and the char its cursor is on (Normal) or before
+    // (Insert) — `None` on selector fields, which show no cursor.
+    let editing = form.focused_text().map(|v| {
+        let len = v.chars().count();
+        let at = match form.nav_mode {
+            VimMode::Normal => form.cursor.min(len.saturating_sub(1)),
+            VimMode::Insert => form.cursor.min(len),
+        };
+        (form.focus, at)
+    });
+
+    // The message wraps under its label, onto as many rows as it needs and the
+    // screen can spare: the preview keeps 3 rows, and the form 9 (borders, the
+    // six other fields, a blank). Past that, the rows shown follow the cursor.
+    let msg_label = format!("{}Message: ", mark(FormField::Message));
+    let label_w = msg_label.chars().count();
+    let starts = wrap_starts(
+        &message,
+        usize::from(area.width.saturating_sub(2)).saturating_sub(label_w),
+    );
+    let msg_rows = starts
+        .len()
+        .min(usize::from(area.height.saturating_sub(12)).max(1));
+    let msg_cursor = match editing {
+        Some((FormField::Message, at)) => Some(wrapped_position(&starts, at)),
+        _ => None,
+    };
+    let top = msg_cursor.map_or(0, |(row, _)| (row + 1).saturating_sub(msg_rows));
+    let msg_chars: Vec<char> = message.chars().collect();
+    let msg_txt = (top..top + msg_rows).map(|row| {
+        let end = starts.get(row + 1).copied().unwrap_or(msg_chars.len());
+        let text: String = msg_chars[starts[row]..end].iter().collect();
+        if row == top {
+            format!("{msg_label}{text}")
+        } else {
+            format!("{}{text}", " ".repeat(label_w))
+        }
+    });
+
     // Field rows, in `FORM_ORDER`. Kept as strings so the cursor can be placed at
-    // the exact end of the focused text row below.
-    let rows_txt = [
-        format!("{}Pane:    {}", mark(FormField::Pane), pane),
-        format!("{}When:    {}", mark(FormField::When), when),
-        format!("{}Message: {}", mark(FormField::Message), message),
-        format!("{}{} verify", mark(FormField::Verify), onoff(form.verify)),
-        format!("{}{} notify", mark(FormField::Notify), onoff(form.notify)),
-        format!(
-            "{}{} {}",
-            mark(FormField::AutoRetry),
-            onoff(form.auto_retry),
-            auto_retry_label
-        ),
-        format!("{}[ Schedule ]", mark(FormField::Submit)),
-    ];
+    // its exact column below.
+    let when_txt = format!("{}When:    {}", mark(FormField::When), when);
+    let rows_txt: Vec<String> = [format!("{}Pane:    {}", mark(FormField::Pane), pane)]
+        .into_iter()
+        .chain([when_txt.clone()])
+        .chain(msg_txt)
+        .chain([
+            format!("{}{} verify", mark(FormField::Verify), onoff(form.verify)),
+            format!("{}{} notify", mark(FormField::Notify), onoff(form.notify)),
+            format!(
+                "{}{} {}",
+                mark(FormField::AutoRetry),
+                onoff(form.auto_retry),
+                auto_retry_label
+            ),
+            format!("{}[ Schedule ]", mark(FormField::Submit)),
+        ])
+        .collect();
     let mut lines: Vec<Line> = rows_txt.iter().map(|s| Line::from(s.clone())).collect();
     // The vim mode lives in the bottom bar now — no duplicate in this title.
     let title = match form.mode {
@@ -267,7 +342,10 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(10)]) // preview grows, form fixed
+        .constraints([
+            Constraint::Min(3), // preview grows
+            Constraint::Length(cols(9 + msg_rows)),
+        ])
         .split(area);
     let preview_area = rows[0];
     let form_area = rows[1];
@@ -286,27 +364,23 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
         preview_area,
     );
 
-    // The focused text row (message, or When-while-Manual) and its editable
-    // value length — `None` on selector fields, which show no cursor.
-    let editable = form.focused_text().map(|v| {
-        let idx = if form.focus == FormField::When { 1 } else { 2 };
-        (idx, v.chars().count())
+    // The cursor's row in the form and its column: the message's from the wrap,
+    // When's (while Manual) after its label.
+    let cursor = editing.map(|(field, at)| match (field, msg_cursor) {
+        (FormField::Message, Some((row, col))) => (2 + row - top, label_w + col),
+        _ => (
+            1,
+            when_txt.chars().count() - form.manual_time.chars().count() + at,
+        ),
     });
 
     // Normal mode draws a block cursor (reverse video on the char under it) by
     // rebuilding that row's spans. No cursor-style escape is emitted, so the
     // terminal's own cursor shape/blink is untouched (Insert uses it below).
     if form.nav_mode == VimMode::Normal
-        && let Some((idx, value_len)) = editable
+        && let Some((idx, col)) = cursor
     {
         let rchars: Vec<char> = rows_txt[idx].chars().collect();
-        let vstart = rchars.len() - value_len;
-        let col = vstart
-            + if value_len == 0 {
-                0
-            } else {
-                form.cursor.min(value_len - 1)
-            };
         let before: String = rchars[..col.min(rchars.len())].iter().collect();
         let under = rchars.get(col).copied().unwrap_or(' ');
         let after: String = rchars
@@ -334,7 +408,7 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
         let now_zoned = model.now.to_zoned(model.defaults.tz.clone());
         if crate::timespec::parse_timespec(&form.manual_time, &now_zoned).is_err() {
             let value_len = cols(form.manual_time.chars().count());
-            let vstart = cols(rows_txt[1].chars().count()).saturating_sub(value_len);
+            let vstart = cols(when_txt.chars().count()).saturating_sub(value_len);
             let y = inner.y + 1; // the When row
             let buf = f.buffer_mut();
             for col in 0..value_len {
@@ -349,14 +423,38 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     // Insert mode places the terminal's own cursor (a bar) at the edit position —
     // position+show only, so it keeps the terminal's shape and blink setting.
     if form.nav_mode == VimMode::Insert
-        && let Some((idx, value_len)) = editable
+        && let Some((idx, col)) = cursor
     {
-        let vstart = rows_txt[idx].chars().count() - value_len;
-        let cursor_x = (inner.x + cols(vstart) + cols(form.cursor.min(value_len)))
-            .min(inner.right().saturating_sub(1));
+        let cursor_x = (inner.x + cols(col)).min(inner.right().saturating_sub(1));
         let cursor_y = (inner.y + cols(idx)).min(inner.bottom().saturating_sub(1));
         f.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+/// Where each row of `value` starts, in chars, wrapped to `width` columns. A
+/// row breaks after its last space, the space staying at the end of the row,
+/// or mid-word when a word fills the row by itself. A last row as wide as the
+/// field breaks too, so the cursor after the last char has a column.
+fn wrap_starts(value: &str, width: usize) -> Vec<usize> {
+    let chars: Vec<char> = value.chars().collect();
+    let width = width.max(1);
+    let mut starts = vec![0];
+    let mut start = 0;
+    while chars.len() - start >= width {
+        let row = &chars[start..start + width];
+        start += row
+            .iter()
+            .rposition(|&c| c == ' ')
+            .map_or(width, |space| space + 1);
+        starts.push(start);
+    }
+    starts
+}
+
+/// The row of `starts` that char `at` falls on, and its column there.
+fn wrapped_position(starts: &[usize], at: usize) -> (usize, usize) {
+    let row = starts.partition_point(|&s| s <= at).saturating_sub(1);
+    (row, at - starts[row])
 }
 
 /// A character count as a terminal column/row offset.
@@ -637,6 +735,90 @@ mod tests {
         m.positions.panes = [("%19".to_string(), "main:11.0".to_string())].into();
         let out = render(&m);
         assert!(out.contains("main:11.0 (%19)"), "{out}");
+    }
+
+    fn job_in(pane: &str) -> crate::job::Job {
+        crate::job::Job {
+            id: 12,
+            target: TargetSpec::Tmux {
+                pane: pane.into(),
+                server: None,
+            },
+            messages: vec!["please continue".into()],
+            send_delay_secs: 0.75,
+            fire_at: "2026-07-16T14:14:00Z".parse().unwrap(),
+            notify: false,
+            verify: false,
+            auto_retry: false,
+            retries_left: 0,
+            settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
+        }
+    }
+
+    #[test]
+    fn a_job_row_names_the_session_in_its_pane() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::Jobs;
+        m.jobs = vec![job_in("%13")];
+        m.positions.panes = [("%13".to_string(), "main:5.0".to_string())].into();
+        m.positions.names = [("%13".to_string(), "ra-scan-3".to_string())].into();
+        let out = render(&m);
+        let row = out.lines().find(|l| l.contains("%13")).unwrap_or("");
+        assert!(row.contains("ra-scan-3"), "{out}");
+        assert!(out.contains("NAME"), "{out}");
+    }
+
+    /// A name longer than the room left is cut, and the pane id is not.
+    #[test]
+    fn a_long_session_name_leaves_the_pane_id_whole() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::Jobs;
+        m.jobs = vec![job_in("%202")];
+        m.positions.panes = [("%202".to_string(), "main:10.0".to_string())].into();
+        m.positions.names = [("%202".to_string(), "Nudge banner ".repeat(5))].into();
+        let out = render(&m);
+        assert!(out.contains("main:10.0 (%202)"), "{out}");
+        assert!(out.contains("2h 14m"), "{out}");
+        assert!(out.contains("FLAGS"), "{out}");
+    }
+
+    /// With no names to show, the table is as it was before it had a NAME
+    /// column, so the PANE column still fits a narrow terminal.
+    #[test]
+    fn no_names_leave_no_name_column() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::Jobs;
+        m.jobs = vec![job_in("%202")];
+        m.positions.panes = [("%202".to_string(), "main:10.0".to_string())].into();
+        let mut term = Terminal::new(TestBackend::new(58, 10)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        let buf = term.backend().buffer();
+        let out: String = (0..10)
+            .map(|y| (0..58).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(out.contains("main:10.0 (%202)"), "{out}");
+        assert!(!out.contains("NAME"), "{out}");
+    }
+
+    /// A NAME column too narrow for its header says nothing, so a terminal
+    /// that leaves it fewer than 4 cells has none.
+    #[test]
+    fn no_room_for_names_leaves_no_name_column() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::Jobs;
+        m.jobs = vec![job_in("%202")];
+        m.positions.panes = [("%202".to_string(), "main:10.0".to_string())].into();
+        m.positions.names = [("%202".to_string(), "ra-scan-3".to_string())].into();
+        let mut term = Terminal::new(TestBackend::new(59, 10)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        let buf = term.backend().buffer();
+        let out: String = (0..10)
+            .map(|y| (0..59).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(out.contains("main:10.0 (%202)"), "{out}");
+        assert!(out.contains("ID    PANE"), "{out}");
     }
 
     /// The PANE column fits its longest label, so the id at the end of one is
@@ -970,5 +1152,111 @@ mod tests {
             cell.modifier.contains(Modifier::REVERSED),
             "Normal-mode cursor is a reverse-video block"
         );
+    }
+
+    /// 60 a's, a space, 20 b's. At 80 columns the value has 78 - 11 = 67 to
+    /// fill, so it breaks after the space: the a's and the space on the
+    /// Message row, the b's on the row under it.
+    fn two_row_message() -> String {
+        format!("{} {}", "a".repeat(60), "b".repeat(20))
+    }
+
+    #[test]
+    fn wrap_starts_breaks_after_the_last_space_that_fits() {
+        assert_eq!(wrap_starts(&two_row_message(), 67), vec![0, 61]);
+        assert_eq!(wrap_starts("", 67), vec![0]);
+        assert_eq!(wrap_starts("please continue", 67), vec![0]);
+    }
+
+    #[test]
+    fn wrap_starts_cuts_a_word_too_long_for_a_row() {
+        assert_eq!(wrap_starts(&"x".repeat(100), 67), vec![0, 67]);
+    }
+
+    /// A full last row leaves the cursor after it nowhere to go but the edge,
+    /// so it gets an empty row of its own.
+    #[test]
+    fn wrap_starts_gives_the_end_of_a_full_row_a_row_of_its_own() {
+        assert_eq!(wrap_starts(&"x".repeat(67), 67), vec![0, 67]);
+    }
+
+    #[test]
+    fn a_long_message_wraps_under_its_label() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        m.form.message = MessageField::Editable(two_row_message());
+        let out = render(&m);
+        let rows: Vec<&str> = out.lines().collect();
+        let first = rows
+            .iter()
+            .position(|r| r.contains("Message: aaa"))
+            .unwrap_or_else(|| panic!("no Message row:\n{out}"));
+        let under: String = rows[first + 1].chars().collect();
+        assert_eq!(
+            under.trim_end_matches([' ', '│']),
+            format!("│{}{}", " ".repeat(11), "b".repeat(20)),
+            "the b's continue under the a's:\n{out}"
+        );
+        assert!(
+            out.contains("[ Schedule ]"),
+            "rows below still show:\n{out}"
+        );
+    }
+
+    #[test]
+    fn insert_mode_puts_the_cursor_on_the_wrapped_row() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        m.form.focus = FormField::Message;
+        let message = two_row_message();
+        m.form.cursor = message.chars().count();
+        m.form.message = MessageField::Editable(message);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        // The form is one row taller, so its inner area starts at y 9, not 10.
+        // The b's are inner row 3; the cursor is after the 20th.
+        let pos = term.get_cursor_position().unwrap();
+        assert_eq!((pos.x, pos.y), (1 + 11 + 20, 12));
+    }
+
+    #[test]
+    fn normal_mode_draws_the_block_cursor_on_the_wrapped_row() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        m.form.focus = FormField::Message;
+        m.form.message = MessageField::Editable(two_row_message());
+        m.form.cursor = 70; // the tenth b
+        m.form.nav_mode = VimMode::Normal;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        let cell = &term.backend().buffer()[(1 + 11 + 9, 12)];
+        assert_eq!(cell.symbol(), "b");
+        assert!(cell.modifier.contains(Modifier::REVERSED));
+    }
+
+    /// Ten rows of message do not fit under an 80x20 screen's 3-row preview.
+    /// The rows shown follow the cursor, and the form keeps its other rows.
+    #[test]
+    fn a_message_taller_than_the_screen_keeps_the_cursor_row_in_view() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        m.form.focus = FormField::Message;
+        let message = format!("{}{}", "x".repeat(67 * 9), "y".repeat(5));
+        m.form.cursor = message.chars().count();
+        m.form.message = MessageField::Editable(message);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| view(&m, f)).unwrap();
+        let pos = term.get_cursor_position().unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| -> String { (0..80).map(|x| buf[(x, y)].symbol()).collect() };
+        assert!(
+            row(pos.y).contains("yyyyy"),
+            "the cursor's row is on screen: {:?}",
+            row(pos.y)
+        );
+        assert_eq!(pos.x, 1 + 11 + 5);
+        let screen: String = (0..20).map(row).collect::<Vec<_>>().join("\n");
+        assert!(screen.contains("[ Schedule ]"), "{screen}");
+        assert!(screen.contains("preview"), "{screen}");
     }
 }

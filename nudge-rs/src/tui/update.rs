@@ -10,7 +10,7 @@ use crate::app::schedule_summary;
 use crate::detect::Detection;
 use crate::job::{Job, JobSpec, TargetSpec};
 use crate::timespec::parse_timespec;
-use crate::tmux_panes::{Pane, Positions};
+use crate::tmux_panes::{Pane, Positions, session_name};
 
 /// How stale the job set may get before a Tick triggers a refresh.
 const POLL_SECS: i64 = 2;
@@ -172,6 +172,13 @@ fn finish_submit(model: &mut Model, id: u64, verb: &str) -> Vec<Effect> {
                     .iter()
                     .map(|p| (p.id.clone(), p.target.clone()))
                     .chain(model.positions.panes.clone())
+                    .collect(),
+                names: model
+                    .form
+                    .panes
+                    .iter()
+                    .filter_map(|p| Some((p.id.clone(), session_name(&p.title)?)))
+                    .chain(model.positions.names.clone())
                     .collect(),
             };
             model.exit_summary = Some(match spec {
@@ -1970,6 +1977,7 @@ mod tests {
         m.positions = crate::tmux_panes::Positions {
             server: Some("300-3".into()),
             panes: std::collections::HashMap::new(),
+            names: std::collections::HashMap::new(),
         };
         m.tab = Tab::Jobs;
         let mut j = job(4, 3600);
@@ -1991,6 +1999,7 @@ mod tests {
         m.positions = crate::tmux_panes::Positions {
             server: Some("200-2".into()),
             panes: std::collections::HashMap::new(),
+            names: std::collections::HashMap::new(),
         };
         m.tab = Tab::Jobs;
         let mut j = job(4, 3600);
@@ -2083,6 +2092,7 @@ mod tests {
         let positions = Positions {
             server: None,
             panes: [("%1".to_string(), "s:0.1".to_string())].into(),
+            names: [("%1".to_string(), "ra-scan-3".to_string())].into(),
         };
         update(
             &mut m,

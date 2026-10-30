@@ -2,7 +2,7 @@
 
 use anyhow::{Context, bail};
 
-use crate::target::tmux::SERVER_FORMAT;
+use crate::target::tmux::{SERVER_FORMAT, TITLE_FORMAT};
 
 /// One selectable tmux pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,13 +15,16 @@ pub struct Pane {
 }
 
 /// Where each pane sits now, keyed by tmux's id for it (`%19` -> `main:12.0`),
-/// and the server those ids were read from.
+/// the name of the session in each pane that has one, and the server those
+/// ids were read from.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Positions {
     /// As [`SERVER_FORMAT`](crate::target::tmux::SERVER_FORMAT) reads it, or
     /// `None` if tmux could not be asked.
     pub server: Option<String>,
     pub panes: std::collections::HashMap<String, String>,
+    /// [`session_name`]s, keyed the same way.
+    pub names: std::collections::HashMap<String, String>,
 }
 
 impl Positions {
@@ -37,6 +40,10 @@ pub fn positions() -> Positions {
     list_rows()
         .map(|rows| Positions {
             server: rows.first().and_then(|r| r.server.clone()),
+            names: rows
+                .iter()
+                .filter_map(|r| Some((r.pane_id.clone(), session_name(&r.title)?)))
+                .collect(),
             panes: rows.into_iter().map(|r| (r.pane_id, r.target)).collect(),
         })
         .unwrap_or_default()
@@ -57,12 +64,96 @@ pub fn label(target: &crate::job::TargetSpec, positions: &Positions) -> String {
     }
 }
 
+/// The name of the session in a job's pane, if its title gives one. Not for
+/// an id from an earlier tmux server: the pane at that id now is another one.
+pub fn name<'a>(target: &crate::job::TargetSpec, positions: &'a Positions) -> Option<&'a str> {
+    let crate::job::TargetSpec::Tmux { pane, .. } = target;
+    if target.from_earlier_server(positions.server.as_deref()) {
+        return None;
+    }
+    positions.names.get(pane).map(String::as_str)
+}
+
+/// A job's pane in a line of text: the [`name`] of its session, where it has
+/// one, then its [`label`], as `ra-scan-3 · main:5.0 (%13)`.
+pub fn named_label(target: &crate::job::TargetSpec, positions: &Positions) -> String {
+    let label = label(target, positions);
+    match name(target, positions) {
+        Some(name) => format!("{name} · {label}"),
+        None => label,
+    }
+}
+
+/// The name of the session in a pane, from the pane's title, or `None` if it
+/// gives none.
+///
+/// Claude Code titles its pane with a status glyph and the session's name:
+/// `✳ warmer-sessions`, or the title it made up before a `/rename`. Codex
+/// joins the items its `terminal_title` setting lists with ` | `, and a thread
+/// id (`01a18bcf-23dc-…`) is no name. Any other title is taken as it is.
+pub fn session_name(title: &str) -> Option<String> {
+    let title = title.trim_start();
+    let mut chars = title.chars();
+    let title = match (chars.next(), chars.next()) {
+        // Claude's glyphs (✳, and a spinner's) are all past ASCII, where a
+        // shell's `~` or `#` is not.
+        (Some(glyph), Some(' ')) if !glyph.is_ascii() && !glyph.is_alphanumeric() => chars.as_str(),
+        _ => title,
+    };
+    let parts: Vec<&str> = title
+        .split(" | ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && !is_thread_id(part))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+/// Whether `s` is a UUID, or the start of one Codex cut short with `...`.
+/// How much of the id is left before the cut depends on how long the title
+/// is, so a cut one need only start like a UUID.
+fn is_thread_id(s: &str) -> bool {
+    const UUID: [usize; 5] = [8, 4, 4, 4, 12];
+    let (s, cut) = match s.strip_suffix("...").or_else(|| s.strip_suffix('…')) {
+        Some(s) => (s, true),
+        None => (s, false),
+    };
+    let mut groups = s.split('-').peekable();
+    let mut n = 0;
+    while let Some(group) = groups.next() {
+        let Some(&len) = UUID.get(n) else {
+            return false;
+        };
+        // Only the last group before the cut may be short, and not the first.
+        let fits = if cut && n > 0 && groups.peek().is_none() {
+            group.len() <= len
+        } else {
+            group.len() == len
+        };
+        if !fits || !group.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        n += 1;
+    }
+    cut || n == UUID.len()
+}
+
 /// Each job's [`label`], in order, and the widest one's width in chars: what
 /// a PANE column needs to show every id whole.
 pub fn job_labels(jobs: &[crate::job::Job], positions: &Positions) -> (Vec<String>, usize) {
     let labels: Vec<String> = jobs.iter().map(|j| label(&j.target, positions)).collect();
     let widest = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     (labels, widest)
+}
+
+/// Each job's [`name`] (empty where it has none), in order, and the widest
+/// one's width in chars.
+pub fn job_names<'a>(jobs: &[crate::job::Job], positions: &'a Positions) -> (Vec<&'a str>, usize) {
+    let names: Vec<&str> = jobs
+        .iter()
+        .map(|j| name(&j.target, positions).unwrap_or(""))
+        .collect();
+    let widest = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+    (names, widest)
 }
 
 /// A parsed `list-panes` row: the human-facing [`Pane`] fields plus the machine
@@ -83,7 +174,7 @@ struct Row {
 /// the same answer as the ids.
 fn format() -> String {
     format!(
-        "{SERVER_FORMAT}\t#{{pane_id}}\t#{{window_id}}\t#{{pane_last}}\t#{{session_name}}:#{{window_index}}.#{{pane_index}}\t#{{pane_title}}"
+        "{SERVER_FORMAT}\t#{{pane_id}}\t#{{window_id}}\t#{{pane_last}}\t#{{session_name}}:#{{window_index}}.#{{pane_index}}\t{TITLE_FORMAT}"
     )
 }
 
@@ -275,6 +366,7 @@ mod tests {
                 .iter()
                 .map(|(id, at)| ((*id).to_string(), (*at).to_string()))
                 .collect(),
+            names: std::collections::HashMap::new(),
         }
     }
 
@@ -301,6 +393,78 @@ mod tests {
     fn an_unknown_current_server_labels_as_before() {
         let p = on(None, &[("%19", "main:12.0")]);
         assert_eq!(label(&tmux("%19", Some("100-1")), &p), "main:12.0 (%19)");
+    }
+
+    /// Titles as Claude Code 2.1.312 and Codex 0.165.0 set them, from live
+    /// panes on 2026-10-30.
+    #[test]
+    fn a_session_name_is_its_panes_title_less_the_parts_that_are_not_a_name() {
+        for (title, name) in [
+            // Claude: a status glyph, idle or working, then the session's name.
+            ("✳ warmer-sessions", Some("warmer-sessions")),
+            ("⠐ ra-scan-3", Some("ra-scan-3")),
+            (
+                "✳ Nudge banner detection and job naming",
+                Some("Nudge banner detection and job naming"),
+            ),
+            // Codex with `terminal_title = ["thread", "thread-id"]`.
+            ("ra-gui | 01a18bcf-23dc-72a1-9ee1-c8d89...", Some("ra-gui")),
+            (
+                "ra-gui | 01a18bcf-23dc-72a1-9ee1-c8d89a2b3c4d",
+                Some("ra-gui"),
+            ),
+            ("01a18bcf-23dc-72a1-9ee1-c8d89...", None),
+            // A longer thread name leaves less of the id before the cut.
+            (
+                "my-long-thread-name | 01a18bcf-23dc-72a1...",
+                Some("my-long-thread-name"),
+            ),
+            ("ra-gui | 01a18bcf-23dc-…", Some("ra-gui")),
+            ("deadbeef-cafe-babe", Some("deadbeef-cafe-babe")),
+            ("notes | cafe...", Some("notes | cafe...")),
+            // A shell's title is what it is.
+            ("~/p/davehugheslegacy", Some("~/p/davehugheslegacy")),
+            ("dead-end | notes", Some("dead-end | notes")),
+            ("20261030-1", Some("20261030-1")),
+            ("deadbeef-cafe", Some("deadbeef-cafe")),
+            ("~ notes", Some("~ notes")),
+            ("# build", Some("# build")),
+            ("", None),
+            ("  ", None),
+            ("✳ ", None),
+        ] {
+            assert_eq!(session_name(title).as_deref(), name, "{title:?}");
+        }
+    }
+
+    #[test]
+    fn a_named_label_leads_with_the_session_name() {
+        let mut p = on(Some("100-1"), &[("%13", "main:5.0"), ("%14", "main:6.0")]);
+        p.names = [("%13".to_string(), "ra-scan-3".to_string())].into();
+        assert_eq!(
+            named_label(&tmux("%13", Some("100-1")), &p),
+            "ra-scan-3 · main:5.0 (%13)"
+        );
+        assert_eq!(
+            named_label(&tmux("%14", Some("100-1")), &p),
+            "main:6.0 (%14)"
+        );
+    }
+
+    /// The pane at the id now is another one, and so is its name.
+    #[test]
+    fn an_id_from_an_earlier_server_is_not_given_the_new_panes_name() {
+        let mut p = on(Some("200-2"), &[("%13", "main:5.0")]);
+        p.names = [("%13".to_string(), "ra-scan-3".to_string())].into();
+        let target = tmux("%13", Some("100-1"));
+        assert_eq!(name(&target, &p), None);
+        assert_eq!(named_label(&target, &p), "%13 (earlier tmux server)");
+    }
+
+    #[test]
+    fn the_title_tmux_gives_a_pane_by_default_is_left_out_of_the_list() {
+        let f = format();
+        assert!(f.ends_with(TITLE_FORMAT), "{f}");
     }
 
     #[test]

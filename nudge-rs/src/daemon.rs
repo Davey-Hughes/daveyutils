@@ -233,9 +233,10 @@ fn log_outcome(
 }
 
 /// A short human-readable description of a job's target, for the log and
-/// notification text: where its pane sits now, and the id the job stores.
+/// notification text: the session's name, where its pane sits now, and the id
+/// the job stores.
 fn describe_pane(job: &crate::job::Job, positions: &Positions) -> String {
-    crate::tmux_panes::label(&job.target, positions)
+    crate::tmux_panes::named_label(&job.target, positions)
 }
 
 /// What to tell the user about firing `job`, or `None` for nothing.

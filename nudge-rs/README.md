@@ -56,6 +56,17 @@ before a reboot. The confirmation, `--list` and the dashboard show both, as
 `main:12.0 (%19)`, with the position read at that moment. A pane tmux doesn't
 have is refused when you schedule.
 
+A job is also named after the session in its pane, read from the pane's title
+whenever the job is shown, so a `/rename` shows up from then on. Claude Code
+titles its pane with the session's name, or with a title it makes up until you
+name it. Codex titles it with the items its `terminal_title` setting lists,
+and the thread name is the one that names a session. A thread id or a status
+glyph is left out. `--list` and the dashboard show the name in a NAME column,
+and the confirmation, the log and `--notify` put it first:
+`ra-scan-3 · main:5.0 (%13)`. A pane nothing has titled has no name. The NAME
+column is left out when no job has a name, and in the dashboard when the
+terminal is too narrow for it.
+
 ### `-a` / `--auto`
 
 `nudge -a` schedules without asking anything. It targets the pane you were last
@@ -103,6 +114,11 @@ piped, prints a static table instead.
 nudge also detects Claude's weekly banner:
 
     You've hit your weekly limit · resets Jul 28 at 8am (America/Los_Angeles)
+
+Its per-model limits are weekly too, and read the same way:
+`You've hit your Opus limit` (or `Sonnet`). The session banner is
+`You've hit your 5-hour limit` since Claude Code 2.1.312, and
+`You've hit your session limit` before it; nudge reads both.
 
 The stated time zone is honored, so the reset resolves on the clock the banner
 quotes rather than your machine's.

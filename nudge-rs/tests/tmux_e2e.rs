@@ -687,6 +687,29 @@ fn locate_names_a_pane_by_its_id_and_where_it_sits_now() {
     assert_eq!(loc.position, "s:0.1");
 }
 
+/// `locate` reads the session's name from the pane's title, and a title tmux
+/// left at the host name gives none. The comma is there for tmux's format
+/// conditional, which splits on commas.
+#[test]
+fn locate_reads_the_session_name_from_the_panes_title() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    server.tmux(&["split-window", "-t", "s:0", "sh"]);
+    server.tmux(&["select-pane", "-t", "s:0.1", "-T", "✳ warmer, sessions"]);
+
+    let named = TmuxTarget::with_socket("s:0.1", &server.socket)
+        .locate()
+        .unwrap();
+    assert_eq!(named.name.as_deref(), Some("warmer, sessions"));
+    let unnamed = TmuxTarget::with_socket("s:0.0", &server.socket)
+        .locate()
+        .unwrap();
+    assert_eq!(unnamed.name, None);
+}
+
 /// The trap in asking tmux for a pane's id. `display-message -t` falls back
 /// to the current pane when its window is gone, prints that pane's id, and
 /// exits 0, so a typo'd or vanished window would have been stored as some
