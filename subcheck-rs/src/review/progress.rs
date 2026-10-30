@@ -106,6 +106,9 @@ pub struct Progress {
     /// An earlier scan of this screen failed, a file in it or the scan itself: `start` resets the
     /// counts, but the exit status still tells.
     pub earlier_failed: bool,
+    /// Files `c` queued while a scan ran, each with the run it is checked into, in the order
+    /// queued: they start when the scan ends, a scan for each run.
+    pub again: Vec<(String, String)>,
 }
 
 impl Progress {
@@ -143,6 +146,7 @@ impl Progress {
             resume: String::new(),
             earlier: Vec::new(),
             earlier_failed: false,
+            again: Vec::new(),
         }
     }
 
@@ -230,7 +234,7 @@ impl Progress {
             "a scan is started only once the last has ended, or its outro would be lost"
         );
         if matches!(self.scan, Scan::Ended(_)) {
-            self.earlier = self.outro();
+            self.earlier = self.ended();
         }
         self.earlier_failed |= self.failed > 0 || matches!(self.scan, Scan::Ended(Err(_)));
         self.scan = Scan::Running;
@@ -270,11 +274,23 @@ impl Progress {
         }
     }
 
-    /// `c` queued `path` to be checked again when the scan ends.
-    pub fn queue_again(&mut self, path: &str) {
+    /// `c` queued `path` to be checked again into run `run` when the scan ends.
+    pub fn queue_again(&mut self, path: &str, run: &str) {
         if let Some(f) = self.file_mut(path) {
             f.stage = Stage::QueuedAgain;
         }
+        self.again.push((path.to_string(), run.to_string()));
+    }
+
+    /// The files `c` queued into the first run among them, taken off the queue as one batch,
+    /// with that run; the rest stay queued. `None` with nothing queued.
+    pub fn next_batch(&mut self) -> Option<(String, Vec<String>)> {
+        let run = self.again.first()?.1.clone();
+        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.again)
+            .into_iter()
+            .partition(|(_, r)| *r == run);
+        self.again = later;
+        Some((run, now.into_iter().map(|(p, _)| p).collect()))
     }
 
     /// `path` will not be checked, and why. It is not the earlier scan's any more, so that scan's
@@ -314,19 +330,32 @@ impl Progress {
         }
     }
 
-    /// What `q` asks while the scan runs.
+    /// What `q` asks while the scan runs, with the files `c` queued counted: quitting drops them.
     pub fn quit_question(&self) -> String {
+        let queued = match self.again.len() {
+            0 => String::new(),
+            n => format!(" · {n} queued to check again"),
+        };
         format!(
-            "scan is on {}/{} — stop it and quit? y/n",
+            "scan is on {}/{}{queued} — stop it and quit? y/n",
             self.done, self.queued
         )
     }
 
-    /// What the terminal gets on leaving the screen, of the scan: each file it checked that failed
-    /// (a run's earlier failures elsewhere are not this scan's, nor in its count), then what `scan`
-    /// would have ended with; for a scan stopped or failed, how far it got and the command that
-    /// finishes it. What earlier scans ended with comes first. Nothing with no scan.
+    /// What the terminal gets on leaving the screen: what the scans ended with (see `ended`),
+    /// then the command that checks the files `c` queued, for each run.
     pub fn outro(&self) -> Vec<String> {
+        let mut lines = self.ended();
+        lines.extend(self.not_checked_again());
+        lines
+    }
+
+    /// What the screen's scans ended with, for the outro and for the next scan to keep: of this
+    /// one, each file it checked that failed (a run's earlier failures elsewhere are not this
+    /// scan's, nor in its count), then what `scan` would have ended with; for a scan stopped or
+    /// failed, how far it got and the command that finishes it. What earlier scans ended with
+    /// comes first. Nothing with no scan.
+    fn ended(&self) -> Vec<String> {
         let mut lines = self.earlier.clone();
         if self.scan == Scan::None {
             return lines;
@@ -362,6 +391,30 @@ impl Progress {
         lines
     }
 
+    /// For each run with files `c` queued, in the order first queued, the command that checks
+    /// them. `Finish it with` does not cover them: without `--force`, `--run` checks only files
+    /// the run has no good record of, and a file `c` queued has one, unless its last check
+    /// failed.
+    fn not_checked_again(&self) -> Vec<String> {
+        let mut runs: Vec<&str> = Vec::new();
+        for (_, run) in &self.again {
+            if !runs.contains(&run.as_str()) {
+                runs.push(run.as_str());
+            }
+        }
+        runs.into_iter()
+            .map(|run| {
+                let paths: Vec<PathBuf> = self
+                    .again
+                    .iter()
+                    .filter(|(_, r)| r == run)
+                    .map(|(p, _)| PathBuf::from(p))
+                    .collect();
+                format!("Not checked again: {}", again_command(run, &paths))
+            })
+            .collect()
+    }
+
     fn file_mut(&mut self, path: &str) -> Option<&mut FileProgress> {
         self.files.iter_mut().find(|f| f.path == path)
     }
@@ -379,7 +432,8 @@ pub fn resume_command(run: &str, paths: &[PathBuf]) -> String {
     format!("subcheck scan --run {run} {}", quoted(paths))
 }
 
-/// The command that finishes a `c` stopped partway: the same files checked again into the run.
+/// The command that checks `paths` again into run `run`: for a `c` stopped partway, or for files
+/// `c` queued that never started.
 pub fn again_command(run: &str, paths: &[PathBuf]) -> String {
     format!("subcheck scan --run {run} --force {}", quoted(paths))
 }
@@ -757,5 +811,75 @@ mod tests {
                 "Finish it with: subcheck scan --run second --force /m/E01.mkv",
             ]
         );
+    }
+
+    #[test]
+    fn the_quit_question_counts_the_files_c_queued() {
+        let mut p = Progress::of_run(&Run::default());
+        p.start("r", "subcheck scan --run r /m".into(), false);
+        p.scan_event(&Event::Queued(vec![
+            "/m/E01.mkv".into(),
+            "/m/E02.mkv".into(),
+        ]));
+        assert_eq!(p.quit_question(), "scan is on 0/2 — stop it and quit? y/n");
+        p.queue_again("/m/E03.mkv", "r");
+        p.queue_again("/m/E04.mkv", "s");
+        assert_eq!(
+            p.quit_question(),
+            "scan is on 0/2 · 2 queued to check again — stop it and quit? y/n"
+        );
+    }
+
+    #[test]
+    fn the_outro_gives_the_command_for_each_runs_queued_files_and_none_for_a_batch_taken() {
+        let mut p = Progress::of_run(&Run::default());
+        p.start("r", "subcheck scan --run r /m".into(), false);
+        p.scan_event(&Event::Queued(vec!["/m/E01.mkv".into()]));
+        p.queue_again("/m/K-On! E03.mkv", "r");
+        p.queue_again("/m/E04.mkv", "s");
+        p.queue_again("/m/E05.mkv", "r");
+        assert_eq!(
+            p.outro(),
+            [
+                "run r: stopped at 0/1 files, 0 failed; 0 findings",
+                "Finish it with: subcheck scan --run r /m",
+                "Not checked again: subcheck scan --run r --force '/m/K-On! E03.mkv' '/m/E05.mkv'",
+                "Not checked again: subcheck scan --run s --force '/m/E04.mkv'",
+            ]
+        );
+        // r's files go as one batch, in the order queued; s's stay queued.
+        assert_eq!(
+            p.next_batch(),
+            Some((
+                "r".to_string(),
+                vec!["/m/K-On! E03.mkv".to_string(), "/m/E05.mkv".to_string()]
+            ))
+        );
+        p.scan = Scan::Ended(Ok(crate::scan::Summary::default()));
+        p.start(
+            "r",
+            "subcheck scan --run r --force '/m/K-On! E03.mkv' '/m/E05.mkv'".into(),
+            true,
+        );
+        // What the first scan ended with is kept without the queue's line, so s's is said once.
+        let outro = p.outro();
+        assert_eq!(
+            outro.last().map(String::as_str),
+            Some("Not checked again: subcheck scan --run s --force '/m/E04.mkv'")
+        );
+        assert_eq!(
+            outro
+                .iter()
+                .filter(|l| l.starts_with("Not checked again"))
+                .count(),
+            1,
+            "{outro:#?}"
+        );
+        assert_eq!(
+            p.next_batch(),
+            Some(("s".to_string(), vec!["/m/E04.mkv".to_string()]))
+        );
+        assert_eq!(p.next_batch(), None);
+        assert!(!p.outro().iter().any(|l| l.starts_with("Not checked again")));
     }
 }

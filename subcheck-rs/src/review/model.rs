@@ -126,9 +126,6 @@ pub struct Model {
     /// The files list's first shown line.
     pub file_scroll: usize,
     pub confirm: Option<Confirm>,
-    /// Files `c` queued while a scan ran, each with the run it is checked into, in the order
-    /// queued: they start when the scan ends, a scan for each run.
-    pub again: Vec<(String, String)>,
     /// Why the screen ended early: a job's thread panicked, or the terminal could not be read.
     pub fatal: Option<String>,
 }
@@ -164,7 +161,6 @@ impl Model {
             file_selected: 0,
             file_scroll: 0,
             confirm: None,
-            again: Vec::new(),
             fatal: None,
         };
         m.selected = m

@@ -55,6 +55,8 @@ written, and the status line says that too.
 `q` while the scan runs asks first, then stops it: the run keeps every file that was done, and the
 terminal gets the command that finishes it (`subcheck scan --run <run> <paths>`; after a `c`,
 `subcheck scan --run <run> --force <files>`).
+Files `c` queued for after the scan are left unchecked: the question counts them, and the terminal
+gets the command that checks them (`Not checked again: subcheck scan --run <run> --force <files>`).
 
 A fix repeated across episodes (an OP lyric, say) is one row; `⏎` expands it into its episodes. A
 season's timing findings on one track are one row too, whatever each episode's fix (`−1 frame ×23 ·

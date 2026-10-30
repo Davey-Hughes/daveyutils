@@ -251,12 +251,9 @@ fn apply(
         Msg::Scan(event) => scanned(m, event),
         Msg::ScanEnded(result) => {
             m.progress.scan = Scan::Ended(result);
-            // A question to stop the scan has nothing left to ask of: it goes, so the line shows
-            // how the scan ended, and the next `q` quits at once.
-            if m.confirm == Some(Confirm::Quit) {
-                m.confirm = None;
-            }
-            next_again(m)
+            let effects = next_again(m);
+            settle_quit(m, &effects);
+            effects
         }
         Msg::Fatal(error) => {
             m.fatal = Some(error);
@@ -925,8 +922,7 @@ fn again(m: &mut Model, path: String, run: String) -> Vec<Effect> {
         "{} will be checked again when the scan is done",
         m.label(&path)
     ));
-    m.progress.queue_again(&path);
-    m.again.push((path, run));
+    m.progress.queue_again(&path, &run);
     Vec::new()
 }
 
@@ -941,17 +937,11 @@ fn run_found(m: &mut Model, path: String, found: Result<(String, String), String
 
 /// The files `c` queued into the first run among them, as one scan; the rest wait for it to end.
 fn next_again(m: &mut Model) -> Vec<Effect> {
-    let Some((_, run)) = m.again.first().cloned() else {
-        return Vec::new();
-    };
-    let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut m.again)
+    m.progress
+        .next_batch()
+        .map(|(run, paths)| Effect::Recheck { run, paths })
         .into_iter()
-        .partition(|(_, r)| *r == run);
-    m.again = later;
-    vec![Effect::Recheck {
-        run,
-        paths: now.into_iter().map(|(p, _)| p).collect(),
-    }]
+        .collect()
 }
 
 /// A scan `c` started, or why none did: then the files asked for that are still on disk fail with
@@ -982,7 +972,17 @@ fn started(
     if let Some(p) = missing.first() {
         m.status = Some(format!("{}: no such file", m.label(p)));
     }
+    settle_quit(m, &effects);
     effects
+}
+
+/// A question to stop the scan stays while a queued batch takes over: `effects` start it, and
+/// effects run before the next key is read. With nothing left to run it goes, so the status line
+/// shows how the scan ended, or why the last batch did not start, and the next `q` quits at once.
+fn settle_quit(m: &mut Model, effects: &[Effect]) {
+    if m.confirm == Some(Confirm::Quit) && !m.progress.running() && effects.is_empty() {
+        m.confirm = None;
+    }
 }
 
 /// `⏎` on a file: the findings, on the first entry with one of the file's, if the filter shows
@@ -1420,6 +1420,123 @@ mod tests {
         );
         press(&mut m, 'q');
         assert!(m.should_quit);
+    }
+
+    #[test]
+    fn a_quit_question_stays_while_a_queued_batch_takes_over_and_goes_after_the_last() {
+        let status = |m: &Model| m.status_text(Rect::new(0, 0, 160, 1));
+        let mut m = scanning();
+        for (ep, run) in [(1, "r"), (2, "s")] {
+            m.confirm = Some(Confirm::Recheck {
+                path: path(ep),
+                run: run.into(),
+                backend: "claude".into(),
+            });
+            assert_eq!(press(&mut m, 'y'), []);
+        }
+        press(&mut m, 'q');
+        let ended = update(&mut m, Msg::ScanEnded(Ok(scan::Summary::default())), now());
+        assert_eq!(
+            ended,
+            [Effect::Recheck {
+                run: "r".into(),
+                paths: vec![path(1)],
+            }]
+        );
+        assert_eq!(m.confirm, Some(Confirm::Quit));
+        let job = Job {
+            run: "r".into(),
+            resume: "subcheck scan --run r --force /m/E01.mkv".into(),
+        };
+        update(
+            &mut m,
+            Msg::Started {
+                job: Ok(job),
+                missing: vec![],
+                paths: vec![path(1)],
+            },
+            now(),
+        );
+        update(
+            &mut m,
+            Msg::Scan(Event::Queued(vec![PathBuf::from(path(1))])),
+            now(),
+        );
+        // The question now asks about the batch that took over.
+        assert_eq!(
+            status(&m).as_deref(),
+            Some("scan is on 0/1 · 1 queued to check again — stop it and quit? y/n")
+        );
+        // r's batch ends and s's cannot start: nothing is left to stop, so the question goes.
+        update(&mut m, Msg::ScanEnded(Ok(scan::Summary::default())), now());
+        assert_eq!(m.confirm, Some(Confirm::Quit));
+        update(
+            &mut m,
+            Msg::Started {
+                job: Err("run s: no LLM is called gpt".into()),
+                missing: vec![],
+                paths: vec![path(2)],
+            },
+            now(),
+        );
+        assert_eq!(m.confirm, None);
+        // s's files failed with the reason: the outro does not list them as left unchecked.
+        assert!(
+            !m.progress
+                .outro()
+                .iter()
+                .any(|l| l.starts_with("Not checked again"))
+        );
+        press(&mut m, 'q');
+        assert!(m.should_quit);
+    }
+
+    #[test]
+    fn a_quit_question_stays_when_a_queued_batch_cannot_start_and_another_goes() {
+        let mut m = scanning();
+        for (ep, run) in [(1, "r"), (2, "s")] {
+            m.confirm = Some(Confirm::Recheck {
+                path: path(ep),
+                run: run.into(),
+                backend: "claude".into(),
+            });
+            assert_eq!(press(&mut m, 'y'), []);
+        }
+        press(&mut m, 'q');
+        update(&mut m, Msg::ScanEnded(Ok(scan::Summary::default())), now());
+        let effects = update(
+            &mut m,
+            Msg::Started {
+                job: Err("run r: no LLM is called gpt".into()),
+                missing: vec![],
+                paths: vec![path(1)],
+            },
+            now(),
+        );
+        assert_eq!(
+            effects,
+            [Effect::Recheck {
+                run: "s".into(),
+                paths: vec![path(2)],
+            }]
+        );
+        assert_eq!(m.confirm, Some(Confirm::Quit));
+        let job = Job {
+            run: "s".into(),
+            resume: "subcheck scan --run s --force /m/E02.mkv".into(),
+        };
+        update(
+            &mut m,
+            Msg::Started {
+                job: Ok(job),
+                missing: vec![],
+                paths: vec![path(2)],
+            },
+            now(),
+        );
+        // `y` over it quits, stopping the batch that took over.
+        press(&mut m, 'y');
+        assert!(m.should_quit && m.progress.running());
     }
 
     #[test]
@@ -2465,7 +2582,7 @@ mod tests {
                 paths: vec![path(1), path(3)],
             }]
         );
-        assert_eq!(m.again, [(path(2), "s".to_string())]);
+        assert_eq!(m.progress.again, [(path(2), "s".to_string())]);
     }
 
     #[test]
@@ -2477,7 +2594,7 @@ mod tests {
         assert_eq!(press(&mut m, 'c'), []);
         assert_eq!(m.status.as_deref(), Some("E04 is being checked now"));
         m.file_selected = 1;
-        m.progress.queue_again(&path(2));
+        m.progress.queue_again(&path(2), "r");
         assert_eq!(press(&mut m, 'c'), []);
         assert_eq!(
             m.status.as_deref(),

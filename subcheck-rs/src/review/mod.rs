@@ -796,6 +796,20 @@ mod tests {
     }
 
     #[test]
+    fn quitting_with_files_queued_gives_the_command_that_checks_them() {
+        let mut m = scanning();
+        m.progress.queue_again("/m/E03.mkv", "2026-10-17T04-39-18");
+        let (code, _, err) = ended(&mut m, Ok(()));
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            err,
+            "run 2026-10-17T04-39-18: stopped at 0/2 files, 0 failed; 0 findings\n\
+             Finish it with: subcheck scan --run r /m\n\
+             Not checked again: subcheck scan --run 2026-10-17T04-39-18 --force '/m/E03.mkv'\n"
+        );
+    }
+
+    #[test]
     fn a_stop_alone_exits_0_and_a_failure_1() {
         let (code, out, err) = ended(&mut scanning(), Ok(()));
         assert_eq!(code.unwrap(), ExitCode::SUCCESS);
