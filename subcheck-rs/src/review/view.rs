@@ -192,7 +192,7 @@ fn keys_box(m: &Model, f: &mut Frame, area: Rect) {
 /// The two tab names that start the left pane's title, the one for `active` reversed. They sit in
 /// the same place in both views, so the title says which view is up before anything else does. The
 /// other one is only dimmed: it should read as a place to go, not as a gap.
-pub(super) fn tabs(active: Pane) -> Vec<Span<'static>> {
+fn tabs(active: Pane) -> Vec<Span<'static>> {
     let tab = |pane, name: &'static str| {
         let style = if pane == active {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -206,26 +206,80 @@ pub(super) fn tabs(active: Pane) -> Vec<Span<'static>> {
         tab(Pane::Findings, "findings"),
         Span::raw("  "),
         tab(Pane::Files, "files"),
+        Span::raw(" "),
     ]
 }
 
-fn list_pane(m: &Model, f: &mut Frame, area: Rect) {
-    let (pending, accepted, rejected) = m.counts();
-    let showing = match m.filter {
-        Filter::All => "all".to_string(),
-        Filter::Only(state) => label(state).to_string(),
-    };
-    let progress = m
-        .progress
-        .title()
-        .map_or_else(String::new, |t| format!(" · {t}"));
-    let mut title = tabs(Pane::Findings);
-    title.push(Span::raw(format!(
-        " · {pending} pending · {accepted} accepted · {rejected} rejected · showing {showing}{progress} "
-    )));
-    let block = Block::default()
+/// The left pane's block, in either view: the tabs on the left of its top border and, while a scan
+/// runs, how far it is on the right. The top border says where you are and whether a scan runs;
+/// each view puts what its list holds on the bottom one. `area` is the pane's: when the tabs, the
+/// progress and a column of border between them do not fit inside its corners, the progress is
+/// left off rather than drawn over the tabs, and the status line still says how far the scan is.
+pub(super) fn pane_block(m: &Model, active: Pane, area: Rect) -> Block<'static> {
+    let tab_line = Line::from(tabs(active));
+    let mut block = Block::default()
         .borders(Borders::ALL)
-        .title(Line::from(title));
+        .title_top(tab_line.clone());
+    if let Some(progress) = m.progress.title() {
+        let progress = Line::from(format!(" {progress} ")).right_aligned();
+        let needed = tab_line.width() + 1 + progress.width();
+        if needed <= usize::from(block.inner(area).width) {
+            block = block.title_top(progress);
+        }
+    }
+    block
+}
+
+/// The findings' bottom border: how many are pending, accepted and rejected, and what the filter
+/// shows, right-aligned. `room` is the border inside its corners. The line is never cut inside a
+/// part: the first of these that fits is drawn, and when none does the last is drawn and clipped.
+/// With the filter `all`, the candidates are the whole line, then the line without `showing all`,
+/// then without the rejected count, then without the accepted count, which leaves ` {p} pending `
+/// as the last. With any other filter the counts go rejected, accepted, then pending, leaving
+/// ` showing {f} `.
+fn counts_line(m: &Model, room: u16) -> Line<'static> {
+    let (pending, accepted, rejected) = m.counts();
+    let counts = [
+        format!("{pending} pending"),
+        format!("{accepted} accepted"),
+        format!("{rejected} rejected"),
+    ];
+    let showing = match m.filter {
+        Filter::All => "showing all".to_string(),
+        Filter::Only(state) => format!("showing {}", label(state)),
+    };
+    // Every candidate keeps the first `n` counts, for `n` from all three down to none; with the
+    // filter `all`, the whole one is also tried with `showing all` and the rest without it.
+    let keep = |n: usize, with_showing: bool| {
+        let mut parts = counts[..n].to_vec();
+        if with_showing {
+            parts.push(showing.clone());
+        }
+        parts.join(" · ")
+    };
+    let mut candidates: Vec<String> = Vec::new();
+    if m.filter == Filter::All {
+        candidates.push(keep(3, true));
+        candidates.extend((1..=3).rev().map(|n| keep(n, false)));
+    } else {
+        candidates.extend((0..=3).rev().map(|n| keep(n, true)));
+    }
+    let lines: Vec<String> = candidates.iter().map(|c| format!(" {c} ")).collect();
+    let line = lines
+        .iter()
+        .find(|l| layout::width(l) <= room)
+        .or(lines.last())
+        .expect("there are candidates");
+    Line::from(line.clone()).right_aligned()
+}
+
+/// The findings view of the left pane: one line per finding, grouped, with the counts and the
+/// filter on the bottom border, or a hint when the filter leaves nothing to list.
+fn list_pane(m: &Model, f: &mut Frame, area: Rect) {
+    let block = pane_block(m, Pane::Findings, area);
+    let block = block
+        .clone()
+        .title_bottom(counts_line(m, block.inner(area).width));
     let entries = m.entries();
     if entries.is_empty() {
         let hint = match m.filter {
@@ -675,8 +729,16 @@ mod tests {
     fn the_list_groups_repeats_and_counts_findings() {
         let m = sample();
         let screen = render(&m, 160, 20);
+        // The top border: the tabs, and nothing else with no scan running.
+        let top: String = screen.lines().next().unwrap().chars().take(80).collect();
+        let rest = top
+            .strip_prefix("┌ findings  files ")
+            .and_then(|r| r.strip_suffix('┐'))
+            .unwrap_or_else(|| panic!("{top}"));
+        assert!(rest.chars().all(|c| c == '─'), "{top}");
+        // The bottom border: the counts and the filter, right-aligned.
         assert!(
-            screen.contains("findings  files · 4 pending · 0 accepted · 0 rejected · showing all"),
+            screen.contains("─ 4 pending · 0 accepted · 0 rejected · showing all ┘"),
             "{screen}"
         );
         assert!(
@@ -687,6 +749,37 @@ mod tests {
             screen.contains("· E02 0:14:54.19 everyday. → every day.  [Dialogue]"),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn a_pane_too_narrow_for_the_bottom_line_drops_whole_parts() {
+        let mut m = sample();
+        // The pane is half the screen, the room two less. Filter all: the whole line is 51 wide
+        // (an exact fit at 105, so no border before it). Without `showing all` it is 37 wide, and
+        // with two counts it is 24.
+        for (width, line) in [
+            (105, "└ 4 pending · 0 accepted · 0 rejected · showing all ┘"), // room 51
+            (104, "─ 4 pending · 0 accepted · 0 rejected ┘"),               // room 50
+            (60, "─ 4 pending · 0 accepted ┘"),                             // room 28
+        ] {
+            let screen = render(&m, width, 20);
+            assert!(screen.contains(line), "{width}: {screen}");
+        }
+        // Filter rejected: the whole line is 56 wide. Without the rejected count it is 43 wide,
+        // with the pending count only 30, and with the filter alone 18.
+        m.filter = Filter::Only(State::Rejected);
+        for (width, line) in [
+            (
+                160,
+                "─ 4 pending · 0 accepted · 0 rejected · showing rejected ┘",
+            ), // room 78
+            (100, "─ 4 pending · 0 accepted · showing rejected ┘"), // room 48
+            (80, "─ 4 pending · showing rejected ┘"),               // room 38
+            (60, "─ showing rejected ┘"),                           // room 28
+        ] {
+            let screen = render(&m, width, 20);
+            assert!(screen.contains(line), "{width}: {screen}");
+        }
     }
 
     #[test]
@@ -884,16 +977,23 @@ mod tests {
             lines: vec!["[1/2] K-On! - E03 - Episode.mkv: 400 lines, 1 findings".into()],
         };
         update::update(&mut m, Msg::Scan(done), now());
-        // Wide enough for the findings' whole title, progress and all.
-        let screen = render(&m, 200, 20);
-        assert!(screen.contains("showing all · scanning 1/2 ⠋ "), "{screen}");
+        // The scan's progress at the right of the top border, the counts on the bottom one.
+        let screen = render(&m, 160, 20);
+        assert!(screen.contains("┌ findings  files ─"), "{screen}");
+        assert!(screen.contains("─ scanning 1/2 ⠋ ┐"), "{screen}");
+        assert!(screen.contains(" · showing all ┘"), "{screen}");
+        // On a narrow pane the progress leaves the border rather than overwrite the tabs: at 60
+        // columns the pane is 30 wide, 28 inside its corners; the tabs take 18, the progress 16.
+        let screen = render(&m, 60, 20);
+        let top: String = screen.lines().next().unwrap().chars().take(30).collect();
+        assert!(top.starts_with("┌ findings  files "), "{top}");
+        assert!(!top.contains("scanning"), "{top}");
         update::update(&mut m, Msg::Key(KeyCode::Tab), now());
         m.file_selected = 2;
         let screen = render(&m, 160, 20);
-        assert!(
-            screen.contains(" findings  files · 4 files · scanning 1/2 ⠋ "),
-            "{screen}"
-        );
+        assert!(screen.contains("┌ findings  files ─"), "{screen}");
+        assert!(screen.contains("─ scanning 1/2 ⠋ ┐"), "{screen}");
+        assert!(screen.contains("─ 4 files ┘"), "{screen}");
         assert!(screen.contains("E01  ✓ 400 lines · 1 finding"), "{screen}");
         assert!(screen.contains("E03  ✓ 1 finding"), "{screen}");
         assert!(screen.contains("E04  ⠋ reading"), "{screen}");
@@ -902,6 +1002,20 @@ mod tests {
             "{screen}"
         );
         assert!(screen.contains("scan 1/2 · 1 finding"), "{screen}");
+        // Once the scan ends, its progress leaves the border.
+        update::update(
+            &mut m,
+            Msg::ScanEnded(Ok(crate::scan::Summary::default())),
+            now(),
+        );
+        let screen = render(&m, 160, 20);
+        let top: String = screen.lines().next().unwrap().chars().take(80).collect();
+        let rest = top
+            .strip_prefix("┌ findings  files ")
+            .and_then(|r| r.strip_suffix('┐'))
+            .unwrap_or_else(|| panic!("{top}"));
+        assert!(rest.chars().all(|c| c == '─'), "{top}");
+        assert!(screen.contains("─ 4 files ┘"), "{screen}");
     }
 
     #[test]

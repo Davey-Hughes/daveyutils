@@ -4,20 +4,18 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::text::Line;
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use super::model::{Model, Pane};
 use super::progress::{FileProgress, Stage};
 
+/// The files view of the left pane: one line per file of the run, with its stage, and how many
+/// files there are on the bottom border.
 pub fn files_pane(m: &Model, f: &mut Frame, area: Rect) {
     let p = &m.progress;
-    let progress = p.title().map_or_else(String::new, |t| format!(" · {t}"));
-    let mut title = super::view::tabs(Pane::Files);
-    title.push(Span::raw(format!(" · {} files{progress} ", p.files.len())));
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(title));
+    let block = super::view::pane_block(m, Pane::Files, area)
+        .title_bottom(Line::from(format!(" {} files ", p.files.len())).right_aligned());
     if p.files.is_empty() {
         f.render_widget(Paragraph::new("No files yet.").block(block), area);
         return;
