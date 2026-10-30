@@ -96,6 +96,10 @@ enum Command {
         /// is not a terminal.
         #[arg(long)]
         no_tui: bool,
+        /// Fix per-letter karaoke too when the screen applies (A, D): change the row's letters and
+        /// re-space it, as `apply --karaoke` does. Look at each one afterwards (o).
+        #[arg(long)]
+        karaoke: bool,
     },
     /// Accept, reject or reword each finding of a run, with a key that opens it in mpv: the newest
     /// run's folders, the run named, or the files under some paths.
@@ -104,6 +108,10 @@ enum Command {
         /// as it is now. Default: the newest run's folders.
         #[arg(value_name = "RUN | PATHS")]
         run: Vec<String>,
+        /// Fix per-letter karaoke too when the screen applies (A, D): change the row's letters and
+        /// re-space it, as `apply --karaoke` does. Look at each one afterwards (o).
+        #[arg(long)]
+        karaoke: bool,
     },
     /// Report subtitle tracks shifted by whole frames against the video. Reads only the index
     /// and the subtitles; no LLM, nothing recorded.
@@ -238,6 +246,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             dry_run,
             verbose,
             no_tui,
+            karaoke,
         } => {
             let state = store::state_dir()?;
             let mut db = Store::open()?;
@@ -288,7 +297,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let s = match scan::plan(&paths, &opts, &mut db, &mut log)? {
                 Planned::Nothing(s) if screen => {
                     match review::nothing_to_check(&db, &s, opts.into.as_deref())? {
-                        Some(shown) => return review::run(review::Open::View(shown), db, &state),
+                        Some(shown) => {
+                            return review::run(review::Open::View(shown), db, &state, karaoke);
+                        }
                         None => s,
                     }
                 }
@@ -301,7 +312,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         paths,
                         warnings,
                     };
-                    return review::run(open, db, &state);
+                    return review::run(open, db, &state, karaoke);
                 }
                 Planned::Scan(plan) => {
                     scan::execute(plan, &opts, &mut db, &mut std::io::stderr(), &|_| {})?
@@ -316,11 +327,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 ExitCode::FAILURE
             })
         }
-        Command::Review { run } => {
+        Command::Review { run, karaoke } => {
             let state = store::state_dir()?;
             let db = Store::open()?;
             let shown = db.view(&Selector::parse(&run)?)?;
-            review::run(review::Open::View(shown), db, &state)
+            review::run(review::Open::View(shown), db, &state, karaoke)
         }
         Command::Timing {
             paths,
@@ -367,6 +378,12 @@ fn apply_run(a: ApplyArgs) -> Result<ExitCode> {
     let state = store::state_dir()?;
     let mut db = Store::open()?;
     let run = db.view(&Selector::parse(&a.run)?)?;
+    // mkvmerge's warnings go to stderr as they come, as before the hook; the rest is on stdout.
+    let warn = |event: apply::Event| {
+        if let apply::Event::Warned { path, text } = event {
+            eprintln!("subcheck: mkvmerge warned about {path}: {text}");
+        }
+    };
     let s = apply::run(
         &run,
         &mut db,
@@ -375,6 +392,7 @@ fn apply_run(a: ApplyArgs) -> Result<ExitCode> {
         a.karaoke,
         a.mkvmerge.as_os_str(),
         &mut std::io::stdout().lock(),
+        &warn,
     )?;
     Ok(if s.failed == 0 {
         ExitCode::SUCCESS

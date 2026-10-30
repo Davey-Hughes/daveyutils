@@ -1,12 +1,18 @@
 //! `subcheck apply` end to end: the real binary on a copy of the apply fixture, with a run whose
-//! findings are accepted. The tests that remux need mkvmerge and are skipped without it.
+//! findings are accepted; and `apply::run`'s hook, in process, on the same setup. The tests that
+//! remux need mkvmerge and are skipped without it.
 
 mod common;
 
+use std::cell::RefCell;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use common::{fixture, have_mkvmerge, patch};
+use subcheck::apply::patch::Outcome;
+use subcheck::apply::{self, Event, Mode, Stage};
+use subcheck::scan::file_stamp;
 use subcheck::store::{
     Attempt, Check, CheckedWith, Decision, Finding, Made, Run, RunHeader, Selector, State, Store,
 };
@@ -312,6 +318,128 @@ fn stdout(o: &Output) -> String {
 
 fn expected(id: usize, ext: &str) -> String {
     std::fs::read_to_string(fixture(&format!("expected/apply.track{id}.{ext}"))).unwrap()
+}
+
+/// `apply::run` in process on the setup's run, as `mode` says: what it wrote, every event it
+/// reported, and its summary.
+fn hooked(s: &Setup, mode: &Mode) -> (String, Vec<Event>, apply::Summary) {
+    let events = RefCell::new(Vec::new());
+    let mut out = Vec::new();
+    let summary = apply::run(
+        &s.run(),
+        &mut s.store(),
+        &s.root.join("state"),
+        mode,
+        false,
+        OsStr::new("mkvmerge"),
+        &mut out,
+        &|e| events.borrow_mut().push(e),
+    )
+    .unwrap();
+    (
+        String::from_utf8(out).unwrap(),
+        events.into_inner(),
+        summary,
+    )
+}
+
+/// The stages `events` give `path`, in order.
+fn stages(events: &[Event], path: &str) -> Vec<Stage> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Stage(p, s) if p == path => Some(*s),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_hook_hears_each_stage_and_gets_the_files_block_as_printed() {
+    if !have_mkvmerge() {
+        return;
+    }
+    let s = Setup::new();
+    let path = s.file.to_string_lossy().into_owned();
+    let (out, events, summary) = hooked(
+        &s,
+        &Mode::Apply {
+            backup: true,
+            full: false,
+        },
+    );
+    assert_eq!(events[0], Event::Queued(vec![path.clone()]));
+    assert_eq!(events[1], Event::File(path.clone()));
+    assert_eq!(
+        stages(&events, &path),
+        [Stage::Plan, Stage::Remux, Stage::Check, Stage::Swap]
+    );
+    let Some(Event::Done {
+        outcomes,
+        remuxed,
+        marked,
+        restamped,
+        text,
+        ..
+    }) = events.last()
+    else {
+        panic!("no Done: {events:?}");
+    };
+    assert!(*remuxed);
+    // The summary is each fix's outcome, counted.
+    let made = outcomes
+        .iter()
+        .filter(|(_, o)| {
+            matches!(
+                o,
+                Outcome::Patched | Outcome::Respaced { .. } | Outcome::Shifted { .. }
+            )
+        })
+        .count();
+    assert_eq!(made, summary.fixed);
+    assert_eq!(
+        outcomes.len(),
+        summary.fixed + summary.already + summary.by_hand + summary.not_found
+    );
+    // The block is all `out` got but the summary line.
+    assert_eq!(
+        format!("{text}{}\n", apply::summary_line(&summary, true)),
+        out
+    );
+    let mut saved: Vec<u64> = s.run().applied.into_iter().collect();
+    saved.sort_unstable();
+    let mut marked = marked.clone();
+    marked.sort_unstable();
+    assert_eq!(marked, saved);
+    assert_eq!(*restamped, Some(file_stamp(&s.file).unwrap()));
+}
+
+#[test]
+fn a_dry_runs_hook_hears_the_plan_alone_and_nothing_is_marked_or_moved() {
+    let s = Setup::new();
+    let path = s.file.to_string_lossy().into_owned();
+    let stamp = file_stamp(&s.file).unwrap();
+    let (out, events, summary) = hooked(&s, &Mode::DryRun);
+    assert_eq!(stages(&events, &path), [Stage::Plan]);
+    let Some(Event::Done {
+        remuxed,
+        marked,
+        restamped,
+        text,
+        ..
+    }) = events.last()
+    else {
+        panic!("no Done: {events:?}");
+    };
+    assert!(!*remuxed);
+    assert_eq!(marked.as_slice(), [] as [u64; 0]);
+    assert_eq!(*restamped, None);
+    assert_eq!(
+        format!("{text}{}\n", apply::summary_line(&summary, false)),
+        out
+    );
+    assert!(s.run().applied.is_empty());
+    assert_eq!(file_stamp(&s.file).unwrap(), stamp);
 }
 
 #[test]
@@ -989,7 +1117,7 @@ fn tracks_only_then_a_remux_elsewhere_then_check_then_apply_records() {
 }
 
 #[test]
-fn a_rejected_finding_that_comes_back_after_apply_keeps_its_decision() {
+fn after_apply_the_next_scan_leaves_the_file_alone_and_its_findings_stand() {
     if !have_mkvmerge() {
         return;
     }
@@ -1006,20 +1134,44 @@ fn a_rejected_finding_that_comes_back_after_apply_keeps_its_decision() {
         [(1, "We should leave befor it rains."), (2, "go trough it")]
     );
     s.store().decide(&[decided(2, State::Rejected)]).unwrap();
+    let calls = || {
+        std::fs::read_to_string(s.root.join("llm-calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let asked = calls();
     let o = s.apply(&[]);
     assert!(o.status.success(), "{}", stdout(&o));
-    // The fix changed the file, so the next scan checks it again. The typo fixed is gone; the
-    // rejected one comes back, with its decision.
+    // The swap moved the file's checks with it: nothing to check, and the LLM not asked.
     let o = s.scan();
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let again = s.run();
-    assert_ne!(again.name, first.name);
-    let back: Vec<(&str, State)> = again
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(o.status.success(), "{err}");
+    assert!(err.contains("Nothing to check: 1 unchanged"), "{err}");
+    assert_eq!(calls(), asked);
+    // Both findings stand: the fixed one applied, the rejected one rejected.
+    let now = s
+        .store()
+        .view(&Selector::Paths(vec![s.file.clone()]))
+        .unwrap();
+    let states: Vec<(&str, State, bool)> = now
         .findings
         .iter()
-        .map(|f| (f.original.as_str(), again.state_of(f.id)))
+        .map(|f| {
+            (
+                f.original.as_str(),
+                now.state_of(f.id),
+                now.applied.contains(&f.id),
+            )
+        })
         .collect();
-    assert_eq!(back, [("go trough it", State::Rejected)]);
+    assert_eq!(
+        states,
+        [
+            ("We should leave befor it rains.", State::Accepted, true),
+            ("go trough it", State::Rejected, false),
+        ]
+    );
 }
 
 #[test]

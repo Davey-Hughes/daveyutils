@@ -15,12 +15,15 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use jiff::Timestamp;
+
 use crate::blocks::{self, Block};
 use crate::group;
 use crate::list::shell_quote;
 use crate::mkv::{self, Layout, Track};
 use crate::review::model::changed;
-use crate::store::{self, Applied, Finding, Run, Store};
+use crate::scan::file_stamp;
+use crate::store::{self, Applied, Finding, Run, Store, Swapped};
 use crate::subs::{self, Kind};
 use crate::text::{timestamp, timestamp_ms};
 use patch::{Fix, Outcome};
@@ -52,6 +55,98 @@ pub struct Summary {
     pub failed: usize,
 }
 
+/// A step of [`run`], for a caller that shows each file's progress: review's screen. The CLI's
+/// hook prints mkvmerge's warnings and lets the rest go.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    /// The files with fixes, in the order apply does them: once, after mkvmerge is found.
+    Queued(Vec<String>),
+    /// A file starts: before its `{path}` line.
+    File(String),
+    /// A file's next stage.
+    Stage(String, Stage),
+    /// mkvmerge warned while remuxing the file.
+    Warned { path: String, text: String },
+    /// A file done: each fix's outcome, by finding; whether it was remuxed; the findings saved as
+    /// applied; the size and mtime its checks moved to, when any did ([`Store::mark_applied`]);
+    /// and its block as `out` got it.
+    Done {
+        path: String,
+        outcomes: Vec<(u64, Outcome)>,
+        remuxed: bool,
+        marked: Vec<u64>,
+        restamped: Option<(u64, Timestamp)>,
+        text: String,
+    },
+    /// A file that failed, why, and its block.
+    Failed {
+        path: String,
+        error: String,
+        text: String,
+    },
+}
+
+/// Where apply is with a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Reading its tracks and finding each fix's events.
+    Plan,
+    /// Writing the fixed tracks and remuxing with mkvmerge.
+    Remux,
+    /// Checking the remux against the original.
+    Check,
+    /// Putting the remux in the original's place.
+    Swap,
+}
+
+impl Stage {
+    /// The stage in a word, as review's files view shows it.
+    pub fn word(self) -> &'static str {
+        match self {
+            Stage::Plan => "plan",
+            Stage::Remux => "remux",
+            Stage::Check => "check",
+            Stage::Swap => "swap",
+        }
+    }
+}
+
+/// The line apply ends with: `made`, the fixes made (the default mode), else those to make.
+pub fn summary_line(s: &Summary, made: bool) -> String {
+    let verb = if made { "applied" } else { "to apply" };
+    format!(
+        "{verb} {}, already applied {}, by hand {}, not found {}; {} remuxed, {} failed",
+        s.fixed, s.already, s.by_hand, s.not_found, s.remuxed, s.failed
+    )
+}
+
+/// What apply writes, passed on to `inner` as it comes and kept since the last [`Kept::take`]:
+/// each file's block, for the hook, while the CLI still prints each line as it is written.
+struct Kept<'w, W> {
+    inner: &'w mut W,
+    kept: Vec<u8>,
+}
+
+impl<W> Kept<'_, W> {
+    /// What was written since the last take.
+    fn take(&mut self) -> String {
+        String::from_utf8_lossy(&std::mem::take(&mut self.kept)).into_owned()
+    }
+}
+
+impl<W: Write> Write for Kept<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Kept as far as `inner` took it, so the two never differ.
+        let n = self.inner.write(buf)?;
+        self.kept.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// The remux of `file`, beside it: hidden, and with no video extension, so Plex leaves it alone.
 pub fn remux_path(file: &Path) -> PathBuf {
     let mut name = OsStr::new(".").to_owned();
@@ -69,7 +164,10 @@ pub fn backup_path(file: &Path) -> PathBuf {
 
 /// Make `run`'s accepted fixes, as `mode` says, marking each one made (or found made) in `store`;
 /// `state` is the state directory. `karaoke`: re-space per-letter karaoke rows rather than leave
-/// them for a hand fix.
+/// them for a hand fix. Each step is told to `report` as it happens. A file swapped in keeps its
+/// checks: they move to the swapped file with its marks ([`Store::mark_applied`]).
+#[allow(clippy::too_many_arguments)] // the command's flags, and the screen's hook
+#[allow(clippy::too_many_lines)] // each file's job, its summary, then its event, in order
 pub fn run(
     run: &Run,
     store: &mut Store,
@@ -78,6 +176,7 @@ pub fn run(
     karaoke: bool,
     mkvmerge: &OsStr,
     out: &mut impl Write,
+    report: &dyn Fn(Event),
 ) -> anyhow::Result<Summary> {
     let accepted = patch::fixes(run);
     let timing = shift::fixes(run);
@@ -93,6 +192,13 @@ pub fn run(
     let marking = matches!(mode, Mode::Apply { .. });
     let paths = with_fixes(run, &accepted, &timing);
     let names = track_names(&paths);
+    report(Event::Queued(
+        paths.iter().map(ToString::to_string).collect(),
+    ));
+    let mut out = Kept {
+        inner: out,
+        kept: Vec::new(),
+    };
     for (path, name) in paths.iter().zip(names) {
         let mine: Vec<Fix> = accepted
             .iter()
@@ -100,6 +206,7 @@ pub fn run(
             .cloned()
             .collect();
         let shifts: Vec<&Finding> = timing.iter().filter(|f| f.file == *path).copied().collect();
+        report(Event::File((*path).to_string()));
         writeln!(out, "{path}")?;
         let job = Job {
             path: Path::new(path),
@@ -110,8 +217,9 @@ pub fn run(
             karaoke,
             state,
             mkvmerge,
+            report,
         };
-        match job.run(out) {
+        let event = match job.run(&mut out) {
             Ok(done) => {
                 for (_, o) in &done.outcomes {
                     match o {
@@ -124,6 +232,7 @@ pub fn run(
                     }
                 }
                 summary.remuxed += usize::from(done.remuxed);
+                let (mut marked, mut restamped) = (Vec::new(), None);
                 if marking {
                     let at = jiff::Timestamp::now();
                     let applied: Vec<Applied> = done
@@ -140,29 +249,44 @@ pub fn run(
                         })
                         .map(|&(finding, _)| Applied { finding, at })
                         .collect();
+                    let swapped = done.stamps.map(|(from, to)| Swapped {
+                        path: (*path).to_string(),
+                        from,
+                        to,
+                    });
                     // The file is swapped in already. If the database stays busy past the timeout,
-                    // apply stops here and this file's marks are not saved; the next `apply`
-                    // finds the fixes already in the file and marks them then.
-                    store.mark_applied(&applied)?;
+                    // apply stops here and this file's marks are not saved, nor its checks moved;
+                    // the next `apply` finds the fixes already in the file and marks them then,
+                    // and the next scan checks the file again.
+                    let moved = store.mark_applied(&applied, swapped.as_ref())?;
+                    marked = applied.iter().map(|a| a.finding).collect();
+                    restamped = swapped.filter(|_| moved).map(|s| s.to);
+                }
+                writeln!(out)?;
+                Event::Done {
+                    path: (*path).to_string(),
+                    outcomes: done.outcomes,
+                    remuxed: done.remuxed,
+                    marked,
+                    restamped,
+                    text: out.take(),
                 }
             }
             Err(e) => {
                 writeln!(out, "  failed: {e}")?;
                 summary.failed += 1;
+                writeln!(out)?;
+                Event::Failed {
+                    path: (*path).to_string(),
+                    error: e,
+                    text: out.take(),
+                }
             }
-        }
-        writeln!(out)?;
+        };
+        report(event);
     }
     let s = summary;
-    let verb = match mode {
-        Mode::Apply { .. } => "applied",
-        _ => "to apply",
-    };
-    writeln!(
-        out,
-        "{verb} {}, already applied {}, by hand {}, not found {}; {} remuxed, {} failed",
-        s.fixed, s.already, s.by_hand, s.not_found, s.remuxed, s.failed
-    )?;
+    writeln!(out, "{}", summary_line(&s, marking))?;
     // The check plans the fixes again, and must plan them as these tracks were.
     if matches!(mode, Mode::TracksOnly(_)) && s.fixed > 0 {
         let flag = if karaoke { " --karaoke" } else { "" };
@@ -242,12 +366,16 @@ struct Job<'a> {
     karaoke: bool,
     state: &'a Path,
     mkvmerge: &'a OsStr,
+    /// Where each stage and mkvmerge's warning are told ([`run`]'s `report`).
+    report: &'a dyn Fn(Event),
 }
 
-/// A file done: each fix's outcome, and whether it was remuxed.
+/// A file done: each fix's outcome, whether it was remuxed, and for a file swapped in its size and
+/// mtime before and after, when both could be read.
 struct Done {
     outcomes: Vec<(u64, Outcome)>,
     remuxed: bool,
+    stamps: Option<((u64, Timestamp), (u64, Timestamp))>,
 }
 
 /// How far after its time a video frame may be stored: one shown before a keyframe can come after
@@ -332,8 +460,20 @@ struct Fixed<'a> {
 }
 
 impl Job<'_> {
+    /// Tell the hook the file's next stage.
+    fn stage(&self, stage: Stage) {
+        (self.report)(Event::Stage(
+            self.path.to_string_lossy().into_owned(),
+            stage,
+        ));
+    }
+
     /// Plan, report, then act as the mode says. An error leaves the file as it was.
+    #[allow(clippy::too_many_lines)] // plan, report, then act, in the order it happens
     fn run(&self, out: &mut impl Write) -> Result<Done, String> {
+        self.stage(Stage::Plan);
+        // The file as apply reads it: a swap moves the checks made of it to the swapped file.
+        let before = file_stamp(self.path).ok();
         let (r, layout) = mkv::open(self.path).map_err(|e| e.to_string())?;
         if let Some(t) = layout.truncated {
             return Err(format!("{t}: replace this copy first"));
@@ -426,9 +566,16 @@ impl Job<'_> {
         } else {
             self.act(&original, &fixed, out)?
         };
+        // Only a swap (the default mode's remux) changes the file.
+        let stamps = if remuxed {
+            before.zip(file_stamp(self.path).ok())
+        } else {
+            None
+        };
         Ok(Done {
             outcomes: plan.outcomes,
             remuxed,
+            stamps,
         })
     }
 
@@ -876,9 +1023,13 @@ impl Job<'_> {
         }
         // mkvmerge's reading of the languages goes into the remux and its check: read before the
         // remux, so a file it cannot read is told before many GB are written, not after.
+        self.stage(Stage::Remux);
         let result = remux::languages(self.mkvmerge, self.path)
             .and_then(|languages| self.remux_and_check(o, fixed, &remuxed, &languages, full))
-            .and_then(|()| swap(self.path, &remuxed, backup.then_some(kept.as_path())));
+            .and_then(|()| {
+                self.stage(Stage::Swap);
+                swap(self.path, &remuxed, backup.then_some(kept.as_path()))
+            });
         if result.is_err() {
             let _ = fs::remove_file(&remuxed);
         }
@@ -902,12 +1053,14 @@ impl Job<'_> {
                 let _ = fs::remove_file(written);
             }
         }
+        // To the hook, not stderr: review's screen draws on the terminal.
         if let Some(warnings) = ran? {
-            eprintln!(
-                "subcheck: mkvmerge warned about {}: {warnings}",
-                self.path.display()
-            );
+            (self.report)(Event::Warned {
+                path: self.path.to_string_lossy().into_owned(),
+                text: warnings,
+            });
         }
+        self.stage(Stage::Check);
         let diffs = verify(o, remuxed, fixed, full, languages)?;
         if !diffs.is_empty() {
             return Err(differs(remuxed, &diffs));

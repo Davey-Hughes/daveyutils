@@ -26,9 +26,11 @@ use subcheck::store::{Decision, Selector, State, Store};
 /// The loop's inner part: a message, then every effect it leads to, run for real.
 fn send(m: &mut Model, msg: Msg, store: &mut Store, player: &mut Player, tx: &mpsc::Sender<Msg>) {
     let now = jiff::Timestamp::now();
+    // Where apply would write its tracks: no test here starts apply, so nothing goes there.
+    let state = Path::new("/no-state");
     let mut queue: VecDeque<_> = update::update(m, msg, now).into();
     while let Some(effect) = queue.pop_front() {
-        let msg = run_effect(effect, store, player, tx);
+        let msg = run_effect(effect, store, player, state, tx);
         queue.extend(update::update(m, msg, now));
     }
 }

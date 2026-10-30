@@ -8,9 +8,10 @@ use jiff::{SignedDuration, Timestamp};
 use ratatui::layout::{Position, Rect};
 
 use super::layout;
-use super::model::{Confirm, Editor, Entry, FileNote, Model, Pane, UndoStep};
+use super::model::{Confirm, Editor, Entry, FileNote, Mark, Model, Pane, UndoStep};
 use super::progress::{Scan, Stage};
 use super::view;
+use crate::apply;
 use crate::list::{self, Filter, label};
 use crate::player::{Moment, PlayState, Playback};
 use crate::scan;
@@ -67,6 +68,12 @@ pub enum Msg {
     Fatal(String),
     /// A quarter of a second passed while the scan runs: the spinner turns.
     Tick,
+    /// What the screen's apply (or dry run) just did.
+    Apply(apply::Event),
+    /// A `StartApply` effect finished: apply's thread started, or why it could not.
+    ApplyStarted(Result<(), String>),
+    /// Apply ended: its summary, or why it failed as a whole.
+    ApplyEnded(Result<apply::Summary, String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +116,7 @@ pub enum Switch {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // effects are few and short-lived, so a box is not worth it
 pub enum Effect {
     /// Record these decisions in the store.
     Write {
@@ -132,6 +140,14 @@ pub enum Effect {
     /// Open the other view of the screen's findings (`v`), read from the store with each file's
     /// note ([`Msg::Switched`]).
     Switch(Switch),
+    /// Apply `run`'s accepted fixes on a thread of their own (with `dry_run`, say what would change
+    /// and write nothing); `karaoke` as `apply --karaoke` ([`Msg::ApplyStarted`], then
+    /// [`Msg::Apply`] for each step and [`Msg::ApplyEnded`]).
+    StartApply {
+        run: Run,
+        dry_run: bool,
+        karaoke: bool,
+    },
     Open(Moment),
     /// Pause or seek the open mpv.
     Playback(Playback),
@@ -175,6 +191,7 @@ pub fn update(m: &mut Model, msg: Msg, now: Timestamp) -> Vec<Effect> {
     effects
 }
 
+#[allow(clippy::too_many_lines)] // one arm per message
 fn apply(
     m: &mut Model,
     msg: Msg,
@@ -182,10 +199,10 @@ fn apply(
     now: Timestamp,
 ) -> Vec<Effect> {
     match msg {
-        // Ctrl-C or Ctrl-D: while the scan runs it asks first, as `q` does; a second one, with the
+        // Ctrl-C or Ctrl-D: while a job runs it asks first, as `q` does; a second one, with the
         // question open, quits.
         Msg::Quit => {
-            if m.progress.running() && m.confirm != Some(Confirm::Quit) {
+            if m.progress.busy() && m.confirm != Some(Confirm::Quit) {
                 m.confirm = Some(Confirm::Quit);
             } else {
                 m.should_quit = true;
@@ -211,6 +228,7 @@ fn apply(
                     Vec::new()
                 }
                 Confirm::Recheck { path, run, .. } => again(m, path, run),
+                Confirm::Apply => start_apply(m, false),
             }
         }
         Msg::Key(key) if m.editor.is_some() => edit_key(m, key, now),
@@ -271,6 +289,18 @@ fn apply(
             let effects = next_again(m);
             settle_quit(m, &effects);
             effects
+        }
+        Msg::Apply(event) => applied(m, event),
+        Msg::ApplyStarted(Ok(())) => Vec::new(),
+        Msg::ApplyStarted(Err(e)) | Msg::ApplyEnded(Err(e)) => {
+            m.progress.apply_ended(Err(e));
+            settle_quit(m, &[]);
+            Vec::new()
+        }
+        Msg::ApplyEnded(Ok(summary)) => {
+            m.progress.apply_ended(Ok(summary));
+            settle_quit(m, &[]);
+            Vec::new()
         }
         Msg::Fatal(error) => {
             m.fatal = Some(error);
@@ -382,6 +412,8 @@ fn key_press(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
         KeyCode::Char('q') => quit_or_ask(m),
         KeyCode::Tab => m.pane = Pane::Files,
         KeyCode::Char('v') => return switch_view(m),
+        KeyCode::Char('A') => return apply_key(m, false),
+        KeyCode::Char('D') => return apply_key(m, true),
         KeyCode::Char('?') => m.help = true,
         KeyCode::Down | KeyCode::Char('j') => m.selected = (m.selected + 1).min(last),
         KeyCode::Up | KeyCode::Char('k') => m.selected = m.selected.saturating_sub(1),
@@ -571,6 +603,7 @@ fn undo(m: &mut Model, now: Timestamp) -> Vec<Effect> {
 
 /// A write's result: on success the decisions take effect, and the selection moves on. A decision
 /// the store found on a replaced finding went to its new one, or nowhere: its file is read back.
+#[allow(clippy::too_many_lines)] // the write's every consequence for the view, in order
 fn written(
     m: &mut Model,
     action: Action,
@@ -588,6 +621,10 @@ fn written(
     let shown = m.entries();
     for d in decisions {
         m.run.decisions.insert(d.finding, d.clone());
+        // A dry run's mark said what apply would do with the decision as it was.
+        if m.marks.get(&d.finding).is_some_and(Mark::dry_run) {
+            m.marks.remove(&d.finding);
+        }
     }
     let n = decisions.len();
     let what = if n == 1 {
@@ -873,18 +910,98 @@ fn open(m: &mut Model) -> Vec<Effect> {
     vec![Effect::Open(moment)]
 }
 
-/// `q`: quit; while the scan runs, ask first.
+/// `q`: quit; while a job runs, ask first.
 fn quit_or_ask(m: &mut Model) {
-    if m.progress.running() {
+    if m.progress.busy() {
         m.confirm = Some(Confirm::Quit);
     } else {
         m.should_quit = true;
     }
 }
 
+/// `A` (or with `dry_run`, `D`): every accepted fix of the view on screen. Not while a scan runs
+/// (apply would contend with its reader for the disks, and findings are still coming) or apply
+/// does, nor with nothing accepted. `A` asks first; a dry run writes nothing, so it starts at once.
+fn apply_key(m: &mut Model, dry_run: bool) -> Vec<Effect> {
+    if m.progress.running() {
+        m.status = Some("the scan is still running".into());
+        return Vec::new();
+    }
+    if m.progress.applying() {
+        m.status = Some("already applying".into());
+        return Vec::new();
+    }
+    if m.apply_counts().0 == 0 {
+        m.status = Some("no accepted fixes".into());
+        return Vec::new();
+    }
+    if dry_run {
+        return start_apply(m, true);
+    }
+    m.confirm = Some(Confirm::Apply);
+    Vec::new()
+}
+
+/// Start apply (or a dry run) on the view as it stands: decisions made meanwhile count from the
+/// next. Running from here, so a `q` before its first step still asks.
+fn start_apply(m: &mut Model, dry_run: bool) -> Vec<Effect> {
+    // A view's name is its run's, or its paths quoted: `subcheck apply` takes either back.
+    let mut resume = format!("subcheck apply {}", m.run.name);
+    if dry_run {
+        resume.push_str(" --dry-run");
+    }
+    if m.karaoke {
+        resume.push_str(" --karaoke");
+    }
+    m.progress.start_apply(dry_run, resume);
+    vec![Effect::StartApply {
+        run: m.run.clone(),
+        dry_run,
+        karaoke: m.karaoke,
+    }]
+}
+
+/// A step of the screen's apply: the files view follows it. A file done marks its findings (a fix
+/// made, or found made, by the store's mark instead), takes the store's new `applied` marks, and
+/// its record takes the size and mtime its checks moved to, so the view matches the store.
+fn applied(m: &mut Model, event: apply::Event) -> Vec<Effect> {
+    m.progress.apply_event(&event);
+    if let apply::Event::Done {
+        path,
+        outcomes,
+        marked,
+        restamped,
+        ..
+    } = event
+    {
+        let dry_run = m.progress.apply.as_ref().is_some_and(|a| a.dry_run);
+        for (id, outcome) in &outcomes {
+            match Mark::of(outcome, dry_run) {
+                Some(mark) => {
+                    m.marks.insert(*id, mark);
+                }
+                None => {
+                    m.marks.remove(id);
+                }
+            }
+        }
+        m.run.applied.extend(marked);
+        // Every model record for the path takes the new stamp, even if only one check kind moved:
+        // only `file_notes` reads it, and `v` re-reads the store.
+        if let Some((size, mtime)) = restamped {
+            for r in m.run.files.iter_mut().filter(|r| r.path == path) {
+                r.size = size;
+                r.mtime = mtime;
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// A key in the files view: moving over the files, `⏎` to a file's findings, `Tab` back. The
 /// decision and mpv keys belong to the findings, except `u`: the status line of a late join
 /// says "u undoes" wherever the user is, so it undoes here too. `c` checks the selected file again.
+/// `A` and `D` apply, as in the findings.
 fn files_key(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
     let last = m.progress.files.len().saturating_sub(1);
     match key {
@@ -893,6 +1010,8 @@ fn files_key(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
         KeyCode::Char('?') => m.help = true,
         KeyCode::Tab => m.pane = Pane::Findings,
         KeyCode::Char('v') => return switch_view(m),
+        KeyCode::Char('A') => return apply_key(m, false),
+        KeyCode::Char('D') => return apply_key(m, true),
         KeyCode::Down | KeyCode::Char('j') => m.file_selected = (m.file_selected + 1).min(last),
         KeyCode::Up | KeyCode::Char('k') => m.file_selected = m.file_selected.saturating_sub(1),
         KeyCode::PageDown => m.file_selected = (m.file_selected + PAGE).min(last),
@@ -922,10 +1041,14 @@ fn switched(
 /// `v`: the other view of the screen's findings. From a run's view, the run's folders; from a paths
 /// view, the newest run that named the selected file: the selected entry's (a row's first
 /// member's), or in the files view, or with nothing selected in the list, the selected file's. Not
-/// while a scan runs: its progress belongs to the view it started in.
+/// while a job runs: its progress belongs to the view it started in.
 fn switch_view(m: &mut Model) -> Vec<Effect> {
     if m.progress.running() {
         m.status = Some("the scan is still running".into());
+        return Vec::new();
+    }
+    if m.progress.applying() {
+        m.status = Some("apply is still running".into());
         return Vec::new();
     }
     if !m.run.of_paths {
@@ -956,6 +1079,11 @@ fn switch_view(m: &mut Model) -> Vec<Effect> {
 /// `c` on the selected file: find the run it is checked again into, then ask. A file the scan is
 /// checking is being checked already, and one `c` queued is queued already.
 fn recheck(m: &mut Model) -> Vec<Effect> {
+    // A check would read a file apply may be remuxing or swapping.
+    if m.progress.applying() {
+        m.status = Some("apply is still running".into());
+        return Vec::new();
+    }
     let Some(file) = m.progress.files.get(m.file_selected) else {
         return Vec::new();
     };
@@ -1046,7 +1174,7 @@ fn started(
 /// effects run before the next key is read. With nothing left to run it goes, so the status line
 /// shows how the scan ended, or why the last batch did not start, and the next `q` quits at once.
 fn settle_quit(m: &mut Model, effects: &[Effect]) {
-    if m.confirm == Some(Confirm::Quit) && !m.progress.running() && effects.is_empty() {
+    if m.confirm == Some(Confirm::Quit) && !m.progress.busy() && effects.is_empty() {
         m.confirm = None;
     }
 }
@@ -1161,6 +1289,10 @@ fn inherit(m: &Model, new: &[usize], now: Timestamp) -> Vec<Effect> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    use crate::apply::patch::Outcome;
+    use crate::review::model::Mark;
+    use ratatui::layout::Rect;
 
     use crate::review::model::tests_support::{self, finding, path, sample};
     use crate::scan::Event;
@@ -2811,6 +2943,249 @@ mod tests {
         assert_eq!(
             m.status.as_deref(),
             Some("could not switch views: disk I/O error")
+        );
+    }
+
+    /// The sample with findings 1 (E01) and 3 (E02) accepted, 3's fix in its file already.
+    fn accepted() -> Model {
+        let mut m = sample();
+        for id in [1, 3] {
+            m.run.decisions.insert(
+                id,
+                Decision {
+                    finding: id,
+                    state: State::Accepted,
+                    edited: None,
+                    at: now(),
+                },
+            );
+        }
+        m.run.applied.insert(3);
+        m
+    }
+
+    /// Apply done with the file at `path`.
+    fn file_done(
+        path: String,
+        outcomes: Vec<(u64, Outcome)>,
+        marked: Vec<u64>,
+        restamped: Option<(u64, Timestamp)>,
+    ) -> Msg {
+        Msg::Apply(apply::Event::Done {
+            path,
+            outcomes,
+            remuxed: restamped.is_some(),
+            marked,
+            restamped,
+            text: String::new(),
+        })
+    }
+
+    #[test]
+    fn a_asks_with_the_counts_then_applies_the_view_as_it_stands() {
+        let mut m = accepted();
+        assert_eq!(press(&mut m, 'A'), []);
+        assert_eq!(m.confirm, Some(Confirm::Apply));
+        assert_eq!(
+            m.status_text(Rect::default()).as_deref(),
+            Some("apply 2 fixes in 2 files (1 applied already), keeping each .orig? y/n")
+        );
+        // Any key but y lets it go.
+        assert_eq!(press(&mut m, 'n'), []);
+        assert_eq!(m.confirm, None);
+        assert!(!m.progress.busy());
+        press(&mut m, 'A');
+        let effects = press(&mut m, 'y');
+        assert_eq!(
+            effects,
+            [Effect::StartApply {
+                run: m.run.clone(),
+                dry_run: false,
+                karaoke: false,
+            }]
+        );
+        assert!(m.progress.applying());
+        assert_eq!(
+            m.progress.apply.as_ref().unwrap().resume,
+            "subcheck apply 2026-10-17T04-39-18"
+        );
+    }
+
+    #[test]
+    fn one_fix_in_one_file_is_asked_of_in_the_singular() {
+        let mut m = accepted();
+        m.run.decisions.remove(&3);
+        press(&mut m, 'A');
+        assert_eq!(
+            m.status_text(Rect::default()).as_deref(),
+            Some("apply 1 fix in 1 file, keeping each .orig? y/n")
+        );
+    }
+
+    #[test]
+    fn d_starts_a_dry_run_at_once_with_the_screens_karaoke() {
+        let mut m = accepted();
+        m.karaoke = true;
+        let effects = press(&mut m, 'D');
+        assert_eq!(
+            effects,
+            [Effect::StartApply {
+                run: m.run.clone(),
+                dry_run: true,
+                karaoke: true,
+            }]
+        );
+        assert_eq!(
+            m.progress.apply.as_ref().unwrap().resume,
+            "subcheck apply 2026-10-17T04-39-18 --dry-run --karaoke"
+        );
+    }
+
+    #[test]
+    fn a_and_d_wait_for_the_scan_and_for_apply_and_need_an_accepted_fix() {
+        let mut m = sample();
+        assert_eq!(press(&mut m, 'A'), []);
+        assert_eq!(m.status.as_deref(), Some("no accepted fixes"));
+        let mut m = accepted();
+        m.progress
+            .start("r", "subcheck scan --run r /m".into(), false);
+        for c in ['A', 'D'] {
+            assert_eq!(press(&mut m, c), []);
+            assert_eq!(m.status.as_deref(), Some("the scan is still running"));
+        }
+        let mut m = accepted();
+        press(&mut m, 'D');
+        for c in ['A', 'D'] {
+            assert_eq!(press(&mut m, c), []);
+            assert_eq!(m.status.as_deref(), Some("already applying"));
+        }
+        // From the files view too.
+        key(&mut m, KeyCode::Tab);
+        assert_eq!(press(&mut m, 'A'), []);
+        assert_eq!(m.status.as_deref(), Some("already applying"));
+    }
+
+    #[test]
+    fn v_and_c_wait_for_apply_and_q_asks_while_it_runs() {
+        let mut m = accepted();
+        press(&mut m, 'D');
+        assert_eq!(press(&mut m, 'v'), []);
+        assert_eq!(m.status.as_deref(), Some("apply is still running"));
+        key(&mut m, KeyCode::Tab);
+        assert_eq!(press(&mut m, 'c'), []);
+        assert_eq!(m.status.as_deref(), Some("apply is still running"));
+        press(&mut m, 'q');
+        assert_eq!(m.confirm, Some(Confirm::Quit));
+        update(
+            &mut m,
+            Msg::Apply(apply::Event::Queued(vec![path(1)])),
+            now(),
+        );
+        update(
+            &mut m,
+            Msg::Apply(apply::Event::Stage(path(1), apply::Stage::Plan)),
+            now(),
+        );
+        assert_eq!(
+            m.status_text(Rect::default()).as_deref(),
+            Some("dry run is on E01 (plan), 0/1 — stop it and quit? y/n")
+        );
+        // Apply ending lets the question go: nothing is left to stop.
+        update(
+            &mut m,
+            Msg::ApplyEnded(Ok(apply::Summary::default())),
+            now(),
+        );
+        assert_eq!(m.confirm, None);
+        assert!(!m.should_quit);
+    }
+
+    #[test]
+    fn a_file_done_marks_its_findings_and_takes_the_stores_marks_and_stamp() {
+        let mut m = accepted();
+        press(&mut m, 'D');
+        update(
+            &mut m,
+            Msg::Apply(apply::Event::Queued(vec![path(1), path(2)])),
+            now(),
+        );
+        update(
+            &mut m,
+            file_done(path(1), vec![(1, Outcome::Patched)], vec![], None),
+            now(),
+        );
+        update(
+            &mut m,
+            file_done(path(2), vec![(3, Outcome::AlreadyApplied)], vec![], None),
+            now(),
+        );
+        assert_eq!(m.marks.get(&1), Some(&Mark::WouldApply));
+        // Findings 1 and 3 are at indexes 0 and 2.
+        assert_eq!(m.mark(0), Some("would apply"));
+        assert_eq!(m.mark(2), Some("already applied"));
+        update(
+            &mut m,
+            Msg::ApplyEnded(Ok(apply::Summary::default())),
+            now(),
+        );
+        // Then for real: E01's fix made, E02's left by hand.
+        press(&mut m, 'A');
+        press(&mut m, 'y');
+        update(
+            &mut m,
+            Msg::Apply(apply::Event::Queued(vec![path(1), path(2)])),
+            now(),
+        );
+        let stamp: (u64, Timestamp) = (123, "2026-10-30T09:00:00Z".parse().unwrap());
+        update(
+            &mut m,
+            file_done(path(1), vec![(1, Outcome::Patched)], vec![1], Some(stamp)),
+            now(),
+        );
+        update(
+            &mut m,
+            file_done(
+                path(2),
+                vec![(3, Outcome::ByHand("a karaoke row".into()))],
+                vec![],
+                None,
+            ),
+            now(),
+        );
+        assert_eq!(m.marks.get(&1), None);
+        assert!(m.run.applied.contains(&1));
+        assert_eq!(m.mark(0), Some("applied"));
+        assert_eq!(m.mark(2), Some("by hand"));
+        assert_eq!((m.run.files[0].size, m.run.files[0].mtime), stamp);
+        assert_eq!(m.run.files[1].size, 100, "E02 was not swapped");
+    }
+
+    #[test]
+    fn a_decision_change_drops_a_dry_run_mark_and_keeps_an_applys() {
+        let mut m = accepted();
+        m.marks.insert(2, Mark::WouldApply);
+        m.marks.insert(3, Mark::ByHand("a karaoke row".into()));
+        // Row 0 is the OP lyric (findings 1, 2 and 4: `r` rejects the pending 2 and 4); row 1 the
+        // snacks typo (3, accepted).
+        m.selected = 0;
+        let effects = press(&mut m, 'r');
+        written(&mut m, effects);
+        assert_eq!(m.marks.get(&2), None);
+        m.selected = 1;
+        let effects = press(&mut m, 'r');
+        written(&mut m, effects);
+        assert_eq!(m.marks.get(&3), Some(&Mark::ByHand("a karaoke row".into())));
+    }
+
+    #[test]
+    fn an_apply_that_cannot_start_says_why() {
+        let mut m = accepted();
+        press(&mut m, 'D');
+        update(&mut m, Msg::ApplyStarted(Err("no threads".into())), now());
+        assert!(!m.progress.busy());
+        assert_eq!(
+            m.status_text(Rect::default()).as_deref(),
+            Some("apply failed: no threads")
         );
     }
 }

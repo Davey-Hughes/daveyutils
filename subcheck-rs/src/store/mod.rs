@@ -25,7 +25,7 @@ use crate::text::Occurrence;
 
 pub use db::{BUSY_TIMEOUT, Location, SCHEMA_VERSION, Store, location, location_from};
 pub use view::Selector;
-pub use write::{Attempt, Decided, Made, Saved, ScanRow, is_busy};
+pub use write::{Attempt, Decided, Made, Saved, ScanRow, Swapped, is_busy};
 
 /// The state directory, from explicit inputs. An empty or relative `XDG_STATE_HOME` is ignored,
 /// as the XDG spec says and as nudge-rs does: a relative one would resolve against the cwd.

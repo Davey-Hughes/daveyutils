@@ -209,6 +209,15 @@ pub struct Saved {
     pub carried: Vec<Decision>,
 }
 
+/// A file apply swapped a remux in for: its size and mtime as apply read it, and after the swap.
+/// The checks made of the file as it was are moved to the swapped file ([`Store::mark_applied`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Swapped {
+    pub path: String,
+    pub from: (u64, Timestamp),
+    pub to: (u64, Timestamp),
+}
+
 /// What became of a decision [`Store::decide`] was given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decided {
@@ -335,11 +344,38 @@ impl Store {
         Ok(outcomes)
     }
 
-    /// Fixes apply made in their files, or found there.
-    pub fn mark_applied(&mut self, applied: &[Applied]) -> rusqlite::Result<()> {
+    /// Fixes apply made in their files, or found there; and for a file it swapped a remux in for
+    /// (`swapped`), its current checks moved to the swapped file's size and mtime, where they were
+    /// made of the file as apply read it. The file's only changes are then the fixes just marked,
+    /// so the next scan leaves it alone instead of asking the LLM again. A check made of the file
+    /// as it was before some other change stays, and the next scan makes it again. One
+    /// transaction, so the marks and the move cannot disagree. Returns whether any check moved.
+    pub fn mark_applied(
+        &mut self,
+        applied: &[Applied],
+        swapped: Option<&Swapped>,
+    ) -> rusqlite::Result<bool> {
         let tx = self.write()?;
         insert_applied(&tx, applied)?;
-        tx.commit()
+        let moved = match swapped {
+            // The mtime is compared as text: only `insert_check` writes a check's mtime, with the
+            // same `Timestamp` formatting, so equal times are equal text.
+            Some(s) => tx.execute(
+                "UPDATE checks SET size = ?1, mtime = ?2
+                 WHERE path = ?3 AND size = ?4 AND mtime = ?5
+                   AND replaced_by IS NULL AND error IS NULL",
+                params![
+                    s.to.0,
+                    s.to.1.to_string(),
+                    s.path,
+                    s.from.0,
+                    s.from.1.to_string()
+                ],
+            )?,
+            None => 0,
+        };
+        tx.commit()?;
+        Ok(moved > 0)
     }
 
     /// LLM calls scan `scan` started, as their answers come: retries and failed ones too.
@@ -1101,6 +1137,99 @@ pub(super) mod tests {
         store.save(&a, both()).unwrap();
         assert!(store.is_fresh(A, 10, a.mtime, &llm()).unwrap());
         assert!(store.is_fresh(A, 10, a.mtime, &timing).unwrap());
+    }
+
+    /// Each check of `path`, oldest first: its size and mtime.
+    fn stamps_of(store: &Store, path: &str) -> Vec<(u64, Timestamp)> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT size, mtime FROM checks WHERE path = ?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map([path], |r| Ok((r.get(0)?, time(r, 1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn a_swap_moves_the_current_checks_that_were_of_the_file_apply_read() {
+        let (_dir, mut store) = store();
+        let scan = store
+            .begin_scan(&header("2026-10-17T10:00:00Z"), &[A.into()])
+            .unwrap();
+        let tracks = [track("cues")];
+        let a = attempt(scan.id, A, &tracks, "2026-10-17T10:01:00Z");
+        let timing = CheckedWith::timing(&["eng".into()], 1);
+        // A failed timing attempt (1); an LLM check (2) that another (3) replaces; and a timing
+        // check (4), newer than the failure.
+        store
+            .fail(&a, &[(timing.clone(), 4)], "timing: boom")
+            .unwrap();
+        store
+            .save(
+                &a,
+                vec![Made {
+                    with: llm(),
+                    lines: 4,
+                    findings: vec![],
+                }],
+            )
+            .unwrap();
+        let saved = store
+            .save(
+                &a,
+                vec![
+                    Made {
+                        with: llm(),
+                        lines: 4,
+                        findings: vec![typo(A, "go trough it", "go through it")],
+                    },
+                    Made {
+                        with: timing.clone(),
+                        lines: 4,
+                        findings: vec![],
+                    },
+                ],
+            )
+            .unwrap();
+        let fix = Applied {
+            finding: saved.findings[0].id,
+            at: at("2026-10-18T09:00:00Z"),
+        };
+        let old = (10, a.mtime);
+        let new = (12, at("2026-10-18T09:00:00Z"));
+        // From a stamp the checks were not made of (the file changed after the scan): nothing
+        // moves, and the mark is saved all the same.
+        let elsewhere = Swapped {
+            path: A.into(),
+            from: (11, a.mtime),
+            to: new,
+        };
+        assert!(
+            !store
+                .mark_applied(std::slice::from_ref(&fix), Some(&elsewhere))
+                .unwrap()
+        );
+        assert_eq!(stamps_of(&store, A), [old; 4]);
+        let marks: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM applied", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(marks, 1);
+        // From the stamp they were made of: the current checks of both kinds move; the failed
+        // attempt and the replaced check stay as they were.
+        let swapped = Swapped {
+            path: A.into(),
+            from: old,
+            to: new,
+        };
+        assert!(store.mark_applied(&[], Some(&swapped)).unwrap());
+        assert_eq!(stamps_of(&store, A), [old, old, new, new]);
+        assert!(store.is_fresh(A, new.0, new.1, &llm()).unwrap());
+        assert!(store.is_fresh(A, new.0, new.1, &timing).unwrap());
+        assert!(!store.is_fresh(A, old.0, old.1, &llm()).unwrap());
+        // No swap: the marks alone, as before.
+        assert!(!store.mark_applied(&[fix], None).unwrap());
     }
 
     #[test]

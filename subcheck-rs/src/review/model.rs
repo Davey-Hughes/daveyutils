@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 
 use super::layout::{self, EDIT_KEYS, HELP, Item};
 use super::progress::Progress;
+use crate::apply::patch::Outcome;
 use crate::list::{self, Filter};
 use crate::llm::Spent;
 use crate::store::{Decision, Finding, Run, State, TrackRecord};
@@ -66,6 +67,71 @@ pub enum Confirm {
         run: String,
         backend: String,
     },
+    /// Apply the view's accepted fixes: `A`.
+    Apply,
+}
+
+/// What the screen's last apply or dry run said of a finding, for its mark ([`Model::mark`]). A
+/// fix apply made, or found made, has none: the store's `applied` speaks for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mark {
+    /// Left for a fix by hand, and why.
+    ByHand(String),
+    NotFound,
+    WouldApply,
+    /// A dry run found the fix in its file already.
+    AlreadyApplied,
+    WouldBeByHand(String),
+    WouldNotBeFound,
+}
+
+impl Mark {
+    /// The mark for what apply (with `dry_run`, a dry run) said of a fix; `None` for a fix it made
+    /// or found made.
+    pub fn of(outcome: &Outcome, dry_run: bool) -> Option<Mark> {
+        Some(match (dry_run, outcome) {
+            (false, Outcome::ByHand(why)) => Mark::ByHand(why.clone()),
+            (false, Outcome::NotFound) => Mark::NotFound,
+            (false, _) => return None,
+            (true, Outcome::AlreadyApplied) => Mark::AlreadyApplied,
+            (true, Outcome::ByHand(why)) => Mark::WouldBeByHand(why.clone()),
+            (true, Outcome::NotFound) => Mark::WouldNotBeFound,
+            (true, _) => Mark::WouldApply,
+        })
+    }
+
+    /// The mark as the list shows it.
+    pub fn text(&self) -> &'static str {
+        match self {
+            Mark::ByHand(_) => "by hand",
+            Mark::NotFound => "not found",
+            Mark::WouldApply => "would apply",
+            Mark::AlreadyApplied => "already applied",
+            Mark::WouldBeByHand(_) => "would be by hand",
+            Mark::WouldNotBeFound => "would not be found",
+        }
+    }
+
+    /// Whether a dry run made it: it says what apply would do with the decision as it was, so a
+    /// new decision drops it.
+    pub fn dry_run(&self) -> bool {
+        matches!(
+            self,
+            Mark::WouldApply
+                | Mark::AlreadyApplied
+                | Mark::WouldBeByHand(_)
+                | Mark::WouldNotBeFound
+        )
+    }
+
+    /// Why the fix is (or would be) left for a hand fix, for the detail pane.
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Mark::ByHand(why) => Some(format!("left for a fix by hand: {why}")),
+            Mark::WouldBeByHand(why) => Some(format!("would be left for a fix by hand: {why}")),
+            _ => None,
+        }
+    }
 }
 
 /// The one-line editor that `e` opens.
@@ -87,6 +153,7 @@ enum Held {
     Member(u64),
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent screen toggles
 pub struct Model {
     pub run: Run,
     pub rows: Vec<Row>,
@@ -126,11 +193,25 @@ pub struct Model {
     /// The files list's first shown line.
     pub file_scroll: usize,
     pub confirm: Option<Confirm>,
+    /// The screen's apply re-spaces per-letter karaoke, as `apply --karaoke` does (`--karaoke` on
+    /// `scan` and `review`).
+    pub karaoke: bool,
+    /// What the screen's applies and dry runs said of findings, by ID ([`Mark`]). By ID, so they
+    /// outlast a remake of the rows and `v`.
+    pub marks: HashMap<u64, Mark>,
     /// Why the screen ended early: a job's thread panicked, or the terminal could not be read.
     pub fatal: Option<String>,
 }
 
 impl Model {
+    /// What the terminal gets on leaving the screen: what its scans ended with, then its applies,
+    /// files named as the list names them ([`Progress::outro`], [`Progress::apply_outro`]).
+    pub fn outro(&self) -> Vec<String> {
+        let mut lines = self.progress.outro();
+        lines.extend(self.progress.apply_outro(&|p| self.label(p)));
+        lines
+    }
+
     /// Every finding, decided or not, with the first row that has a pending one selected: a
     /// half-reviewed run opens where the work is.
     pub fn new(run: Run, notes: HashMap<String, FileNote>) -> Model {
@@ -161,6 +242,8 @@ impl Model {
             file_selected: 0,
             file_scroll: 0,
             confirm: None,
+            karaoke: false,
+            marks: HashMap::new(),
             fatal: None,
         };
         m.selected = m
@@ -445,15 +528,84 @@ impl Model {
         layout::right_shown(status, items, left).then_some(items)
     }
 
+    /// Finding `i`'s mark: what the screen's last apply or dry run said of it, else `applied` when
+    /// its fix is in its file, else none.
+    pub fn mark(&self, i: usize) -> Option<&'static str> {
+        let id = self.finding(i).id;
+        match self.marks.get(&id) {
+            Some(mark) => Some(mark.text()),
+            None => self.run.applied.contains(&id).then_some("applied"),
+        }
+    }
+
+    /// Row `r`'s mark, over the members the filter shows: theirs when they all agree; when they
+    /// differ, each mark with how many have it, in the order the members come
+    /// (`applied 5 · by hand 1`), leaving out members with none.
+    pub fn row_mark(&self, r: usize) -> Option<String> {
+        let marks: Vec<Option<&str>> = self
+            .shown_members(r)
+            .iter()
+            .map(|&i| self.mark(i))
+            .collect();
+        if marks.iter().all(|m| *m == marks[0]) {
+            return marks[0].map(str::to_string);
+        }
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for mark in marks.into_iter().flatten() {
+            match counts.iter_mut().find(|(t, _)| *t == mark) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((mark, 1)),
+            }
+        }
+        let parts: Vec<String> = counts.iter().map(|(t, n)| format!("{t} {n}")).collect();
+        Some(parts.join(" · "))
+    }
+
+    /// What `A` would apply, as its question counts it: the view's accepted fixes (typos and
+    /// timing fixes, whatever the filter), the files that hold them, and of the fixes those in
+    /// their files already.
+    pub fn apply_counts(&self) -> (usize, usize, usize) {
+        let fixes: Vec<&Finding> = self
+            .run
+            .findings
+            .iter()
+            .filter(|f| self.run.state_of(f.id) == State::Accepted)
+            .collect();
+        let paths: HashSet<&str> = fixes.iter().map(|f| f.file.as_str()).collect();
+        let already = fixes
+            .iter()
+            .filter(|f| self.run.applied.contains(&f.id))
+            .count();
+        (fixes.len(), paths.len(), already)
+    }
+
     /// What the status line `status` says: the question waiting for `y`; else its message; else
     /// how far the scan is, or how it ended; else what the run's LLM calls cost while
     /// [`Model::show_cost`] holds, as much of it as fits beside `? help`.
     pub fn status_text(&self, status: Rect) -> Option<String> {
         if let Some(confirm) = &self.confirm {
             return Some(match confirm {
+                Confirm::Quit if self.progress.applying() => {
+                    self.progress.apply_question(&|p| self.label(p))
+                }
                 Confirm::Quit => self.progress.quit_question(),
                 Confirm::Recheck { path, backend, .. } => {
                     format!("check {} again with {backend}? y/n", self.label(path))
+                }
+                Confirm::Apply => {
+                    let (fixes, paths, already) = self.apply_counts();
+                    let count = |n: usize, one: &str, many: &str| {
+                        format!("{n} {}", if n == 1 { one } else { many })
+                    };
+                    let already = match already {
+                        0 => String::new(),
+                        n => format!(" ({n} applied already)"),
+                    };
+                    format!(
+                        "apply {} in {}{already}, keeping each .orig? y/n",
+                        count(fixes, "fix", "fixes"),
+                        count(paths, "file", "files")
+                    )
                 }
             });
         }

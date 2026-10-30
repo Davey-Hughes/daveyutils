@@ -10,7 +10,8 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
   checked it the same way is skipped; `--force` checks it again. `--run <run>` adds the files to
   that run, making only the checks they need. On a terminal it opens review's screen as it
   starts, and each file's findings join the list when the file is done ([Review](#review));
-  `--no-tui` prints its log instead.
+  `--no-tui` prints its log instead. `--karaoke` makes the screen's apply re-space per-letter
+  karaoke as `apply --karaoke` does.
 - `subcheck review` steps through a run's fixes, or those of the files under some paths, to
   accept, reject or reword each one. With no argument it opens the folders that hold the newest
   run's files.
@@ -65,6 +66,20 @@ recorded there, whichever run checked it. The list's top border names what is sh
 or from folders to the newest run that named the selected file. The selection, the filter and what
 you can undo come along where the other view shows them.
 
+`A` applies the accepted fixes of the view on screen, whatever the filter, as `subcheck apply`
+would with the same view: it asks first (`apply 37 fixes in 9 files (30 applied already), keeping
+each .orig? y/n`), then remuxes, checks and swaps each file in turn while you go on reviewing. `D`
+is a dry run: it asks nothing and writes nothing. Both wait for a scan to end. While they run, the
+list's top border and the status line say how far they are, the files view shows each file's
+stage (`queued`, `remux`, `✓ swapped · 3 applied · 1 by hand`), and its detail pane what apply
+wrote for it; `v` and `c` are refused until apply ends. Each row then says what became of its fix:
+`applied` (from the database, so it shows in every later review), `by hand` or `not found` for this
+session, or after a dry run `would apply`, `already applied`, `would be by hand`, `would not be
+found`; a row whose episodes differ counts them (`applied 5 · by hand 1`), and the detail pane gives
+a by-hand fix's reason. `--karaoke` on `review` or `scan` re-spaces per-letter karaoke as `apply
+--karaoke` does. `q` while apply runs asks first; the file it was on is left as it was, and the
+terminal gets the command that makes the rest (`subcheck apply <view>`).
+
 A fix repeated across episodes (an OP lyric, say) is one row; `⏎` expands it into its episodes. A
 season's timing findings on one track are one row too, whatever each episode's fix (`−1 frame ×23 ·
 partial ×1`): `o` opens one paused on the frame that shows the error, `[` `]` step from there, and
@@ -86,15 +101,17 @@ filter, to the next row).
 | `u` | undo this session's last decision or clear |
 | `f` | filter: all, pending, accepted, rejected |
 | `Tab` | the files, or back to the findings |
-| `v` | a run's folders, or from folders, the newest run that named the selected file (not while a scan runs) |
-| `c` | in the files view: check the file again (asks first; while a scan runs, once it ends) |
+| `v` | a run's folders, or from folders, the newest run that named the selected file (not while a scan or apply runs) |
+| `c` | in the files view: check the file again (asks first; while a scan runs, once it ends; refused while apply runs) |
+| `A` | apply the accepted fixes of the view (asks first; not while a scan runs) |
+| `D` | dry run: what apply would do, writing nothing |
 | `o` | open the line in mpv, 2 s early, with its subtitle track; again on the same line replays it |
 | Space | pause or resume mpv |
 | ← → | mpv back or forward 5 s |
 | `,` `.` | mpv back or forward 1 s |
 | `[` `]` | mpv back or forward one frame (it stays paused) |
 | `?` | show every key, and what the run's LLM calls cost, in a box over the list; `q` quits from it, any other key closes it |
-| `q` | quit, closing the mpv window review started; while the scan runs, ask first, and stop it |
+| `q` | quit, closing the mpv window review started; while a scan or apply runs, ask first, and stop it |
 
 The mouse works too. Click a row to select it, and double-click to open it in mpv. The wheel moves
 the selection over the list and scrolls the detail pane. `? help` at the end of the status line, and
@@ -284,6 +301,14 @@ file:
 4. The original becomes `<name>.mkv.orig` and the remux takes its name. The original is linked to
    that name first, so the file is never missing on the way; a filesystem without hard links
    needs `--no-backup`.
+
+A file apply swaps keeps its checks: they move to the swapped file, so the next scan leaves it
+alone rather than sending its lines to the LLM again. A remux swapped in by hand (after
+`--tracks-only` or `--check`) is checked again.
+
+An existing `<name>.mkv.orig` stops a later apply of that file, since an earlier backup is never
+overwritten, and the screen always keeps one. Move or delete the old `.orig`, or use `subcheck
+apply --no-backup`.
 
 A fixed track's own tags (a `Source` note, say) are carried over to its replacement. The check does
 not compare tags. Any that may not come over exactly are noted in the output, the dry run's too:

@@ -2,6 +2,7 @@
 //! run's view and by `list`. The screen itself is not drawn here; `review::view` has its own tests.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 
 use crossterm::event::KeyCode;
 use subcheck::list::{self, Filter};
@@ -75,9 +76,11 @@ fn send(m: &mut Model, msg: Msg, store: &mut Store, player: &mut Player) {
     let now = jiff::Timestamp::now();
     // None of these effects starts a scan: the channel is only there to be passed.
     let (tx, _rx) = std::sync::mpsc::channel();
+    // Where apply would write its tracks: no test here starts apply, so nothing goes there.
+    let state = Path::new("/no-state");
     let mut queue: VecDeque<_> = update::update(m, msg, now).into();
     while let Some(effect) = queue.pop_front() {
-        let msg = run_effect(effect, store, player, &tx);
+        let msg = run_effect(effect, store, player, state, &tx);
         queue.extend(update::update(m, msg, now));
     }
 }

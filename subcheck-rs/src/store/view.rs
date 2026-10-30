@@ -597,10 +597,13 @@ mod tests {
             .add_usage(first.id, &[call(a, 1.0), call(b, 2.0)])
             .unwrap();
         store
-            .mark_applied(&[Applied {
-                finding: 2,
-                at: at("2026-10-17T12:00:00Z"),
-            }])
+            .mark_applied(
+                &[Applied {
+                    finding: 2,
+                    at: at("2026-10-17T12:00:00Z"),
+                }],
+                None,
+            )
             .unwrap();
         let view = store.run_view(&first).unwrap();
         assert_eq!(view.applied, [2].into());
@@ -779,10 +782,13 @@ mod tests {
             .decide(&[decision(ids[0], State::Accepted, None)])
             .unwrap();
         store
-            .mark_applied(&[Applied {
-                finding: ids[0],
-                at: at("2026-10-17T12:00:00Z"),
-            }])
+            .mark_applied(
+                &[Applied {
+                    finding: ids[0],
+                    at: at("2026-10-17T12:00:00Z"),
+                }],
+                None,
+            )
             .unwrap();
         let view = store.file_view(a).unwrap();
         assert_eq!(paths(&view), [a]);

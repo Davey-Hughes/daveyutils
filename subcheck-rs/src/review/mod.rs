@@ -111,8 +111,15 @@ pub fn file_notes(run: &Run) -> HashMap<String, FileNote> {
     notes
 }
 
-/// Run one effect and say how it went. `tx` is the screen's channel, for the scans `c` starts.
-pub fn run_effect(effect: Effect, store: &mut Store, player: &mut Player, tx: &Sender<Msg>) -> Msg {
+/// Run one effect and say how it went. `state` is the state directory, where apply writes the
+/// fixed tracks; `tx` is the screen's channel, for the jobs `c`, `A` and `D` start.
+pub fn run_effect(
+    effect: Effect,
+    store: &mut Store,
+    player: &mut Player,
+    state: &Path,
+    tx: &Sender<Msg>,
+) -> Msg {
     match effect {
         Effect::Write { action, decisions } => {
             let result = store.decide(&decisions).map_err(|e| e.to_string());
@@ -156,6 +163,26 @@ pub fn run_effect(effect: Effect, store: &mut Store, player: &mut Player, tx: &S
                 paths,
             }
         }
+        Effect::StartApply {
+            run,
+            dry_run,
+            karaoke,
+        } => Msg::ApplyStarted(
+            store
+                .reopen()
+                .map_err(|e| e.to_string())
+                .and_then(|applying| {
+                    jobs::apply(
+                        run,
+                        dry_run,
+                        karaoke,
+                        applying,
+                        state.to_path_buf(),
+                        tx.clone(),
+                    )
+                    .map_err(|e| e.to_string())
+                }),
+        ),
         Effect::Switch(to) => Msg::Switched(
             other_view(store, &to)
                 .map(|run| {
@@ -348,9 +375,10 @@ pub fn nothing_to_check(
 const TICK: Duration = Duration::from_millis(250);
 
 /// Open the screen on `open`, writing decisions through `store`. `state` is the state directory,
-/// where mpv's socket goes when there is no runtime directory. Exit status 1 when the scan failed,
-/// or a file in it did.
-pub fn run(open: Open, mut store: Store, state: &Path) -> anyhow::Result<ExitCode> {
+/// where mpv's socket goes when there is no runtime directory, and apply writes the fixed tracks.
+/// `karaoke`: the screen's apply re-spaces per-letter karaoke. Exit status 1 when a scan or an
+/// apply failed, or a file in one did.
+pub fn run(open: Open, mut store: Store, state: &Path, karaoke: bool) -> anyhow::Result<ExitCode> {
     let (run, scanning, warnings) = match open {
         Open::View(run) => (run, None, Vec::new()),
         Open::Scan {
@@ -372,6 +400,7 @@ pub fn run(open: Open, mut store: Store, state: &Path) -> anyhow::Result<ExitCod
     let mut player = Player::new("mpv", player::socket_path(state));
     // Else the status line opens on what the run's LLM calls cost (`Model::show_cost`).
     let mut model = Model::new(run, notes);
+    model.karaoke = karaoke;
     model.status = opening_status(&warnings);
 
     // The terminal is restored should the screen's own thread panic. A job's panic comes to the
@@ -407,7 +436,15 @@ pub fn run(open: Open, mut store: Store, state: &Path) -> anyhow::Result<ExitCod
     // let go of its own.
     let looped = match jobs::input(tx.clone()) {
         Ok(()) => panic::catch_unwind(AssertUnwindSafe(|| {
-            screen_loop(&mut terminal, &mut model, &rx, &tx, &mut store, &mut player)
+            screen_loop(
+                &mut terminal,
+                &mut model,
+                &rx,
+                &tx,
+                &mut store,
+                &mut player,
+                state,
+            )
         })),
         Err(e) => Ok(Err(e).context("reading the terminal")),
     };
@@ -416,7 +453,7 @@ pub fn run(open: Open, mut store: Store, state: &Path) -> anyhow::Result<ExitCod
     // The mpv this review started is closed, and its registration let go, before `group::end`: one
     // let go after it would wait forever.
     drop(player);
-    if model.progress.running() || model.fatal.is_some() {
+    if model.progress.busy() || model.fatal.is_some() {
         group::end();
     }
     let looped = looped.unwrap_or_else(|panic| panic::resume_unwind(panic));
@@ -429,21 +466,21 @@ pub fn run(open: Open, mut store: Store, state: &Path) -> anyhow::Result<ExitCod
 }
 
 /// What the terminal gets as the screen ends, and the exit status. On an error (the loop's, or the
-/// model's fatal one), the error, returned; a scan it stopped says first how far it got and the
+/// model's fatal one), the error, returned; a job it stopped says first how far it got and the
 /// command that finishes it. Otherwise the outro on `err`, then the decisions' counts on `out`:
-/// exit status 1 when any scan the screen ran failed, or a file in it did.
+/// exit status 1 when any scan or apply the screen ran failed, or a file in it did.
 fn outcome(
     model: &mut Model,
     looped: anyhow::Result<()>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> anyhow::Result<ExitCode> {
-    let outro = model.progress.outro();
+    let outro = model.outro();
     if let Some(e) = looped
         .err()
         .or_else(|| model.fatal.take().map(anyhow::Error::msg))
     {
-        if model.progress.running() {
+        if model.progress.busy() {
             for line in outro {
                 writeln!(err, "{line}")?;
             }
@@ -461,7 +498,8 @@ fn outcome(
     )?;
     let failed = model.progress.earlier_failed
         || model.progress.failed > 0
-        || matches!(model.progress.scan, Scan::Ended(Err(_)));
+        || matches!(model.progress.scan, Scan::Ended(Err(_)))
+        || model.progress.apply_failed();
     Ok(if failed {
         ExitCode::FAILURE
     } else {
@@ -469,7 +507,7 @@ fn outcome(
     })
 }
 
-/// Draw, take the next message (the terminal's, the scan's, or a tick while it runs), update, and
+/// Draw, take the next message (the terminal's, a job's, or a tick while one runs), update, and
 /// run the effects, until the model quits.
 fn screen_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -478,10 +516,11 @@ fn screen_loop(
     tx: &Sender<Msg>,
     store: &mut Store,
     player: &mut Player,
+    state: &Path,
 ) -> anyhow::Result<()> {
     while !model.should_quit {
         terminal.draw(|f| view::view(model, f))?;
-        let msg = receive(rx, model.progress.running());
+        let msg = receive(rx, model.progress.busy());
         let effects = update::update(model, msg, jiff::Timestamp::now());
         // Show what is about to happen (`opening E02 at …`) before an effect holds the loop:
         // starting mpv can take seconds.
@@ -490,20 +529,20 @@ fn screen_loop(
         }
         let mut queue: VecDeque<Effect> = effects.into();
         while let Some(effect) = queue.pop_front() {
-            let msg = run_effect(effect, store, player, tx);
+            let msg = run_effect(effect, store, player, state, tx);
             queue.extend(update::update(model, msg, jiff::Timestamp::now()));
         }
     }
     Ok(())
 }
 
-/// The loop's next message: the terminal's or the scan's, or while the scan runs a tick should
-/// none come for [`TICK`]. The loop holds a `Sender` of its own (for `c`'s scans), so the channel
+/// The loop's next message: the terminal's or a job's, or while a job runs a tick should none come
+/// for [`TICK`]. The loop holds a `Sender` of its own (for `c`'s scans), so the channel
 /// cannot close while the screen runs; a disconnect is fatal, a backstop: each job (the input
 /// thread, each scan) reports why it ends (`Msg::Fatal`, `Msg::ScanEnded`) before it does, and
 /// with the input thread gone no key can quit.
-fn receive(rx: &mpsc::Receiver<Msg>, running: bool) -> Msg {
-    let got = if running {
+fn receive(rx: &mpsc::Receiver<Msg>, busy: bool) -> Msg {
+    let got = if busy {
         match rx.recv_timeout(TICK) {
             Err(mpsc::RecvTimeoutError::Timeout) => return Msg::Tick,
             got => got.ok(),
@@ -517,6 +556,7 @@ fn receive(rx: &mpsc::Receiver<Msg>, running: bool) -> Msg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apply;
     use crossterm::event::{KeyEvent, MouseEvent};
 
     #[test]
@@ -880,5 +920,52 @@ mod tests {
         m.progress.scan = Scan::Ended(Ok(scan::Summary::default()));
         assert_eq!(m.progress.failed, 0);
         assert_eq!(ended(&mut m, Ok(())).0.unwrap(), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn an_apply_that_failed_a_file_is_in_the_outro_and_exits_1() {
+        let mut m = model::tests_support::sample();
+        let e01 = model::tests_support::path(1);
+        m.progress.start_apply(false, "subcheck apply r".into());
+        m.progress
+            .apply_event(&apply::Event::Queued(vec![e01.clone()]));
+        m.progress.apply_event(&apply::Event::Failed {
+            path: e01.clone(),
+            error: "disk full".into(),
+            text: String::new(),
+        });
+        m.progress.apply_ended(Ok(apply::Summary {
+            failed: 1,
+            ..apply::Summary::default()
+        }));
+        let (code, _, err) = ended(&mut m, Ok(()));
+        assert_eq!(code.unwrap(), ExitCode::FAILURE);
+        assert_eq!(
+            err,
+            format!(
+                "{e01}: failed: disk full\n\
+                 applied 0, already applied 0, by hand 0, not found 0; 0 remuxed, 1 failed\n"
+            )
+        );
+    }
+
+    #[test]
+    fn quitting_during_apply_gives_the_command_that_finishes_it() {
+        let mut m = model::tests_support::sample();
+        let (e01, e02) = (model::tests_support::path(1), model::tests_support::path(2));
+        m.progress
+            .start_apply(false, "subcheck apply 2026-10-17T04-39-18".into());
+        m.progress
+            .apply_event(&apply::Event::Queued(vec![e01.clone(), e02]));
+        m.progress
+            .apply_event(&apply::Event::Stage(e01, apply::Stage::Remux));
+        let (code, _, err) = ended(&mut m, Ok(()));
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            err,
+            "apply stopped on E01 (remux), 0/2 files done:\n\
+             applied 0, already applied 0, by hand 0, not found 0; 0 remuxed, 0 failed\n\
+             Finish it with: subcheck apply 2026-10-17T04-39-18\n"
+        );
     }
 }

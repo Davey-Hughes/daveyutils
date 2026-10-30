@@ -13,7 +13,7 @@ use ratatui::widgets::{
 
 use super::files;
 use super::layout;
-use super::model::{Entry, FileNote, Model, Pane, changed, fix_label};
+use super::model::{Entry, FileNote, Mark, Model, Pane, changed, fix_label};
 use crate::list::{self, Filter, label};
 use crate::llm::Spent;
 use crate::store::{State, TimingFix};
@@ -34,7 +34,7 @@ pub fn view(m: &Model, f: &mut Frame) {
 }
 
 /// What `?` shows, a column to each group: each key and what it does.
-const KEY_GROUPS: [(&str, &[(&str, &str)]); 3] = [
+const KEY_GROUPS: [(&str, &[(&str, &str)]); 4] = [
     (
         "decide",
         &[
@@ -67,6 +67,13 @@ const KEY_GROUPS: [(&str, &[(&str, &str)]); 3] = [
             ("← →", "5 s back, forward"),
             (", .", "1 s back, forward"),
             ("[ ]", "a frame back, forward"),
+        ],
+    ),
+    (
+        "apply",
+        &[
+            ("A", "apply the accepted fixes"),
+            ("D", "dry run: what apply would do"),
         ],
     ),
 ];
@@ -376,9 +383,11 @@ fn entry_text(m: &Model, e: Entry) -> Line<'static> {
                 }
             };
             let f = m.finding(first);
+            // What apply did, or would do, with the row's fixes.
+            let outcome = m.row_mark(r).map_or_else(String::new, |t| format!("  {t}"));
             if f.timing.is_some() {
                 return Line::from(format!(
-                    "{} {who} {}  {}",
+                    "{} {who} {}  {}{outcome}",
                     mark(m.shown_state(r)),
                     m.track_name(first),
                     m.fix_summary(&shown)
@@ -387,7 +396,7 @@ fn entry_text(m: &Model, e: Entry) -> Line<'static> {
             let wording = m.wording(first);
             let (ra, rb) = changed(&f.original, wording);
             Line::from(format!(
-                "{} {who} {} {} → {}  [{}]",
+                "{} {who} {} {} → {}  [{}]{outcome}",
                 mark(m.shown_state(r)),
                 timestamp(m.start_ms(first)),
                 &f.original[ra],
@@ -402,8 +411,9 @@ fn entry_text(m: &Model, e: Entry) -> Line<'static> {
             } else {
                 timestamp(m.start_ms(i))
             };
+            let outcome = m.mark(i).map_or_else(String::new, |t| format!("  {t}"));
             Line::from(format!(
-                "    {} {}{} {what}",
+                "    {} {}{} {what}{outcome}",
                 mark(Some(m.state(i))),
                 m.label(&m.finding(i).file),
                 spin(&m.finding(i).file)
@@ -490,8 +500,9 @@ pub fn detail_lines(m: &Model) -> Vec<Line<'static>> {
         .decisions
         .get(&finding.id)
         .and_then(|d| d.edited.as_ref());
+    let outcome = m.mark(i).map_or_else(String::new, |t| format!(" · {t}"));
     lines.push(Line::from(format!(
-        "state: {}{}",
+        "state: {}{}{outcome}",
         label(state),
         if edited.is_some() {
             " (your wording)"
@@ -499,6 +510,9 @@ pub fn detail_lines(m: &Model) -> Vec<Line<'static>> {
             ""
         }
     )));
+    if let Some(why) = m.marks.get(&finding.id).and_then(Mark::reason) {
+        lines.push(warn(&why));
+    }
     lines.push(Line::default());
 
     let wording = m.wording(i);
@@ -681,13 +695,109 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use crate::apply::{self, patch::Outcome};
+    use crate::review::model::Mark;
+    use crate::review::model::tests_support::{path, sample};
     use crate::review::update::{self, Msg};
 
     fn now() -> jiff::Timestamp {
         "2026-10-17T12:00:00Z".parse().unwrap()
     }
 
-    use crate::review::model::tests_support::sample;
+    #[test]
+    fn rows_and_members_carry_their_marks() {
+        let mut m = sample();
+        // The OP lyric's row: findings 1, 2 and 4 (E01, E02, E03).
+        m.run.applied.extend([1, 2, 4]);
+        let screen = render(&m, 140, 20);
+        assert!(screen.contains("[OP en]  applied"), "{screen}");
+        m.marks.insert(4, Mark::ByHand("a karaoke row".into()));
+        let screen = render(&m, 140, 20);
+        assert!(
+            screen.contains("[OP en]  applied 2 · by hand 1"),
+            "{screen}"
+        );
+        m.expanded.insert(0);
+        let screen = render(&m, 140, 20);
+        // E03's member line carries its own mark.
+        assert!(
+            screen
+                .lines()
+                .any(|l| l.contains("E03 0:02:45.06  by hand")),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_detail_pane_says_why_a_fix_is_left_by_hand() {
+        let mut m = sample();
+        m.marks
+            .insert(1, Mark::ByHand("per-letter karaoke (try --karaoke)".into()));
+        m.selected = 0;
+        let text: Vec<String> = detail_lines(&m).iter().map(ToString::to_string).collect();
+        assert!(
+            text.iter().any(|l| l == "state: pending · by hand"),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|l| l == "⚠ left for a fix by hand: per-letter karaoke (try --karaoke)"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn the_files_view_shows_apply_on_each_file_and_its_block() {
+        let mut m = sample();
+        m.progress.start_apply(false, "subcheck apply r".into());
+        m.progress
+            .apply_event(&apply::Event::Queued(vec![path(1), path(2)]));
+        m.progress.apply_event(&apply::Event::Done {
+            path: path(1),
+            outcomes: vec![(1, Outcome::Patched)],
+            remuxed: true,
+            marked: vec![1],
+            restamped: None,
+            text: format!("{}\n  remuxed, verified (quick), swapped\n\n", path(1)),
+        });
+        m.progress
+            .apply_event(&apply::Event::Stage(path(2), apply::Stage::Remux));
+        key_into_files(&mut m);
+        let screen = render(&m, 140, 20);
+        assert!(screen.contains("E01  ✓ swapped · 1 applied"), "{screen}");
+        assert!(screen.contains("E02  ⠋ remux"), "{screen}");
+        assert!(screen.contains("applying 1/2 ⠋"), "{screen}");
+        assert!(
+            screen.contains("applying 1/2 · 1 applied"),
+            "the status line: {screen}"
+        );
+        let text: Vec<String> = files::detail_lines(&m)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            text.iter()
+                .any(|l| l == "  remuxed, verified (quick), swapped"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn the_keys_box_lists_a_and_d() {
+        let mut m = sample();
+        m.help = true;
+        let screen = render(&m, 140, 30);
+        assert!(screen.contains("A  apply the accepted fixes"), "{screen}");
+        assert!(
+            screen.contains("D  dry run: what apply would do"),
+            "{screen}"
+        );
+    }
+
+    /// `Tab` to the files view.
+    fn key_into_files(m: &mut Model) {
+        update::update(m, Msg::Key(KeyCode::Tab), now());
+    }
 
     fn render(m: &Model, width: u16, height: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -1262,11 +1372,12 @@ mod tests {
         // Under the last row of keys: a blank line, a heading, then the costs.
         let last_key = lines
             .iter()
-            .position(|l| l.contains("v          a run, its folders"));
+            .position(|l| l.contains("D  dry run: what apply would do"));
         assert_eq!(last_key, Some(at - 3), "{screen}");
         assert!(lines[at - 1].contains("│ LLM "), "{screen}");
         // Too narrow for one line, it wraps between the parts.
-        let screen = render(&m, 50, 30);
+        // (Taller: the apply group makes the box too tall for 30 lines at this width.)
+        let screen = render(&m, 50, 40);
         assert!(
             screen.contains("│ 1 call · 1.23M in / 31.2k out tokens "),
             "{screen}"
