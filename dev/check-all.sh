@@ -8,6 +8,8 @@
 #
 # The point of this file is that the local gate and the CI gate cannot drift: CI's gating jobs are
 # reproduced here in the same order with the same commands. When a job changes there, change it here.
+# The Rust is the same too: rust-toolchain.toml pins it for every cargo run in the repository, and
+# CI's image is that version.
 #
 # `make check` is NOT this gate and never was — it runs the bash suite and the Rust crates' tests,
 # but not rustfmt, not clippy, and not the syntax sweep. Landing on `make check` alone would miss
@@ -50,6 +52,8 @@ else
   # As in CI: subcheck's `apply` tests fail, rather than skip, without mkvmerge, and its `audio`
   # tests without ffmpeg.
   export SUBCHECK_NEED_MKVMERGE=1 SUBCHECK_NEED_FFMPEG=1
+  # As in CI: which Rust this was, in the log (rust-toolchain.toml names it).
+  run rustc --version
   for crate in "${crates[@]}"; do
     manifest=$crate/Cargo.toml
     run cargo fmt --manifest-path "$manifest" --all --check

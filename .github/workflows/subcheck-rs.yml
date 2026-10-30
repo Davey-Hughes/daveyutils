@@ -23,9 +23,8 @@ jobs:
         working-directory: subcheck-rs
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # The toolchain rust-toolchain.toml names, with its components.
+      - run: rustup toolchain install
       # The `apply` tests remux with mkvmerge and the `audio` tests decode with
       # ffmpeg: both installed on Linux and required there (SUBCHECK_NEED_MKVMERGE,
       # SUBCHECK_NEED_FFMPEG), left out on macOS, where those tests skip. The

@@ -1,0 +1,17 @@
+# The one Rust that dev/check-all.sh, the Makefile and both forges' CI build with. Unpinned, the
+# local gate ran whatever `rustup update` last fetched while CI ran the rust:1-bookworm its runner
+# had cached, and the two clippies disagreed: #46 passed locally on 1.99 and failed CI on 1.97's
+# `duration_suboptimal_units`.
+#
+# rustup finds this file from the working directory upward, so it governs every cargo run inside
+# the repository, from the root with --manifest-path or from a crate.
+#
+# To move on: change `channel` here and the four `image: rust:<version>-bookworm` lines in
+# .forgejo/workflows/ci.yml with it. A mismatch still builds with this version -- rustup honours
+# the file inside the image too -- but every job then downloads it first. An editor's
+# rust-analyzer, through rustup's proxy, needs `rustup component add rust-analyzer` after a bump;
+# it is not listed below because CI would then download it in every job.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

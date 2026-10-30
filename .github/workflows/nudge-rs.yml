@@ -23,9 +23,8 @@ jobs:
         working-directory: nudge-rs
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # The toolchain rust-toolchain.toml names, with its components.
+      - run: rustup toolchain install
       - name: Install tmux (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y tmux
