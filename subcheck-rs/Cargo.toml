@@ -24,7 +24,7 @@ clap = { version = "4", features = ["derive"] }
 # Default backend is miniz_oxide: pure Rust, so no zlib to link.
 flate2 = "1"
 thiserror = "2"
-jiff = { version = "0.2", features = ["serde"] }
+jiff = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The review screen, at nudge-rs's versions.
@@ -37,6 +37,10 @@ rustfft = "6"
 # already; rustix's `process` and `fs` features are ours.
 signal-hook = "0.3"
 rustix = { version = "1", features = ["fs", "process"] }
+# The store: SQLite compiled in (`bundled`), so there is no system library to find, and it builds
+# the same on macOS; it needs a C compiler. `fallible_uint` lets a u64 or usize be a parameter,
+# refused rather than wrapped past i64::MAX.
+rusqlite = { version = "=0.40.2", features = ["bundled", "fallible_uint"] }
 
 [dev-dependencies]
 tempfile = "3"

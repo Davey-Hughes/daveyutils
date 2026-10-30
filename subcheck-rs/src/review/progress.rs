@@ -35,15 +35,12 @@ pub struct FileProgress {
     pub stage: Stage,
     /// Distinct lines checked, from its record.
     pub lines: Option<usize>,
-    /// Checked for timing alone, with no LLM check of its own to count lines for, as its record
-    /// says. A record that adds the timing check to a run's (`--run`) keeps the old record's lines
-    /// and its LLM check, which this scan did not make.
+    /// Checked for timing alone, with no LLM check to count lines for: by the scan, as the record
+    /// of what it made says, though the file's LLM check from an earlier scan stands; or, with no
+    /// scan, as the file's record says.
     pub timing_only: bool,
     /// The scan checks it: a file of the run that the scan leaves alone is as recorded.
     pub queued: bool,
-    /// Its good record in the run, from before the scan, has the LLM check: adding to the run
-    /// makes only the checks that record lacks, so the scan's record of it is of timing alone.
-    had_llm: bool,
     /// What the scan wrote to its log for it; for a file the screen did not scan, what its record
     /// says.
     pub log: Vec<String>,
@@ -114,7 +111,6 @@ impl Progress {
                     lines: r.error.is_none().then_some(r.lines),
                     timing_only: r.error.is_none() && !r.checks.contains(&Check::Llm),
                     queued: false,
-                    had_llm: r.error.is_none() && r.checks.contains(&Check::Llm),
                     log: record_log(r, findings),
                 }
             })
@@ -147,7 +143,6 @@ impl Progress {
                         lines: None,
                         timing_only: false,
                         queued: true,
-                        had_llm: old.is_some_and(|i| self.files[i].had_llm),
                         log: Vec::new(),
                     };
                     match old {
@@ -175,7 +170,7 @@ impl Progress {
                         Record::File(f) => {
                             if let Some(file) = self.file_mut(&f.path) {
                                 file.lines = Some(f.lines);
-                                file.timing_only = file.had_llm || !f.checks.contains(&Check::Llm);
+                                file.timing_only = !f.checks.contains(&Check::Llm);
                             }
                         }
                         _ => {}
@@ -554,9 +549,8 @@ mod tests {
             checks: checks.to_vec(),
             ..record(path, lines, None)
         };
-        // `--run`: E01's record has the LLM check, so the timing check is added alone (its new
-        // record keeps the old one's lines); E03 failed before, so it is checked whole; E02 is new,
-        // its LLM check cached from another scan.
+        // E01's LLM check stands, so the scan makes the timing check alone; E03 failed before, so
+        // it is checked whole; E02 is new to the run, its LLM check made by another scan.
         let run = Run {
             files: vec![
                 record("/m/E01.mkv", 412, None),
@@ -572,7 +566,7 @@ mod tests {
         ]));
         let both = [Check::Llm, Check::Timing];
         for (path, lines, checks, findings) in [
-            ("/m/E01.mkv", 412, both.as_slice(), 1),
+            ("/m/E01.mkv", 0, [Check::Timing].as_slice(), 1),
             ("/m/E02.mkv", 0, &[Check::Timing], 2),
             ("/m/E03.mkv", 380, &both, 3),
         ] {

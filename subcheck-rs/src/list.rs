@@ -34,10 +34,14 @@ pub fn render(run: &Run, filter: Filter, mpv: bool) -> String {
     shown.sort_by_key(|f| first[f.file.as_str()]);
     let failed: Vec<&FileRecord> = run.files.iter().filter(|f| f.error.is_some()).collect();
     let backend = run.header.as_ref().map_or("?", |h| h.backend.as_str());
+    let heading = if run.of_paths {
+        run.name.clone()
+    } else {
+        format!("Run {} ({backend})", run.name)
+    };
     let _ = writeln!(
         out,
-        "Run {} ({backend}): {} files, {} findings{}, {} failed",
-        run.name,
+        "{heading}: {} files, {} findings{}, {} failed",
         run.files.len(),
         shown.len(),
         match filter {
@@ -364,6 +368,20 @@ mod tests {
                 "Run 2026-10-17T14-03-22 (?): 1 files, 2 findings, 0 failed\n\
                  LLM: 1 call, 1.23M in / 31.2k out tokens, $3.21 at API prices\n\n"
             ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_files_under_some_paths_are_headed_by_the_paths() {
+        let r = Run {
+            name: "'/m/K-On!!'".into(),
+            of_paths: true,
+            ..run()
+        };
+        let text = render(&r, Filter::All, false);
+        assert!(
+            text.starts_with("'/m/K-On!!': 1 files, 2 findings, 0 failed\n"),
             "{text}"
         );
     }

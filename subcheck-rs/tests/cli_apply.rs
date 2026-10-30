@@ -7,13 +7,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use common::{fixture, have_mkvmerge, patch};
-use subcheck::store::{Decision, Finding, Record, RunWriter, State};
+use subcheck::store::{
+    Attempt, Check, CheckedWith, Decision, Finding, Made, Run, RunHeader, Selector, State, Store,
+};
 use subcheck::text::Occurrence;
 
 /// A finding: style, original, fix, and occurrences as (track, start ms, end ms).
 type Line<'a> = (&'a str, &'a str, &'a str, &'a [(usize, i64, i64)]);
 
-/// A copy of a fixture in `media/`, a state dir with one run of findings for it, and the paths.
+/// A copy of a fixture in `media/`, a database with one run of findings for it, and the paths.
 struct Setup {
     _dir: tempfile::TempDir,
     root: PathBuf,
@@ -70,13 +72,12 @@ const APPLY_LINES: &[Line] = &[
     ),
 ];
 
-/// Records of findings for `path`, numbered from `first`, each accepted but number `rejected`.
-fn records(path: &Path, lines: &[Line], first: u64, rejected: u64) -> Vec<Record> {
-    let mut out = Vec::new();
-    for (i, (style, original, fix, at)) in lines.iter().enumerate() {
-        let id = first + i as u64;
-        out.push(Record::Finding(Finding {
-            id,
+/// Findings for `path`, their IDs for the store to give.
+fn findings(path: &Path, lines: &[Line]) -> Vec<Finding> {
+    lines
+        .iter()
+        .map(|(style, original, fix, at)| Finding {
+            id: 0,
             file: path.to_string_lossy().into_owned(),
             style: (*style).into(),
             original: (*original).into(),
@@ -94,19 +95,18 @@ fn records(path: &Path, lines: &[Line], first: u64, rejected: u64) -> Vec<Record
             before: vec![],
             after: vec![],
             timing: None,
-        }));
-        out.push(Record::Decision(Decision {
-            finding: id,
-            state: if id == rejected {
-                State::Rejected
-            } else {
-                State::Accepted
-            },
-            edited: None,
-            at: jiff::Timestamp::UNIX_EPOCH,
-        }));
+        })
+        .collect()
+}
+
+/// `state` for finding `finding`, as review records it.
+fn decided(finding: u64, state: State) -> Decision {
+    Decision {
+        finding,
+        state,
+        edited: None,
+        at: jiff::Timestamp::UNIX_EPOCH,
     }
-    out
 }
 
 impl Setup {
@@ -127,8 +127,36 @@ impl Setup {
             root,
             file,
         };
-        let mut w = RunWriter::create(&s.state()).unwrap();
-        w.append(&records(&s.file, lines, 1, rejected)).unwrap();
+        let mut store = s.store();
+        let header = RunHeader {
+            started: jiff::Timestamp::now(),
+            backend: "claude".into(),
+            command: vec![],
+            prompt_version: 1,
+            version: "0".into(),
+            langs: vec!["eng".into()],
+        };
+        store
+            .begin_scan(&header, std::slice::from_ref(&s.file))
+            .unwrap();
+        // The finding at `rejected`, counting from 1, rejected: the store numbers them from 1.
+        let ids = s.save(&s.file, Check::Llm, findings(&s.file, lines));
+        let decisions: Vec<Decision> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                let rejected = u64::try_from(i + 1).unwrap() == rejected;
+                decided(
+                    id,
+                    if rejected {
+                        State::Rejected
+                    } else {
+                        State::Accepted
+                    },
+                )
+            })
+            .collect();
+        store.decide(&decisions).unwrap();
         s
     }
 
@@ -151,45 +179,112 @@ impl Setup {
             root,
             file,
         };
-        let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
-        let o = Command::new(env!("CARGO_BIN_EXE_subcheck"))
-            .arg("scan")
-            .arg(&s.file)
-            .arg("--llm-cmd")
-            .arg(format!("'{}'", fake.display()))
-            .env("XDG_STATE_HOME", s.root.join("state"))
-            .env("FAKE_LLM_LOG", s.root.join("llm-calls.log"))
-            .output()
-            .unwrap();
+        let o = s.scan();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-        let run = subcheck::store::read_run(&s.run_file()).unwrap();
-        let accepted: Vec<Record> = run
+        let accepted: Vec<Decision> = s
+            .run()
             .findings
             .iter()
-            .map(|f| {
-                Record::Decision(Decision {
-                    finding: f.id,
-                    state: State::Accepted,
-                    edited: None,
-                    at: jiff::Timestamp::UNIX_EPOCH,
-                })
-            })
+            .map(|f| decided(f.id, State::Accepted))
             .collect();
-        RunWriter::open(&s.run_file())
-            .unwrap()
-            .append(&accepted)
-            .unwrap();
+        s.store().decide(&accepted).unwrap();
         s
     }
 
-    /// More findings, for `path`, in the same run.
-    fn add(&self, path: &Path, lines: &[Line], first: u64) {
-        let mut w = RunWriter::open(&self.run_file()).unwrap();
-        w.append(&records(path, lines, first, 0)).unwrap();
+    /// `subcheck scan` of the file, with tests/fake-llm.sh as its LLM.
+    fn scan(&self) -> Output {
+        let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
+        Command::new(env!("CARGO_BIN_EXE_subcheck"))
+            .arg("scan")
+            .arg(&self.file)
+            .arg("--llm-cmd")
+            .arg(format!("'{}'", fake.display()))
+            .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("SUBCHECK_DB", self.db())
+            .env("FAKE_LLM_LOG", self.root.join("llm-calls.log"))
+            .output()
+            .unwrap()
     }
 
-    fn state(&self) -> PathBuf {
-        self.root.join("state/subcheck")
+    /// A check of `path` of kind `check`, under the run, with `findings`: it replaces the file's
+    /// check of that kind, so give a kind's findings all at once. Their decisions carry over from
+    /// the check it replaces, where one has the same line and fix. Returns their IDs.
+    fn save(&self, path: &Path, check: Check, findings: Vec<Finding>) -> Vec<u64> {
+        let mut store = self.store();
+        let scan = store.newest_scan().unwrap().unwrap();
+        let path = path.to_string_lossy();
+        let (size, mtime) = subcheck::scan::file_stamp(Path::new(path.as_ref())).unwrap();
+        let with = match check {
+            Check::Llm => CheckedWith::new("claude", &["eng".into()], 1),
+            Check::Timing => CheckedWith::timing(&["eng".into()], 1),
+        };
+        let attempt = Attempt {
+            scan: scan.id,
+            path: &path,
+            size,
+            mtime,
+            tracks: &[],
+            truncated: None,
+            at: jiff::Timestamp::now(),
+        };
+        store.add_files(scan.id, &[path.as_ref().into()]).unwrap();
+        let saved = store
+            .save(
+                &attempt,
+                vec![Made {
+                    with,
+                    lines: 0,
+                    findings,
+                }],
+            )
+            .unwrap();
+        saved.findings.iter().map(|f| f.id).collect()
+    }
+
+    /// More typos, for `path`, in the run, every one accepted: the file's typos all at once.
+    fn add(&self, path: &Path, lines: &[Line]) {
+        let ids = self.save(path, Check::Llm, findings(path, lines));
+        let accepted: Vec<Decision> = ids.iter().map(|&id| decided(id, State::Accepted)).collect();
+        self.store().decide(&accepted).unwrap();
+    }
+
+    /// The file's timing check made again, with its first timing finding twice: two timing fixes
+    /// on one track. Both take the first's decision, carried over.
+    fn twice_on_one_track(&self) {
+        let mut timing: Vec<Finding> = self
+            .run()
+            .findings
+            .into_iter()
+            .filter(|f| f.timing.is_some())
+            .collect();
+        timing.push(timing[0].clone());
+        self.save(&self.file, Check::Timing, timing);
+    }
+
+    fn db(&self) -> PathBuf {
+        self.root.join("subcheck.db")
+    }
+
+    fn store(&self) -> Store {
+        Store::open_at(&self.db()).unwrap()
+    }
+
+    /// The run, as the store shows it.
+    fn run(&self) -> Run {
+        self.store().view(&Selector::Newest).unwrap()
+    }
+
+    /// The database's checks, decisions and applied marks, counted.
+    fn rows(&self) -> (i64, i64, i64) {
+        rusqlite::Connection::open(self.db())
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM checks), (SELECT COUNT(*) FROM decisions),
+                     (SELECT COUNT(*) FROM applied)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
     }
 
     fn apply(&self, args: &[&str]) -> Output {
@@ -197,18 +292,9 @@ impl Setup {
             .arg("apply")
             .args(args)
             .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("SUBCHECK_DB", self.db())
             .output()
             .unwrap()
-    }
-
-    fn run_file(&self) -> PathBuf {
-        let dir = self.state().join("runs");
-        std::fs::read_dir(dir)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path()
     }
 }
 
@@ -231,7 +317,7 @@ fn expected(id: usize, ext: &str) -> String {
 #[test]
 fn a_dry_run_says_what_would_change_and_writes_nothing() {
     let s = Setup::new();
-    let run_before = std::fs::read(s.run_file()).unwrap();
+    let rows = s.rows();
     let o = s.apply(&["--dry-run"]);
     let text = stdout(&o);
     assert!(
@@ -277,7 +363,7 @@ fn a_dry_run_says_what_would_change_and_writes_nothing() {
         std::fs::read(&s.file).unwrap(),
         std::fs::read(fixture("apply.mkv")).unwrap()
     );
-    assert_eq!(std::fs::read(s.run_file()).unwrap(), run_before);
+    assert_eq!(s.rows(), rows);
 }
 
 #[test]
@@ -331,8 +417,7 @@ fn apply_remuxes_checks_and_swaps_keeping_the_original() {
             .replace("acros ", "across ")
     );
     assert!(!subcheck::apply::remux_path(&s.file).exists());
-    let run = subcheck::store::read_run(&s.run_file()).unwrap();
-    assert_eq!(run.applied, [1, 2, 3, 4, 5, 7, 8].into());
+    assert_eq!(s.run().applied, [1, 2, 3, 4, 5, 7, 8].into());
 
     // Again: every fix is in already, so nothing is remuxed, and the backup is no obstacle.
     let o = s.apply(&[]);
@@ -783,12 +868,7 @@ fn a_bad_remux_leaves_the_original_and_no_remux_behind() {
     );
     assert!(!subcheck::apply::remux_path(&s.file).exists());
     assert!(!subcheck::apply::backup_path(&s.file).exists());
-    assert!(
-        subcheck::store::read_run(&s.run_file())
-            .unwrap()
-            .applied
-            .is_empty()
-    );
+    assert_eq!(s.run().applied.len(), 0);
 }
 
 #[test]
@@ -843,31 +923,25 @@ fn tracks_only_then_a_remux_elsewhere_then_check_then_apply_records() {
         std::fs::read(&s.file).unwrap(),
         std::fs::read(fixture("apply.mkv")).unwrap()
     );
-    let name = s
-        .run_file()
-        .file_stem()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
+    let name = s.run().name;
     assert!(
         text.ends_with(&format!(
             "\nOnce they are remuxed, check them with: subcheck apply {name} --check\n"
         )),
         "{text}"
     );
-    // A run given as a file elsewhere is named by its path, quoted for the shell.
-    let elsewhere = s.root.join("a run.jsonl");
-    std::fs::copy(s.run_file(), &elsewhere).unwrap();
+    // The files under a path are named by it, quoted for the shell.
+    let media = s.root.join("media");
     let other = s.root.join("other tracks");
     let text = stdout(&s.apply(&[
-        elsewhere.to_str().unwrap(),
+        media.to_str().unwrap(),
         "--tracks-only",
         other.to_str().unwrap(),
     ]));
     assert!(
         text.ends_with(&format!(
             "check them with: subcheck apply '{}' --check\n",
-            elsewhere.display()
+            media.display()
         )),
         "{text}"
     );
@@ -899,13 +973,7 @@ fn tracks_only_then_a_remux_elsewhere_then_check_then_apply_records() {
         text.contains(&format!("  {} checked (quick): OK\n", remuxed.display())),
         "{text}"
     );
-    assert!(
-        subcheck::store::read_run(&s.run_file())
-            .unwrap()
-            .applied
-            .is_empty(),
-        "check records nothing"
-    );
+    assert_eq!(s.run().applied.len(), 0, "check records nothing");
     // The swap, done by hand; then apply finds every fix in and records it.
     std::fs::rename(&remuxed, &s.file).unwrap();
     let o = s.apply(&[]);
@@ -917,30 +985,50 @@ fn tracks_only_then_a_remux_elsewhere_then_check_then_apply_records() {
         ),
         "{text}"
     );
+    assert_eq!(s.run().applied.len(), 7);
+}
+
+#[test]
+fn a_rejected_finding_that_comes_back_after_apply_keeps_its_decision() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // The fake LLM finds the planted "befor" and "trough": one accepted, one rejected.
+    let s = Setup::scanned("typos.mkv");
+    let first = s.run();
+    let typos: Vec<(u64, &str)> = first
+        .findings
+        .iter()
+        .map(|f| (f.id, f.original.as_str()))
+        .collect();
     assert_eq!(
-        subcheck::store::read_run(&s.run_file())
-            .unwrap()
-            .applied
-            .len(),
-        7
+        typos,
+        [(1, "We should leave befor it rains."), (2, "go trough it")]
     );
+    s.store().decide(&[decided(2, State::Rejected)]).unwrap();
+    let o = s.apply(&[]);
+    assert!(o.status.success(), "{}", stdout(&o));
+    // The fix changed the file, so the next scan checks it again. The typo fixed is gone; the
+    // rejected one comes back, with its decision.
+    let o = s.scan();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let again = s.run();
+    assert_ne!(again.name, first.name);
+    let back: Vec<(&str, State)> = again
+        .findings
+        .iter()
+        .map(|f| (f.original.as_str(), again.state_of(f.id)))
+        .collect();
+    assert_eq!(back, [("go trough it", State::Rejected)]);
 }
 
 #[test]
 fn a_run_with_nothing_accepted_has_nothing_to_do() {
     let s = Setup::new();
-    let mut w = RunWriter::open(&s.run_file()).unwrap();
-    let rejected: Vec<Record> = (1..=10)
-        .map(|finding| {
-            Record::Decision(Decision {
-                finding,
-                state: State::Rejected,
-                edited: None,
-                at: jiff::Timestamp::UNIX_EPOCH,
-            })
-        })
+    let rejected: Vec<Decision> = (1..=10)
+        .map(|finding| decided(finding, State::Rejected))
         .collect();
-    w.append(&rejected).unwrap();
+    s.store().decide(&rejected).unwrap();
     let o = s.apply(&["--dry-run"]);
     assert!(o.status.success());
     assert!(
@@ -956,7 +1044,7 @@ fn files_of_one_name_get_track_files_of_their_own() {
     std::fs::create_dir(s.root.join("media/b")).unwrap();
     let other = s.root.join("media/b/apply.mkv");
     std::fs::copy(fixture("apply.mkv"), &other).unwrap();
-    s.add(&other, APPLY_LINES, 11);
+    s.add(&other, APPLY_LINES);
     let out = s.root.join("tracks");
     let o = s.apply(&["--tracks-only", out.to_str().unwrap()]);
     let text = stdout(&o);
@@ -1132,7 +1220,7 @@ fn timing_fixes_shift_their_tracks_with_the_typos_in_one_remux() {
         return;
     }
     let s = Setup::scanned("timing.mkv");
-    s.add(&s.file, LATE_TYPO, 3);
+    s.add(&s.file, LATE_TYPO);
     let o = s.apply(&["--dry-run"]);
     let text = stdout(&o);
     assert!(o.status.success(), "{text}");
@@ -1163,13 +1251,7 @@ fn timing_fixes_shift_their_tracks_with_the_typos_in_one_remux() {
         ),
         "{text}"
     );
-    assert_eq!(
-        subcheck::store::read_run(&s.run_file())
-            .unwrap()
-            .applied
-            .len(),
-        3
-    );
+    assert_eq!(s.run().applied.len(), 3);
     let now = track(&s.file, 2);
     assert!(
         now.contains("Dialogue: 0,0:00:00.00,0:00:06.75,Default,,0,0,0,,Line zero on the cut.\n"),
@@ -1264,7 +1346,7 @@ fn a_timing_fix_reads_the_frames_the_keyframes_leave_at_either_of_two_times() {
     );
     // Typos found before the shift on two lines whose moves turn on frame 989: each is looked
     // for where frame 989's time put its line, one moved and one left where it was.
-    s.add(&s.file, TIES_TYPOS, 2);
+    s.add(&s.file, TIES_TYPOS);
     // No backup: the first remux's original is still there.
     let o = s.apply(&["--no-backup"]);
     let text = stdout(&o);
@@ -1303,11 +1385,7 @@ const TIES_TYPOS: &[Line] = &[
 fn a_timing_fix_that_cannot_be_made_is_left_for_a_hand_fix() {
     // A file whose video has too few keyframes to give the frame grid.
     let s = Setup::with("apply.mkv", &[], 0);
-    let mut late = subcheck::store::read_run(&Setup::scanned("timing.mkv").run_file())
-        .unwrap()
-        .findings
-        .remove(0);
-    late.id = 1;
+    let mut late = Setup::scanned("timing.mkv").run().findings.remove(0);
     late.file = s.file.to_string_lossy().into_owned();
     // Its one stretch's ends: apply.mkv's first line on track 2, where the scan found it.
     let first = subcheck::store::LineRef {
@@ -1319,20 +1397,13 @@ fn a_timing_fix_that_cannot_be_made_is_left_for_a_hand_fix() {
     fix.stretches.truncate(1);
     fix.stretches[0].first = Some(first.clone());
     fix.stretches[0].last = Some(first);
-    let accepted = |finding| {
-        Record::Decision(Decision {
-            finding,
-            state: State::Accepted,
-            edited: None,
-            at: jiff::Timestamp::UNIX_EPOCH,
-        })
-    };
-    let mut w = RunWriter::open(&s.run_file()).unwrap();
-    w.append(&[Record::Finding(late.clone()), accepted(1)])
+    let ids = s.save(&s.file, Check::Timing, vec![late]);
+    s.store()
+        .decide(&[decided(ids[0], State::Accepted)])
         .unwrap();
     // A typo on that line: with the fix's lines where the scan found them, no grid is needed to
     // know it is there too.
-    s.add(&s.file, &APPLY_LINES[..1], 2);
+    s.add(&s.file, &APPLY_LINES[..1]);
     let text = stdout(&s.apply(&["--dry-run"]));
     assert!(
         text.contains(
@@ -1346,10 +1417,7 @@ fn a_timing_fix_that_cannot_be_made_is_left_for_a_hand_fix() {
     );
     // Two timing findings on one track: neither is made.
     let s = Setup::scanned("timing.mkv");
-    let mut again = subcheck::store::read_run(&s.run_file()).unwrap().findings[0].clone();
-    again.id = 3;
-    let mut w = RunWriter::open(&s.run_file()).unwrap();
-    w.append(&[Record::Finding(again), accepted(3)]).unwrap();
+    s.twice_on_one_track();
     let text = stdout(&s.apply(&["--dry-run"]));
     let hand =
         "  track 2  1 frame late → shift 1 frame earlier  by hand: two timing fixes on one track\n";
@@ -1371,21 +1439,12 @@ fn a_typo_is_looked_for_at_shifted_times_only_on_a_track_shifted_already() {
         "Line zero on the cut.",
         &[(2, 1000, 7750)],
     )];
-    s.add(&s.file, early, 3);
+    s.add(&s.file, early);
     let not_found = "  0:00:01.00  0 → zero  not found: the file changed since the scan\n";
     let text = stdout(&s.apply(&["--dry-run"]));
     assert!(text.contains(not_found), "{text}");
     // Nor with the track's timing fix left for a hand fix: two of them on it.
-    let mut again = subcheck::store::read_run(&s.run_file()).unwrap().findings[0].clone();
-    again.id = 4;
-    let accepted = Record::Decision(Decision {
-        finding: 4,
-        state: State::Accepted,
-        edited: None,
-        at: jiff::Timestamp::UNIX_EPOCH,
-    });
-    let mut w = RunWriter::open(&s.run_file()).unwrap();
-    w.append(&[Record::Finding(again), accepted]).unwrap();
+    s.twice_on_one_track();
     // Nor with the track's two timing fixes left for a hand fix: not knowing whether the track
     // is shifted, a line they move is left for one too.
     let text = stdout(&s.apply(&["--dry-run"]));
@@ -1410,23 +1469,29 @@ fn a_typo_on_a_line_a_timing_fix_reading_not_found_moves_is_left_for_a_hand_fix(
     // Track 2's first line, as the run recorded it, reads otherwise now (its style changed by
     // hand, say): its timing fix reads neither in nor to do, and a typo on a line it moves could
     // be at either time.
-    let run = std::fs::read_to_string(s.run_file()).unwrap();
-    let changed = run.replacen(
-        "\"raw\":\"0,Default,,0,0,0,,Line 0 on the cut.\"",
-        "\"raw\":\"0,Sign,,0,0,0,,Line 0 on the cut.\"",
-        1,
-    );
-    assert_ne!(changed, run);
-    std::fs::write(s.run_file(), changed).unwrap();
-    s.add(&s.file, LATE_TYPO, 3);
-    // At the times where the line is now, too.
-    let where_now: &[Line] = &[(
+    let db = rusqlite::Connection::open(s.db()).unwrap();
+    let was = "\"raw\":\"0,Default,,0,0,0,,Line 0 on the cut.\"";
+    let (id, fix): (i64, String) = db
+        .query_row(
+            "SELECT id, timing FROM findings WHERE instr(timing, ?1) > 0 ORDER BY id LIMIT 1",
+            [was],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let changed = fix.replacen(was, "\"raw\":\"0,Sign,,0,0,0,,Line 0 on the cut.\"", 1);
+    db.execute(
+        "UPDATE findings SET timing = ?1 WHERE id = ?2",
+        (changed, id),
+    )
+    .unwrap();
+    // The typo, and at the times where the line is now, too: one check of the file's typos.
+    let where_now: Line = (
         "Default",
         "Line 0 on the cut.",
         "Line nought on the cut.",
         &[(2, 0, 6750)],
-    )];
-    s.add(&s.file, where_now, 4);
+    );
+    s.add(&s.file, &[LATE_TYPO[0], where_now]);
     let text = stdout(&s.apply(&["--dry-run"]));
     assert!(
         text.contains("  track 2  1 frame late → shift 1 frame earlier  not found: "),

@@ -120,6 +120,15 @@ fn files_found_in_a_directory_are_headed_by_their_path_below_it() {
 }
 
 #[test]
+fn a_directory_argument_with_dot_dot_heads_its_files_as_without() {
+    let dir = seasons();
+    assert_eq!(
+        headers(dir.path(), &["Season 1/.."]),
+        ["Season 1/01.mkv", "Season 2/01.mkv", "Season 2/02.mkv"]
+    );
+}
+
+#[test]
 fn files_named_alike_on_the_command_line_are_headed_by_their_paths_as_given() {
     // As `subcheck timing */01.mkv` names them; 02.mkv shares its name with nothing.
     let dir = seasons();

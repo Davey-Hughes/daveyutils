@@ -14,7 +14,8 @@ use serde::Deserialize;
 use crate::group;
 use crate::text::{Line, timestamp};
 
-/// Stored in every run file, so findings can be traced to the prompt that produced them.
+/// Stored with every scan and every LLM check, so findings can be traced to the prompt that
+/// produced them.
 pub const PROMPT_VERSION: u32 = 1;
 
 /// One chunk's run limit; a chunk that takes longer is killed, retried once, then failed.
@@ -28,7 +29,7 @@ pub const CHUNK_LINES_OLLAMA: usize = 150;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backend {
-    /// What the run file records: `claude`, `gpt`, `ollama:<model>` or `cmd:<command>`.
+    /// What a run records: `claude`, `gpt`, `ollama:<model>` or `cmd:<command>`.
     pub label: String,
     pub argv: Vec<String>,
     pub chunk_lines: usize,
@@ -129,7 +130,7 @@ impl Backend {
         }
     }
 
-    /// The backend a run file records by its label.
+    /// The backend a run records, by its label.
     pub fn from_label(label: &str) -> Result<Backend, String> {
         match label.strip_prefix("cmd:") {
             Some(command) => Ok(Backend::shell(command)),
@@ -168,8 +169,8 @@ impl Backend {
     }
 }
 
-/// What one call used, as its backend reported it. A run file holds it as
-/// [`crate::store::LlmCall`] does.
+/// What one call used, as its backend reported it. The store keeps it as a `usage` row
+/// ([`crate::store::LlmCall`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Usage {
     /// All of its input, read from a cache or not. (claude's own `input_tokens` leaves out the
@@ -345,7 +346,7 @@ impl Output {
 }
 
 /// Whether `cost` can be a price: finite, and not below 0. In claude's reply one that is not is
-/// taken as no price at all; in a run file it makes the record unreadable.
+/// taken as no price at all.
 pub fn is_price(cost: f64) -> bool {
     cost.is_finite() && cost >= 0.0
 }

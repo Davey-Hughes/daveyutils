@@ -16,7 +16,7 @@ use subcheck::llm::Backend;
 use subcheck::mkv::{self, Track};
 use subcheck::review;
 use subcheck::scan::{self, Planned};
-use subcheck::store::{self, State};
+use subcheck::store::{self, Selector, State, Store};
 use subcheck::subs::{self, Kind};
 use subcheck::text;
 use subcheck::timing::{self, Analysis, TrackReport};
@@ -58,14 +58,14 @@ enum Command {
     /// Proofread the text subtitles of MKV files with an LLM and record each suggested fix.
     ///
     /// Files are walked recursively; files unchanged since an earlier scan are skipped. Findings
-    /// go to a run file under the state directory; read them with `subcheck list`.
+    /// go to the store, under a run named for when it started; read them with `subcheck list`.
     Scan {
         /// MKV files, or directories to search for them.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        /// Add to this run (a name as `scan` prints it, or a run file) instead of starting one:
-        /// only the checks it does not have yet are made, so running it again adds nothing.
-        #[arg(long, conflicts_with_all = ["force", "dry_run"])]
+        /// Add the files to this run (a name as `scan` prints it) instead of starting one: only the
+        /// checks they need are made, under it, so running it again adds nothing.
+        #[arg(long, conflicts_with = "dry_run")]
         run: Option<String>,
         /// claude, gpt (Codex) or ollama:<model>. Default: claude, or with --run the run's.
         #[arg(long)]
@@ -98,10 +98,12 @@ enum Command {
         no_tui: bool,
     },
     /// Accept, reject or reword each finding of a run, with a key that opens it in mpv: the newest
-    /// run, or the one named.
+    /// run, the one named, or the files under some paths.
     Review {
-        /// A run name (as `scan` prints it) or a run file. Default: the newest.
-        run: Option<String>,
+        /// A run name, as `scan` prints it; or MKV files and directories, for every file under them
+        /// as it is now. Default: the newest run.
+        #[arg(value_name = "RUN | PATHS")]
+        run: Vec<String>,
     },
     /// Report subtitle tracks shifted by whole frames against the video. Reads only the index
     /// and the subtitles; no LLM, nothing recorded.
@@ -140,15 +142,19 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Make a run's accepted fixes in its MKV files: the newest run, or the one named.
+    /// Make a run's accepted fixes in its MKV files: the newest run, the one named, or those of the
+    /// files under some paths.
     ///
     /// Each file is remuxed with mkvmerge beside the original, checked against it, and swapped
     /// in; the original is kept as <name>.mkv.orig.
     Apply(ApplyArgs),
-    /// Show a run's findings as text: the newest run, or the one named.
+    /// Show a run's findings as text: the newest run, the one named, or those of the files under
+    /// some paths.
     List {
-        /// A run name (as `scan` prints it) or a run file. Default: the newest.
-        run: Option<String>,
+        /// A run name, as `scan` prints it; or MKV files and directories, for every file under them
+        /// as it is now. Default: the newest run.
+        #[arg(value_name = "RUN | PATHS")]
+        run: Vec<String>,
         /// Only findings you accepted.
         #[arg(long, conflicts_with_all = ["rejected", "pending"])]
         accepted: bool,
@@ -167,8 +173,10 @@ enum Command {
 #[derive(Args)]
 #[allow(clippy::struct_excessive_bools)] // command-line flags
 struct ApplyArgs {
-    /// A run name (as `scan` prints it) or a run file. Default: the newest.
-    run: Option<String>,
+    /// A run name, as `scan` prints it; or MKV files and directories, for every file under them as
+    /// it is now. Default: the newest run.
+    #[arg(value_name = "RUN | PATHS")]
+    run: Vec<String>,
     /// Show what would change, event by event; write nothing.
     #[arg(long, conflicts_with_all = ["no_backup", "full", "tracks_only", "check"])]
     dry_run: bool,
@@ -232,21 +240,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             no_tui,
         } => {
             let state = store::state_dir()?;
-            let into = run
-                .as_deref()
-                .map(|r| store::find_run(&state, Some(r)))
-                .transpose()?;
-            let (backend, langs) = if let Some(path) = &into {
-                let run =
-                    store::read_run(path).with_context(|| format!("reading {}", path.display()))?;
-                // The cache says which languages a run from before runs kept them checked.
-                let old = run.header.as_ref().is_some_and(|h| h.langs.is_empty());
-                let cache = if old {
-                    store::Cache::load(&state)?
-                } else {
-                    store::Cache::default()
-                };
-                scan::resume(&run, &cache, llm.as_deref(), llm_cmd.as_deref(), &langs)
+            let mut db = Store::open()?;
+            let (backend, langs) = if let Some(name) = &run {
+                let scan = db
+                    .scan_named(name)?
+                    .with_context(|| format!("no run named {name}"))?;
+                scan::resume(&scan, llm.as_deref(), llm_cmd.as_deref(), &langs)
                     .map_err(anyhow::Error::msg)?
             } else {
                 let backend = match llm_cmd {
@@ -268,25 +267,31 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 langs,
                 force,
                 verbose,
-                into: into.clone(),
+                into: run,
             };
             if dry_run {
                 scan::dry_run(
                     &paths,
                     &opts,
-                    &state,
+                    &db,
                     &mut std::io::stdout().lock(),
                     &mut std::io::stderr(),
                 )?;
                 return Ok(ExitCode::SUCCESS);
             }
-            let adding = into.is_some();
+            let adding = opts.into.is_some();
             let screen =
                 !no_tui && std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
             // What planning warns of goes to stderr as it comes, and is kept for the screen, which
             // covers it once it opens.
             let mut log = review::Tee::new(std::io::stderr());
-            let s = match scan::plan(&paths, &opts, &state, &mut log)? {
+            let s = match scan::plan(&paths, &opts, &mut db, &mut log)? {
+                Planned::Nothing(s) if screen => {
+                    match review::nothing_to_check(&db, &s, opts.into.as_deref())? {
+                        Some(shown) => return review::run(review::Open::View(shown), db, &state),
+                        None => s,
+                    }
+                }
                 Planned::Nothing(s) => s,
                 Planned::Scan(plan) if screen => {
                     let warnings = log.into_lines();
@@ -296,10 +301,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         paths,
                         warnings,
                     };
-                    return review::run(open, &state);
+                    return review::run(open, db, &state);
                 }
                 Planned::Scan(plan) => {
-                    scan::execute(plan, &opts, &state, &mut std::io::stderr(), &|_| {})?
+                    scan::execute(plan, &opts, &mut db, &mut std::io::stderr(), &|_| {})?
                 }
             };
             for line in scan::summary_lines(&s, adding) {
@@ -313,8 +318,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Review { run } => {
             let state = store::state_dir()?;
-            let path = store::find_run(&state, run.as_deref())?;
-            review::run(review::Open::Run(path), &state)
+            let db = Store::open()?;
+            let shown = db.view(&Selector::parse(&run)?)?;
+            review::run(review::Open::View(shown), db, &state)
         }
         Command::Timing {
             paths,
@@ -334,9 +340,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             pending,
             mpv,
         } => {
-            let path = store::find_run(&store::state_dir()?, run.as_deref())?;
-            let run =
-                store::read_run(&path).with_context(|| format!("reading {}", path.display()))?;
+            let run = Store::open()?.view(&Selector::parse(&run)?)?;
             let filter = match (accepted, rejected, pending) {
                 (true, _, _) => Filter::Only(State::Accepted),
                 (_, true, _) => Filter::Only(State::Rejected),
@@ -361,9 +365,11 @@ fn apply_run(a: ApplyArgs) -> Result<ExitCode> {
         },
     };
     let state = store::state_dir()?;
-    let path = store::find_run(&state, a.run.as_deref())?;
+    let mut db = Store::open()?;
+    let run = db.view(&Selector::parse(&a.run)?)?;
     let s = apply::run(
-        &path,
+        &run,
+        &mut db,
         &state,
         &mode,
         a.karaoke,
@@ -497,7 +503,7 @@ fn labelled_files(paths: &[PathBuf]) -> (Vec<(PathBuf, String)>, bool) {
                 for w in warnings {
                     eprintln!("warning: {w}");
                 }
-                let root = std::path::absolute(p).ok().filter(|r| r.is_dir());
+                let root = subcheck::store::absolute(p).ok().filter(|r| r.is_dir());
                 files.extend(found.into_iter().map(|f| {
                     let (short, long) = timing_labels(p, root.as_deref(), &f);
                     (f, short, long)

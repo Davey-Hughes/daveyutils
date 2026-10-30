@@ -4,16 +4,17 @@ Proofread the text subtitles embedded in MKV files with an LLM, then review the 
 
 - `subcheck extract` writes a subtitle track out the way mkvextract does, reading only the
   subtitle packets (through the file's Cues) instead of the whole file.
-- `subcheck scan` sends the English lines to an LLM and records each suggested fix in a run file
-  under `~/.local/state/subcheck/`, with each track `timing` finds shifted, and what each LLM call
-  used ([LLM costs](#llm-costs)). `--run <run>` adds to that run only the checks it lacks: the
-  timing check, say, for a run made before it existed. An LLM check the cache has from another
-  run of the unchanged file is not made again. On a terminal it opens review's screen as it
+- `subcheck scan` sends the English lines to an LLM and records each suggested fix in its database
+  ([Where findings are kept](#where-findings-are-kept)), with each track `timing` finds shifted,
+  and what each LLM call used ([LLM costs](#llm-costs)). A file unchanged since any earlier scan
+  checked it the same way is skipped; `--force` checks it again. `--run <run>` adds the files to
+  that run, making only the checks they need. On a terminal it opens review's screen as it
   starts, and each file's findings join the list when the file is done ([Review](#review));
   `--no-tui` prints its log instead.
-- `subcheck review` steps through a run's fixes to accept, reject or reword each one.
-- `subcheck list` prints a run's fixes as text, under what its LLM calls cost; `--mpv` adds a
-  command that opens each one.
+- `subcheck review` steps through a run's fixes, or those of the files under some paths, to
+  accept, reject or reword each one.
+- `subcheck list` prints a run's fixes (or those of the files under some paths) as text, under
+  what their LLM calls cost; `--mpv` adds a command that opens each one.
 - `subcheck apply` makes a run's accepted fixes in the MKV files, keeping each original as
   `<name>.mkv.orig`: a file's typos and timing fixes in one remux, each shifted line moved by whole
   frames on the video's frame grid. Needs mkvtoolnix.
@@ -37,12 +38,15 @@ back. A timing finding that joins a row stays pending: each episode's fix can di
 detail pane what the scan said of it. `⏎` on a file goes to its first finding, and `u` undoes there
 as it does in the list. While the scan runs, the list's title and the status line say how far it
 is; once it ends, the status line gives its summary. What the scan warns of as it starts (a folder
-it cannot read; with `--run`, a file changed since the run) stays on the terminal above the screen,
-and the first of it is on the status line as the screen opens.
+it cannot read) stays on the terminal above the screen, and the first of it is on the status line
+as the screen opens. Files the scan skips as unchanged are in the list from the start.
+
+When a scan checks a file again and that check fails, the file's earlier findings stay recorded: they
+are left out of the screen's list until that scan ends, and are back when you open it again with
+`subcheck review`.
 
 `q` while the scan runs asks first, then stops it: the run keeps every file that was done, and the
-terminal gets the command that finishes it (`subcheck scan --run <run> <paths>`, the run by its
-path when it is a run file outside the state directory).
+terminal gets the command that finishes it (`subcheck scan --run <run> <paths>`).
 
 A fix repeated across episodes (an OP lyric, say) is one row; `⏎` expands it into its episodes. A
 season's timing findings on one track are one row too, whatever each episode's fix (`−1 frame ×23 ·
@@ -80,8 +84,9 @@ in the terminal with Shift+drag.
 
 ## LLM costs
 
-A scan records in its run file what each LLM call used, retries and failed calls too, and after
-its summary says what its calls cost. `list` says it for the whole run under its first line, and
+A scan records what each LLM call used, retries and failed calls too, and after its summary says
+what its calls cost. `list` says it for the whole run under its first line (for the files under
+some paths, the calls of the scans that made their current LLM checks), and
 review in `?`'s box and on the status line as it opens, until the first key or click (as much as
 fits beside `? help`: the tokens go first, then the calls, keeping the price):
 
@@ -110,6 +115,39 @@ LLM: 200 calls (none reported usage)
 
 A failed call's error is the exit status and stderr, then what the backend's JSON says of it:
 `claude exited with exit status: 1; claude said: You've hit your session limit`.
+
+## Where findings are kept
+
+Everything subcheck records is in one SQLite database: `~/.local/state/subcheck/subcheck.db`
+(under `$XDG_STATE_HOME` when that is set, `~/Library/Application Support/subcheck/` on macOS), or
+the absolute path in `SUBCHECK_DB`. Findings and decisions belong to files: each file has at most
+one current LLM check and one current timing check, and a check made again (the file changed, or
+`--force`) replaces the one before, whichever scan made it. A decision carries over to a finding
+that comes back with the same line and the same fix: a typo you rejected stays rejected when
+`apply` changes the file and the next scan reads it again.
+
+A run is the record of one scan, and a view of the files it named as they are now: two runs that
+share a file show it the same. `review`, `list` and `apply` take a run name, or files and
+directories instead, for every file recorded under them:
+
+```
+subcheck list ~/Videos/K-On!
+subcheck review 2026-10-28T19-04-11
+```
+
+A scan with nothing to check makes no run. On a terminal it opens the screen on its files; in a
+pipe it says how to (`Nothing to check: 12 unchanged (subcheck review '/m/K-On!')`).
+
+The database is in WAL mode, so to back it up copy it with
+`sqlite3 ~/.local/state/subcheck/subcheck.db ".backup 'subcheck-backup.db'"`, not `cp`, which can
+miss what is still in `subcheck.db-wal`.
+
+To look inside, `sqlite3 ~/.local/state/subcheck/subcheck.db`: `scans` and `scan_files` are the
+runs, `checks` each attempt to check a file (the current one has no `replaced_by` and no `error`),
+then `findings`, `decisions` (a finding's latest is its current one), `applied` and `usage`.
+
+Run files from before the database (`runs/` and `cache.jsonl` in the state directory) are no longer
+read, and can be deleted.
 
 ## Keeping focus in the terminal
 
@@ -206,8 +244,8 @@ a window cannot be read; `--ffmpeg` names the program.
 
 ## Apply
 
-`subcheck apply` takes the newest run's accepted fixes (or those of the run named), with your
-wording where you reworded one, and makes them in each file:
+`subcheck apply` takes the newest run's accepted fixes (or those of the run named, or of the files
+under some paths), with your wording where you reworded one, and makes them in each file:
 
 1. It finds the events each fix was made from and changes just the words that differ, keeping the
    tags around them (`{\i1}Ihave{\i0}` becomes `{\i1}I have{\i0}`).

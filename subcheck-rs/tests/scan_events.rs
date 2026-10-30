@@ -1,5 +1,5 @@
 //! What `scan` tells its hook (`scan::execute`), as review's screen reads it, checked against the
-//! run file the scan writes. tests/fake-llm.sh is the LLM.
+//! run as the store shows it. tests/fake-llm.sh is the LLM.
 
 mod common;
 
@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use common::fixture;
 use subcheck::llm::Backend;
 use subcheck::scan::{self, Event, Planned};
-use subcheck::store::Record;
+use subcheck::store::{Run, Selector, Store};
 
 fn options() -> scan::Options {
     let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-llm.sh");
@@ -26,8 +26,9 @@ fn options() -> scan::Options {
 }
 
 #[test]
-fn the_hook_hears_every_file_and_exactly_the_records_the_run_gets() {
-    let state = tempfile::tempdir().unwrap();
+fn the_hook_hears_every_file_and_records_that_make_the_run_the_store_shows() {
+    let db = tempfile::tempdir().unwrap();
+    let mut store = Store::open_at(&db.path().join("subcheck.db")).unwrap();
     let dir = tempfile::tempdir().unwrap();
     // Two copies of one file: the second's lines were all sent with the first, so it waits on the
     // first's chunk.
@@ -42,15 +43,15 @@ fn the_hook_hears_every_file_and_exactly_the_records_the_run_gets() {
     let Planned::Scan(plan) = scan::plan(
         &[dir.path().to_path_buf()],
         &opts,
-        state.path(),
+        &mut store,
         &mut std::io::sink(),
     )
     .unwrap() else {
         panic!("nothing to check");
     };
-    let run_path = plan.run_path().to_path_buf();
+    let name = plan.scan().name.clone();
     let heard = Mutex::new(Vec::new());
-    let summary = scan::execute(plan, &opts, state.path(), &mut std::io::sink(), &|e| {
+    let summary = scan::execute(plan, &opts, &mut store, &mut std::io::sink(), &|e| {
         heard.lock().unwrap().push(e);
     })
     .unwrap();
@@ -77,22 +78,30 @@ fn the_hook_hears_every_file_and_exactly_the_records_the_run_gets() {
         });
         assert_eq!(last, Some((1, 1)), "{}", f.display());
     }
-    // Exactly the records the run file has after its header, in its order.
-    let appended: Vec<Record> = events
-        .iter()
-        .filter_map(|e| match e {
-            Event::Appended(records) => Some(records.clone()),
-            _ => None,
-        })
-        .flatten()
-        .collect();
-    let text = std::fs::read_to_string(&run_path).unwrap();
-    let on_disk: Vec<Record> = text
-        .lines()
-        .skip(1)
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(appended, on_disk);
+    // The records heard, taken as review's model takes them, are the run as the store shows it.
+    let mut heard_run = Run::default();
+    for e in &events {
+        if let Event::Appended(records) = e {
+            for r in records {
+                heard_run.add(r.clone());
+            }
+        }
+    }
+    let shown = store.view(&Selector::Run(name)).unwrap();
+    let files = |run: &Run| {
+        let mut files = run.files.clone();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        files
+    };
+    assert_eq!(files(&heard_run), files(&shown));
+    let findings = |run: &Run| {
+        let mut findings = run.findings.clone();
+        findings.sort_by_key(|f| f.id);
+        findings
+    };
+    assert_eq!(findings(&heard_run), findings(&shown));
+    assert_eq!(heard_run.decisions, shown.decisions);
+    assert_eq!(heard_run.spent, shown.spent);
     // Each file finished, after its records, with its findings and its log line.
     let finished: Vec<(&PathBuf, &Option<String>, usize, &Vec<String>)> = events
         .iter()

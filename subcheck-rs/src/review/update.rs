@@ -1,5 +1,5 @@
-//! Keys to state changes, and the effects the event loop runs for them. Pure: the run file and mpv
-//! are touched only by the effects, so every rule here is tested without a terminal.
+//! Keys to state changes, and the effects the event loop runs for them. Pure: the store and mpv are
+//! touched only by the effects, so every rule here is tested without a terminal.
 
 use crossterm::event::KeyCode;
 use jiff::{SignedDuration, Timestamp};
@@ -70,7 +70,7 @@ pub enum Action {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
-    /// Append these decisions to the run file.
+    /// Record these decisions in the store.
     Write {
         action: Action,
         decisions: Vec<Decision>,
@@ -833,12 +833,15 @@ fn scanned(m: &mut Model, event: scan::Event, now: Timestamp) -> Vec<Effect> {
 
 /// The decision each of the `new` findings takes from its row: a typo finding whose row's other
 /// members are all decided alike (the same state, the same wording or none) takes theirs. A
-/// timing finding takes none: each episode's fix can differ. One undo step for them all.
+/// timing finding takes none: each episode's fix can differ. Nor does one that came with a
+/// decision carried over from the file's earlier check of the same line and fix. One undo step for
+/// them all.
 fn inherit(m: &Model, new: &[usize], now: Timestamp) -> Vec<Effect> {
     let mut before = Vec::new();
     let mut decisions = Vec::new();
     for &i in new {
-        if m.finding(i).timing.is_some() {
+        let f = m.finding(i);
+        if f.timing.is_some() || m.run.decisions.contains_key(&f.id) {
             continue;
         }
         let Some(row) = m.rows.iter().find(|r| r.members.contains(&i)) else {
@@ -896,7 +899,7 @@ mod tests {
         key(m, KeyCode::Char(c))
     }
 
-    /// Run a Write effect as if the run file took it, and feed the result back.
+    /// Run a Write effect as if the store took it, and feed the result back.
     fn written(m: &mut Model, effects: Vec<Effect>) {
         let [Effect::Write { action, decisions }] = <[Effect; 1]>::try_from(effects).unwrap()
         else {
@@ -974,6 +977,29 @@ mod tests {
         );
         let effects = press(&mut m, 'u');
         assert_eq!(decided(&effects), [(5, State::Pending, None)]);
+    }
+
+    #[test]
+    fn a_typo_that_comes_with_a_decision_carried_over_keeps_it_over_its_rows() {
+        // E04 checked again: its lyric comes back rejected, carried over from its earlier check,
+        // into a row the other episodes accepted.
+        let mut m = sample();
+        decide_as(&mut m, &[1, 2, 4], State::Accepted, None);
+        let carried = Decision {
+            finding: 5,
+            state: State::Rejected,
+            edited: None,
+            at: now(),
+        };
+        let Msg::Scan(Event::Appended(mut records)) =
+            appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)])
+        else {
+            unreachable!("appended makes an Appended")
+        };
+        records.push(Record::Decision(carried));
+        let effects = update(&mut m, Msg::Scan(Event::Appended(records)), now());
+        assert_eq!(effects, []);
+        assert_eq!(m.run.state_of(5), State::Rejected);
     }
 
     #[test]

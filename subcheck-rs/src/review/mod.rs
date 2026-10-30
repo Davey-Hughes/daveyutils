@@ -1,5 +1,5 @@
 //! `subcheck review`: accept, reject or reword each finding of a run, with a key that opens the
-//! moment in mpv. A pure Elm-style core (`model`, `update`) with the run file and mpv at the edges
+//! moment in mpv. A pure Elm-style core (`model`, `update`) with the store and mpv at the edges
 //! (`run_effect`), as in nudge-rs's dashboard.
 
 pub mod files;
@@ -32,10 +32,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 
 use crate::group;
-use crate::list;
 use crate::player::{self, Player};
 use crate::scan::{self, file_stamp};
-use crate::store::{self, Record, Run, RunWriter};
+use crate::store::{Run, Selector, Store};
 use model::{FileNote, Model};
 use progress::Scan;
 use update::{Effect, Mouse, Msg};
@@ -111,28 +110,11 @@ pub fn file_notes(run: &Run) -> HashMap<String, FileNote> {
     notes
 }
 
-/// How the command that finishes a scan names its run (`name`, at `path`) to `--run`: by its name
-/// when `find_run` finds that run by it, as it does a run in the state directory `state`; else by
-/// its path, which `--run` takes too, quoted for the shell. A run given by a path elsewhere has a
-/// name that finds nothing, or another run.
-fn run_arg(state: &Path, name: &str, path: &Path) -> String {
-    let same = |found: PathBuf| match (std::fs::canonicalize(found), std::fs::canonicalize(path)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    };
-    if store::find_run(state, Some(name)).is_ok_and(same) {
-        name.to_string()
-    } else {
-        list::shell_quote(&path.to_string_lossy())
-    }
-}
-
 /// Run one effect and say how it went.
-pub fn run_effect(effect: Effect, writer: &mut RunWriter, player: &mut Player) -> Msg {
+pub fn run_effect(effect: Effect, store: &mut Store, player: &mut Player) -> Msg {
     match effect {
         Effect::Write { action, decisions } => {
-            let records: Vec<Record> = decisions.iter().cloned().map(Record::Decision).collect();
-            let result = writer.append(&records).map_err(|e| e.to_string());
+            let result = store.decide(&decisions).map_err(|e| e.to_string());
             Msg::Written {
                 action,
                 decisions,
@@ -173,9 +155,9 @@ fn leave() {
 /// What review's screen opens on.
 #[allow(clippy::large_enum_variant)] // one per process, moved once: a box would save nothing
 pub enum Open {
-    /// A run, as `subcheck review` names it.
-    Run(PathBuf),
-    /// A scan, as `subcheck scan` planned it: the screen runs it, on the run it writes to. `paths`
+    /// A run, as `subcheck review` names it, put together from the store.
+    View(Run),
+    /// A scan, as `subcheck scan` planned it: the screen runs it, on the run it records under. `paths`
     /// are the arguments it was given, for the command that finishes it if it is stopped;
     /// `warnings`, what planning it wrote to the terminal (see [`Tee`]), which the screen covers.
     Scan {
@@ -228,60 +210,82 @@ impl<W: Write> Write for Tee<W> {
     }
 }
 
-/// What the status line opens with: the run file's lines that could not be read, else the first
-/// of what `scan` warned of before the screen covered it; and how many warnings are more. The
-/// unreadable lines lead because nothing else says them, while the warnings are printed above the
-/// screen too, so `+n more` points at what the user can scroll up to. A message as others are,
-/// until the next key.
-fn opening_status(warnings: &[String], bad_lines: usize) -> Option<String> {
-    let (first, more) = if bad_lines > 0 {
-        let bad = format!("{bad_lines} line(s) of the run file could not be read");
-        (bad, warnings.len())
-    } else {
-        let (first, rest) = warnings.split_first()?;
-        (first.clone(), rest.len())
-    };
-    Some(match more {
-        0 => first,
+/// What the status line opens with: the first of what `scan` warned of before the screen covered
+/// it, and how many warnings are more. They are printed above the screen too, so `+n more` points
+/// at what the user can scroll up to. A message as others are, until the next key.
+fn opening_status(warnings: &[String]) -> Option<String> {
+    let (first, rest) = warnings.split_first()?;
+    Some(match rest.len() {
+        0 => first.clone(),
         n => format!("{first} · +{n} more"),
     })
+}
+
+/// The run a scan's screen opens on: the run as the store shows it, but for the findings of each
+/// check the scan makes again, which join the list as the scan saves the new ones. A file the scan
+/// skips is there from the start.
+pub fn opening(store: &Store, plan: &scan::Plan) -> rusqlite::Result<Run> {
+    let mut run = store.run_view(plan.scan())?;
+    run.findings.retain(|f| {
+        !plan
+            .todo()
+            .iter()
+            .any(|(path, checks)| f.file == *path.to_string_lossy() && checks.contains(&f.check()))
+    });
+    Ok(run)
+}
+
+/// What the screen opens on when a scan has nothing to check (`s`): with `--run` (`into`), the run;
+/// else the files under the paths it was given, as they are. `None` when there is nothing to show,
+/// and `scan`'s line says why.
+pub fn nothing_to_check(
+    store: &Store,
+    s: &scan::Summary,
+    into: Option<&str>,
+) -> anyhow::Result<Option<Run>> {
+    if s.files == 0 {
+        return Ok(None);
+    }
+    let selector = match into {
+        Some(name) => Selector::Run(name.to_string()),
+        None => Selector::Paths(s.paths.clone()),
+    };
+    let run = store.view(&selector)?;
+    Ok((!run.findings.is_empty()).then_some(run))
 }
 
 /// How long the loop waits for a message while the scan runs before the spinner turns.
 const TICK: Duration = Duration::from_millis(250);
 
-/// Open the screen on `open`. `state` is the state directory, where mpv's socket goes when there
-/// is no runtime directory. Exit status 1 when the scan failed, or a file in it did.
-pub fn run(open: Open, state: &Path) -> anyhow::Result<ExitCode> {
-    let (path, scanning, warnings) = match open {
-        Open::Run(path) => (path, None, Vec::new()),
+/// Open the screen on `open`, writing decisions through `store`. `state` is the state directory,
+/// where mpv's socket goes when there is no runtime directory. Exit status 1 when the scan failed,
+/// or a file in it did.
+pub fn run(open: Open, mut store: Store, state: &Path) -> anyhow::Result<ExitCode> {
+    let (run, scanning, warnings) = match open {
+        Open::View(run) => (run, None, Vec::new()),
         Open::Scan {
             plan,
             opts,
             paths,
             warnings,
         } => (
-            plan.run_path().to_path_buf(),
+            opening(&store, &plan).context("reading the run")?,
             Some((plan, opts, paths)),
             warnings,
         ),
     };
-    let run = store::read_run(&path).with_context(|| format!("reading {}", path.display()))?;
     if run.findings.is_empty() && scanning.is_none() {
-        println!("No findings in run {}.", run.name);
+        println!("No findings in {}.", run.called());
         return Ok(ExitCode::SUCCESS);
     }
-    let bad_lines = run.bad_lines;
     let notes = file_notes(&run);
-    let mut writer =
-        RunWriter::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let mut player = Player::new("mpv", player::socket_path(state));
     // Else the status line opens on what the run's LLM calls cost (`Model::show_cost`).
     let mut model = Model::new(run, notes);
-    model.status = opening_status(&warnings, bad_lines);
-    let resume = scanning.as_ref().map(|(_, _, paths)| {
-        progress::resume_command(&run_arg(state, &model.run.name, &path), paths)
-    });
+    model.status = opening_status(&warnings);
+    let resume = scanning
+        .as_ref()
+        .map(|(_, _, paths)| progress::resume_command(&model.run.name, paths));
 
     // The terminal is restored should the screen's own thread panic. A job's panic comes to the
     // loop as `Msg::Fatal`, which ends the screen in order.
@@ -302,7 +306,8 @@ pub fn run(open: Open, state: &Path) -> anyhow::Result<ExitCode> {
         model.progress.adding = opts.into.is_some();
         // Running from the start, so a `q` before the scan's first word still asks.
         model.progress.scan = Scan::Running;
-        jobs::scan(plan, opts, state.to_path_buf(), tx.clone()).context("starting the scan")?;
+        let scans = store.reopen()?;
+        jobs::scan(plan, opts, scans, tx.clone()).context("starting the scan")?;
     }
     // A scan may be running from here, so every way out goes through the teardown below, which
     // ends its LLM calls: an input thread that does not start, the loop's error, and a panic on
@@ -311,7 +316,7 @@ pub fn run(open: Open, state: &Path) -> anyhow::Result<ExitCode> {
     // let go of its own.
     let looped = match jobs::input(tx) {
         Ok(()) => panic::catch_unwind(AssertUnwindSafe(|| {
-            screen_loop(&mut terminal, &mut model, &rx, &mut writer, &mut player)
+            screen_loop(&mut terminal, &mut model, &rx, &mut store, &mut player)
         })),
         Err(e) => Ok(Err(e).context("reading the terminal")),
     };
@@ -362,8 +367,8 @@ fn outcome(
     let (pending, accepted, rejected) = model.counts();
     writeln!(
         out,
-        "run {}: {accepted} accepted, {rejected} rejected, {pending} pending",
-        model.run.name
+        "{}: {accepted} accepted, {rejected} rejected, {pending} pending",
+        model.run.called()
     )?;
     let failed = model.progress.failed > 0 || matches!(model.progress.scan, Scan::Ended(Err(_)));
     Ok(if failed {
@@ -379,7 +384,7 @@ fn screen_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     model: &mut Model,
     rx: &mpsc::Receiver<Msg>,
-    writer: &mut RunWriter,
+    store: &mut Store,
     player: &mut Player,
 ) -> anyhow::Result<()> {
     while !model.should_quit {
@@ -393,7 +398,7 @@ fn screen_loop(
         }
         let mut queue: VecDeque<Effect> = effects.into();
         while let Some(effect) = queue.pop_front() {
-            let msg = run_effect(effect, writer, player);
+            let msg = run_effect(effect, store, player);
             queue.extend(update::update(model, msg, jiff::Timestamp::now()));
         }
     }
@@ -517,7 +522,7 @@ mod tests {
         std::fs::write(&changed, b"1234").unwrap();
         let record = |p: &Path| {
             let (size, mtime) = file_stamp(p).unwrap();
-            store::FileRecord {
+            crate::store::FileRecord {
                 path: p.to_string_lossy().into_owned(),
                 size,
                 mtime,
@@ -525,10 +530,10 @@ mod tests {
                 tracks: vec![],
                 lines: 0,
                 truncated: None,
-                checks: vec![store::Check::Llm],
+                checks: vec![crate::store::Check::Llm],
             }
         };
-        let gone = |name: &str| store::FileRecord {
+        let gone = |name: &str| crate::store::FileRecord {
             path: dir.path().join(name).to_string_lossy().into_owned(),
             ..record(&same)
         };
@@ -541,7 +546,7 @@ mod tests {
         // Findings in the first three; the fourth had none, so it is never shown or checked.
         let findings = files[..3]
             .iter()
-            .map(|f| store::Finding {
+            .map(|f| crate::store::Finding {
                 file: f.path.clone(),
                 ..model::tests_support::finding(1, 1, "a", "b", 0)
             })
@@ -563,10 +568,10 @@ mod tests {
         let status = |m: &Model| m.status_text(Rect::new(0, 0, 160, 1));
         let warnings = vec![
             "warning: /m/locked: skipped: Permission denied (os error 13)".to_string(),
-            "/m/E02.mkv: changed since run r; scan it into a new run".to_string(),
+            "warning: /m/lost: skipped: Input/output error (os error 5)".to_string(),
         ];
         let mut m = scanning();
-        m.status = opening_status(&warnings, 0);
+        m.status = opening_status(&warnings);
         assert_eq!(
             status(&m).as_deref(),
             Some("warning: /m/locked: skipped: Permission denied (os error 13) · +1 more")
@@ -574,25 +579,9 @@ mod tests {
         // A message as others are: the next key ends it, and the scan's progress shows.
         update::update(&mut m, Msg::Key(KeyCode::Char('j')), jiff::Timestamp::now());
         assert_eq!(status(&m).as_deref(), Some("scan 0/2 · 0 findings"));
-        // One warning alone; and the run file's unread lines, ahead of the warnings, or alone as
-        // `review` opens with them.
-        let one = || warnings[..1].to_vec();
-        assert_eq!(opening_status(&one(), 0), Some(warnings[0].clone()));
-        assert_eq!(
-            opening_status(&one(), 2),
-            Some("2 line(s) of the run file could not be read · +1 more".to_string())
-        );
-        assert_eq!(
-            opening_status(&[], 2).as_deref(),
-            Some("2 line(s) of the run file could not be read")
-        );
-        // The unreadable lines lead, since nothing else says them: `+n more` counts the warnings,
-        // which are above the screen too.
-        assert_eq!(
-            opening_status(&warnings, 2),
-            Some("2 line(s) of the run file could not be read · +2 more".to_string())
-        );
-        assert_eq!(opening_status(&[], 0), None);
+        // One warning alone, or none.
+        assert_eq!(opening_status(&warnings[..1]), Some(warnings[0].clone()));
+        assert_eq!(opening_status(&[]), None);
     }
 
     #[test]
@@ -606,25 +595,72 @@ mod tests {
     }
 
     #[test]
-    fn the_command_that_finishes_a_scan_names_a_run_elsewhere_by_its_path() {
-        let state = tempfile::tempdir().unwrap();
-        let runs = state.path().join("runs");
-        std::fs::create_dir(&runs).unwrap();
-        let name = "2026-10-17T04-39-18";
-        let mine = runs.join(format!("{name}.jsonl"));
-        std::fs::write(&mine, "").unwrap();
-        // A run in the state directory goes by its name, however its path was given.
-        assert_eq!(run_arg(state.path(), name, &mine), name);
-        let roundabout = runs.join(format!("../runs/{name}.jsonl"));
-        assert_eq!(run_arg(state.path(), name, &roundabout), name);
-        // One elsewhere goes by its path: its name finds no run, or another run of that name.
-        let elsewhere = tempfile::tempdir().unwrap();
-        let x = elsewhere.path().join("x y.jsonl");
-        std::fs::write(&x, "").unwrap();
-        let quoted = list::shell_quote(&x.to_string_lossy());
-        assert_eq!(run_arg(state.path(), "x y", &x), quoted);
-        std::fs::write(runs.join("x y.jsonl"), "").unwrap();
-        assert_eq!(run_arg(state.path(), "x y", &x), quoted);
+    fn a_scan_with_nothing_to_check_shows_its_paths_or_its_run() {
+        use crate::store::{Attempt, CheckedWith, Made, RunHeader};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_at(&dir.path().join("subcheck.db")).unwrap();
+        let show = dir.path().join("Show");
+        std::fs::create_dir(&show).unwrap();
+        let e01 = show.join("E01.mkv");
+        let header = RunHeader {
+            started: jiff::Timestamp::UNIX_EPOCH,
+            backend: "claude".into(),
+            command: vec![],
+            prompt_version: 1,
+            version: "0".into(),
+            langs: vec!["eng".into()],
+        };
+        let scan = store
+            .begin_scan(&header, std::slice::from_ref(&e01))
+            .unwrap();
+        let path = e01.to_string_lossy();
+        let attempt = Attempt {
+            scan: scan.id,
+            path: &path,
+            size: 1,
+            mtime: jiff::Timestamp::UNIX_EPOCH,
+            tracks: &[],
+            truncated: None,
+            at: jiff::Timestamp::UNIX_EPOCH,
+        };
+        let save = |store: &mut Store, findings| {
+            let with = CheckedWith::new("claude", &["eng".into()], 1);
+            let made = Made {
+                with,
+                lines: 1,
+                findings,
+            };
+            store.save(&attempt, vec![made]).unwrap();
+        };
+        let finding = crate::store::Finding {
+            file: path.to_string(),
+            ..model::tests_support::finding(0, 1, "a", "b", 0)
+        };
+        save(&mut store, vec![finding]);
+        let s = scan::Summary {
+            files: 1,
+            cached: 1,
+            paths: vec![show.clone()],
+            ..scan::Summary::default()
+        };
+        let shown = nothing_to_check(&store, &s, None).unwrap().unwrap();
+        assert_eq!(
+            shown.called(),
+            crate::list::shell_quote(&show.to_string_lossy())
+        );
+        assert_eq!(shown.findings.len(), 1);
+        let run = nothing_to_check(&store, &s, Some(&scan.name))
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.called(), format!("run {}", scan.name));
+        // No MKV files, or no findings in them: the line says so, not the screen.
+        let none = scan::Summary {
+            files: 0,
+            ..s.clone()
+        };
+        assert!(nothing_to_check(&store, &none, None).unwrap().is_none());
+        save(&mut store, vec![]);
+        assert!(nothing_to_check(&store, &s, None).unwrap().is_none());
     }
 
     #[test]

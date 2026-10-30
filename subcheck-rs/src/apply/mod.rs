@@ -20,7 +20,7 @@ use crate::group;
 use crate::list::shell_quote;
 use crate::mkv::{self, Layout, Track};
 use crate::review::model::changed;
-use crate::store::{self, Applied, Finding, Record, RunWriter};
+use crate::store::{self, Applied, Finding, Run, Store};
 use crate::subs::{self, Kind};
 use crate::text::{timestamp, timestamp_ms};
 use patch::{Fix, Outcome};
@@ -67,33 +67,31 @@ pub fn backup_path(file: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Apply the run in `run_path`'s accepted fixes, as `mode` says; `state` is the state directory.
-/// `karaoke`: re-space per-letter karaoke rows rather than leave them for a hand fix.
+/// Make `run`'s accepted fixes, as `mode` says, marking each one made (or found made) in `store`;
+/// `state` is the state directory. `karaoke`: re-space per-letter karaoke rows rather than leave
+/// them for a hand fix.
 pub fn run(
-    run_path: &Path,
+    run: &Run,
+    store: &mut Store,
     state: &Path,
     mode: &Mode,
     karaoke: bool,
     mkvmerge: &OsStr,
     out: &mut impl Write,
 ) -> anyhow::Result<Summary> {
-    let run = store::read_run(run_path)?;
-    let accepted = patch::fixes(&run);
-    let timing = shift::fixes(&run);
+    let accepted = patch::fixes(run);
+    let timing = shift::fixes(run);
     let mut summary = Summary::default();
     if accepted.is_empty() && timing.is_empty() {
-        writeln!(out, "No accepted fixes in run {}.", run.name)?;
+        writeln!(out, "No accepted fixes in {}.", run.called())?;
         return Ok(summary);
     }
-    let mut writer = None;
     // The check reads the original's languages as mkvmerge does.
     if matches!(mode, Mode::Apply { .. } | Mode::Check { .. }) {
         remux::run(mkvmerge, &["--version".into()]).map_err(anyhow::Error::msg)?;
     }
-    if matches!(mode, Mode::Apply { .. }) {
-        writer = Some(RunWriter::open(run_path)?);
-    }
-    let paths = with_fixes(&run, &accepted, &timing);
+    let marking = matches!(mode, Mode::Apply { .. });
+    let paths = with_fixes(run, &accepted, &timing);
     let names = track_names(&paths);
     for (path, name) in paths.iter().zip(names) {
         let mine: Vec<Fix> = accepted
@@ -126,9 +124,9 @@ pub fn run(
                     }
                 }
                 summary.remuxed += usize::from(done.remuxed);
-                if let Some(w) = &mut writer {
+                if marking {
                     let at = jiff::Timestamp::now();
-                    let records: Vec<Record> = done
+                    let applied: Vec<Applied> = done
                         .outcomes
                         .iter()
                         .filter(|(_, o)| {
@@ -140,9 +138,12 @@ pub fn run(
                                     | Outcome::Shifted { .. }
                             )
                         })
-                        .map(|&(finding, _)| Record::Applied(Applied { finding, at }))
+                        .map(|&(finding, _)| Applied { finding, at })
                         .collect();
-                    w.append(&records)?;
+                    // The file is swapped in already. If the database stays busy past the timeout,
+                    // apply stops here and this file's marks are not saved; the next `apply`
+                    // finds the fixes already in the file and marks them then.
+                    store.mark_applied(&applied)?;
                 }
             }
             Err(e) => {
@@ -162,19 +163,13 @@ pub fn run(
         "{verb} {}, already applied {}, by hand {}, not found {}; {} remuxed, {} failed",
         s.fixed, s.already, s.by_hand, s.not_found, s.remuxed, s.failed
     )?;
-    // The check plans the fixes again, and must plan them as these tracks were. A run outside the
-    // state directory is found by its path, not its name.
+    // The check plans the fixes again, and must plan them as these tracks were.
     if matches!(mode, Mode::TracksOnly(_)) && s.fixed > 0 {
         let flag = if karaoke { " --karaoke" } else { "" };
-        let in_state = run_path.parent() == Some(state.join("runs").as_path());
-        let shown = if in_state {
-            run.name.clone()
-        } else {
-            shell_quote(&run_path.to_string_lossy())
-        };
         writeln!(
             out,
-            "Once they are remuxed, check them with: subcheck apply {shown} --check{flag}"
+            "Once they are remuxed, check them with: subcheck apply {} --check{flag}",
+            run.name
         )?;
     }
     Ok(summary)

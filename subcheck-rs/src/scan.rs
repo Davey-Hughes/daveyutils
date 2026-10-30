@@ -1,9 +1,10 @@
 //! `subcheck scan`: find MKVs, read their text subtitle tracks, send the lines to the LLM in
-//! chunks, and record every suggested fix in a run file.
+//! chunks, and record every suggested fix in the store.
 //!
 //! One reader thread reads files in order (the array's disks are the bottleneck, so never two at
-//! once), `-j` workers run the LLM, and the calling thread collects: it appends a file's records
-//! the moment every one of that file's lines has an answer, and each LLM call's usage as it comes.
+//! once), `-j` workers run the LLM, and the calling thread collects: it saves a file, in one
+//! transaction, the moment every one of its lines has an answer, and each LLM call's usage as it
+//! comes.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -14,11 +15,12 @@ use std::thread;
 use jiff::Timestamp;
 
 use crate::blocks::{self, ReadPath};
+use crate::list::shell_quote;
 use crate::llm::{self, Answer, Backend, Spent, Suggestion, Usage, Used};
 use crate::mkv::{self, Layout, TRACK_TYPE_SUBTITLE, Track, Truncated};
 use crate::store::{
-    self, Cache, CacheEntry, Check, CheckedWith, FileRecord, Finding, LlmCall, Record, Run,
-    RunHeader, RunWriter, TrackRecord,
+    self, Attempt, Check, CheckedWith, FileRecord, Finding, LlmCall, Made, Record, RunHeader,
+    Saved, ScanRow, Store, TrackRecord,
 };
 use crate::subs::Kind;
 use crate::text::{self, Line};
@@ -35,8 +37,8 @@ pub struct Options {
     pub langs: Vec<String>,
     pub force: bool,
     pub verbose: bool,
-    /// The run file to add to (`--run`) instead of starting a run.
-    pub into: Option<PathBuf>,
+    /// The run to add to (`--run`), by name, instead of starting a run.
+    pub into: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -49,16 +51,14 @@ pub struct Summary {
     pub findings: usize,
     /// Of the findings, those of the timing check.
     pub timing: usize,
-    /// With `--run`: files left out as changed since the run.
-    pub changed: usize,
-    /// With `--run`: files whose LLM check is in another run, and was not made again.
-    pub elsewhere: usize,
     /// What this scan's LLM calls used.
     pub spent: Spent,
+    /// The paths the scan was given, absolute: what `subcheck review` takes to show their files.
+    pub paths: Vec<PathBuf>,
 }
 
 /// What a scan tells the hook [`execute`] is given, as it goes: enough for review's screen to show
-/// each file's progress, and to take each record as the run file does.
+/// each file's progress, and to take each record as the store shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// The files to check, in the order they are read: once, first.
@@ -73,8 +73,8 @@ pub enum Event {
         answered: usize,
         chunks: usize,
     },
-    /// Records just appended to the run, in order: an LLM call's usage, or a file's record and its
-    /// findings.
+    /// Records just saved, in order: an LLM call's usage, or a file's record (of the checks this
+    /// scan made, or of its failure), its findings, and the decisions carried over to them.
     Appended(Vec<Record>),
     /// A file done, after its records: why it failed, if it did; its findings; and the lines just
     /// written to the log for it.
@@ -89,21 +89,26 @@ pub enum Event {
 /// What [`plan`] found.
 pub enum Planned {
     /// Nothing to check; the summary says why (no files, every one unchanged since an earlier
-    /// scan, or with `--run`, nothing the run lacks).
+    /// scan, or with `--run`, nothing the run needs).
     Nothing(Summary),
     Scan(Plan),
 }
 
-/// A scan ready to run: its run file made (or, with `--run`, taken) and locked.
+/// A scan ready to run: its run made (or, with `--run`, found), with every file it names.
 pub struct Plan {
     start: Start,
     summary: Summary,
 }
 
 impl Plan {
-    /// The run file the scan writes to.
-    pub fn run_path(&self) -> &Path {
-        &self.start.writer.path
+    /// The run the scan records under.
+    pub fn scan(&self) -> &ScanRow {
+        &self.start.scan
+    }
+
+    /// The files the scan checks, in the order it reads them, each with the checks it makes.
+    pub fn todo(&self) -> &[(PathBuf, Vec<Check>)] {
+        &self.start.todo
     }
 }
 
@@ -115,7 +120,7 @@ pub fn mkv_files(paths: &[PathBuf]) -> io::Result<(Vec<PathBuf>, Vec<String>)> {
     let mut out = Vec::new();
     let mut warnings = Vec::new();
     for p in paths {
-        let p = std::path::absolute(p)?;
+        let p = crate::store::absolute(p)?;
         if p.is_dir() {
             walk(&p, &mut out, &mut warnings);
         } else if p.is_file() {
@@ -214,16 +219,14 @@ struct Prepared {
     timing: Vec<Finding>,
     timing_notes: Vec<String>,
     error: Option<String>,
-    /// A track could not be read; the file is then not cached, so it is tried again.
-    skipped_tracks: bool,
-    /// The file is shorter than its Segment says. Not cached either, so every scan says so until
-    /// the copy is replaced.
+    /// The file is shorter than its Segment says. Its check is never fresh, so every scan says so
+    /// until the copy is replaced; nor is one with a track that could not be read.
     truncated: Option<Truncated>,
     /// Shown with `-v`.
     notes: Vec<String>,
 }
 
-/// A file's size and modification time: what the cache and review compare.
+/// A file's size and modification time: what a check's freshness and review compare.
 pub fn file_stamp(path: &Path) -> io::Result<(u64, Timestamp)> {
     let meta = std::fs::metadata(path)?;
     let mtime = Timestamp::try_from(meta.modified()?).map_err(io::Error::other)?;
@@ -241,7 +244,6 @@ fn prepare(path: &Path, langs: &[String], checks: &[Check]) -> Prepared {
         timing: Vec::new(),
         timing_notes: Vec::new(),
         error: None,
-        skipped_tracks: false,
         truncated: None,
         notes: Vec::new(),
     };
@@ -301,7 +303,6 @@ fn prepare(path: &Path, langs: &[String], checks: &[Check]) -> Prepared {
             // An unsupported encoding loses that track, not the file.
             Err(e) => {
                 p.notes.push(format!("{named}: skipped: {e}"));
-                p.skipped_tracks = true;
                 format!("skipped: {e}")
             }
         };
@@ -423,30 +424,30 @@ pub fn files(n: usize) -> String {
 /// A file to read, and the checks it needs.
 type Todo = (PathBuf, Vec<Check>);
 
-/// Each file with the checks it needs, and how many files need none: unchanged since an earlier
-/// scan made every check, the LLM's with the same backend, languages and prompt, the timing check
-/// with the same languages and rules.
-fn to_check(all: Vec<PathBuf>, opts: &Options, state: &Path) -> anyhow::Result<(Vec<Todo>, usize)> {
-    let cache = Cache::load(state)?;
+/// Each file with the checks it needs, and how many files need none: each file's current check
+/// of each kind is fresh ([`Store::is_fresh`]), the LLM's made with the same backend, languages
+/// and prompt, the timing check's with the same languages and rules. `--force` needs them all.
+fn to_check(all: &[PathBuf], opts: &Options, store: &Store) -> anyhow::Result<(Vec<Todo>, usize)> {
     let withs = [Check::Llm, Check::Timing].map(|c| (c, checked_with(opts, c)));
     let mut cached = 0;
     let mut todo = Vec::new();
     for path in all {
-        let stamp = file_stamp(&path).ok();
-        let needed: Vec<Check> = withs
-            .iter()
-            .filter(|(_, with)| {
-                opts.force
-                    || !stamp.is_some_and(|(size, mtime)| {
-                        cache.is_fresh(&path.to_string_lossy(), size, mtime, with)
-                    })
-            })
-            .map(|(c, _)| *c)
-            .collect();
+        let key = path.to_string_lossy();
+        let stamp = file_stamp(path).ok().filter(|_| !opts.force);
+        let mut needed = Vec::new();
+        for (check, with) in &withs {
+            let fresh = match stamp {
+                Some((size, mtime)) => store.is_fresh(&key, size, mtime, with)?,
+                None => false,
+            };
+            if !fresh {
+                needed.push(*check);
+            }
+        }
         if needed.is_empty() {
             cached += 1;
         } else {
-            todo.push((path, needed));
+            todo.push((path.clone(), needed));
         }
     }
     Ok((todo, cached))
@@ -464,7 +465,7 @@ fn checked_with(opts: &Options, check: Check) -> CheckedWith {
 pub fn dry_run(
     paths: &[PathBuf],
     opts: &Options,
-    state: &Path,
+    store: &Store,
     out: &mut dyn Write,
     log: &mut dyn Write,
 ) -> anyhow::Result<()> {
@@ -473,7 +474,7 @@ pub fn dry_run(
         writeln!(log, "warning: {w}")?;
     }
     let total = all.len();
-    let (todo, _) = to_check(all, opts, state)?;
+    let (todo, _) = to_check(&all, opts, store)?;
     let todo: Vec<PathBuf> = todo
         .into_iter()
         .filter(|(_, checks)| checks.contains(&Check::Llm))
@@ -622,20 +623,16 @@ fn read(
     }
 }
 
-/// The backend and languages for adding to `run` (`scan --run`): the run's own, which `llm`,
-/// `llm_cmd` and `langs`, when given, must match. A run has one backend and one set of languages.
-/// A run from before runs kept their languages has them in the cache's entries.
+/// The backend and languages for adding to the run `scan` (`scan --run`): the run's own, which
+/// `llm`, `llm_cmd` and `langs`, when given, must match. A run has one backend and one set of
+/// languages.
 pub fn resume(
-    run: &Run,
-    cache: &Cache,
+    scan: &ScanRow,
     llm: Option<&str>,
     llm_cmd: Option<&str>,
     langs: &[String],
 ) -> Result<(Backend, Vec<String>), String> {
-    let header = run
-        .header
-        .as_ref()
-        .ok_or_else(|| format!("run {} has no run record", run.name))?;
+    let header = &scan.header;
     let given = match (llm_cmd, llm) {
         (Some(cmd), _) => Some(Backend::shell(cmd)),
         (None, Some(name)) => Some(Backend::preset(name)?),
@@ -645,7 +642,7 @@ pub fn resume(
         Some(b) if b.label != header.backend => {
             return Err(format!(
                 "run {} was scanned with {}; leave out --llm and --llm-cmd to use it",
-                run.name, header.backend
+                scan.name, header.backend
             ));
         }
         Some(b) => b,
@@ -658,201 +655,72 @@ pub fn resume(
             output: llm::Output::Text,
         }),
     };
-    // A run from before the languages were kept: as the cache recorded them; with nothing to say,
-    // as given, else English (scan's default).
-    let recorded = if header.langs.is_empty() {
-        cache.langs_of(&run.name)
-    } else {
-        Some(header.langs.clone())
-    };
-    let Some(checked) = recorded else {
-        let these = if langs.is_empty() {
-            vec![DEFAULT_LANG.to_string()]
-        } else {
-            langs.to_vec()
-        };
-        return Ok((backend, these));
-    };
     let set = |l: &[String]| CheckedWith::new("", l, 0).langs;
-    if !langs.is_empty() && set(langs) != set(&checked) {
-        let from = if header.langs.is_empty() {
-            " (as the cache recorded it: the run is from before runs kept their languages)"
-        } else {
-            ""
-        };
+    if !langs.is_empty() && set(langs) != set(&header.langs) {
         return Err(format!(
-            "run {} checked --lang {}{from}; leave out --lang to use it",
-            run.name,
-            checked.join(" --lang ")
+            "run {} checked --lang {}; leave out --lang to use it",
+            scan.name,
+            header.langs.join(" --lang ")
         ));
     }
-    Ok((backend, checked))
+    Ok((backend, header.langs.clone()))
 }
 
-/// What a run lacks, file by file.
-#[derive(Debug, Default)]
-struct InRun {
-    todo: Vec<Todo>,
-    /// Files with every check.
-    complete: usize,
-    /// Files changed since the run: its findings there are stale, so they are left out.
-    changed: Vec<PathBuf>,
-    /// Files whose LLM check the run lacks but another run has, unchanged since, and that run.
-    elsewhere: Vec<(PathBuf, String)>,
-    /// Of those, the files left out for it: they lack no other check.
-    only_elsewhere: usize,
-    /// Runs the cache names that could not be read, and why: their files' LLM checks are made.
-    unreadable: Vec<(String, String)>,
-}
-
-/// What the run `name` lacks for each file, from its records (`before`, by path): every check for a
-/// file it does not have or failed on, else the checks its record lacks. An LLM check the cache has
-/// from a scan of the file as it is (`llm` says how it is made) is not made again while that scan's
-/// run in `runs` holds it (a good record of the file, unchanged, with the LLM check): it costs, and
-/// its findings are there. The timing check is cheap, and always added.
-fn in_run(
-    all: Vec<PathBuf>,
-    before: &HashMap<String, FileRecord>,
-    (name, runs): (&str, &Path),
-    cache: &Cache,
-    llm: &CheckedWith,
-) -> InRun {
-    // Each other run's files with a good LLM record, read once.
-    let mut held: HashMap<String, HashMap<String, (u64, Timestamp)>> = HashMap::new();
-    let mut unreadable = Vec::new();
-    let every = [Check::Llm, Check::Timing];
-    let mut out = InRun::default();
-    for path in all {
-        let key = path.to_string_lossy().into_owned();
-        let stamp = file_stamp(&path).ok();
-        let mut needed = match before.get(&key) {
-            Some(f) if f.error.is_none() => {
-                if stamp != Some((f.size, f.mtime)) {
-                    out.changed.push(path);
-                    continue;
-                }
-                every
-                    .into_iter()
-                    .filter(|c| !f.checks.contains(c))
-                    .collect()
-            }
-            _ => every.to_vec(),
-        };
-        let mut skipped = false;
-        if needed.contains(&Check::Llm)
-            && let Some((size, mtime)) = stamp
-            && let Some(other) = cache.run_of(&key, size, mtime, llm)
-            && other != name
-            && held
-                .entry(other.to_string())
-                .or_insert_with(|| {
-                    llm_records(&runs.join(format!("{other}.jsonl"))).unwrap_or_else(|e| {
-                        unreadable.push((other.to_string(), e.to_string()));
-                        HashMap::new()
-                    })
-                })
-                .get(&key)
-                == Some(&(size, mtime))
-        {
-            needed.retain(|c| *c != Check::Llm);
-            out.elsewhere.push((path.clone(), other.to_string()));
-            skipped = true;
-        }
-        match (needed.is_empty(), skipped) {
-            (true, true) => out.only_elsewhere += 1,
-            (true, false) => out.complete += 1,
-            (false, _) => out.todo.push((path, needed)),
-        }
-    }
-    out.unreadable = unreadable;
-    out
-}
-
-/// What a scan writes to: the files to read and their checks, the run, the next finding's ID, and
-/// with `--run` the run's records of its files.
+/// What a scan records under: the files to read and their checks, and the run.
 struct Start {
     todo: Vec<Todo>,
-    writer: RunWriter,
-    next_finding: u64,
-    before: HashMap<String, FileRecord>,
+    scan: ScanRow,
 }
 
-/// A new run for the files the cache says need a check; `None` when none do.
+/// A new run for the files that need a check, naming every file found; `None` when none needs
+/// one.
 fn start_new(
-    all: Vec<PathBuf>,
+    all: &[PathBuf],
     opts: &Options,
-    state: &Path,
+    store: &mut Store,
     summary: &mut Summary,
 ) -> anyhow::Result<Option<Start>> {
-    let (todo, cached) = to_check(all, opts, state)?;
+    let (todo, cached) = to_check(all, opts, store)?;
     summary.cached = cached;
-    // No run file for a scan with nothing to check: an empty run would become the newest and hide
-    // the last real one from a plain `subcheck list`.
+    // No run for a scan with nothing to check: an empty run would become the newest and hide the
+    // last real one from a plain `subcheck list`.
     if todo.is_empty() {
         return Ok(None);
     }
-    let mut writer = RunWriter::create(state)?;
-    writer.lock()?;
-    writer.append(&[Record::Run(RunHeader {
+    let header = RunHeader {
         started: Timestamp::now(),
         backend: opts.backend.label.clone(),
         command: opts.backend.argv.clone(),
         prompt_version: llm::PROMPT_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         langs: opts.langs.clone(),
-    })])?;
-    Ok(Some(Start {
-        todo,
-        writer,
-        next_finding: 1,
-        before: HashMap::new(),
-    }))
+    };
+    let scan = store.begin_scan(&header, all)?;
+    Ok(Some(Start { todo, scan }))
 }
 
-/// Adding to the run file `path` (`--run`) what it lacks; `None` when it lacks nothing.
+/// Adding to the run `name` (`--run`): every file found joins it, and the checks they need are
+/// made under it; `None` when none needs one.
 fn start_adding(
-    path: &Path,
-    all: Vec<PathBuf>,
+    name: &str,
+    all: &[PathBuf],
     opts: &Options,
-    state: &Path,
+    store: &mut Store,
     summary: &mut Summary,
-    log: &mut dyn Write,
 ) -> anyhow::Result<Option<Start>> {
-    let mut writer = RunWriter::open_locked(path)?;
-    let run = store::read_run(path)?;
-    let next_finding = run.next_finding_id();
-    let Run {
-        name,
-        header,
-        files,
-        ..
-    } = run;
-    let before: HashMap<String, FileRecord> =
-        files.into_iter().map(|f| (f.path.clone(), f)).collect();
-    let cache = Cache::load(state)?;
-    let llm = checked_with(opts, Check::Llm);
-    let found = in_run(all, &before, (&name, &state.join("runs")), &cache, &llm);
-    summary.cached = found.complete;
-    summary.changed = found.changed.len();
-    summary.elsewhere = found.only_elsewhere;
-    summary.run.clone_from(&name);
-    for path in &found.changed {
-        writeln!(
-            log,
-            "{}: changed since run {}; scan it into a new run",
-            path.display(),
-            name
-        )?;
-    }
-    let todo = found.todo;
+    let scan = store
+        .scan_named(name)?
+        .ok_or_else(|| anyhow::anyhow!("no run named {name}"))?;
+    summary.run.clone_from(&scan.name);
+    let (todo, cached) = to_check(all, opts, store)?;
+    summary.cached = cached;
     if todo.iter().any(|(_, c)| c.contains(&Check::Llm)) {
-        let prompt = header.as_ref().map(|h| h.prompt_version);
-        if prompt != Some(llm::PROMPT_VERSION) {
+        let prompt = scan.header.prompt_version;
+        if prompt != llm::PROMPT_VERSION {
             anyhow::bail!(
-                "run {} was made with prompt version {}, this subcheck has {}: scan the files \
-                 it lacks into a new run",
-                name,
-                prompt.map_or("?".into(), |p| p.to_string()),
+                "run {} was made with prompt version {prompt}, this subcheck has {}: scan the \
+                 files it lacks into a new run",
+                scan.name,
                 llm::PROMPT_VERSION
             );
         }
@@ -860,65 +728,25 @@ fn start_adding(
             anyhow::bail!(
                 "run {} was scanned with {}, which this subcheck does not know: scan the files \
                  it lacks into a new run",
-                name,
+                scan.name,
                 opts.backend.label
             );
         }
     }
-    for (other, e) in &found.unreadable {
-        writeln!(
-            log,
-            "run {other} cannot be read ({e}): the LLM checks the cache says it has are made"
-        )?;
-    }
-    for (path, other) in &found.elsewhere {
-        writeln!(
-            log,
-            "{}: its LLM check is in run {other}, unchanged since; not made again",
-            path.display()
-        )?;
-    }
+    store.add_files(scan.id, all)?;
     if todo.is_empty() {
         return Ok(None);
     }
-    // A run from before the languages were kept: say which it is added to with, so the next
-    // `--run` takes the same (the latest run record wins).
-    if let Some(h) = header.as_ref().filter(|h| h.langs.is_empty()) {
-        writer.append(&[Record::Run(RunHeader {
-            langs: opts.langs.clone(),
-            ..h.clone()
-        })])?;
-    }
-    Ok(Some(Start {
-        todo,
-        writer,
-        next_finding,
-        before,
-    }))
+    Ok(Some(Start { todo, scan }))
 }
 
-/// The files a run file holds a good record of with the LLM check, and their size and mtime then.
-/// A run that is gone holds none.
-fn llm_records(path: &Path) -> io::Result<HashMap<String, (u64, Timestamp)>> {
-    match store::read_run(path) {
-        Ok(run) => Ok(run
-            .files
-            .into_iter()
-            .filter(|f| f.error.is_none() && f.checks.contains(&Check::Llm))
-            .map(|f| (f.path, (f.size, f.mtime)))
-            .collect()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(HashMap::new()),
-        Err(e) => Err(e),
-    }
-}
-
-/// The files under `paths` and what each needs, and the run they go to: a new one, or with
-/// `--run` (`opts.into`) the run named, locked for this scan. Warnings, and with `--run` what is
-/// left out and why, go to `log`.
+/// The files under `paths` and what each needs, and the run they go under: a new one, or with
+/// `--run` (`opts.into`) the run named. Every file found is the run's, skipped ones too, before
+/// checking starts. Warnings go to `log`.
 pub fn plan(
     paths: &[PathBuf],
     opts: &Options,
-    state: &Path,
+    store: &mut Store,
     log: &mut dyn Write,
 ) -> anyhow::Result<Planned> {
     let (all, warnings) = mkv_files(paths)?;
@@ -927,52 +755,48 @@ pub fn plan(
     }
     let mut summary = Summary {
         files: all.len(),
+        paths: paths
+            .iter()
+            .map(|p| store::absolute(p))
+            .collect::<io::Result<_>>()?,
         ..Summary::default()
     };
     let start = match &opts.into {
-        None => start_new(all, opts, state, &mut summary)?,
-        Some(path) => start_adding(path, all, opts, state, &mut summary, log)?,
+        None => start_new(&all, opts, store, &mut summary)?,
+        Some(name) => start_adding(name, &all, opts, store, &mut summary)?,
     };
     Ok(match start {
         None => Planned::Nothing(summary),
         Some(start) => {
-            summary.run.clone_from(&start.writer.name);
+            summary.run.clone_from(&start.scan.name);
             Planned::Scan(Plan { start, summary })
         }
     })
 }
 
-/// Run `plan`: one reader thread, `-j` workers, and the collector on this thread, which appends
-/// each file's records the moment its lines are all answered. `report` hears each step (see
-/// [`Event`]), from the reader's thread and this one.
+/// Run `plan`: one reader thread, `-j` workers, and the collector on this thread, which saves
+/// each file the moment its lines are all answered. `report` hears each step (see [`Event`]),
+/// from the reader's thread and this one.
 pub fn execute(
     plan: Plan,
     opts: &Options,
-    state: &Path,
+    store: &mut Store,
     log: &mut dyn Write,
     report: &(dyn Fn(Event) + Sync),
 ) -> anyhow::Result<Summary> {
     let Plan {
-        start:
-            Start {
-                todo,
-                writer,
-                next_finding,
-                before,
-            },
+        start: Start { todo, scan },
         summary,
     } = plan;
     report(Event::Queued(todo.iter().map(|(p, _)| p.clone()).collect()));
     let mut collector = Collector {
-        writer,
-        state,
+        store,
+        scan,
         opts,
         report,
         summary,
         total: todo.len(),
         done: 0,
-        next_finding,
-        before,
         answers: HashMap::new(),
         waiting: Vec::new(),
     };
@@ -1004,9 +828,15 @@ pub fn summary_lines(s: &Summary, adding: bool) -> Vec<String> {
         return vec![if s.files == 0 {
             "Nothing to check: no MKV files found".to_string()
         } else {
+            let paths: Vec<String> = s
+                .paths
+                .iter()
+                .map(|p| shell_quote(&p.to_string_lossy()))
+                .collect();
             format!(
-                "Nothing to check: {} unchanged since an earlier scan (--force to check again)",
-                files(s.cached)
+                "Nothing to check: {} unchanged (subcheck review {})",
+                s.cached,
+                paths.join(" ")
             )
         }];
     }
@@ -1030,15 +860,6 @@ fn added_lines(s: &Summary) -> Vec<String> {
     let mut left = Vec::new();
     if s.cached > 0 {
         left.push(format!("{} with every check already", files(s.cached)));
-    }
-    if s.changed > 0 {
-        left.push(format!("{} changed since the run", files(s.changed)));
-    }
-    if s.elsewhere > 0 {
-        left.push(format!(
-            "{} with the LLM check in another run",
-            files(s.elsewhere)
-        ));
     }
     if s.checked + s.failed == 0 {
         return vec![format!(
@@ -1078,19 +899,16 @@ fn review_hint(run: &str) -> String {
     format!("Review them with: subcheck review {run} (or print them: subcheck list {run})")
 }
 
-/// Writes each file's records the moment every one of its lines has an answer.
+/// Saves each file the moment every one of its lines has an answer.
 struct Collector<'a> {
-    writer: RunWriter,
-    state: &'a Path,
+    store: &'a mut Store,
+    scan: ScanRow,
     opts: &'a Options,
-    /// Told of each file's progress and of every record appended.
+    /// Told of each file's progress and of every record saved.
     report: &'a (dyn Fn(Event) + Sync),
     summary: Summary,
     total: usize,
     done: usize,
-    next_finding: u64,
-    /// With `--run`: the run's records of its files, whose checks a new record adds to.
-    before: HashMap<String, FileRecord>,
     answers: HashMap<usize, Result<Vec<Suggestion>, String>>,
     waiting: Vec<FileJob>,
 }
@@ -1112,12 +930,15 @@ impl Collector<'_> {
                     self.waiting.push(*job);
                 }
                 Msg::Chunk(c) => {
-                    // Written as they come, so a scan cut short still says what it used.
+                    // Saved as they come, so a scan cut short still says what it used.
                     if !c.calls.is_empty() {
                         for call in &c.calls {
                             self.summary.spent.add(call.usage.as_ref());
                         }
-                        self.append(c.calls.into_iter().map(Record::Usage).collect())?;
+                        self.store.add_usage(self.scan.id, &c.calls)?;
+                        (self.report)(Event::Appended(
+                            c.calls.into_iter().map(Record::Usage).collect(),
+                        ));
                     }
                     let id = c.id;
                     self.answers.insert(id, c.result);
@@ -1154,18 +975,7 @@ impl Collector<'_> {
             self.summary.failed += 1;
             let error = "no answer for some lines".to_string();
             let path = p.path.to_string_lossy().into_owned();
-            if self.earlier(&path).is_none() {
-                self.append(vec![Record::File(FileRecord {
-                    path,
-                    size: p.size,
-                    mtime: p.mtime,
-                    error: Some(error.clone()),
-                    tracks: p.tracks,
-                    lines: p.lines.len(),
-                    truncated: p.truncated,
-                    checks: p.checks,
-                })])?;
-            }
+            self.failed(&p, &path, &error)?;
             say(
                 log,
                 &mut said,
@@ -1181,11 +991,15 @@ impl Collector<'_> {
         Ok(())
     }
 
-    /// A file whose lines all have their answers: its records appended and its lines logged, and
-    /// what it came to, for the hook.
-    #[allow(clippy::too_many_lines)] // one file's records, then its log, in the order written
+    /// A file whose lines all have their answers: saved in one transaction (its checks, or its
+    /// failed attempt), its lines logged, and what it came to, for the hook. A save the database
+    /// stays too busy for fails the file: nothing of it is saved, so the next scan checks it again.
+    #[allow(clippy::too_many_lines)] // one file's save, then its log, in the order written
     fn finish(&mut self, job: FileJob, log: &mut dyn Write) -> anyhow::Result<Event> {
-        let FileJob { prepared: p, refs } = job;
+        let FileJob {
+            prepared: mut p,
+            refs,
+        } = job;
         self.done += 1;
         let name = p
             .path
@@ -1202,59 +1016,40 @@ impl Collector<'_> {
             .iter()
             .find_map(|(chunk, _)| self.answers[chunk].as_ref().err())
             .map(|e| format!("LLM: {e}"));
-        let error = p.error.clone().or(llm_error);
-        // A check added to a file the run has: the new record keeps what the old one says of the
-        // checks not made now.
-        let earlier = self.earlier(&path);
-        let keep = earlier.is_some();
-        let mut checks = p.checks.clone();
-        checks.extend(earlier.iter().flat_map(|f| f.checks.iter().copied()));
-        checks.sort();
-        checks.dedup();
-        let lines = match earlier {
-            Some(f) if !p.checks.contains(&Check::Llm) => f.lines,
-            _ => p.lines.len(),
-        };
-        let file = Record::File(FileRecord {
-            path: path.clone(),
-            size: p.size,
-            mtime: p.mtime,
-            error: error.clone(),
-            tracks: p.tracks,
-            lines,
-            truncated: p.truncated,
-            checks,
-        });
+        let mut error = p.error.clone().or(llm_error);
+        let timing = p.timing.len();
         let mut found = 0;
         if let Some(e) = &error {
-            self.summary.failed += 1;
-            if !keep {
-                self.append(vec![file])?;
+            self.failed(&p, &path, e)?;
+        } else {
+            let mut made = Vec::new();
+            for &check in &p.checks {
+                let findings = match check {
+                    Check::Llm => findings(&self.answers, &p.lines, &refs, &path),
+                    Check::Timing => std::mem::take(&mut p.timing),
+                };
+                made.push(Made {
+                    with: checked_with(self.opts, check),
+                    lines: p.lines.len(),
+                    findings,
+                });
             }
+            match self.store.save(&self.attempt(&p, &path), made) {
+                Ok(Saved { findings, carried }) => {
+                    found = findings.len();
+                    let mut records = vec![Record::File(record(&p, &path, None))];
+                    records.extend(findings.into_iter().map(Record::Finding));
+                    records.extend(carried.into_iter().map(Record::Decision));
+                    (self.report)(Event::Appended(records));
+                }
+                Err(e) if store::is_busy(&e) => error = Some(format!("not saved: {e}")),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if let Some(e) = &error {
+            self.summary.failed += 1;
             say(log, &mut said, format!("{progress}: FAILED: {e}"))?;
         } else {
-            let mut findings = findings(
-                &self.answers,
-                &p.lines,
-                &refs,
-                &path,
-                &mut self.next_finding,
-            );
-            let timing = p.timing.len();
-            for f in p.timing {
-                findings.push(Finding {
-                    id: self.next_finding,
-                    ..f
-                });
-                self.next_finding += 1;
-            }
-            found = findings.len();
-            let mut records = vec![file];
-            records.extend(findings.into_iter().map(Record::Finding));
-            self.append(records)?;
-            if !p.skipped_tracks && p.truncated.is_none() {
-                self.cache(&path, p.size, p.mtime, &p.checks)?;
-            }
             self.summary.checked += 1;
             self.summary.findings += found;
             self.summary.timing += timing;
@@ -1287,36 +1082,37 @@ impl Collector<'_> {
 }
 
 impl Collector<'_> {
-    /// With `--run`, the run's good record of the file: a new record adds its checks to it, and a
-    /// failure adding one leaves it standing, so the next `--run` adds only the missing check
-    /// again (a failed record would have it redo them all, and the LLM's findings twice).
-    fn earlier(&self, path: &str) -> Option<&FileRecord> {
-        self.before.get(path).filter(|f| f.error.is_none())
-    }
-
-    /// Each check made of a file, so the next scan skips it. Written once its records are in the
-    /// run.
-    fn cache(&self, path: &str, size: u64, mtime: Timestamp, checks: &[Check]) -> io::Result<()> {
-        for &check in checks {
-            Cache::append(
-                self.state,
-                &CacheEntry {
-                    path: path.to_string(),
-                    size,
-                    mtime,
-                    with: checked_with(self.opts, check),
-                    run: self.writer.name.clone(),
-                },
-            )?;
+    /// What the scan read of the file, for its save.
+    fn attempt<'p>(&self, p: &'p Prepared, path: &'p str) -> Attempt<'p> {
+        Attempt {
+            scan: self.scan.id,
+            path,
+            size: p.size,
+            mtime: p.mtime,
+            tracks: &p.tracks,
+            truncated: p.truncated,
+            at: Timestamp::now(),
         }
-        Ok(())
     }
 
-    /// Append `records` to the run, and tell the hook they are there.
-    fn append(&mut self, records: Vec<Record>) -> io::Result<()> {
-        self.writer.append(&records)?;
-        (self.report)(Event::Appended(records));
-        Ok(())
+    /// Save a failed attempt at the file's checks, and tell the hook. It replaces nothing: the
+    /// file's earlier findings stay current. A database too busy to take it is no further error,
+    /// as the file has failed already.
+    fn failed(&mut self, p: &Prepared, path: &str, error: &str) -> anyhow::Result<()> {
+        let tried: Vec<(CheckedWith, usize)> = p
+            .checks
+            .iter()
+            .map(|&c| (checked_with(self.opts, c), p.lines.len()))
+            .collect();
+        match self.store.fail(&self.attempt(p, path), &tried, error) {
+            Ok(()) => {
+                let failed = record(p, path, Some(error));
+                (self.report)(Event::Appended(vec![Record::File(failed)]));
+                Ok(())
+            }
+            Err(e) if store::is_busy(&e) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Of the chunks that answer a file's lines (`refs`), how many have answered, and how many
@@ -1333,6 +1129,26 @@ impl Collector<'_> {
     }
 }
 
+/// The file's record of what this scan made of it, for the hook: the checks it made, or none for a
+/// failed attempt, which makes none. Review's model merges it into the file's record as a view
+/// would ([`FileRecord::merge`]).
+fn record(p: &Prepared, path: &str, error: Option<&str>) -> FileRecord {
+    FileRecord {
+        path: path.to_string(),
+        size: p.size,
+        mtime: p.mtime,
+        error: error.map(Into::into),
+        tracks: p.tracks.clone(),
+        lines: p.lines.len(),
+        truncated: p.truncated,
+        checks: if error.is_some() {
+            Vec::new()
+        } else {
+            p.checks.clone()
+        },
+    }
+}
+
 /// Write `line` to the log, and keep it for the file's [`Event::Finished`].
 fn say(log: &mut dyn Write, said: &mut Vec<String>, line: String) -> io::Result<()> {
     writeln!(log, "{line}")?;
@@ -1341,12 +1157,12 @@ fn say(log: &mut dyn Write, said: &mut Vec<String>, line: String) -> io::Result<
 }
 
 /// One finding per distinct suggestion for each line, with up to two lines of context either side.
+/// Numbered 0: the store gives each its ID as it saves it.
 fn findings(
     answers: &HashMap<usize, Result<Vec<Suggestion>, String>>,
     lines: &[Line],
     refs: &[(usize, usize)],
     path: &str,
-    next_id: &mut u64,
 ) -> Vec<Finding> {
     let context = |from: usize, to: usize| -> Vec<String> {
         let to = to.min(lines.len());
@@ -1367,7 +1183,7 @@ fn findings(
             }
             seen.push(&s.corrected);
             out.push(Finding {
-                id: *next_id,
+                id: 0,
                 file: path.to_string(),
                 style: line.style.clone(),
                 original: line.text.clone(),
@@ -1379,7 +1195,6 @@ fn findings(
                 after: context(i + 1, i + 3),
                 timing: None,
             });
-            *next_id += 1;
         }
     }
     out
@@ -1402,18 +1217,18 @@ mod tests {
         }
     }
 
-    fn run_with(backend: &str, langs: &[&str]) -> Run {
-        Run {
+    fn run_with(backend: &str, langs: &[&str]) -> ScanRow {
+        ScanRow {
+            id: 1,
             name: "r".into(),
-            header: Some(RunHeader {
+            header: RunHeader {
                 started: Timestamp::UNIX_EPOCH,
                 backend: backend.into(),
                 command: Vec::new(),
                 prompt_version: llm::PROMPT_VERSION,
                 version: String::new(),
                 langs: langs.iter().map(|l| (*l).to_string()).collect(),
-            }),
-            ..Run::default()
+            },
         }
     }
 
@@ -1423,10 +1238,8 @@ mod tests {
 
     #[test]
     fn adding_to_a_run_takes_its_backend_and_languages_unless_they_are_given_alike() {
-        let none = Cache::default();
-        let resume = |run: &Run, llm, llm_cmd, langs: &[String]| {
-            super::resume(run, &none, llm, llm_cmd, langs)
-        };
+        let resume =
+            |run: &ScanRow, llm, llm_cmd, langs: &[String]| super::resume(run, llm, llm_cmd, langs);
         let run = run_with("claude", &["eng", "und"]);
         let (b, l) = resume(&run, None, None, &[]).unwrap();
         assert_eq!((b.label.as_str(), l), ("claude", langs(&["eng", "und"])));
@@ -1445,121 +1258,107 @@ mod tests {
         let cmd = run_with("cmd:my-llm --x", &["eng"]);
         let (b, _) = resume(&cmd, None, None, &[]).unwrap();
         assert_eq!(b.argv, ["sh", "-c", "my-llm --x"]);
-        // A run from before the languages were kept, with nothing in the cache to say: as given,
-        // else English.
-        let old = run_with("claude", &[]);
-        assert_eq!(resume(&old, None, None, &[]).unwrap().1, ["eng"]);
-        assert_eq!(
-            resume(&old, None, None, &langs(&["und"])).unwrap().1,
-            ["und"]
-        );
-        assert!(resume(&Run::default(), None, None, &[]).is_err());
         // A backend this subcheck does not know: no command, refused later if a file needs it,
         // whatever command the run recorded.
         let mut gone = run_with("gemini", &["eng"]);
-        if let Some(h) = &mut gone.header {
-            h.command = vec!["gemini".into(), "-p".into()];
-        }
+        gone.header.command = vec!["gemini".into(), "-p".into()];
         let (b, _) = resume(&gone, None, None, &[]).unwrap();
         assert_eq!((b.label.as_str(), b.argv.len()), ("gemini", 0));
     }
 
-    #[test]
-    fn an_old_runs_languages_come_from_the_cache() {
-        let dir = tempfile::tempdir().unwrap();
-        let entry = |run: &str, check: Check| CacheEntry {
-            path: format!("/m/{run}.mkv"),
-            size: 1,
-            mtime: Timestamp::UNIX_EPOCH,
-            with: CheckedWith {
-                check,
-                ..CheckedWith::new("claude", &langs(&["eng", "und"]), 1)
+    /// A file as `finish` gets it when only the timing check is made of it and found nothing.
+    fn timing_only(path: &str) -> FileJob {
+        FileJob {
+            prepared: Prepared {
+                path: PathBuf::from(path),
+                size: 10,
+                mtime: Timestamp::UNIX_EPOCH,
+                checks: vec![Check::Timing],
+                tracks: Vec::new(),
+                lines: Vec::new(),
+                timing: Vec::new(),
+                timing_notes: Vec::new(),
+                error: None,
+                truncated: None,
+                notes: Vec::new(),
             },
-            run: run.into(),
-        };
-        // Its timing check, of other languages, says nothing of what its LLM checks were of.
-        let timing = CacheEntry {
-            path: "/m/b.mkv".into(),
-            with: CheckedWith::timing(&langs(&["jpn"]), 1),
-            ..entry("r", Check::Timing)
-        };
-        Cache::append(dir.path(), &timing).unwrap();
-        let old = run_with("claude", &[]);
-        let cache = Cache::load(dir.path()).unwrap();
-        assert_eq!(resume(&old, &cache, None, None, &[]).unwrap().1, ["eng"]);
-        Cache::append(dir.path(), &entry("r", Check::Llm)).unwrap();
-        let cache = Cache::load(dir.path()).unwrap();
-        assert_eq!(
-            resume(&old, &cache, None, None, &[]).unwrap().1,
-            ["eng", "und"]
-        );
-        assert_eq!(
-            resume(&old, &cache, None, None, &langs(&["eng"])).unwrap_err(),
-            "run r checked --lang eng --lang und (as the cache recorded it: the run is from \
-             before runs kept their languages); leave out --lang to use it"
-        );
+            refs: Vec::new(),
+        }
     }
 
     #[test]
-    fn an_llm_check_is_not_made_again_only_while_another_run_holds_the_file_as_it_is() {
+    fn a_save_that_stays_busy_fails_that_file_alone_and_the_scan_goes_on() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("a.mkv");
-        std::fs::write(&file, b"x").unwrap();
-        let key = file.to_string_lossy().into_owned();
-        let (size, mtime) = file_stamp(&file).unwrap();
-        let state = dir.path().join("state");
-        let runs = state.join("runs");
-        std::fs::create_dir_all(&runs).unwrap();
-        let llm = CheckedWith::new("claude", &langs(&["eng"]), 1);
-        let entry = CacheEntry {
-            path: key.clone(),
-            size,
-            mtime,
-            with: llm.clone(),
-            run: "y".into(),
+        let mut store = Store::open_at(&dir.path().join("subcheck.db")).unwrap();
+        store
+            .set_busy_timeout(std::time::Duration::from_millis(50))
+            .unwrap();
+        let files = [PathBuf::from("/m/a.mkv"), PathBuf::from("/m/b.mkv")];
+        let header = run_with("claude", &["eng"]).header;
+        let scan = store.begin_scan(&header, &files).unwrap();
+        let opts = Options {
+            backend: Backend::shell("true"),
+            chunk_lines: 10,
+            jobs: 1,
+            langs: langs(&["eng"]),
+            force: false,
+            verbose: false,
+            into: None,
         };
-        Cache::append(&state, &entry).unwrap();
-        let cache = Cache::load(&state).unwrap();
-        let record = |size| {
-            let r = Record::File(FileRecord {
-                path: key.clone(),
-                size,
-                mtime,
-                error: None,
-                tracks: vec![],
-                lines: 1,
-                truncated: None,
-                checks: vec![Check::Llm],
-            });
-            serde_json::to_string(&r).unwrap() + "\n"
+        let events = Mutex::new(Vec::new());
+        let report = |e: Event| events.lock().unwrap().push(e);
+        let mut collector = Collector {
+            store: &mut store,
+            scan,
+            opts: &opts,
+            report: &report,
+            summary: Summary::default(),
+            total: 2,
+            done: 0,
+            answers: HashMap::new(),
+            waiting: Vec::new(),
         };
-        let y = runs.join("y.jsonl");
-        let needs = |adding_to: &str| {
-            let found = in_run(
-                vec![file.clone()],
-                &HashMap::new(),
-                (adding_to, &runs),
-                &cache,
-                &llm,
-            );
-            let todo: Vec<Vec<Check>> = found.todo.into_iter().map(|(_, c)| c).collect();
-            (todo, found.elsewhere.len(), found.unreadable.len())
+        let mut log = Vec::new();
+
+        // Another connection holds the write lock while the first file is saved.
+        let other = rusqlite::Connection::open(dir.path().join("subcheck.db")).unwrap();
+        other.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let first = collector.finish(timing_only("/m/a.mkv"), &mut log).unwrap();
+        other.execute_batch("ROLLBACK").unwrap();
+        let Event::Finished {
+            error, findings, ..
+        } = first
+        else {
+            panic!("not a Finished event");
         };
-        let both = vec![vec![Check::Llm, Check::Timing]];
-        // Run y holds the file as it is: only the timing check.
-        std::fs::write(&y, record(size)).unwrap();
-        assert_eq!(needs("x"), (vec![vec![Check::Timing]], 1, 0));
-        // Not when y is the run being added to.
-        assert_eq!(needs("y"), (both.clone(), 0, 0));
-        // Its record is of an older copy of the file.
-        std::fs::write(&y, record(size + 1)).unwrap();
-        assert_eq!(needs("x"), (both.clone(), 0, 0));
-        // It cannot be read: said so.
-        std::fs::write(&y, b"\xff\n").unwrap();
-        assert_eq!(needs("x"), (both.clone(), 0, 1));
-        // It is gone.
-        std::fs::remove_file(&y).unwrap();
-        assert_eq!(needs("x"), (both, 0, 0));
+        assert!(error.unwrap().starts_with("not saved: "));
+        assert_eq!(findings, 0);
+
+        // The lock is gone: the next file is saved.
+        collector.finish(timing_only("/m/b.mkv"), &mut log).unwrap();
+        assert_eq!(
+            (collector.summary.failed, collector.summary.checked),
+            (1, 1)
+        );
+        let log = String::from_utf8(log).unwrap();
+        assert!(log.contains("[1/2] a.mkv: FAILED: not saved: "), "{log}");
+        assert!(
+            log.contains("[2/2] b.mkv: timing only, 0 findings"),
+            "{log}"
+        );
+
+        let timing = checked_with(&opts, Check::Timing);
+        let mtime = Timestamp::UNIX_EPOCH;
+        assert!(!store.is_fresh("/m/a.mkv", 10, mtime, &timing).unwrap());
+        assert!(store.is_fresh("/m/b.mkv", 10, mtime, &timing).unwrap());
+        let rows: i64 = other
+            .query_row(
+                "SELECT COUNT(*) FROM checks WHERE path = '/m/a.mkv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "a busy save leaves no attempt behind either");
     }
 
     #[test]
@@ -1660,5 +1459,24 @@ mod tests {
             .collect();
         assert_eq!(names, ["Show/Specials/c.mkv", "Show/a.MKV", "Show/b.mkv"]);
         assert!(mkv_files(&[d.join("missing")]).is_err());
+    }
+
+    #[test]
+    fn mkv_files_given_a_path_with_dot_or_dotdot_finds_the_same_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("x")).unwrap();
+        std::fs::create_dir_all(d.join("Show/Specials")).unwrap();
+        for f in ["Show/a.mkv", "Show/Specials/b.mkv"] {
+            std::fs::write(d.join(f), "").unwrap();
+        }
+        let plain = mkv_files(&[d.join("Show")]).unwrap().0;
+        assert_eq!(plain, [d.join("Show/Specials/b.mkv"), d.join("Show/a.mkv")]);
+        for odd in [d.join("x/../Show"), d.join("Show/.")] {
+            assert_eq!(mkv_files(&[odd]).unwrap().0, plain);
+        }
+        // A file named through `..` is recorded at its clean path.
+        let file = mkv_files(&[d.join("x/../Show/a.mkv")]).unwrap().0;
+        assert_eq!(file, [d.join("Show/a.mkv")]);
     }
 }

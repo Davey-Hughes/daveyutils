@@ -965,8 +965,12 @@ mod tests {
         // Too narrow for even that beside the button: the price, and the button gives way.
         assert_eq!(last(&m, 20), "LLM: $3.21 at API pr");
         // A message of its own takes the line.
-        m.status = Some("2 line(s) of the run file could not be read".into());
-        assert!(last(&m, 80).starts_with("2 line(s) of"), "{}", last(&m, 80));
+        m.status = Some("warning: /m/locked: skipped: Permission denied".into());
+        assert!(
+            last(&m, 80).starts_with("warning: /m/locked"),
+            "{}",
+            last(&m, 80)
+        );
         // Gone after the first key, whatever the width after.
         m.status = None;
         update::update(&mut m, Msg::Key(KeyCode::Char('j')), now());

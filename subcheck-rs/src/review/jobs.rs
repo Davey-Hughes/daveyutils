@@ -5,13 +5,13 @@
 use std::any::Any;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use crossterm::event;
 
 use super::update::Msg;
 use crate::scan::{self, Options, Plan};
+use crate::store::Store;
 
 /// Read the terminal on a thread of its own, each key, click or resize sent as its `Msg`. A
 /// terminal that cannot be read ends the screen (`Msg::Fatal`), and so does a panic: with this
@@ -40,10 +40,10 @@ pub fn input(tx: Sender<Msg>) -> io::Result<()> {
     Ok(())
 }
 
-/// Run `plan` on a thread of its own: each step sent as `Msg::Scan`, then how it ended as
-/// `Msg::ScanEnded`. What `scan` would log goes nowhere: the screen has each file's lines from its
-/// events. A panic is `Msg::Fatal`.
-pub fn scan(plan: Plan, opts: Options, state: PathBuf, tx: Sender<Msg>) -> io::Result<()> {
+/// Run `plan` on a thread of its own, saving through `store`, a connection of its own: each step
+/// sent as `Msg::Scan`, then how it ended as `Msg::ScanEnded`. What `scan` would log goes nowhere:
+/// the screen has each file's lines from its events. A panic is `Msg::Fatal`.
+pub fn scan(plan: Plan, opts: Options, mut store: Store, tx: Sender<Msg>) -> io::Result<()> {
     std::thread::Builder::new()
         .name("scan".into())
         .spawn(move || {
@@ -51,7 +51,7 @@ pub fn scan(plan: Plan, opts: Options, state: PathBuf, tx: Sender<Msg>) -> io::R
                 let _ = tx.send(Msg::Scan(event));
             };
             let ran = panic::catch_unwind(AssertUnwindSafe(|| {
-                scan::execute(plan, &opts, &state, &mut io::sink(), &report)
+                scan::execute(plan, &opts, &mut store, &mut io::sink(), &report)
             }));
             let _ = tx.send(match ran {
                 Ok(ended) => Msg::ScanEnded(ended.map_err(|e| format!("{e:#}"))),
