@@ -33,20 +33,28 @@ selection staying on its row as rows come in above it. A typo that joins a row w
 all decided alike takes that decision, your wording too, and the status line says so; `u` takes it
 back. A timing finding that joins a row stays pending: each episode's fix can differ.
 
-`Tab` shows the files instead: each with where the scan is with it (`queued`, `reading`,
-`LLM 2/3`, `✓ 412 lines · 3 findings`, `✓ timing only · 1 finding`, `✗ FAILED: …`), and in the
-detail pane what the scan said of it. `⏎` on a file goes to its first finding, and `u` undoes there
-as it does in the list. While the scan runs, the list's title and the status line say how far it
-is; once it ends, the status line gives its summary. What the scan warns of as it starts (a folder
-it cannot read) stays on the terminal above the screen, and the first of it is on the status line
-as the screen opens. Files the scan skips as unchanged are in the list from the start.
+`Tab` shows the files instead: each with where the scan is with it (`queued`, `reading`, `LLM 2/3`,
+`✓ 412 lines · 3 findings`, `✓ timing only · 1 finding`, `✗ FAILED: …`), and in the detail pane
+what the scan said of it. `⏎` on a file goes to its first finding, and `u` undoes there as it does
+in the list. `c` checks the file again, as `subcheck scan --run <run> --force <file>` does: into
+the run you are reviewing, or in a view of files and folders, the newest run that named it, with
+that run's LLM and languages. It asks first, since it spends money, and while a scan runs it waits
+for that to end. While the scan runs, the list's title and the status line say how far it is; once
+it ends, the status line gives its summary. What the scan warns of as it starts (a folder it cannot
+read) stays on the terminal above the screen, and the first of it is on the status line as the
+screen opens. Files the scan skips as unchanged are in the list from the start.
 
-When a scan checks a file again and that check fails, the file's earlier findings stay recorded: they
-are left out of the screen's list until that scan ends, and are back when you open it again with
-`subcheck review`.
+When a scan checks a file again, its earlier findings stay in the list until the new ones are
+saved, and you can decide them meanwhile: a decision carries over to the finding that comes back
+with the same line and fix. While it is checked, the file's name spins in the list, and the detail
+pane says where the check is (`checking again: LLM 1/3`). If the check fails, the findings stay. A
+decision on a finding that another subcheck checked again since the screen opened goes to the
+finding that came back in its place, and the status line says so; when none came back, nothing is
+written, and the status line says that too.
 
 `q` while the scan runs asks first, then stops it: the run keeps every file that was done, and the
-terminal gets the command that finishes it (`subcheck scan --run <run> <paths>`).
+terminal gets the command that finishes it (`subcheck scan --run <run> <paths>`; after a `c`,
+`subcheck scan --run <run> --force <files>`).
 
 A fix repeated across episodes (an OP lyric, say) is one row; `⏎` expands it into its episodes. A
 season's timing findings on one track are one row too, whatever each episode's fix (`−1 frame ×23 ·
@@ -69,6 +77,7 @@ filter, to the next row).
 | `u` | undo this session's last decision or clear |
 | `f` | filter: all, pending, accepted, rejected |
 | `Tab` | the files, or back to the findings |
+| `c` | in the files view: check the file again (asks first; while a scan runs, once it ends) |
 | `o` | open the line in mpv, 2 s early, with its subtitle track; again on the same line replays it |
 | Space | pause or resume mpv |
 | ← → | mpv back or forward 5 s |
@@ -125,6 +134,8 @@ one current LLM check and one current timing check, and a check made again (the 
 `--force`) replaces the one before, whichever scan made it. A decision carries over to a finding
 that comes back with the same line and the same fix: a typo you rejected stays rejected when
 `apply` changes the file and the next scan reads it again.
+A timing fix is the same fix when it moves the same track's stretches by the same frames: timing
+rules that change what a finding rests on keep your decision on it.
 
 A run is the record of one scan, and a view of the files it named as they are now: two runs that
 share a file show it the same. `review`, `list` and `apply` take a run name, or files and

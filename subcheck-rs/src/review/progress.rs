@@ -17,6 +17,8 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 pub enum Stage {
     /// Waiting for the reader.
     Queued,
+    /// Queued by `c` while a scan runs: checked again when it ends.
+    QueuedAgain,
     Reading,
     /// Read; `answered` of the `chunks` its lines need have come back from the LLM.
     Asking {
@@ -47,11 +49,13 @@ pub struct FileProgress {
 }
 
 impl FileProgress {
-    /// Where the file is, in a few words: `queued`, `⠙ LLM 2/3`, `✓ 412 lines · 3 findings`,
-    /// `✓ timing only · 1 finding`, `✗ FAILED: …`. `spinner` turns beside a stage under way.
+    /// Where the file is, in a few words: `queued`, `queued again`, `⠙ LLM 2/3`,
+    /// `✓ 412 lines · 3 findings`, `✓ timing only · 1 finding`, `✗ FAILED: …`. `spinner` turns
+    /// beside a stage under way.
     pub fn label(&self, spinner: char) -> String {
         match &self.stage {
             Stage::Queued => "queued".into(),
+            Stage::QueuedAgain => "queued again".into(),
             Stage::Reading => format!("{spinner} reading"),
             Stage::Asking { answered, chunks } => format!("{spinner} LLM {answered}/{chunks}"),
             Stage::Done { findings } if self.timing_only => {
@@ -92,6 +96,16 @@ pub struct Progress {
     pub spent: Spent,
     /// Quarter seconds the scan has run: the spinner's step.
     pub ticks: usize,
+    /// The run the scan records under, and the command that finishes it should it stop: for the
+    /// outro. Empty before the first scan.
+    pub run: String,
+    pub resume: String,
+    /// What the screen's earlier scans ended with, for the outro, oldest first: `c` starts another
+    /// once one has ended.
+    pub earlier: Vec<String>,
+    /// An earlier scan of this screen failed, a file in it or the scan itself: `start` resets the
+    /// counts, but the exit status still tells.
+    pub earlier_failed: bool,
 }
 
 impl Progress {
@@ -125,6 +139,10 @@ impl Progress {
             findings: 0,
             spent: Spent::default(),
             ticks: 0,
+            run: String::new(),
+            resume: String::new(),
+            earlier: Vec::new(),
+            earlier_failed: false,
         }
     }
 
@@ -202,12 +220,70 @@ impl Progress {
         }
     }
 
+    /// A scan into run `run` from now: running, with nothing counted, and none of the files known
+    /// to be its own until it says (`Event::Queued`). `resume` is the command that finishes it
+    /// should it stop; `adding`, whether it adds to a run (`--run`). What the last scan ended with
+    /// is kept for the outro.
+    pub fn start(&mut self, run: &str, resume: String, adding: bool) {
+        debug_assert!(
+            !self.running(),
+            "a scan is started only once the last has ended, or its outro would be lost"
+        );
+        if matches!(self.scan, Scan::Ended(_)) {
+            self.earlier = self.outro();
+        }
+        self.earlier_failed |= self.failed > 0 || matches!(self.scan, Scan::Ended(Err(_)));
+        self.scan = Scan::Running;
+        self.run = run.to_string();
+        self.resume = resume;
+        self.adding = adding;
+        self.queued = 0;
+        self.done = 0;
+        self.failed = 0;
+        self.findings = 0;
+        self.spent = Spent::default();
+        for f in &mut self.files {
+            f.queued = false;
+        }
+    }
+
     pub fn running(&self) -> bool {
         self.scan == Scan::Running
     }
 
     pub fn spinner(&self) -> char {
         SPINNER[self.ticks % SPINNER.len()]
+    }
+
+    /// While the scan runs, where it is with `path`, in the files view's words: `queued`,
+    /// `reading`, `LLM 1/3`. `None` once the scan has ended, even if it left the file queued or
+    /// being read, and for a file it is not checking or is done with.
+    pub fn checking(&self, path: &str) -> Option<String> {
+        if !self.running() {
+            return None;
+        }
+        match &self.files.iter().find(|f| f.path == path)?.stage {
+            Stage::Queued => Some("queued".into()),
+            Stage::Reading => Some("reading".into()),
+            Stage::Asking { answered, chunks } => Some(format!("LLM {answered}/{chunks}")),
+            _ => None,
+        }
+    }
+
+    /// `c` queued `path` to be checked again when the scan ends.
+    pub fn queue_again(&mut self, path: &str) {
+        if let Some(f) = self.file_mut(path) {
+            f.stage = Stage::QueuedAgain;
+        }
+    }
+
+    /// `path` will not be checked, and why. It is not the earlier scan's any more, so that scan's
+    /// outro does not list it among its failures.
+    pub fn fail(&mut self, path: &str, why: &str) {
+        if let Some(f) = self.file_mut(path) {
+            f.stage = Stage::Failed(why.into());
+            f.queued = false;
+        }
     }
 
     /// For the list's title while the scan runs: `scanning 7/24 ⠙`.
@@ -248,37 +324,39 @@ impl Progress {
 
     /// What the terminal gets on leaving the screen, of the scan: each file it checked that failed
     /// (a run's earlier failures elsewhere are not this scan's, nor in its count), then what `scan`
-    /// would have ended with; for a scan stopped or failed, how far it got and `resume`, the
-    /// command that finishes it. Nothing with no scan.
-    pub fn outro(&self, run: &str, resume: &str) -> Vec<String> {
+    /// would have ended with; for a scan stopped or failed, how far it got and the command that
+    /// finishes it. What earlier scans ended with comes first. Nothing with no scan.
+    pub fn outro(&self) -> Vec<String> {
+        let mut lines = self.earlier.clone();
         if self.scan == Scan::None {
-            return Vec::new();
+            return lines;
         }
-        let mut lines: Vec<String> = self
-            .files
-            .iter()
-            .filter(|f| f.queued)
-            .filter_map(|f| match &f.stage {
-                Stage::Failed(e) => Some(format!("{}: FAILED: {e}", f.path)),
-                _ => None,
-            })
-            .collect();
+        lines.extend(
+            self.files
+                .iter()
+                .filter(|f| f.queued)
+                .filter_map(|f| match &f.stage {
+                    Stage::Failed(e) => Some(format!("{}: FAILED: {e}", f.path)),
+                    _ => None,
+                }),
+        );
         match &self.scan {
             Scan::Ended(Ok(s)) => lines.extend(scan::summary_lines(s, self.adding)),
             Scan::Ended(Err(e)) => {
                 lines.push(format!("the scan failed: {e}"));
-                lines.push(format!("Finish it with: {resume}"));
+                lines.push(format!("Finish it with: {}", self.resume));
             }
             Scan::Running | Scan::None => {
                 lines.push(format!(
-                    "run {run}: stopped at {}/{} files, {} failed; {}",
+                    "run {}: stopped at {}/{} files, {} failed; {}",
+                    self.run,
                     self.done,
                     self.queued,
                     self.failed,
                     findings_text(self.findings)
                 ));
                 lines.extend(self.spent.line(", "));
-                lines.push(format!("Finish it with: {resume}"));
+                lines.push(format!("Finish it with: {}", self.resume));
             }
         }
         lines
@@ -298,11 +376,21 @@ impl Progress {
 /// The command that finishes a scan stopped partway: `--run` checks every file the run has no good
 /// record of. `paths` as the scan was given them.
 pub fn resume_command(run: &str, paths: &[PathBuf]) -> String {
+    format!("subcheck scan --run {run} {}", quoted(paths))
+}
+
+/// The command that finishes a `c` stopped partway: the same files checked again into the run.
+pub fn again_command(run: &str, paths: &[PathBuf]) -> String {
+    format!("subcheck scan --run {run} --force {}", quoted(paths))
+}
+
+/// `paths`, each quoted for the shell, with a space between.
+fn quoted(paths: &[PathBuf]) -> String {
     let paths: Vec<String> = paths
         .iter()
         .map(|p| shell_quote(&p.to_string_lossy()))
         .collect();
-    format!("subcheck scan --run {run} {}", paths.join(" "))
+    paths.join(" ")
 }
 
 /// "1 finding", "3 findings".
@@ -488,8 +576,10 @@ mod tests {
         });
         let resume = resume_command("r", &["/m/K-On! S1".into()]);
         assert_eq!(resume, "subcheck scan --run r '/m/K-On! S1'");
+        p.run = "r".into();
+        p.resume = resume.clone();
         assert_eq!(
-            p.outro("r", &resume),
+            p.outro(),
             [
                 "/m/E01.mkv: FAILED: LLM: boom",
                 "run r: stopped at 1/2 files, 1 failed; 0 findings",
@@ -503,8 +593,10 @@ mod tests {
             failed: 1,
             ..scan::Summary::default()
         }));
+        p.run = "r".into();
+        p.resume = resume.clone();
         assert_eq!(
-            p.outro("r", &resume),
+            p.outro(),
             [
                 "/m/E01.mkv: FAILED: LLM: boom",
                 "run r: 2 files, 1 checked, 1 failed, 0 unchanged since an earlier scan; 0 findings",
@@ -512,7 +604,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            Progress::of_run(&Run::default()).outro("r", &resume),
+            Progress::of_run(&Run::default()).outro(),
             Vec::<String>::new()
         );
     }
@@ -533,8 +625,10 @@ mod tests {
             findings: 0,
             lines: vec![],
         });
+        p.run = "r".into();
+        p.resume = "subcheck scan --run r /m/S2".into();
         assert_eq!(
-            p.outro("r", "subcheck scan --run r /m/S2"),
+            p.outro(),
             [
                 "/m/S2/E02.mkv: FAILED: LLM: boom",
                 "run r: stopped at 1/1 files, 1 failed; 0 findings",
@@ -599,5 +693,69 @@ mod tests {
             ..Run::default()
         });
         assert_eq!(p.files[0].label('⠙'), "✓ timing only · 0 findings");
+    }
+
+    #[test]
+    fn a_file_is_being_checked_from_queued_until_it_is_done() {
+        let mut p = Progress::of_run(&Run::default());
+        p.scan_event(&Event::Queued(vec!["/m/E01.mkv".into()]));
+        assert_eq!(p.checking("/m/E01.mkv").as_deref(), Some("queued"));
+        p.scan_event(&Event::Reading("/m/E01.mkv".into()));
+        assert_eq!(p.checking("/m/E01.mkv").as_deref(), Some("reading"));
+        p.scan_event(&Event::Asking {
+            path: "/m/E01.mkv".into(),
+            answered: 1,
+            chunks: 3,
+        });
+        assert_eq!(p.checking("/m/E01.mkv").as_deref(), Some("LLM 1/3"));
+        p.scan_event(&Event::Finished {
+            path: "/m/E01.mkv".into(),
+            error: None,
+            findings: 0,
+            lines: vec![],
+        });
+        assert_eq!(p.checking("/m/E01.mkv"), None);
+        assert_eq!(p.checking("/m/E02.mkv"), None);
+    }
+
+    #[test]
+    fn a_file_left_queued_by_a_scan_that_failed_is_not_being_checked() {
+        let mut p = Progress::of_run(&Run::default());
+        p.scan_event(&Event::Queued(vec!["/m/E01.mkv".into()]));
+        assert_eq!(p.checking("/m/E01.mkv").as_deref(), Some("queued"));
+        p.scan = Scan::Ended(Err("disk full".into()));
+        assert_eq!(p.checking("/m/E01.mkv"), None);
+    }
+
+    #[test]
+    fn a_scan_started_after_one_ended_counts_afresh_and_the_outro_keeps_both() {
+        let mut p = Progress::of_run(&Run::default());
+        p.start("first", "subcheck scan --run first /m".into(), false);
+        p.scan_event(&Event::Queued(vec!["/m/E01.mkv".into()]));
+        p.scan_event(&Event::Finished {
+            path: "/m/E01.mkv".into(),
+            error: Some("LLM: boom".into()),
+            findings: 0,
+            lines: vec![],
+        });
+        p.scan = Scan::Ended(Err("disk full".into()));
+        p.start(
+            "second",
+            "subcheck scan --run second --force /m/E01.mkv".into(),
+            true,
+        );
+        assert!(p.running());
+        assert_eq!((p.queued, p.done, p.failed, p.findings), (0, 0, 0, 0));
+        assert!(p.adding);
+        assert_eq!(
+            p.outro(),
+            [
+                "/m/E01.mkv: FAILED: LLM: boom",
+                "the scan failed: disk full",
+                "Finish it with: subcheck scan --run first /m",
+                "run second: stopped at 0/0 files, 0 failed; 0 findings",
+                "Finish it with: subcheck scan --run second --force /m/E01.mkv",
+            ]
+        );
     }
 }

@@ -7,25 +7,44 @@ use ratatui::layout::{Position, Rect};
 
 use super::layout;
 use super::model::{Confirm, Editor, Entry, FileNote, Model, Pane, UndoStep};
-use super::progress::Scan;
+use super::progress::{Scan, Stage};
 use super::view;
 use crate::list::{self, Filter, label};
 use crate::player::{Moment, PlayState, Playback};
 use crate::scan;
-use crate::store::{Decision, State};
+use crate::store::{Decided, Decision, Record, Run, State};
 use crate::text::{timestamp, timestamp_ms};
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // a read-back is rare; boxing it would only add noise
 pub enum Msg {
     Key(KeyCode),
     /// Ctrl-U: in the editor, delete back to the start.
     KillLine,
     Quit,
-    /// A `Write` effect finished.
+    /// A `Write` effect finished: what became of each decision, or why none was written.
     Written {
         action: Action,
         decisions: Vec<Decision>,
-        result: Result<(), String>,
+        result: Result<Vec<Decided>, String>,
+    },
+    /// A `ReadBack` effect finished: the file as the store shows it, or why it could not be read.
+    ReadBack {
+        path: String,
+        view: Result<Run, String>,
+    },
+    /// A `FindRun` effect finished: the run's name and backend, or why there is none.
+    RunFound {
+        path: String,
+        found: Result<(String, String), String>,
+    },
+    /// A `Recheck` effect finished: the scan it started, or why none did; the files it left out,
+    /// no longer on disk; and all the files it was asked for (when no scan started, those still
+    /// on disk fail with the reason).
+    Started {
+        job: Result<Job, String>,
+        missing: Vec<String>,
+        paths: Vec<String>,
     },
     /// An `Open` effect finished.
     Opened(Result<(), String>),
@@ -68,12 +87,34 @@ pub enum Action {
     },
 }
 
+/// A scan `c` started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Job {
+    pub run: String,
+    /// The command that finishes it, should it stop.
+    pub resume: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     /// Record these decisions in the store.
     Write {
         action: Action,
         decisions: Vec<Decision>,
+    },
+    /// Read a file back from the store, as it is now ([`Msg::ReadBack`]).
+    ReadBack(String),
+    /// Find the run `c` checks a file again into: `run`, the one the screen shows, or with none (a
+    /// paths view) the newest that named the file ([`Msg::RunFound`]).
+    FindRun {
+        path: String,
+        run: Option<String>,
+    },
+    /// Check `paths` again into `run`, as `subcheck scan --run <run> --force <paths>` does
+    /// ([`Msg::Started`]).
+    Recheck {
+        run: String,
+        paths: Vec<String>,
     },
     Open(Moment),
     /// Pause or seek the open mpv.
@@ -97,7 +138,7 @@ pub fn update(m: &mut Model, msg: Msg, now: Timestamp) -> Vec<Effect> {
     );
     // A double-click is two clicks with nothing the user did in between: a key or another click
     // starts over. The scan's messages and the spinner's ticks come unasked, so they leave the
-    // first click be (`Model::add` keeps it on its entry as rows come in).
+    // first click be (`Model::refresh` keeps it on its entry as rows come and go).
     let last_click = if input { m.last_click.take() } else { None };
     let effects = apply(m, msg, last_click, now);
     // The cost line review opened with ends at the first key (Ctrl-U and Ctrl-C too), click or
@@ -128,7 +169,7 @@ fn apply(
         // Ctrl-C or Ctrl-D: while the scan runs it asks first, as `q` does; a second one, with the
         // question open, quits.
         Msg::Quit => {
-            if m.progress.running() && m.confirm.is_none() {
+            if m.progress.running() && m.confirm != Some(Confirm::Quit) {
                 m.confirm = Some(Confirm::Quit);
             } else {
                 m.should_quit = true;
@@ -144,9 +185,17 @@ fn apply(
         }
         // The question takes the next key: `y` answers it, any other lets it go.
         Msg::Key(key) if m.confirm.is_some() => {
-            m.confirm = None;
-            m.should_quit = key == KeyCode::Char('y');
-            Vec::new()
+            let confirm = m.confirm.take().expect("checked above");
+            if key != KeyCode::Char('y') {
+                return Vec::new();
+            }
+            match confirm {
+                Confirm::Quit => {
+                    m.should_quit = true;
+                    Vec::new()
+                }
+                Confirm::Recheck { path, run, .. } => again(m, path, run),
+            }
         }
         Msg::Key(key) if m.editor.is_some() => edit_key(m, key, now),
         // Any key closes the box of keys and does nothing else; but `q` quits, as the box says.
@@ -168,10 +217,14 @@ fn apply(
             action,
             decisions,
             result,
-        } => {
-            written(m, action, &decisions, result);
-            Vec::new()
-        }
+        } => written(m, action, &decisions, result),
+        Msg::ReadBack { path, view } => read_back(m, &path, view, now),
+        Msg::RunFound { path, found } => run_found(m, path, found),
+        Msg::Started {
+            job,
+            missing,
+            paths: p,
+        } => started(m, job, &missing, &p),
         Msg::Opened(result) => {
             m.status = Some(match result {
                 Ok(()) => "opened in mpv".into(),
@@ -195,13 +248,15 @@ fn apply(
             Vec::new()
         }
         Msg::Mouse(action, x, y) => mouse(m, action, Position::new(x, y), last_click, now),
-        Msg::Scan(event) => scanned(m, event, now),
+        Msg::Scan(event) => scanned(m, event),
         Msg::ScanEnded(result) => {
             m.progress.scan = Scan::Ended(result);
             // A question to stop the scan has nothing left to ask of: it goes, so the line shows
             // how the scan ended, and the next `q` quits at once.
-            m.confirm = None;
-            Vec::new()
+            if m.confirm == Some(Confirm::Quit) {
+                m.confirm = None;
+            }
+            next_again(m)
         }
         Msg::Fatal(error) => {
             m.fatal = Some(error);
@@ -499,12 +554,21 @@ fn undo(m: &mut Model, now: Timestamp) -> Vec<Effect> {
     }]
 }
 
-/// A write's result: on success the decisions take effect, and the selection moves on.
-fn written(m: &mut Model, action: Action, decisions: &[Decision], result: Result<(), String>) {
-    if let Err(e) = result {
-        m.status = Some(format!("not saved: {e}"));
-        return;
-    }
+/// A write's result: on success the decisions take effect, and the selection moves on. A decision
+/// the store found on a replaced finding went to its new one, or nowhere: its file is read back.
+fn written(
+    m: &mut Model,
+    action: Action,
+    decisions: &[Decision],
+    result: Result<Vec<Decided>, String>,
+) -> Vec<Effect> {
+    let outcomes = match result {
+        Ok(outcomes) => outcomes,
+        Err(e) => {
+            m.status = Some(format!("not saved: {e}"));
+            return Vec::new();
+        }
+    };
     let old = m.selected;
     let shown = m.entries();
     for d in decisions {
@@ -563,7 +627,7 @@ fn written(m: &mut Model, action: Action, decisions: &[Decision], result: Result
                 .get(old)
                 .and_then(|e| m.entries().iter().position(|n| n == e))
             {
-                // `Model::add` raised the scroll to hold the row's screen line; the hidden row
+                // `Model::refresh` raised the scroll to hold the row's screen line; the hidden row
                 // took a line from above it, so the scroll gives one back, and the row stays
                 // where the user was looking.
                 m.scroll = (m.scroll + at).saturating_sub(old);
@@ -609,6 +673,35 @@ fn written(m: &mut Model, action: Action, decisions: &[Decision], result: Result
         }
     }
     m.clamp();
+    replaced(m, decisions, &outcomes)
+}
+
+/// The files whose findings a write found replaced: the store put each decision on its finding's
+/// new one, or on none. Each is read back, and the status line says which happened.
+fn replaced(m: &mut Model, decisions: &[Decision], outcomes: &[Decided]) -> Vec<Effect> {
+    let mut files: Vec<String> = Vec::new();
+    let mut gone = false;
+    for (d, outcome) in decisions.iter().zip(outcomes) {
+        if *outcome == Decided::Written {
+            continue;
+        }
+        gone |= *outcome == Decided::Gone;
+        if let Some(f) = m.run.findings.iter().find(|f| f.id == d.finding)
+            && !files.contains(&f.file)
+        {
+            files.push(f.file.clone());
+        }
+    }
+    let Some(first) = files.first() else {
+        return Vec::new();
+    };
+    let what = if gone {
+        "that finding is gone"
+    } else {
+        "your decision went to its new finding"
+    };
+    m.status = Some(format!("{} was checked again; {what}", m.label(first)));
+    files.into_iter().map(Effect::ReadBack).collect()
 }
 
 /// The episode labels of the files the decisions are on, each once, in order of first appearance.
@@ -776,7 +869,7 @@ fn quit_or_ask(m: &mut Model) {
 
 /// A key in the files view: moving over the files, `⏎` to a file's findings, `Tab` back. The
 /// decision and mpv keys belong to the findings, except `u`: the status line of a late join
-/// says "u undoes" wherever the user is, so it undoes here too.
+/// says "u undoes" wherever the user is, so it undoes here too. `c` checks the selected file again.
 fn files_key(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
     let last = m.progress.files.len().saturating_sub(1);
     match key {
@@ -791,9 +884,105 @@ fn files_key(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
         KeyCode::Home | KeyCode::Char('g') => m.file_selected = 0,
         KeyCode::End | KeyCode::Char('G') => m.file_selected = last,
         KeyCode::Enter => file_findings(m),
+        KeyCode::Char('c') => return recheck(m),
         _ => {}
     }
     Vec::new()
+}
+
+/// `c` on the selected file: find the run it is checked again into, then ask. A file the scan is
+/// checking is being checked already, and one `c` queued is queued already.
+fn recheck(m: &mut Model) -> Vec<Effect> {
+    let Some(file) = m.progress.files.get(m.file_selected) else {
+        return Vec::new();
+    };
+    let path = file.path.clone();
+    let queued_again = file.stage == Stage::QueuedAgain;
+    let name = m.label(&path);
+    if m.progress.checking(&path).is_some() {
+        m.status = Some(format!("{name} is being checked now"));
+        return Vec::new();
+    }
+    if queued_again {
+        m.status = Some(format!(
+            "{name} will be checked again when the scan is done"
+        ));
+        return Vec::new();
+    }
+    let run = (!m.run.of_paths).then(|| m.run.name.clone());
+    vec![Effect::FindRun { path, run }]
+}
+
+/// `y` to checking `path` again into `run`: at once with no scan running, else once it ends.
+fn again(m: &mut Model, path: String, run: String) -> Vec<Effect> {
+    if !m.progress.running() {
+        return vec![Effect::Recheck {
+            run,
+            paths: vec![path],
+        }];
+    }
+    m.status = Some(format!(
+        "{} will be checked again when the scan is done",
+        m.label(&path)
+    ));
+    m.progress.queue_again(&path);
+    m.again.push((path, run));
+    Vec::new()
+}
+
+/// The run `c` checks a file again into, and its LLM, for the question; or why there is none.
+fn run_found(m: &mut Model, path: String, found: Result<(String, String), String>) -> Vec<Effect> {
+    match found {
+        Ok((run, backend)) => m.confirm = Some(Confirm::Recheck { path, run, backend }),
+        Err(e) => m.status = Some(e),
+    }
+    Vec::new()
+}
+
+/// The files `c` queued into the first run among them, as one scan; the rest wait for it to end.
+fn next_again(m: &mut Model) -> Vec<Effect> {
+    let Some((_, run)) = m.again.first().cloned() else {
+        return Vec::new();
+    };
+    let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut m.again)
+        .into_iter()
+        .partition(|(_, r)| *r == run);
+    m.again = later;
+    vec![Effect::Recheck {
+        run,
+        paths: now.into_iter().map(|(p, _)| p).collect(),
+    }]
+}
+
+/// A scan `c` started, or why none did: then the files asked for that are still on disk fail with
+/// the reason (so `c` works on them again), and the next run's queued files go. A file left out is
+/// no longer on disk.
+fn started(
+    m: &mut Model,
+    job: Result<Job, String>,
+    missing: &[String],
+    paths: &[String],
+) -> Vec<Effect> {
+    let effects = match job {
+        Ok(job) => {
+            m.progress.start(&job.run, job.resume, true);
+            Vec::new()
+        }
+        Err(e) => {
+            for p in paths.iter().filter(|p| !missing.contains(p)) {
+                m.progress.fail(p, &e);
+            }
+            m.status = Some(e);
+            next_again(m)
+        }
+    };
+    for p in missing {
+        m.progress.fail(p, "no such file");
+    }
+    if let Some(p) = missing.first() {
+        m.status = Some(format!("{}: no such file", m.label(p)));
+    }
+    effects
 }
 
 /// `⏎` on a file: the findings, on the first entry with one of the file's, if the filter shows
@@ -820,15 +1009,39 @@ fn file_findings(m: &mut Model) {
     }
 }
 
-/// A step of the scan: its progress, and the records it appended, whose findings join their rows
-/// (see [`inherit`]).
-fn scanned(m: &mut Model, event: scan::Event, now: Timestamp) -> Vec<Effect> {
+/// A step of the scan: its progress; and of the records it appended, its LLM calls' cost, and a
+/// failed attempt's record, which leaves the file's findings standing. A file it saved is read back
+/// from the store, which brings its findings with the decisions carried to them.
+fn scanned(m: &mut Model, event: scan::Event) -> Vec<Effect> {
     m.progress.scan_event(&event);
     let scan::Event::Appended(records) = event else {
         return Vec::new();
     };
-    let new = m.add(records);
-    inherit(m, &new, now)
+    let mut effects = Vec::new();
+    for r in records {
+        match r {
+            Record::File(f) if f.error.is_none() => effects.push(Effect::ReadBack(f.path)),
+            r @ (Record::File(_) | Record::Usage(_)) => m.run.add(r),
+            // They come with the read-back, as the store has them by then.
+            Record::Finding(_) | Record::Decision(_) => {}
+        }
+    }
+    effects
+}
+
+/// A file read back from the store: its findings swapped in ([`Model::refresh`]), and the new ones
+/// taking their rows' decisions ([`inherit`]).
+fn read_back(m: &mut Model, path: &str, view: Result<Run, String>, now: Timestamp) -> Vec<Effect> {
+    match view {
+        Ok(view) => {
+            let new = m.refresh(path, view);
+            inherit(m, &new, now)
+        }
+        Err(e) => {
+            m.status = Some(format!("could not read {} back: {e}", m.label(path)));
+            Vec::new()
+        }
+    }
 }
 
 /// The decision each of the `new` findings takes from its row: a typo finding whose row's other
@@ -885,7 +1098,7 @@ mod tests {
 
     use crate::review::model::tests_support::{self, finding, path, sample};
     use crate::scan::Event;
-    use crate::store::Record;
+    use crate::store::{Decided, Record};
 
     fn now() -> Timestamp {
         "2026-10-17T12:00:00Z".parse().unwrap()
@@ -905,12 +1118,13 @@ mod tests {
         else {
             panic!("expected one write");
         };
+        let n = decisions.len();
         update(
             m,
             Msg::Written {
                 action,
                 decisions,
-                result: Ok(()),
+                result: Ok(vec![Decided::Written; n]),
             },
             now(),
         );
@@ -931,6 +1145,14 @@ mod tests {
         let mut records = vec![Record::File(tests_support::file(ep))];
         records.extend(findings.into_iter().map(Record::Finding));
         Msg::Scan(Event::Appended(records))
+    }
+
+    /// Episode `ep` read back once `scan` saved `findings` for it (see `tests_support::read_back`).
+    fn saved(m: &Model, ep: u32, findings: Vec<crate::store::Finding>) -> Msg {
+        Msg::ReadBack {
+            path: path(ep),
+            view: Ok(tests_support::read_back(m, ep, findings)),
+        }
     }
 
     const TYPO: &str = "The beat gets trough to our mind";
@@ -963,11 +1185,8 @@ mod tests {
         let mut m = sample();
         let mine = "The beat gets through to our minds";
         decide_as(&mut m, &[1, 2, 4], State::Accepted, Some(mine));
-        let effects = update(
-            &mut m,
-            appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)]),
-            now(),
-        );
+        let msg = saved(&m, 4, vec![finding(5, 4, TYPO, FIXED, 165_060)]);
+        let effects = update(&mut m, msg, now());
         assert_eq!(decided(&effects), [(5, State::Accepted, Some(mine))]);
         written(&mut m, effects);
         assert_eq!(m.run.state_of(5), State::Accepted);
@@ -991,13 +1210,16 @@ mod tests {
             edited: None,
             at: now(),
         };
-        let Msg::Scan(Event::Appended(mut records)) =
-            appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)])
-        else {
-            unreachable!("appended makes an Appended")
-        };
-        records.push(Record::Decision(carried));
-        let effects = update(&mut m, Msg::Scan(Event::Appended(records)), now());
+        let mut view = tests_support::read_back(&m, 4, vec![finding(5, 4, TYPO, FIXED, 165_060)]);
+        view.decisions.insert(5, carried);
+        let effects = update(
+            &mut m,
+            Msg::ReadBack {
+                path: path(4),
+                view: Ok(view),
+            },
+            now(),
+        );
         assert_eq!(effects, []);
         assert_eq!(m.run.state_of(5), State::Rejected);
     }
@@ -1006,23 +1228,19 @@ mod tests {
     fn a_late_join_that_takes_its_rows_decision_leaves_the_selection_on_its_row() {
         // A third row, E03's, below the snacks row: one for the selection to slip onto.
         let mut m = sample();
-        m.add(vec![Record::Finding(finding(
-            5,
+        let view = tests_support::read_back(
+            &m,
             3,
-            "An erly line.",
-            "An early line.",
-            2_000_000,
-        ))]);
+            vec![finding(5, 3, "An erly line.", "An early line.", 2_000_000)],
+        );
+        m.refresh(&path(3), view);
         decide_as(&mut m, &[1, 2, 4], State::Accepted, None);
         // Pending only: the lyric's row is hidden until E04's lyric shows it for a moment.
         m.filter = Filter::Only(State::Pending);
         m.selected = 0;
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
-        let effects = update(
-            &mut m,
-            appended(4, vec![finding(6, 4, TYPO, FIXED, 165_060)]),
-            now(),
-        );
+        let msg = saved(&m, 4, vec![finding(6, 4, TYPO, FIXED, 165_060)]);
+        let effects = update(&mut m, msg, now());
         written(&mut m, effects);
         assert_eq!(m.entries(), [Entry::Row(1), Entry::Row(2)]);
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)), "the snacks row");
@@ -1034,11 +1252,8 @@ mod tests {
         m.expanded.insert(0);
         m.selected = 4;
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)));
-        let effects = update(
-            &mut m,
-            appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)]),
-            now(),
-        );
+        let msg = saved(&m, 4, vec![finding(5, 4, TYPO, FIXED, 165_060)]);
+        let effects = update(&mut m, msg, now());
         written(&mut m, effects);
         assert_eq!(m.entries().len(), 6);
         assert_eq!(m.selected_entry(), Some(Entry::Row(1)), "the snacks row");
@@ -1048,19 +1263,20 @@ mod tests {
     fn a_late_join_that_hides_a_row_above_the_selection_keeps_its_row_on_the_same_screen_line() {
         // Ten more rows, pending: the list is taller than the five rows the screen shows.
         let mut m = sample();
-        let more: Vec<Record> = (0..10_u64)
+        let more: Vec<crate::store::Finding> = (0..10_u64)
             .map(|n| {
                 let line = format!("Line {n} has an erly typo.");
-                Record::Finding(finding(
+                finding(
                     10 + n,
                     3,
                     &line,
                     "Fixed.",
                     3_000_000 + 10_000 * i64::try_from(n).unwrap(),
-                ))
+                )
             })
             .collect();
-        m.add(more);
+        let view = tests_support::read_back(&m, 3, more);
+        m.refresh(&path(3), view);
         decide_as(&mut m, &[1, 2, 4], State::Accepted, None);
         m.filter = Filter::Only(State::Pending);
         m.selected = 8;
@@ -1070,11 +1286,8 @@ mod tests {
         assert_eq!(line(&m), 4, "scrolled to the bottom of the screen");
         // E04's lyric joins the decided lyric row: the row shows above the selection for a
         // moment, then the inherited decision hides it again.
-        let effects = update(
-            &mut m,
-            appended(4, vec![finding(30, 4, TYPO, FIXED, 165_060)]),
-            now(),
-        );
+        let msg = saved(&m, 4, vec![finding(30, 4, TYPO, FIXED, 165_060)]);
+        let effects = update(&mut m, msg, now());
         written(&mut m, effects);
         assert_eq!(m.selected_entry(), selected);
         assert_eq!(m.selected, 8);
@@ -1085,11 +1298,8 @@ mod tests {
     fn u_in_the_files_view_takes_a_late_join_back_and_names_its_episode() {
         let mut m = sample();
         decide_as(&mut m, &[1, 2, 4], State::Accepted, None);
-        let effects = update(
-            &mut m,
-            appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)]),
-            now(),
-        );
+        let msg = saved(&m, 4, vec![finding(5, 4, TYPO, FIXED, 165_060)]);
+        let effects = update(&mut m, msg, now());
         written(&mut m, effects);
         m.pane = Pane::Files;
         let effects = press(&mut m, 'u');
@@ -1104,17 +1314,11 @@ mod tests {
     fn an_undo_across_two_episodes_names_both_in_order_of_first_appearance() {
         let mut m = sample();
         decide_as(&mut m, &[1, 2, 4], State::Accepted, None);
-        let effects = update(
-            &mut m,
-            appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)]),
-            now(),
-        );
+        let msg = saved(&m, 4, vec![finding(5, 4, TYPO, FIXED, 165_060)]);
+        let effects = update(&mut m, msg, now());
         written(&mut m, effects);
-        let effects = update(
-            &mut m,
-            appended(5, vec![finding(6, 5, TYPO, FIXED, 165_060)]),
-            now(),
-        );
+        let msg = saved(&m, 5, vec![finding(6, 5, TYPO, FIXED, 165_060)]);
+        let effects = update(&mut m, msg, now());
         written(&mut m, effects);
         // One step taking back findings of E05 and E04 at once.
         m.undo.push(vec![(6, None), (5, None)]);
@@ -1128,21 +1332,15 @@ mod tests {
         let mut m = sample();
         decide_as(&mut m, &[1], State::Accepted, None);
         decide_as(&mut m, &[2], State::Rejected, None);
-        let effects = update(
-            &mut m,
-            appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)]),
-            now(),
-        );
+        let msg = saved(&m, 4, vec![finding(5, 4, TYPO, FIXED, 165_060)]);
+        let effects = update(&mut m, msg, now());
         assert_eq!(effects, []);
         assert_eq!(m.run.state_of(5), State::Pending);
         // A season's track accepted at −1 frame: E04's fix may differ, so it waits.
         let mut m = tests_support::with_timing();
         decide_as(&mut m, &[11, 12, 13], State::Accepted, None);
-        let effects = update(
-            &mut m,
-            appended(4, vec![tests_support::timing(14, 4, false)]),
-            now(),
-        );
+        let msg = saved(&m, 4, vec![tests_support::timing(14, 4, false)]);
+        let effects = update(&mut m, msg, now());
         assert_eq!(effects, []);
         assert_eq!(m.run.state_of(14), State::Pending);
     }
@@ -1150,11 +1348,8 @@ mod tests {
     #[test]
     fn a_new_finding_stays_pending_in_a_row_accepted_in_two_wordings_or_with_one_pending() {
         let join = |m: &mut Model| {
-            update(
-                m,
-                appended(4, vec![finding(5, 4, TYPO, FIXED, 165_060)]),
-                now(),
-            )
+            let msg = saved(m, 4, vec![finding(5, 4, TYPO, FIXED, 165_060)]);
+            update(m, msg, now())
         };
         // Every member accepted, E03's in words of the user's own: no one wording to take.
         let mut m = sample();
@@ -1991,14 +2186,12 @@ mod tests {
         // second click lands on it there.
         let mut m = on_screen();
         assert_eq!(click(&mut m, 5, 2, 0), []);
-        update(
-            &mut m,
-            appended(
-                1,
-                vec![finding(5, 1, "An erly line.", "An early line.", 1000)],
-            ),
-            now(),
+        let msg = saved(
+            &m,
+            1,
+            vec![finding(5, 1, "An erly line.", "An early line.", 1000)],
         );
+        update(&mut m, msg, now());
         assert_eq!(m.entries()[2], Entry::Row(2));
         assert!(opens(click(&mut m, 5, 3, 300)), "a row in above it");
     }
@@ -2091,6 +2284,293 @@ mod tests {
         press(&mut m, 'q');
         assert!(m.should_quit);
         let mut m = sample();
+        update(&mut m, Msg::Quit, now());
+        assert!(m.should_quit);
+    }
+
+    #[test]
+    fn a_file_the_scan_saved_is_read_back_and_one_it_failed_keeps_its_findings() {
+        let mut m = sample();
+        let effects = update(
+            &mut m,
+            appended(2, vec![finding(9, 2, TYPO, FIXED, 165_060)]),
+            now(),
+        );
+        assert_eq!(effects, [Effect::ReadBack(path(2))]);
+        assert_eq!(
+            m.run.findings.len(),
+            4,
+            "its findings come with the read-back"
+        );
+        let failed = crate::store::FileRecord {
+            error: Some("LLM: boom".into()),
+            ..tests_support::file(2)
+        };
+        let effects = update(
+            &mut m,
+            Msg::Scan(Event::Appended(vec![Record::File(failed)])),
+            now(),
+        );
+        assert_eq!(effects, []);
+        assert_eq!(m.run.findings.len(), 4);
+        assert_eq!(m.run.files[1].error.as_deref(), Some("LLM: boom"));
+    }
+
+    #[test]
+    fn a_decision_the_store_found_replaced_reads_its_file_back_and_says_so() {
+        let mut m = sample();
+        m.selected = 1;
+        let effects = press(&mut m, 'a');
+        let [Effect::Write { action, decisions }] = <[Effect; 1]>::try_from(effects).unwrap()
+        else {
+            panic!("expected one write");
+        };
+        let followed = Msg::Written {
+            action: action.clone(),
+            decisions: decisions.clone(),
+            result: Ok(vec![Decided::Followed(vec![9])]),
+        };
+        assert_eq!(update(&mut m, followed, now()), [Effect::ReadBack(path(2))]);
+        assert_eq!(
+            m.status.as_deref(),
+            Some("E02 was checked again; your decision went to its new finding")
+        );
+        let gone = Msg::Written {
+            action,
+            decisions,
+            result: Ok(vec![Decided::Gone]),
+        };
+        assert_eq!(update(&mut m, gone, now()), [Effect::ReadBack(path(2))]);
+        assert_eq!(
+            m.status.as_deref(),
+            Some("E02 was checked again; that finding is gone")
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_back_says_so_and_stays_as_it_was() {
+        let mut m = sample();
+        let effects = update(
+            &mut m,
+            Msg::ReadBack {
+                path: path(2),
+                view: Err("database is locked".into()),
+            },
+            now(),
+        );
+        assert_eq!(effects, []);
+        assert_eq!(
+            m.status.as_deref(),
+            Some("could not read E02 back: database is locked")
+        );
+        assert_eq!(m.run.findings.len(), 4);
+    }
+
+    /// The sample run's files view, on E02.
+    fn on_e02_in_files() -> Model {
+        let mut m = sample();
+        update(&mut m, Msg::Key(KeyCode::Tab), now());
+        m.file_selected = 1;
+        m
+    }
+
+    #[test]
+    fn c_on_a_file_finds_its_run_then_asks() {
+        let mut m = on_e02_in_files();
+        assert_eq!(
+            press(&mut m, 'c'),
+            [Effect::FindRun {
+                path: path(2),
+                run: Some("2026-10-17T04-39-18".into()),
+            }]
+        );
+        let found = Msg::RunFound {
+            path: path(2),
+            found: Ok(("2026-10-17T04-39-18".into(), "claude".into())),
+        };
+        update(&mut m, found, now());
+        assert_eq!(
+            m.status_text(Rect::new(0, 0, 160, 1)).as_deref(),
+            Some("check E02 again with claude? y/n")
+        );
+        // Anything but `y` lets it go.
+        assert_eq!(press(&mut m, 'n'), []);
+        assert_eq!(m.confirm, None);
+        // A paths view has no run of its own: the store finds the newest that named the file.
+        let mut m = on_e02_in_files();
+        m.run.of_paths = true;
+        assert_eq!(
+            press(&mut m, 'c'),
+            [Effect::FindRun {
+                path: path(2),
+                run: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn y_with_no_scan_running_checks_the_file_again_at_once() {
+        let mut m = on_e02_in_files();
+        m.confirm = Some(Confirm::Recheck {
+            path: path(2),
+            run: "r".into(),
+            backend: "claude".into(),
+        });
+        assert_eq!(
+            press(&mut m, 'y'),
+            [Effect::Recheck {
+                run: "r".into(),
+                paths: vec![path(2)],
+            }]
+        );
+        let job = Job {
+            run: "r".into(),
+            resume: "subcheck scan --run r --force /m/E02.mkv".into(),
+        };
+        update(
+            &mut m,
+            Msg::Started {
+                job: Ok(job),
+                missing: vec![],
+                paths: vec![path(2)],
+            },
+            now(),
+        );
+        assert!(m.progress.running());
+        assert_eq!(m.progress.run, "r");
+    }
+
+    #[test]
+    fn y_while_a_scan_runs_queues_the_file_and_the_queue_starts_a_run_at_a_time_when_it_ends() {
+        let mut m = scanning();
+        for (ep, run) in [(1, "r"), (2, "s"), (3, "r")] {
+            m.confirm = Some(Confirm::Recheck {
+                path: path(ep),
+                run: run.into(),
+                backend: "claude".into(),
+            });
+            assert_eq!(press(&mut m, 'y'), []);
+        }
+        assert_eq!(
+            m.status.as_deref(),
+            Some("E03 will be checked again when the scan is done")
+        );
+        let labels: Vec<String> = m.progress.files[..3].iter().map(|f| f.label('⠙')).collect();
+        assert_eq!(labels, ["queued again"; 3]);
+        let ended = update(&mut m, Msg::ScanEnded(Ok(scan::Summary::default())), now());
+        assert_eq!(
+            ended,
+            [Effect::Recheck {
+                run: "r".into(),
+                paths: vec![path(1), path(3)],
+            }]
+        );
+        assert_eq!(m.again, [(path(2), "s".to_string())]);
+    }
+
+    #[test]
+    fn c_on_a_file_being_checked_or_queued_again_says_so() {
+        let mut m = scanning();
+        update(&mut m, Msg::Key(KeyCode::Tab), now());
+        m.file_selected = 3;
+        assert_eq!(m.progress.files[3].path, path(4));
+        assert_eq!(press(&mut m, 'c'), []);
+        assert_eq!(m.status.as_deref(), Some("E04 is being checked now"));
+        m.file_selected = 1;
+        m.progress.queue_again(&path(2));
+        assert_eq!(press(&mut m, 'c'), []);
+        assert_eq!(
+            m.status.as_deref(),
+            Some("E02 will be checked again when the scan is done")
+        );
+    }
+
+    #[test]
+    fn c_in_the_findings_does_nothing() {
+        let mut m = sample();
+        assert_eq!(press(&mut m, 'c'), []);
+        assert_eq!(m.confirm, None);
+    }
+
+    #[test]
+    fn a_file_no_longer_on_disk_is_not_checked_and_the_status_line_says_so() {
+        let mut m = on_e02_in_files();
+        let effects = update(
+            &mut m,
+            Msg::Started {
+                job: Err("nothing to check".into()),
+                missing: vec![path(2)],
+                paths: vec![path(2)],
+            },
+            now(),
+        );
+        assert_eq!(effects, []);
+        assert_eq!(m.status.as_deref(), Some("E02: no such file"));
+        assert_eq!(m.progress.files[1].label('⠙'), "✗ FAILED: no such file");
+        assert!(!m.progress.running());
+    }
+
+    #[test]
+    fn a_queued_check_that_cannot_start_fails_its_files_and_the_next_run_goes() {
+        let mut m = scanning();
+        for (ep, run) in [(1, "r"), (2, "s")] {
+            m.confirm = Some(Confirm::Recheck {
+                path: path(ep),
+                run: run.into(),
+                backend: "claude".into(),
+            });
+            assert_eq!(press(&mut m, 'y'), []);
+        }
+        let ended = update(&mut m, Msg::ScanEnded(Ok(scan::Summary::default())), now());
+        assert_eq!(
+            ended,
+            [Effect::Recheck {
+                run: "r".into(),
+                paths: vec![path(1)],
+            }]
+        );
+        let why = "run r: no LLM is called gpt";
+        let effects = update(
+            &mut m,
+            Msg::Started {
+                job: Err(why.into()),
+                missing: vec![],
+                paths: vec![path(1)],
+            },
+            now(),
+        );
+        assert_eq!(
+            effects,
+            [Effect::Recheck {
+                run: "s".into(),
+                paths: vec![path(2)],
+            }]
+        );
+        assert_eq!(m.progress.files[0].label('⠙'), format!("✗ FAILED: {why}"));
+        assert!(
+            !m.progress.outro().iter().any(|l| l.contains("FAILED")),
+            "the earlier scan's outro does not list a file its recheck never started"
+        );
+        assert_eq!(m.status.as_deref(), Some(why));
+        update(&mut m, Msg::Key(KeyCode::Tab), now());
+        m.file_selected = 0;
+        assert!(matches!(
+            press(&mut m, 'c').as_slice(),
+            [Effect::FindRun { .. }]
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_over_cs_question_asks_to_quit_first() {
+        let mut m = scanning();
+        m.confirm = Some(Confirm::Recheck {
+            path: path(1),
+            run: "r".into(),
+            backend: "claude".into(),
+        });
+        update(&mut m, Msg::Quit, now());
+        assert!(!m.should_quit);
+        assert_eq!(m.confirm, Some(Confirm::Quit));
         update(&mut m, Msg::Quit, now());
         assert!(m.should_quit);
     }

@@ -78,7 +78,7 @@ enum Command {
         #[arg(long = "lang")]
         langs: Vec<String>,
         /// LLM calls to run at once.
-        #[arg(short, long, default_value_t = 2)]
+        #[arg(short, long, default_value_t = scan::DEFAULT_JOBS)]
         jobs: usize,
         /// Lines per LLM call. Default 400, or 150 for ollama (its default context is 4k tokens).
         #[arg(long)]

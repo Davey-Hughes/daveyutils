@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -32,12 +32,13 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 
 use crate::group;
+use crate::llm::Backend;
 use crate::player::{self, Player};
 use crate::scan::{self, file_stamp};
 use crate::store::{Run, Selector, Store};
 use model::{FileNote, Model};
 use progress::Scan;
-use update::{Effect, Mouse, Msg};
+use update::{Effect, Job, Mouse, Msg};
 
 /// A terminal event as a `Msg`. Ctrl and Alt chords never reach the plain-key handlers, so Ctrl-C
 /// quits instead of reading as `c` (the lesson of nudge-rs's `map_event`); with the mouse they are
@@ -110,8 +111,8 @@ pub fn file_notes(run: &Run) -> HashMap<String, FileNote> {
     notes
 }
 
-/// Run one effect and say how it went.
-pub fn run_effect(effect: Effect, store: &mut Store, player: &mut Player) -> Msg {
+/// Run one effect and say how it went. `tx` is the screen's channel, for the scans `c` starts.
+pub fn run_effect(effect: Effect, store: &mut Store, player: &mut Player, tx: &Sender<Msg>) -> Msg {
     match effect {
         Effect::Write { action, decisions } => {
             let result = store.decide(&decisions).map_err(|e| e.to_string());
@@ -121,9 +122,79 @@ pub fn run_effect(effect: Effect, store: &mut Store, player: &mut Player) -> Msg
                 result,
             }
         }
+        Effect::ReadBack(path) => {
+            let view = store.file_view(&path).map_err(|e| e.to_string());
+            Msg::ReadBack { path, view }
+        }
+        Effect::FindRun { path, run } => {
+            let found = match &run {
+                Some(name) => store.scan_named(name),
+                None => store.newest_scan_naming(&path),
+            };
+            let found = match found {
+                Ok(Some(scan)) => Ok((scan.name, scan.header.backend)),
+                Ok(None) => Err(match run {
+                    Some(name) => format!("no run named {name}"),
+                    None => format!("{}: no run named it", model::episode(&path)),
+                }),
+                Err(e) => Err(e.to_string()),
+            };
+            Msg::RunFound { path, found }
+        }
+        Effect::Recheck { run, paths } => {
+            let (here, missing): (Vec<String>, Vec<String>) =
+                paths.iter().cloned().partition(|p| Path::new(p).is_file());
+            let job = if here.is_empty() {
+                Err("nothing to check".into())
+            } else {
+                let files: Vec<PathBuf> = here.iter().map(PathBuf::from).collect();
+                recheck(store, tx, &run, &files)
+            };
+            Msg::Started {
+                job,
+                missing,
+                paths,
+            }
+        }
         Effect::Open(moment) => Msg::Opened(player.open(&moment)),
         Effect::Playback(p) => Msg::Played(player.playback(p)),
     }
+}
+
+/// Check `files` again into run `run`, as `subcheck scan --run <run> --force <files>` does: with
+/// the run's backend and languages, on a thread of its own that sends to `tx`.
+fn recheck(
+    store: &mut Store,
+    tx: &Sender<Msg>,
+    run: &str,
+    files: &[PathBuf],
+) -> Result<Job, String> {
+    let scan = store
+        .scan_named(run)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no run named {run}"))?;
+    // One this subcheck no longer knows would fail every file at the LLM: refused here instead.
+    Backend::from_label(&scan.header.backend).map_err(|e| format!("run {run}: {e}"))?;
+    let (backend, langs) = scan::resume(&scan, None, None, &[])?;
+    let opts = scan::Options {
+        chunk_lines: backend.chunk_lines,
+        backend,
+        jobs: scan::DEFAULT_JOBS,
+        langs,
+        force: true,
+        verbose: false,
+        into: Some(run.to_string()),
+    };
+    let planned = scan::plan(files, &opts, store, &mut io::sink()).map_err(|e| format!("{e:#}"))?;
+    let scan::Planned::Scan(plan) = planned else {
+        return Err("nothing to check".into());
+    };
+    let scans = store.reopen().map_err(|e| e.to_string())?;
+    jobs::scan(plan, opts, scans, tx.clone()).map_err(|e| e.to_string())?;
+    Ok(Job {
+        run: run.to_string(),
+        resume: progress::again_command(run, files),
+    })
 }
 
 /// Restores the terminal on every exit path: normal return, `?`, or panic.
@@ -221,18 +292,11 @@ fn opening_status(warnings: &[String]) -> Option<String> {
     })
 }
 
-/// The run a scan's screen opens on: the run as the store shows it, but for the findings of each
-/// check the scan makes again, which join the list as the scan saves the new ones. A file the scan
-/// skips is there from the start.
+/// The run a scan's screen opens on: the run as the store shows it. A file the scan checks again
+/// keeps its findings in the list until the scan saves the new ones (see `Model::refresh`); a file
+/// it skips is there from the start.
 pub fn opening(store: &Store, plan: &scan::Plan) -> rusqlite::Result<Run> {
-    let mut run = store.run_view(plan.scan())?;
-    run.findings.retain(|f| {
-        !plan
-            .todo()
-            .iter()
-            .any(|(path, checks)| f.file == *path.to_string_lossy() && checks.contains(&f.check()))
-    });
-    Ok(run)
+    store.run_view(plan.scan())
 }
 
 /// What the screen opens on when a scan has nothing to check (`s`): with `--run` (`into`), the run;
@@ -283,9 +347,6 @@ pub fn run(open: Open, mut store: Store, state: &Path) -> anyhow::Result<ExitCod
     // Else the status line opens on what the run's LLM calls cost (`Model::show_cost`).
     let mut model = Model::new(run, notes);
     model.status = opening_status(&warnings);
-    let resume = scanning
-        .as_ref()
-        .map(|(_, _, paths)| progress::resume_command(&model.run.name, paths));
 
     // The terminal is restored should the screen's own thread panic. A job's panic comes to the
     // loop as `Msg::Fatal`, which ends the screen in order.
@@ -301,11 +362,15 @@ pub fn run(open: Open, mut store: Store, state: &Path) -> anyhow::Result<ExitCod
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let size = terminal.size()?;
     model.set_area(Rect::new(0, 0, size.width, size.height));
+    // The loop keeps a sender of its own, for the scans `c` starts: the channel no longer closes
+    // while the screen runs, and each job says why it ends before it does (`Msg::ScanEnded`,
+    // `Msg::Fatal`), as the input thread does.
     let (tx, rx) = mpsc::channel();
-    if let Some((plan, opts, _)) = scanning {
-        model.progress.adding = opts.into.is_some();
+    if let Some((plan, opts, paths)) = scanning {
         // Running from the start, so a `q` before the scan's first word still asks.
-        model.progress.scan = Scan::Running;
+        let name = model.run.name.clone();
+        let resume = progress::resume_command(&name, &paths);
+        model.progress.start(&name, resume, opts.into.is_some());
         let scans = store.reopen()?;
         jobs::scan(plan, opts, scans, tx.clone()).context("starting the scan")?;
     }
@@ -314,9 +379,9 @@ pub fn run(open: Open, mut store: Store, state: &Path) -> anyhow::Result<ExitCod
     // this thread, caught here (the hook has restored the terminal) and resumed once they are
     // ended. Not a drop guard: one made here would end the groups before `player`, made earlier,
     // let go of its own.
-    let looped = match jobs::input(tx) {
+    let looped = match jobs::input(tx.clone()) {
         Ok(()) => panic::catch_unwind(AssertUnwindSafe(|| {
-            screen_loop(&mut terminal, &mut model, &rx, &mut store, &mut player)
+            screen_loop(&mut terminal, &mut model, &rx, &tx, &mut store, &mut player)
         })),
         Err(e) => Ok(Err(e).context("reading the terminal")),
     };
@@ -332,7 +397,6 @@ pub fn run(open: Open, mut store: Store, state: &Path) -> anyhow::Result<ExitCod
     outcome(
         &mut model,
         looped,
-        resume.as_deref().unwrap_or_default(),
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     )
@@ -340,16 +404,15 @@ pub fn run(open: Open, mut store: Store, state: &Path) -> anyhow::Result<ExitCod
 
 /// What the terminal gets as the screen ends, and the exit status. On an error (the loop's, or the
 /// model's fatal one), the error, returned; a scan it stopped says first how far it got and the
-/// command that finishes it (`resume`). Otherwise the outro on `err`, then the decisions' counts
-/// on `out`: exit status 1 when the scan failed, or a file in it did.
+/// command that finishes it. Otherwise the outro on `err`, then the decisions' counts on `out`:
+/// exit status 1 when any scan the screen ran failed, or a file in it did.
 fn outcome(
     model: &mut Model,
     looped: anyhow::Result<()>,
-    resume: &str,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> anyhow::Result<ExitCode> {
-    let outro = model.progress.outro(&model.run.name, resume);
+    let outro = model.progress.outro();
     if let Some(e) = looped
         .err()
         .or_else(|| model.fatal.take().map(anyhow::Error::msg))
@@ -370,7 +433,9 @@ fn outcome(
         "{}: {accepted} accepted, {rejected} rejected, {pending} pending",
         model.run.called()
     )?;
-    let failed = model.progress.failed > 0 || matches!(model.progress.scan, Scan::Ended(Err(_)));
+    let failed = model.progress.earlier_failed
+        || model.progress.failed > 0
+        || matches!(model.progress.scan, Scan::Ended(Err(_)));
     Ok(if failed {
         ExitCode::FAILURE
     } else {
@@ -384,6 +449,7 @@ fn screen_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     model: &mut Model,
     rx: &mpsc::Receiver<Msg>,
+    tx: &Sender<Msg>,
     store: &mut Store,
     player: &mut Player,
 ) -> anyhow::Result<()> {
@@ -398,7 +464,7 @@ fn screen_loop(
         }
         let mut queue: VecDeque<Effect> = effects.into();
         while let Some(effect) = queue.pop_front() {
-            let msg = run_effect(effect, store, player);
+            let msg = run_effect(effect, store, player, tx);
             queue.extend(update::update(model, msg, jiff::Timestamp::now()));
         }
     }
@@ -406,8 +472,10 @@ fn screen_loop(
 }
 
 /// The loop's next message: the terminal's or the scan's, or while the scan runs a tick should
-/// none come for [`TICK`]. A channel no job sends on any more is fatal: each job says why it ends
-/// before it does, so one went without a word, and with the input thread gone no key can quit.
+/// none come for [`TICK`]. The loop holds a `Sender` of its own (for `c`'s scans), so the channel
+/// cannot close while the screen runs; a disconnect is fatal, a backstop: each job (the input
+/// thread, each scan) reports why it ends (`Msg::Fatal`, `Msg::ScanEnded`) before it does, and
+/// with the input thread gone no key can quit.
 fn receive(rx: &mpsc::Receiver<Msg>, running: bool) -> Msg {
     let got = if running {
         match rx.recv_timeout(TICK) {
@@ -683,6 +751,11 @@ mod tests {
     /// The sample run with a scan of two files under way, as the loop leaves it on a stop.
     fn scanning() -> Model {
         let mut m = model::tests_support::sample();
+        m.progress.start(
+            "2026-10-17T04-39-18",
+            "subcheck scan --run r /m".into(),
+            false,
+        );
         m.progress.scan_event(&scan::Event::Queued(vec![
             "/m/E01.mkv".into(),
             "/m/E02.mkv".into(),
@@ -696,7 +769,7 @@ mod tests {
         looped: anyhow::Result<()>,
     ) -> (anyhow::Result<ExitCode>, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = outcome(m, looped, "subcheck scan --run r /m", &mut out, &mut err);
+        let code = outcome(m, looped, &mut out, &mut err);
         let text = |b: Vec<u8>| String::from_utf8(b).unwrap();
         (code, text(out), text(err))
     }
@@ -750,5 +823,22 @@ mod tests {
         assert_eq!(code.unwrap(), ExitCode::SUCCESS);
         assert_eq!(err, "");
         assert!(out.ends_with("4 pending\n"), "{out}");
+    }
+
+    #[test]
+    fn an_earlier_scans_failure_still_exits_1_after_a_clean_one() {
+        let mut m = scanning();
+        m.progress.scan_event(&scan::Event::Finished {
+            path: "/m/E01.mkv".into(),
+            error: Some("LLM: boom".into()),
+            findings: 0,
+            lines: vec![],
+        });
+        m.progress.scan = Scan::Ended(Ok(scan::Summary::default()));
+        m.progress
+            .start("r2", "subcheck scan --run r2 /m".into(), true);
+        m.progress.scan = Scan::Ended(Ok(scan::Summary::default()));
+        assert_eq!(m.progress.failed, 0);
+        assert_eq!(ended(&mut m, Ok(())).0.unwrap(), ExitCode::FAILURE);
     }
 }

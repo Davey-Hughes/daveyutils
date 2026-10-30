@@ -25,7 +25,7 @@ use crate::text::Occurrence;
 
 pub use db::{BUSY_TIMEOUT, Location, SCHEMA_VERSION, Store, location, location_from};
 pub use view::Selector;
-pub use write::{Attempt, Made, Saved, ScanRow, is_busy};
+pub use write::{Attempt, Decided, Made, Saved, ScanRow, is_busy};
 
 /// The state directory, from explicit inputs. An empty or relative `XDG_STATE_HOME` is ignored,
 /// as the XDG spec says and as nudge-rs does: a relative one would resolve against the cwd.
@@ -171,6 +171,27 @@ pub struct Finding {
     pub timing: Option<TimingFix>,
 }
 
+/// What makes a finding the same as another of its file, so that a decision on one carries to the
+/// other ([`Finding::carry_key`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CarryKey {
+    /// A typo: its line and fix.
+    Text {
+        path: String,
+        original: String,
+        suggestion: String,
+    },
+    /// A timing fix: its track, and how far it moves each stretch. What it rests on, the frame that
+    /// shows it and the lines it names differ between timing rules; the fix `apply` makes does not.
+    Timing {
+        path: String,
+        track: usize,
+        frame_ns: u64,
+        /// Each stretch's `from_ms`, `to_ms` and `frames`, in order.
+        stretches: Vec<(Option<i64>, Option<i64>, i64)>,
+    },
+}
+
 impl Finding {
     /// The check that made it, by its source.
     pub fn check(&self) -> Check {
@@ -178,6 +199,27 @@ impl Finding {
             Check::Timing
         } else {
             Check::Llm
+        }
+    }
+
+    /// Its [`CarryKey`].
+    pub fn carry_key(&self) -> CarryKey {
+        match &self.timing {
+            Some(t) => CarryKey::Timing {
+                path: self.file.clone(),
+                track: t.track,
+                frame_ns: t.frame_ns,
+                stretches: t
+                    .stretches
+                    .iter()
+                    .map(|s| (s.from_ms, s.to_ms, s.frames))
+                    .collect(),
+            },
+            None => CarryKey::Text {
+                path: self.file.clone(),
+                original: self.original.clone(),
+                suggestion: self.suggestion.clone(),
+            },
         }
     }
 }
@@ -313,7 +355,7 @@ impl FileRecord {
 
 /// Some files as a view shows them ([`Store::view`]): a run's, or those under some paths; their
 /// current findings with the latest decision for each. Review's screen keeps one in memory.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Run {
     pub name: String,
     pub header: Option<RunHeader>,

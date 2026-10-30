@@ -43,6 +43,7 @@ const KEY_GROUPS: [(&str, &[(&str, &str)]); 3] = [
             ("x", "clear: back to pending"),
             ("e", "reword, then accept"),
             ("u", "undo"),
+            ("c", "check a file again (files)"),
         ],
     ),
     (
@@ -283,6 +284,15 @@ fn entry_line(m: &Model, e: Entry) -> Line<'static> {
 }
 
 fn entry_text(m: &Model, e: Entry) -> Line<'static> {
+    // A file the scan is checking again has the spinner on its name: its findings here are the
+    // earlier check's until the new ones are saved.
+    let spin = |file: &str| {
+        if m.progress.checking(file).is_some() {
+            m.progress.spinner().to_string()
+        } else {
+            String::new()
+        }
+    };
     match e {
         Entry::Row(r) => {
             // What the row's keys act on: the members the filter shows.
@@ -290,9 +300,25 @@ fn entry_text(m: &Model, e: Entry) -> Line<'static> {
             let shown = m.shown_members(r);
             let first = shown[0];
             let who = match (all, shown.len()) {
-                (1, _) => m.label(&m.finding(first).file),
-                (all, n) if n == all => format!("×{all}"),
-                (all, n) => format!("×{n}/{all}"),
+                (1, _) => {
+                    let file = &m.finding(first).file;
+                    format!("{}{}", m.label(file), spin(file))
+                }
+                (all, n) => {
+                    let checking = shown
+                        .iter()
+                        .any(|&i| m.progress.checking(&m.finding(i).file).is_some());
+                    let spinner = if checking {
+                        m.progress.spinner().to_string()
+                    } else {
+                        String::new()
+                    };
+                    if n == all {
+                        format!("×{all}{spinner}")
+                    } else {
+                        format!("×{n}/{all}{spinner}")
+                    }
+                }
             };
             let f = m.finding(first);
             if f.timing.is_some() {
@@ -322,9 +348,10 @@ fn entry_text(m: &Model, e: Entry) -> Line<'static> {
                 timestamp(m.start_ms(i))
             };
             Line::from(format!(
-                "    {} {} {what}",
+                "    {} {}{} {what}",
                 mark(Some(m.state(i))),
-                m.label(&m.finding(i).file)
+                m.label(&m.finding(i).file),
+                spin(&m.finding(i).file)
             ))
         }
     }
@@ -394,6 +421,9 @@ pub fn detail_lines(m: &Model) -> Vec<Line<'static>> {
         Some(FileNote::Changed) => lines.push(warn("file changed since scan")),
         Some(FileNote::Missing) => lines.push(warn("file missing")),
         None => {}
+    }
+    if let Some(stage) = m.progress.checking(&finding.file) {
+        lines.push(warn(&format!("checking again: {stage}")));
     }
     let record = m.run.files.iter().rev().find(|r| r.path == finding.file);
     if let Some(t) = record.and_then(|r| r.truncated) {
@@ -875,6 +905,51 @@ mod tests {
     }
 
     #[test]
+    fn a_file_being_checked_again_spins_on_its_findings_and_says_where_the_check_is() {
+        use crate::review::model::tests_support::path;
+        use crate::scan::Event;
+        let mut m = sample();
+        // E02 checked again: the lyric's row (E01, E02, E03) and E02's snacks row spin.
+        update::update(
+            &mut m,
+            Msg::Scan(Event::Queued(vec![path(2).into()])),
+            now(),
+        );
+        let asking = Event::Asking {
+            path: path(2).into(),
+            answered: 1,
+            chunks: 3,
+        };
+        update::update(&mut m, Msg::Scan(asking), now());
+        let screen = render(&m, 160, 20);
+        assert!(
+            screen.contains("· ×3⠋ 0:02:45.06 trough → through  [OP en]"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("· E02⠋ 0:14:54.19 everyday. → every day.  [Dialogue]"),
+            "{screen}"
+        );
+        // The lyric's row shows E01 in the detail pane, which is not being checked.
+        assert!(!screen.contains("checking again"), "{screen}");
+        m.selected = 1;
+        let screen = render(&m, 160, 20);
+        assert!(screen.contains("checking again: LLM 1/3"), "{screen}");
+        let done = Event::Finished {
+            path: path(2).into(),
+            error: None,
+            findings: 2,
+            lines: vec![],
+        };
+        update::update(&mut m, Msg::Scan(done), now());
+        // The scan has not ended, so the title still spins: the rows no longer do.
+        let screen = render(&m, 160, 20);
+        assert!(!screen.contains("E02⠋"), "{screen}");
+        assert!(!screen.contains("×3⠋"), "{screen}");
+        assert!(!screen.contains("checking again"), "{screen}");
+    }
+
+    #[test]
     fn an_empty_list_while_scanning_says_findings_are_coming() {
         let mut m = Model::new(
             crate::store::Run {
@@ -902,6 +977,7 @@ mod tests {
             "decide",
             "a  accept",
             "x  clear: back to pending",
+            "c  check a file again (files)",
             "PgUp PgDn  page",
             "Tab        findings, files",
             "␣    pause",

@@ -1,6 +1,8 @@
 //! What scan, review and apply write: each scan and the files it names, each file's checks with
 //! their findings, the decisions on those, applied marks, and LLM calls.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry as Slot;
 use std::path::PathBuf;
 
 use jiff::Timestamp;
@@ -9,8 +11,10 @@ use rusqlite::{ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavi
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::view::{FINDING_COLUMNS, finding};
 use super::{
-    Applied, Check, CheckedWith, Decision, Finding, LlmCall, RunHeader, State, Store, TrackRecord,
+    Applied, CarryKey, Check, CheckedWith, Decision, Finding, LlmCall, RunHeader, State, Store,
+    TrackRecord,
 };
 use crate::llm::Usage;
 use crate::mkv::Truncated;
@@ -81,6 +85,18 @@ impl Store {
             .prepare(&format!("SELECT {SCAN_COLUMNS} FROM scans"))?;
         let scans = stmt
             .query_map([], scan_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(scans.into_iter().max_by_key(|s| (s.header.started, s.id)))
+    }
+
+    /// Of the scans that named `path`, the one that started last (see [`Store::newest_scan`]).
+    pub fn newest_scan_naming(&self, path: &str) -> rusqlite::Result<Option<ScanRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SCAN_COLUMNS} FROM scans
+             WHERE id IN (SELECT scan FROM scan_files WHERE path = ?1)"
+        ))?;
+        let scans = stmt
+            .query_map([path], scan_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(scans.into_iter().max_by_key(|s| (s.header.started, s.id)))
     }
@@ -193,6 +209,19 @@ pub struct Saved {
     pub carried: Vec<Decision>,
 }
 
+/// What became of a decision [`Store::decide`] was given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decided {
+    /// Written on its finding, which is current.
+    Written,
+    /// Its finding's check was replaced since: written instead on these findings of the file's
+    /// current check of that kind, of the same [`CarryKey`].
+    Followed(Vec<u64>),
+    /// Its finding's check was replaced, and the current one has no finding of its key: not
+    /// written.
+    Gone,
+}
+
 impl Store {
     /// Whether the file's current check of `with`'s kind was made of the file as it is (`size`,
     /// `mtime`) with the same backend, languages and version, so a scan skips it. A check of a file
@@ -269,13 +298,41 @@ impl Store {
     }
 
     /// Decisions made in review, in one transaction. Each is a row, the latest a finding's current
-    /// one: an undo, or `x`, is a row too.
-    pub fn decide(&mut self, decisions: &[Decision]) -> rusqlite::Result<()> {
+    /// one: an undo, or `x`, is a row too. A decision on a finding whose check another scan has
+    /// replaced since review read it follows the finding: it goes on the findings of the same
+    /// [`CarryKey`] in the file's current check of that kind, however many checks came between,
+    /// and on none when there are none. Returns what became of each, in order.
+    pub fn decide(&mut self, decisions: &[Decision]) -> rusqlite::Result<Vec<Decided>> {
         let tx = self.write()?;
+        let mut outcomes = Vec::new();
         for d in decisions {
-            insert_decision(&tx, d)?;
+            let outcome = match replaced(&tx, d.finding)? {
+                None => {
+                    insert_decision(&tx, d)?;
+                    Decided::Written
+                }
+                Some(f) => {
+                    let ids = current_of_key(&tx, &f)?;
+                    for &id in &ids {
+                        insert_decision(
+                            &tx,
+                            &Decision {
+                                finding: id,
+                                ..d.clone()
+                            },
+                        )?;
+                    }
+                    if ids.is_empty() {
+                        Decided::Gone
+                    } else {
+                        Decided::Followed(ids)
+                    }
+                }
+            };
+            outcomes.push(outcome);
         }
-        tx.commit()
+        tx.commit()?;
+        Ok(outcomes)
     }
 
     /// Fixes apply made in their files, or found there.
@@ -381,42 +438,91 @@ pub(super) fn insert_finding(tx: &Transaction, check: i64, f: &Finding) -> rusql
 }
 
 /// Carry decisions over from check `old` to check `new`, which replaced it: each finding of `new`
-/// takes the current decision of `old`'s finding of the same line and fix (path, original and
-/// suggestion; and a timing finding's fix, which names its track), with its wording and time.
-/// Never over a decision the finding has; a cleared one (pending) is none to carry; of two that
-/// match, the one decided last. Returns the decisions carried.
+/// takes the current decision of `old`'s finding of the same [`CarryKey`], with its wording and
+/// time. Never over a decision the finding has; a cleared one (pending) is none to carry; of two
+/// that match, the one decided last. Returns the decisions carried.
 pub(super) fn carry(tx: &Transaction, old: i64, new: i64) -> rusqlite::Result<Vec<Decision>> {
-    let mut stmt = tx.prepare_cached(
-        r#"SELECT n.id, d.state, d.edited, d.at
-           FROM findings n
-           JOIN findings o ON o."check" = ?1 AND o.path = n.path AND o.original = n.original
-               AND o.suggestion = n.suggestion AND o.timing IS n.timing
-           JOIN decisions d ON d.id = (SELECT MAX(id) FROM decisions WHERE finding = o.id)
-           WHERE n."check" = ?2 AND d.state != 'pending'
-               AND NOT EXISTS (SELECT 1 FROM decisions WHERE finding = n.id)
-           ORDER BY n.id, d.id"#,
-    )?;
-    let found = stmt
-        .query_map(params![old, new], |r| {
-            Ok(Decision {
-                finding: r.get(0)?,
-                state: state_of(r, 1)?,
-                edited: r.get(2)?,
-                at: time(r, 3)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut carried: Vec<Decision> = Vec::new();
-    for d in found {
-        match carried.last_mut() {
-            Some(last) if last.finding == d.finding => *last = d,
-            _ => carried.push(d),
+    // `old`'s findings decided, each by its latest decision, and of one key the one decided last:
+    // decisions are numbered as they are made.
+    let mut decided: HashMap<CarryKey, (i64, Decision)> = HashMap::new();
+    let mut stmt = tx.prepare_cached(&format!(
+        r#"SELECT {FINDING_COLUMNS}, d.id, d.state, d.edited, d.at
+           FROM findings f
+           JOIN decisions d ON d.id = (SELECT MAX(id) FROM decisions WHERE finding = f.id)
+           WHERE f."check" = ?1 AND d.state != 'pending'"#
+    ))?;
+    let rows = stmt.query_map([old], |r| {
+        let decision = Decision {
+            finding: 0,
+            state: state_of(r, 12)?,
+            edited: r.get(13)?,
+            at: time(r, 14)?,
+        };
+        Ok((finding(r)?, r.get::<_, i64>(11)?, decision))
+    })?;
+    for row in rows {
+        let (f, number, d) = row?;
+        match decided.entry(f.carry_key()) {
+            Slot::Occupied(mut slot) if slot.get().0 < number => {
+                slot.insert((number, d));
+            }
+            Slot::Occupied(_) => {}
+            Slot::Vacant(slot) => {
+                slot.insert((number, d));
+            }
         }
     }
+    let mut stmt = tx.prepare_cached(&format!(
+        r#"SELECT {FINDING_COLUMNS} FROM findings f
+           WHERE f."check" = ?1 AND NOT EXISTS (SELECT 1 FROM decisions WHERE finding = f.id)
+           ORDER BY f.id"#
+    ))?;
+    let undecided = stmt
+        .query_map([new], finding)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let carried: Vec<Decision> = undecided
+        .iter()
+        .filter_map(|n| {
+            let (_, d) = decided.get(&n.carry_key())?;
+            Some(Decision {
+                finding: n.id,
+                ..d.clone()
+            })
+        })
+        .collect();
     for d in &carried {
         insert_decision(tx, d)?;
     }
     Ok(carried)
+}
+
+/// Finding `id`, when a later check has replaced its own; `None` when it is current, or not there
+/// (which the insert then refuses).
+fn replaced(tx: &Transaction, id: u64) -> rusqlite::Result<Option<Finding>> {
+    tx.prepare_cached(&format!(
+        r#"SELECT {FINDING_COLUMNS} FROM findings f JOIN checks c ON c.id = f."check"
+           WHERE f.id = ?1 AND c.replaced_by IS NOT NULL"#
+    ))?
+    .query_row([id], finding)
+    .optional()
+}
+
+/// The findings of `f`'s [`CarryKey`] in its file's current check of its kind.
+fn current_of_key(tx: &Transaction, f: &Finding) -> rusqlite::Result<Vec<u64>> {
+    let key = f.carry_key();
+    let mut stmt = tx.prepare_cached(&format!(
+        r#"SELECT {FINDING_COLUMNS} FROM checks c JOIN findings f ON f."check" = c.id
+           WHERE c.path = ?1 AND c.kind = ?2 AND c.replaced_by IS NULL AND c.error IS NULL
+           ORDER BY f.id"#
+    ))?;
+    let mut ids = Vec::new();
+    for n in stmt.query_map(params![f.file, check_text(f.check())], finding)? {
+        let n = n?;
+        if n.carry_key() == key {
+            ids.push(n.id);
+        }
+    }
+    Ok(ids)
 }
 
 pub(super) fn insert_decision(tx: &Transaction, d: &Decision) -> rusqlite::Result<()> {
@@ -582,6 +688,25 @@ pub(super) mod tests {
             .begin_scan(&header("2026-10-17T10:00:00Z"), &[])
             .unwrap();
         assert_eq!(store.newest_scan().unwrap(), Some(later));
+    }
+
+    #[test]
+    fn the_newest_scan_naming_a_file_is_the_last_started_of_those_that_named_it() {
+        let (_dir, mut store) = store();
+        let first = store
+            .begin_scan(&header("2026-10-17T10:00:00Z"), &[A.into()])
+            .unwrap();
+        store
+            .begin_scan(&header("2026-10-17T12:00:00Z"), &["/m/Show/E02.mkv".into()])
+            .unwrap();
+        assert_eq!(store.newest_scan_naming(A).unwrap(), Some(first));
+        // A later scan that named it with `--run`'s add.
+        let second = store
+            .begin_scan(&header("2026-10-17T11:00:00Z"), &[])
+            .unwrap();
+        store.add_files(second.id, &[A.into()]).unwrap();
+        assert_eq!(store.newest_scan_naming(A).unwrap(), Some(second));
+        assert_eq!(store.newest_scan_naming("/m/Show/E09.mkv").unwrap(), None);
     }
 
     pub(in crate::store) fn llm() -> CheckedWith {
@@ -845,6 +970,91 @@ pub(super) mod tests {
         // Another fix of the same track is another finding.
         let other = save(&mut store, vec![late(2, 2)]);
         assert_eq!(other.carried, []);
+    }
+
+    #[test]
+    fn a_timing_decision_carries_by_its_track_and_stretches_whatever_the_rules_rest_them_on() {
+        use crate::store::{Basis, FixStretch, LineRef, TimingFix};
+        let (_dir, mut store) = store();
+        let scan = store
+            .begin_scan(&header("2026-10-17T10:00:00Z"), &[A.into()])
+            .unwrap();
+        let tracks = [track("cues")];
+        let line = |raw: &str, start_ms| LineRef {
+            raw: raw.into(),
+            start_ms,
+            end_ms: start_ms + 2000,
+        };
+        // Late to `to_ms` by `frames`, then in sync; read with `times` cuts, shown by `frame_ms`,
+        // its first line `first`.
+        let fix = |to_ms: i64, frames, times, frame_ms, first: &str| Finding {
+            style: String::new(),
+            original: format!("partial, from {times} times"),
+            suggestion: "shift earlier: start – 0:07:55.78".into(),
+            source: "timing".into(),
+            timing: Some(TimingFix {
+                track: 2,
+                frame_ns: 41_708_333,
+                stretches: vec![
+                    FixStretch {
+                        from_ms: None,
+                        to_ms: Some(to_ms),
+                        frames,
+                        first: Some(line(first, 1000)),
+                        last: Some(line("Last.", 470_000)),
+                        frame_ms: Some(frame_ms),
+                    },
+                    FixStretch {
+                        from_ms: Some(to_ms + 5000),
+                        to_ms: None,
+                        frames: 0,
+                        first: None,
+                        last: None,
+                        frame_ms: None,
+                    },
+                ],
+                unshifted: vec![],
+                basis: Basis::Cuts {
+                    times,
+                    agreeing: 2,
+                    windows: 2,
+                },
+            }),
+            ..typo(A, "", "")
+        };
+        let timing = CheckedWith::timing(&["eng".into()], 1);
+        let save = |store: &mut Store, finding: Finding| {
+            store
+                .save(
+                    &attempt(scan.id, A, &tracks, "2026-10-17T10:01:00Z"),
+                    vec![Made {
+                        with: timing.clone(),
+                        lines: 0,
+                        findings: vec![finding],
+                    }],
+                )
+                .unwrap()
+        };
+        save(&mut store, fix(475_780, 1, 289, 246_788, "First."));
+        store.decide(&[decision(1, State::Accepted, None)]).unwrap();
+        // New rules: other counts and words, another frame to show it by, another first line.
+        let again = save(
+            &mut store,
+            fix(475_780, 1, 301, 250_000, "First, read again."),
+        );
+        let carried: Vec<(u64, State)> =
+            again.carried.iter().map(|d| (d.finding, d.state)).collect();
+        assert_eq!(carried, [(2, State::Accepted)]);
+        // A stretch that ends elsewhere is another fix, and so is one moved by another count.
+        assert_eq!(
+            save(&mut store, fix(476_000, 1, 301, 250_000, "First.")).carried,
+            []
+        );
+        store.decide(&[decision(3, State::Rejected, None)]).unwrap();
+        assert_eq!(
+            save(&mut store, fix(476_000, 2, 301, 250_000, "First.")).carried,
+            []
+        );
     }
 
     #[test]
@@ -1153,5 +1363,84 @@ pub(super) mod tests {
             .unwrap_err();
         assert!(is_busy(&e), "{e}");
         drop(held);
+    }
+
+    /// Three checks of A in a row: the first two find the same three typos (IDs 1–3, 4–6), the
+    /// third `last` (from 7).
+    fn checked_three_times(store: &mut Store, last: Vec<Finding>) {
+        let scan = store
+            .begin_scan(&header("2026-10-17T10:00:00Z"), &[A.into()])
+            .unwrap();
+        let tracks = [track("cues")];
+        let three = || {
+            vec![
+                typo(A, "leave befor it", "leave before it"),
+                typo(A, "go trough it", "go through it"),
+                typo(A, "Ihave to", "I have to"),
+            ]
+        };
+        for findings in [three(), three(), last] {
+            store
+                .save(
+                    &attempt(scan.id, A, &tracks, "2026-10-17T10:01:00Z"),
+                    vec![Made {
+                        with: llm(),
+                        lines: 3,
+                        findings,
+                    }],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_decision_on_a_replaced_finding_follows_it_to_the_current_check() {
+        let (_dir, mut store) = store();
+        checked_three_times(
+            &mut store,
+            vec![
+                typo(A, "leave befor it", "leave before it"),
+                typo(A, "go trough it", "go through it"),
+                typo(A, "Ihave to", "I have to"),
+            ],
+        );
+        // Review read the first check; two have replaced it since.
+        let outcomes = store
+            .decide(&[
+                decision(2, State::Rejected, None),
+                decision(9, State::Accepted, Some("I have to!")),
+            ])
+            .unwrap();
+        assert_eq!(outcomes, [Decided::Followed(vec![8]), Decided::Written]);
+        assert_eq!(current(&store, 8), Some((State::Rejected, None)));
+        assert_eq!(current(&store, 2), None, "nothing on the replaced finding");
+        assert_eq!(
+            current(&store, 9),
+            Some((State::Accepted, Some("I have to!".into())))
+        );
+        // An undo is a decision too, and follows the same way.
+        assert_eq!(
+            store.decide(&[decision(2, State::Pending, None)]).unwrap(),
+            [Decided::Followed(vec![8])]
+        );
+        assert_eq!(current(&store, 8), Some((State::Pending, None)));
+    }
+
+    #[test]
+    fn a_decision_on_a_finding_that_did_not_come_back_is_not_written() {
+        let (_dir, mut store) = store();
+        checked_three_times(&mut store, vec![typo(A, "Ihave to", "I have to")]);
+        let rows = |store: &Store| -> i64 {
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM decisions", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = rows(&store);
+        assert_eq!(
+            store.decide(&[decision(2, State::Rejected, None)]).unwrap(),
+            [Decided::Gone]
+        );
+        assert_eq!(rows(&store), before);
     }
 }

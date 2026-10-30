@@ -29,6 +29,9 @@ use crate::timing::{self, record, shared};
 /// The subtitle languages a scan checks unless told otherwise.
 pub const DEFAULT_LANG: &str = "eng";
 
+/// LLM calls a scan runs at once, unless `--jobs` says.
+pub const DEFAULT_JOBS: usize = 2;
+
 pub struct Options {
     pub backend: Backend,
     pub chunk_lines: usize,

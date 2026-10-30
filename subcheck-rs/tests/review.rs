@@ -73,9 +73,11 @@ fn checked(store: &mut Store, scan: &ScanRow, path: &str, findings: Vec<Finding>
 /// The event loop's inner part: a message, then every effect it leads to, run for real.
 fn send(m: &mut Model, msg: Msg, store: &mut Store, player: &mut Player) {
     let now = jiff::Timestamp::now();
+    // None of these effects starts a scan: the channel is only there to be passed.
+    let (tx, _rx) = std::sync::mpsc::channel();
     let mut queue: VecDeque<_> = update::update(m, msg, now).into();
     while let Some(effect) = queue.pop_front() {
-        let msg = run_effect(effect, store, player);
+        let msg = run_effect(effect, store, player, &tx);
         queue.extend(update::update(m, msg, now));
     }
 }
@@ -154,4 +156,49 @@ fn decisions_made_in_review_are_in_the_store() {
         "{:?}",
         model.status
     );
+}
+
+#[test]
+fn a_decision_on_a_finding_checked_again_follows_it_through_the_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open_at(&dir.path().join("subcheck.db")).unwrap();
+    let header = RunHeader {
+        started: jiff::Timestamp::UNIX_EPOCH,
+        backend: "claude".into(),
+        command: vec![],
+        prompt_version: 1,
+        version: "0".into(),
+        langs: vec!["eng".into()],
+    };
+    let scan = store.begin_scan(&header, &[FILE.into()]).unwrap();
+    let typo = || vec![finding(FILE, "gets trough", "gets through")];
+    checked(&mut store, &scan, FILE, typo());
+    let mut model = Model::new(store.run_view(&scan).unwrap(), HashMap::new());
+    let old = model.run.findings[0].id;
+    let mut player = Player::new(dir.path().join("no-mpv"), dir.path().join("mpv.sock"));
+    let key = |c| Msg::Key(KeyCode::Char(c));
+
+    // A second check of the file replaces the first, with the same finding under a new ID: the
+    // model's finding is stale.
+    checked(&mut store, &scan, FILE, typo());
+    let run = store.run_view(&scan).unwrap();
+    let new = run.findings[0].id;
+    assert_ne!(old, new);
+
+    send(&mut model, key('a'), &mut store, &mut player);
+    let run = store.run_view(&scan).unwrap();
+    assert_eq!(run.state_of(new), State::Accepted);
+    assert_eq!(run.state_of(old), State::Pending);
+    assert!(!run.decisions.contains_key(&old));
+    let ids: Vec<u64> = model.run.findings.iter().map(|f| f.id).collect();
+    assert_eq!(ids, [new]);
+    assert_eq!(model.run.state_of(new), State::Accepted);
+    assert_eq!(
+        model.status.as_deref(),
+        Some("E01 was checked again; your decision went to its new finding")
+    );
+
+    send(&mut model, key('u'), &mut store, &mut player);
+    let run = store.run_view(&scan).unwrap();
+    assert_eq!(run.state_of(new), State::Pending);
 }

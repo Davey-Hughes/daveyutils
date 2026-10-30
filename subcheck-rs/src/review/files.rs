@@ -45,7 +45,7 @@ fn line(m: &Model, file: &FileProgress, spinner: char) -> Line<'static> {
     let style = match file.stage {
         Stage::Done { .. } => fg(Color::Green),
         Stage::Failed(_) => fg(Color::Red),
-        Stage::Queued => fg(Color::DarkGray),
+        Stage::Queued | Stage::QueuedAgain => fg(Color::DarkGray),
         Stage::Reading | Stage::Asking { .. } => Style::default(),
     };
     Line::styled(

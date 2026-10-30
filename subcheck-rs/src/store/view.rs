@@ -86,6 +86,18 @@ impl Store {
         Ok(run)
     }
 
+    /// One file as a view shows it (see [`Store::run_view`]), with no name, header or cost: what
+    /// review's screen reads back when a scan saves the file, or a decision followed one of its
+    /// findings. A file with nothing recorded has no record and no findings.
+    pub fn file_view(&self, path: &str) -> rusqlite::Result<Run> {
+        let tx = self.conn.unchecked_transaction()?;
+        start_showing(&tx)?;
+        tx.execute("INSERT INTO temp.shown(path, pos) VALUES (?1, 0)", [path])?;
+        let run = shown(&tx)?;
+        tx.commit()?;
+        Ok(run)
+    }
+
     /// The view of `paths`: as a run's, of every file with a check that is one of `paths`, or
     /// under one that is a directory, by path. Its cost is those files' LLM calls in the scans that
     /// made their current LLM checks. Named by the paths, quoted, as `subcheck` takes them back.
@@ -149,6 +161,10 @@ fn start_showing(tx: &Transaction) -> rusqlite::Result<()> {
     )
 }
 
+/// A finding's columns, of `findings f`, in the order [`finding`] reads them.
+pub(super) const FINDING_COLUMNS: &str = "f.id, f.path, f.style, f.original, f.suggestion, \
+     f.reason, f.source, f.occurrences, f.\"before\", f.\"after\", f.timing";
+
 /// The files in `temp.shown` as a view shows them, in its order (see [`Store::run_view`]): no
 /// name, header or cost yet.
 fn shown(tx: &Transaction) -> rusqlite::Result<Run> {
@@ -176,9 +192,7 @@ fn shown(tx: &Transaction) -> rusqlite::Result<Run> {
          JOIN checks c ON c.path = s.path AND c.replaced_by IS NULL AND c.error IS NULL
          JOIN findings f ON f.\"check\" = c.id";
     let mut findings = tx.prepare(&format!(
-        "SELECT f.id, f.path, f.style, f.original, f.suggestion, f.reason, f.source,
-             f.occurrences, f.\"before\", f.\"after\", f.timing
-         {current} ORDER BY s.pos, s.path, f.id"
+        "SELECT {FINDING_COLUMNS} {current} ORDER BY s.pos, s.path, f.id"
     ))?;
     for f in findings.query_map([], finding)? {
         run.findings.push(f?);
@@ -236,7 +250,7 @@ fn file_record(r: &Row) -> rusqlite::Result<FileRecord> {
     })
 }
 
-fn finding(r: &Row) -> rusqlite::Result<Finding> {
+pub(super) fn finding(r: &Row) -> rusqlite::Result<Finding> {
     Ok(Finding {
         id: r.get(0)?,
         file: r.get(1)?,
@@ -651,5 +665,32 @@ mod tests {
                 .to_string(),
             "no run named nope"
         );
+    }
+
+    #[test]
+    fn a_files_view_is_that_file_alone_as_it_is_now() {
+        let (_dir, mut store) = store();
+        let (a, b) = ("/m/E01.mkv", "/m/E02.mkv");
+        let scan = store
+            .begin_scan(&header("2026-10-17T10:00:00Z"), &[a.into(), b.into()])
+            .unwrap();
+        let ids = checked(&mut store, &scan, a, &[("teh", "the"), ("adn", "and")]);
+        checked(&mut store, &scan, b, &[("wiht", "with")]);
+        store
+            .decide(&[decision(ids[0], State::Accepted, None)])
+            .unwrap();
+        store
+            .mark_applied(&[Applied {
+                finding: ids[0],
+                at: at("2026-10-17T12:00:00Z"),
+            }])
+            .unwrap();
+        let view = store.file_view(a).unwrap();
+        assert_eq!(paths(&view), [a]);
+        assert_eq!(found(&view), [(ids[0], "teh"), (ids[1], "adn")]);
+        assert_eq!(view.state_of(ids[0]), State::Accepted);
+        assert_eq!(view.applied, [ids[0]].into());
+        let nothing = store.file_view("/m/E03.mkv").unwrap();
+        assert!(nothing.files.is_empty() && nothing.findings.is_empty());
     }
 }
