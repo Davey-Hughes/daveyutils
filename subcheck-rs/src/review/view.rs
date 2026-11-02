@@ -63,6 +63,7 @@ const KEY_GROUPS: [(&str, &[(&str, &str)]); 4] = [
         "mpv",
         &[
             ("o", "open the line"),
+            ("O", "close mpv"),
             ("␣", "pause"),
             ("← →", "5 s back, forward"),
             (", .", "1 s back, forward"),
@@ -167,13 +168,16 @@ fn spent_lines(spent: &Spent, columns: usize) -> Vec<Line<'static>> {
 }
 
 /// The box of keys `?` opens, over the middle of `area`, with how to leave it in its bottom
-/// border: on a screen too short for every key that still shows.
+/// border: on a screen too short for every key that still shows. A blank row keeps it apart from
+/// the last line, so it reads as the border's and not as one more line that ran out of the box.
 fn keys_box(m: &Model, f: &mut Frame, area: Rect) {
     const LEAVE: &str = " q quits · any other key closes this ";
     // Inside a border and a column of padding each side.
     let columns = usize::from(area.width.saturating_sub(4));
     let mut lines = keys_lines(columns);
     lines.extend(spent_lines(&m.run.spent, columns));
+    // The last of the lines, so on a short screen it is the first to go.
+    lines.push(Line::raw(""));
     let widest = lines.iter().map(Line::width).max().unwrap_or(0);
     let widest = widest.max(usize::from(layout::width(LEAVE)));
     let width = u16::try_from(widest + 4)
@@ -1225,6 +1229,7 @@ mod tests {
             "Tab        findings, files",
             "␣    pause",
             "[ ]  a frame back, forward",
+            "O    close mpv",
             "└ q quits · any other key closes this ",
         ] {
             assert!(screen.contains(text), "{text}\n{screen}");
@@ -1245,6 +1250,35 @@ mod tests {
         let screen = render(&m, 50, 20);
         assert!(
             screen.contains("q quits · any other key closes"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_way_out_of_the_keys_box_has_a_blank_row_above_it() {
+        let mut m = with_cost();
+        m.help = true;
+        // The row above the bottom border, inside the box's corners.
+        let above_the_way_out = |screen: &str| {
+            let lines: Vec<Vec<char>> = screen.lines().map(|l| l.chars().collect()).collect();
+            let at = lines
+                .iter()
+                .position(|l| String::from_iter(l).contains("└ q quits"))
+                .expect("the way out shows");
+            let left = lines[at].iter().position(|&c| c == '└').unwrap();
+            let right = left + lines[at][left..].iter().position(|&c| c == '┘').unwrap();
+            String::from_iter(&lines[at - 1][left..=right])
+        };
+        let screen = render(&m, 120, 24);
+        let row = above_the_way_out(&screen);
+        assert!(
+            row.starts_with('│') && row.ends_with('│') && row.trim_matches('│').trim().is_empty(),
+            "{row:?}\n{screen}"
+        );
+        // A row short of the whole box, the blank row is what goes: the cost still shows.
+        let screen = render(&m, 120, 18);
+        assert!(
+            above_the_way_out(&screen).contains("$3.21 at API prices"),
             "{screen}"
         );
     }

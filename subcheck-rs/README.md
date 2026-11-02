@@ -106,6 +106,7 @@ filter, to the next row).
 | `A` | apply the accepted fixes of the view (asks first; not while a scan runs) |
 | `D` | dry run: what apply would do, writing nothing |
 | `o` | open the line in mpv, 2 s early, with its subtitle track; again on the same line replays it |
+| `O` | close mpv and stay in review; the next `o` opens it again |
 | Space | pause or resume mpv |
 | ← → | mpv back or forward 5 s |
 | `,` `.` | mpv back or forward 1 s |

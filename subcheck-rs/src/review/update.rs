@@ -55,6 +55,8 @@ pub enum Msg {
     Opened(Result<(), String>),
     /// A `Playback` effect finished: where mpv is now.
     Played(Result<PlayState, String>),
+    /// A `Close` effect finished.
+    Closed(Result<(), String>),
     /// The terminal's new size.
     Resize(u16, u16),
     /// A mouse action at a column and row of the screen.
@@ -151,6 +153,8 @@ pub enum Effect {
     Open(Moment),
     /// Pause or seek the open mpv.
     Playback(Playback),
+    /// Close mpv, and leave review open.
+    Close,
 }
 
 /// Rows a PgUp or PgDn moves.
@@ -274,6 +278,13 @@ fn apply(
                     if p.paused { "⏸" } else { "▶" },
                     timestamp_ms(p.at_ms)
                 ),
+                Err(e) => e,
+            });
+            Vec::new()
+        }
+        Msg::Closed(result) => {
+            m.status = Some(match result {
+                Ok(()) => "closed mpv".into(),
                 Err(e) => e,
             });
             Vec::new()
@@ -458,6 +469,7 @@ fn key_press(m: &mut Model, key: KeyCode, now: Timestamp) -> Vec<Effect> {
         }
         KeyCode::Char('u') => return undo(m, now),
         KeyCode::Char('o') => return open(m),
+        KeyCode::Char('O') => return vec![Effect::Close],
         KeyCode::Char(' ') => return vec![Effect::Playback(Playback::Pause)],
         KeyCode::Left => return vec![Effect::Playback(Playback::Seek(-5))],
         KeyCode::Right => return vec![Effect::Playback(Playback::Seek(5))],
@@ -2392,6 +2404,16 @@ mod tests {
             now(),
         );
         assert_eq!(m.status.as_deref(), Some("mpv is not open (o opens it)"));
+    }
+
+    #[test]
+    fn capital_o_closes_mpv_and_says_so() {
+        let mut m = sample();
+        assert_eq!(press(&mut m, 'O'), [Effect::Close]);
+        update(&mut m, Msg::Closed(Ok(())), now());
+        assert_eq!(m.status.as_deref(), Some("closed mpv"));
+        update(&mut m, Msg::Closed(Err("mpv is not open".into())), now());
+        assert_eq!(m.status.as_deref(), Some("mpv is not open"));
     }
 
     #[test]

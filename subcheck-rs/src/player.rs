@@ -1,6 +1,6 @@
 //! Opening a moment in mpv. One window serves a whole review: the first `o` starts mpv with an IPC
 //! socket, and every later one loads the next file into that window. The playback keys go to the
-//! same socket.
+//! same socket, and `O` closes the window from there.
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
@@ -22,6 +22,13 @@ const START_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a frame step gets to land. A step back seeks from the keyframe before it, and until it
 /// has (70 ms on K-On!! E09, read over NFS) mpv still reports the old position.
 const FRAME_WAIT: Duration = Duration::from_secs(1);
+
+/// How long the mpvs this review started get to exit once `O` asked the one on the socket to
+/// quit, before they are killed.
+const QUIT_WAIT: Duration = Duration::from_secs(1);
+
+/// A request's error when mpv closed the connection first.
+const HUNG_UP: &str = "mpv closed the connection without answering";
 
 /// The app id of mpv's window on Wayland, so that a window rule can match it and no other mpv
 /// (README, "Window focus").
@@ -199,6 +206,41 @@ impl Player {
         })
     }
 
+    /// Close mpv (`O`), as its window takes no keys. The one on the socket is asked to quit,
+    /// whether this review started it or found it open. Each one this review started that is still
+    /// up is then killed: after [`QUIT_WAIT`] when one was asked, at once when none answered. That
+    /// covers one the socket does not reach, and one that does not quit, stuck reading over NFS
+    /// say. The next `o` starts another.
+    pub fn close(&mut self) -> Result<(), String> {
+        self.reap();
+        // mpv 0.41 answers `quit` before it hangs up; one that hangs up first has quit too.
+        let quit =
+            Conn::connect(&self.socket)
+                .ok()
+                .map(|mut conn| match conn.request(&json!(["quit"])) {
+                    Err(e) if e == HUNG_UP => Ok(()),
+                    asked => asked.map(drop),
+                });
+        if quit.is_none() && self.children.is_empty() {
+            return Err("mpv is not open".into());
+        }
+        let wait = if quit.is_some() {
+            QUIT_WAIT
+        } else {
+            Duration::ZERO
+        };
+        let deadline = Instant::now() + wait;
+        while !self.children.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            self.reap();
+        }
+        for (mut child, _running) in self.children.drain(..) {
+            group::kill(&child);
+            let _ = child.wait();
+        }
+        quit.unwrap_or(Ok(()))
+    }
+
     /// Forget the started mpvs that have exited (and collect their exit status).
     fn reap(&mut self) {
         self.children
@@ -283,9 +325,9 @@ impl Player {
 }
 
 /// Every mpv this review started that is still up closes with it: the window takes no keys, so it
-/// has no `q` of its own. Killed, as `group` does when a signal ends the review (the terminal
-/// closed): mpv without a terminal has no handler for SIGTERM either. One the review found open on
-/// the socket is left alone.
+/// has no `q` of its own (review's `O` closes it sooner). Killed, as `group` does when a signal
+/// ends the review (the terminal closed): mpv without a terminal has no handler for SIGTERM
+/// either. One the review found open on the socket is left alone.
 impl Drop for Player {
     fn drop(&mut self) {
         self.reap();
@@ -345,7 +387,7 @@ impl Conn {
         loop {
             reply.clear();
             if self.reader.read_line(&mut reply).map_err(fail)? == 0 {
-                return Err("mpv closed the connection without answering".into());
+                return Err(HUNG_UP.into());
             }
             let Ok(v) = serde_json::from_str::<Value>(&reply) else {
                 continue;
@@ -1021,5 +1063,84 @@ mod tests {
             Err("mpv: invalid parameter".into())
         );
         mpv.join().unwrap();
+    }
+
+    /// Whether no process `pid` is left: killed, and waited for.
+    fn gone(pid: u32) -> bool {
+        let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+        rustix::process::test_kill_process(pid).is_err()
+    }
+
+    #[test]
+    fn close_asks_the_mpv_on_the_socket_to_quit() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        // One this review did not start: found open, and closed all the same.
+        let mpv = fake_mpv(UnixListener::bind(&socket).unwrap(), idle);
+        let mut player = Player::new("mpv", socket);
+        assert_eq!(player.close(), Ok(()));
+        assert_eq!(mpv.join().unwrap(), [json!(["quit"])]);
+    }
+
+    #[test]
+    fn an_mpv_that_hangs_up_on_quit_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mpv = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            line
+        });
+        let mut player = Player::new("mpv", socket);
+        assert_eq!(player.close(), Ok(()));
+        assert!(mpv.join().unwrap().contains(r#"["quit"]"#));
+    }
+
+    #[test]
+    fn close_with_no_mpv_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut player = Player::new("mpv", dir.path().join("mpv.sock"));
+        assert_eq!(player.close(), Err("mpv is not open".into()));
+    }
+
+    #[test]
+    fn an_mpv_the_review_started_that_does_not_quit_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        let (program, argv) = fake_program(dir.path());
+        let server = mpv_once_started(&socket, &argv);
+        let mut player = Player::new(&program, socket.clone());
+        assert_eq!(player.open(&moment()), Ok(()));
+        server.join().unwrap();
+        let pid = newest(&player);
+        // The socket answers `quit`, but the program (a `sleep`) stays up.
+        std::fs::remove_file(&socket).unwrap();
+        let mpv = fake_mpv(UnixListener::bind(&socket).unwrap(), idle);
+        let asked = Instant::now();
+        assert_eq!(player.close(), Ok(()));
+        assert!(asked.elapsed() >= QUIT_WAIT);
+        assert_eq!(mpv.join().unwrap(), [json!(["quit"])]);
+        assert!(gone(pid));
+        assert!(player.children.is_empty());
+    }
+
+    #[test]
+    fn an_mpv_out_of_the_sockets_reach_is_killed_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mpv.sock");
+        let (program, argv) = fake_program(dir.path());
+        let server = mpv_once_started(&socket, &argv);
+        let mut player = Player::new(&program, socket.clone());
+        assert_eq!(player.open(&moment()), Ok(()));
+        server.join().unwrap();
+        let pid = newest(&player);
+        std::fs::remove_file(&socket).unwrap();
+        let asked = Instant::now();
+        assert_eq!(player.close(), Ok(()));
+        assert!(asked.elapsed() < QUIT_WAIT);
+        assert!(gone(pid));
+        assert!(player.children.is_empty());
     }
 }

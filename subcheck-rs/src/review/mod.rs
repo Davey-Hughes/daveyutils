@@ -193,6 +193,7 @@ pub fn run_effect(
         ),
         Effect::Open(moment) => Msg::Opened(player.open(&moment)),
         Effect::Playback(p) => Msg::Played(player.playback(p)),
+        Effect::Close => Msg::Closed(player.close()),
     }
 }
 
