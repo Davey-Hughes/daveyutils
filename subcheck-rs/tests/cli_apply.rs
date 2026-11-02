@@ -1024,6 +1024,52 @@ fn no_backup_keeps_nothing_and_checks_every_frame() {
 }
 
 #[test]
+fn a_dry_run_says_a_file_with_an_earlier_backup_in_the_way_would_fail() {
+    let s = Setup::new();
+    let backup = subcheck::apply::backup_path(&s.file);
+    std::fs::write(&backup, "an earlier backup").unwrap();
+    let o = s.apply(&["--dry-run"]);
+    let text = stdout(&o);
+    assert_eq!(o.status.code(), Some(1), "{text}");
+    // The plan first, as for any dry run, then why apply would stop.
+    assert!(
+        text.contains("  0:00:01.00  befor → before  ok\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(".orig exists: an earlier backup is never overwritten\n"),
+        "{text}"
+    );
+    assert!(text.contains("  failed: "), "{text}");
+    assert!(text.ends_with("; 0 remuxed, 1 failed\n"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(&backup).unwrap(),
+        "an earlier backup"
+    );
+    assert_eq!(
+        std::fs::read(&s.file).unwrap(),
+        std::fs::read(fixture("apply.mkv")).unwrap()
+    );
+    assert!(s.run().applied.is_empty());
+}
+
+#[test]
+fn a_dry_run_after_apply_finds_the_fixes_in_and_does_not_fail_on_their_backup() {
+    if !have_mkvmerge() {
+        return;
+    }
+    let s = Setup::new();
+    let o = s.apply(&[]);
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert!(subcheck::apply::backup_path(&s.file).exists());
+    let o = s.apply(&["--dry-run"]);
+    let text = stdout(&o);
+    assert!(o.status.success(), "{text}");
+    assert!(!text.contains("failed: "), "{text}");
+    assert!(text.contains("to apply 0, already applied "), "{text}");
+}
+
+#[test]
 fn an_earlier_backup_is_never_overwritten() {
     if !have_mkvmerge() {
         return;

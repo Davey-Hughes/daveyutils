@@ -350,7 +350,9 @@ the video around it; video there that does not read fails the file. A line still
 millisecond unsure leaves its fix for a hand fix, and so does a typo on it once the fix is in.
 
 `--no-backup` keeps no original. `--dry-run` shows each changed event before and after, and writes
-nothing. Running apply again is safe: a fix already in its file is reported and left alone.
+nothing. It also checks what stops apply before it writes, an earlier `.orig` in the way or too
+little free space, and fails such a file as apply would (in review, `D` marks its fixes `would
+fail`). Running apply again is safe: a fix already in its file is reported and left alone.
 
 Some fixes are left for a hand fix, with the reason: per-letter karaoke (one event per letter)
 without `--karaoke`, signs set letter by letter (a tag before nearly every letter), a change

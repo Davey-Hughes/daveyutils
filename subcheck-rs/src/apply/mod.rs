@@ -753,7 +753,9 @@ impl Job<'_> {
     /// What the mode does with a file that has fixes to make; whether it was remuxed.
     fn act(&self, o: &Original, fixed: &[Fixed], out: &mut impl Write) -> Result<bool, String> {
         match self.mode {
-            Mode::DryRun => Ok(false),
+            // What apply checks before it writes, for the apply that keeps a backup: --dry-run does
+            // not go with --no-backup, and the screen's apply always keeps one.
+            Mode::DryRun => self.preflight(true).map(|()| false),
             Mode::TracksOnly(dir) => {
                 // The files are what was asked for, and stay. Until the last is written a signal
                 // removes those written, as a failure does.
@@ -991,14 +993,10 @@ impl Job<'_> {
         Ok(files)
     }
 
-    /// Remux beside the original, check it, and swap it in. The backup's path when one is kept.
-    fn apply(
-        &self,
-        o: &Original,
-        fixed: &[Fixed],
-        backup: bool,
-        full: bool,
-    ) -> Result<Option<PathBuf>, String> {
+    /// What stops apply before it writes anything: with `backup`, an earlier backup where this one
+    /// would go; and too little free space beside the file for its remux. A dry run checks these
+    /// too, so that it says a file would fail where apply will.
+    fn preflight(&self, backup: bool) -> Result<(), String> {
         let kept = backup_path(self.path);
         if backup && kept.exists() {
             return Err(format!(
@@ -1016,6 +1014,20 @@ impl Job<'_> {
                 dir.display()
             ));
         }
+        Ok(())
+    }
+
+    /// Remux beside the original, check it, and swap it in. The backup's path when one is kept.
+    fn apply(
+        &self,
+        o: &Original,
+        fixed: &[Fixed],
+        backup: bool,
+        full: bool,
+    ) -> Result<Option<PathBuf>, String> {
+        self.preflight(backup)?;
+        let kept = backup_path(self.path);
+        let dir = dir_of(self.path);
         let remuxed = remux_path(self.path);
         // Created here first: an unwritable directory says so before any work. Held through the
         // swap too: once the remux is renamed into place, removing it by its old name finds
