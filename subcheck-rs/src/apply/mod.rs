@@ -78,11 +78,13 @@ pub enum Event {
         restamped: Option<(u64, Timestamp)>,
         text: String,
     },
-    /// A file that failed, why, and its block.
+    /// A file that failed: why, its block, and the findings it was to fix (its accepted fixes and
+    /// timing findings, those `Done`'s outcomes would cover).
     Failed {
         path: String,
         error: String,
         text: String,
+        findings: Vec<u64>,
     },
 }
 
@@ -219,6 +221,11 @@ pub fn run(
             mkvmerge,
             report,
         };
+        let findings: Vec<u64> = mine
+            .iter()
+            .map(|f| f.finding.id)
+            .chain(shifts.iter().map(|f| f.id))
+            .collect();
         let event = match job.run(&mut out) {
             Ok(done) => {
                 for (_, o) in &done.outcomes {
@@ -280,6 +287,7 @@ pub fn run(
                     path: (*path).to_string(),
                     error: e,
                     text: out.take(),
+                    findings,
                 }
             }
         };
@@ -457,6 +465,20 @@ struct Fixed<'a> {
     kind: Kind,
     patched: Vec<Block>,
     early: exact::Early,
+}
+
+/// Fixed-track files written for mkvmerge to read ([`Job::write_tracks`]).
+struct Written {
+    files: Vec<Replacement>,
+    /// Every file written, track and tags, with the guard that has a signal remove it.
+    removing: Vec<(PathBuf, group::Removing)>,
+}
+
+/// Remove each file, then forget it, with no signal between.
+fn remove_written(removing: Vec<(PathBuf, group::Removing)>) {
+    for (path, guard) in removing {
+        let _ = guard.forget_after(|| fs::remove_file(&path));
+    }
 }
 
 impl Job<'_> {
@@ -733,7 +755,10 @@ impl Job<'_> {
         match self.mode {
             Mode::DryRun => Ok(false),
             Mode::TracksOnly(dir) => {
-                let files = self.write_tracks(dir, o, fixed)?;
+                // The files are what was asked for, and stay. Until the last is written a signal
+                // removes those written, as a failure does.
+                let Written { files, removing } = self.write_tracks(dir, o, fixed)?;
+                drop(removing);
                 for f in &files {
                     for written in std::iter::once(&f.file).chain(&f.tags) {
                         say(out, &format!("wrote {}", written.display()))?;
@@ -885,40 +910,43 @@ impl Job<'_> {
     }
 
     /// Each fixed track written to `dir`, named as `extract` names it, with its own tags beside it
-    /// as `<name>.track<ID>.tags.xml` when it has any. A failure removes what it wrote, a file cut
-    /// short by it too.
-    fn write_tracks(
-        &self,
-        dir: &Path,
-        o: &Original,
-        fixed: &[Fixed],
-    ) -> Result<Vec<Replacement>, String> {
-        let mut written = Vec::new();
-        let files = self.write_each(dir, o, fixed, &mut written);
-        if files.is_err() {
-            for path in &written {
-                let _ = fs::remove_file(path);
+    /// as `<name>.track<ID>.tags.xml` when it has any. Each file is registered with `group` as it
+    /// is created, so a signal that ends subcheck removes it until its guard is dropped. A failure
+    /// removes what it wrote, a file cut short by it too.
+    fn write_tracks(&self, dir: &Path, o: &Original, fixed: &[Fixed]) -> Result<Written, String> {
+        let mut removing = Vec::new();
+        match self.write_each(dir, o, fixed, &mut removing) {
+            Ok(files) => Ok(Written { files, removing }),
+            Err(e) => {
+                remove_written(removing);
+                Err(e)
             }
         }
-        files
     }
 
-    /// The work of [`Job::write_tracks`], each file added to `written` before it is written.
+    /// The work of [`Job::write_tracks`], each file added to `written` with its guard once it is
+    /// created.
     fn write_each(
         &self,
         dir: &Path,
         o: &Original,
         fixed: &[Fixed],
-        written: &mut Vec<PathBuf>,
+        written: &mut Vec<(PathBuf, group::Removing)>,
     ) -> Result<Vec<Replacement>, String> {
         fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
         let tags = tags_data(o.r, o.layout)?;
-        // A file is ours to remove once it is opened for writing (a write cut short leaves part of
-        // it); one that could not even be opened is someone else's.
+        // A file is ours to remove once it is created (a write cut short leaves part of it); one
+        // that could not even be created is someone else's, and is not registered.
         let mut write = |path: PathBuf, bytes: &[u8]| {
             let fail = |e: io::Error| format!("writing {}: {e}", path.display());
-            let mut file = fs::File::create(&path).map_err(fail)?;
-            written.push(path.clone());
+            let mut created = None;
+            let guard = group::create_removing(&path, |p| {
+                created = Some(fs::File::create(p)?);
+                Ok(())
+            })
+            .map_err(fail)?;
+            written.push((path.clone(), guard));
+            let mut file = created.expect("created with its guard");
             file.write_all(bytes).map_err(fail)?;
             Ok::<PathBuf, String>(path)
         };
@@ -1045,14 +1073,11 @@ impl Job<'_> {
         full: bool,
     ) -> Result<(), String> {
         let tracks = self.state.join("apply");
-        let files = self.write_tracks(&tracks, o, fixed)?;
+        let Written { files, removing } = self.write_tracks(&tracks, o, fixed)?;
         let args = remux::args(self.path, o.layout, &files, languages, remuxed);
         let ran = remux::run(self.mkvmerge, &args);
-        for f in &files {
-            for written in std::iter::once(&f.file).chain(&f.tags) {
-                let _ = fs::remove_file(written);
-            }
-        }
+        // Each removed before it is forgotten: a signal finds it either way.
+        remove_written(removing);
         // To the hook, not stderr: review's screen draws on the terminal.
         if let Some(warnings) = ran? {
             (self.report)(Event::Warned {

@@ -80,6 +80,26 @@ impl FileProgress {
             Stage::Failed(e) => format!("✗ FAILED: {e}"),
         }
     }
+
+    /// [`FileProgress::label`] as the files list writes it. An apply failure names the file by
+    /// `name`, the row's name, and any other file in its folder by its file name, so the reason
+    /// fits on the row; the detail pane keeps the paths whole.
+    pub fn list_label(&self, spinner: char, name: &str) -> String {
+        match &self.applying {
+            Some(ApplyStage::Failed(e)) => failed_label(&short_paths(e, &self.path, name)),
+            _ => self.label(spinner),
+        }
+    }
+}
+
+/// `text` with `path` written as `name`, then every other path in `path`'s folder as its file
+/// name: `<path>.orig` reads `<name>.orig`, `<folder>/.<file>.subcheck` reads `.<file>.subcheck`.
+fn short_paths(text: &str, path: &str, name: &str) -> String {
+    let text = text.replace(path, name);
+    match Path::new(path).parent().map(Path::to_string_lossy) {
+        Some(dir) if !dir.is_empty() => text.replace(&format!("{dir}/"), ""),
+        _ => text,
+    }
 }
 
 /// Whether a scan runs, and how it ended.
@@ -192,15 +212,23 @@ impl ApplyStage {
                 parts.extend(counts.parts(true));
                 format!("✓ {}", parts.join(" · "))
             }
-            ApplyStage::Failed(e) => format!("✗ failed: {e}"),
+            ApplyStage::Failed(e) => failed_label(e),
         }
     }
+}
+
+/// An apply failure as a file's stage reads: `✗ failed: <why>`.
+fn failed_label(why: &str) -> String {
+    format!("✗ failed: {why}")
 }
 
 /// The screen's apply, or a dry run: how far it is, and how it ended.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Applying {
     pub dry_run: bool,
+    /// The files with fixes, in the order apply goes through them, once it has said them
+    /// ([`apply::Event::Queued`]).
+    pub order: Option<Vec<String>>,
     /// The files with fixes, those done, and of those the ones that failed and those remuxed.
     pub queued: usize,
     pub done: usize,
@@ -257,6 +285,18 @@ impl Applying {
             Some(Err(e)) => format!("apply failed: {e}"),
         }
     }
+}
+
+/// Where the screen's apply is, for the quit question and the outro.
+enum Whereabouts<'p> {
+    /// A file at a stage.
+    On(&'p str, apply::Stage),
+    /// No file at a stage: the next it goes to.
+    Before(&'p str),
+    /// Past its last file.
+    Finishing,
+    /// It has not said its files yet.
+    Starting,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -482,6 +522,7 @@ impl Progress {
         }
         self.apply = Some(Applying {
             dry_run,
+            order: None,
             queued: 0,
             done: 0,
             failed: 0,
@@ -500,6 +541,7 @@ impl Progress {
             apply::Event::Queued(paths) => {
                 if let Some(a) = &mut self.apply {
                     a.queued = paths.len();
+                    a.order = Some(paths.clone());
                 }
                 for p in paths {
                     self.set_applying(p, ApplyStage::Queued);
@@ -534,7 +576,9 @@ impl Progress {
                 };
                 self.finish_applying(path, stage, text);
             }
-            apply::Event::Failed { path, error, text } => {
+            apply::Event::Failed {
+                path, error, text, ..
+            } => {
                 if let Some(a) = &mut self.apply {
                     a.done += 1;
                     a.failed += 1;
@@ -579,28 +623,28 @@ impl Progress {
                 .is_some_and(|a| a.failed > 0 || matches!(a.ended, Some(Err(_))))
     }
 
-    /// What `q` asks while apply runs: the file it is on, by `label`'s name for it, and the stage;
-    /// how far it is.
+    /// What `q` asks while apply runs: the file it is on (by `label`'s name for it) and the
+    /// stage, else the file it goes to next, and how far it is.
     pub fn apply_question(&self, label: &dyn Fn(&str) -> String) -> String {
         let Some(a) = &self.apply else {
             return String::new();
         };
-        let at = match self.apply_at() {
-            Some((path, stage)) => format!(" on {} ({}),", label(path), stage.word()),
-            None => " on".into(),
+        let count = format!("{}/{}", a.done, a.queued);
+        let at = match self.whereabouts() {
+            Whereabouts::On(path, stage) => {
+                format!("on {} ({}), {count}", label(path), stage.word())
+            }
+            Whereabouts::Before(path) => format!("starting {}, {count}", label(path)),
+            Whereabouts::Finishing => format!("finishing, {count}"),
+            Whereabouts::Starting => "starting".into(),
         };
-        format!(
-            "{} is{at} {}/{} — stop it and quit? y/n",
-            a.noun(),
-            a.done,
-            a.queued
-        )
+        format!("{} is {at} — stop it and quit? y/n", a.noun())
     }
 
     /// What the terminal gets of the screen's applies on leaving, after [`Progress::outro`]'s:
-    /// what the earlier ones ended with, then the last (see `applied_lines`). One stopped says the
-    /// file it was on (by `label`'s name) and its stage, what the files done came to, and the
-    /// command that makes the rest.
+    /// what the earlier ones ended with, then the last (see `applied_lines`). One stopped
+    /// says where it was (as the quit question does), what the files done came to, and the command
+    /// that makes the rest.
     pub fn apply_outro(&self, label: &dyn Fn(&str) -> String) -> Vec<String> {
         let mut lines = self.earlier_applies.clone();
         let Some(a) = &self.apply else {
@@ -611,16 +655,19 @@ impl Progress {
             return lines;
         }
         lines.extend(self.apply_failures());
-        let at = match self.apply_at() {
-            Some((path, stage)) => format!(" on {} ({})", label(path), stage.word()),
-            None => String::new(),
-        };
-        lines.push(format!(
-            "{} stopped{at}, {}/{} files done:",
-            a.noun(),
-            a.done,
-            a.queued
-        ));
+        let (noun, count) = (a.noun(), format!("{}/{} files done:", a.done, a.queued));
+        lines.push(match self.whereabouts() {
+            Whereabouts::On(path, stage) => {
+                format!(
+                    "{noun} stopped on {} ({}), {count}",
+                    label(path),
+                    stage.word()
+                )
+            }
+            Whereabouts::Before(path) => format!("{noun} stopped before {}, {count}", label(path)),
+            Whereabouts::Finishing => format!("{noun} stopped after the last file, {count}"),
+            Whereabouts::Starting => format!("{noun} stopped before its first file:"),
+        });
         lines.push(apply::summary_line(&a.so_far(), !a.dry_run));
         lines.push(format!("Finish it with: {}", a.resume));
         lines
@@ -659,6 +706,27 @@ impl Progress {
             Some(ApplyStage::At(stage)) => Some((f.path.as_str(), stage)),
             _ => None,
         })
+    }
+
+    /// Where apply is: the file at a stage; else the next file, the one after those done, as
+    /// apply goes through them in order; else past the last; or, before apply has said its
+    /// files, starting.
+    fn whereabouts(&self) -> Whereabouts<'_> {
+        if let Some((path, stage)) = self.apply_at() {
+            return Whereabouts::On(path, stage);
+        }
+        let Some(Applying {
+            order: Some(order),
+            done,
+            ..
+        }) = &self.apply
+        else {
+            return Whereabouts::Starting;
+        };
+        match order.get(*done) {
+            Some(path) => Whereabouts::Before(path),
+            None => Whereabouts::Finishing,
+        }
     }
 
     /// Put file `path` at `stage` of apply.
@@ -1494,6 +1562,7 @@ mod tests {
             path: "/m/E01.mkv".into(),
             error: "disk full".into(),
             text: "/m/E01.mkv\n  failed: disk full\n\n".into(),
+            findings: vec![],
         });
         p.apply_event(&apply::Event::Stage(
             "/m/E02.mkv".into(),
@@ -1517,12 +1586,173 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_dry_run_says_how_far_it_got_and_how_to_finish_it() {
+        let mut p = Progress::of_run(&Run {
+            files: vec![
+                record("/m/E01.mkv", 400, None),
+                record("/m/E02.mkv", 400, None),
+            ],
+            ..Run::default()
+        });
+        p.start_apply(true, "subcheck apply r --dry-run".into());
+        p.apply_event(&apply::Event::Queued(vec![
+            "/m/E01.mkv".into(),
+            "/m/E02.mkv".into(),
+        ]));
+        p.apply_event(&done(
+            "/m/E01.mkv",
+            vec![
+                (1, Outcome::Patched),
+                (2, Outcome::ByHand("a karaoke row".into())),
+            ],
+            false,
+        ));
+        p.apply_event(&apply::Event::Stage(
+            "/m/E02.mkv".into(),
+            apply::Stage::Plan,
+        ));
+        assert_eq!(
+            p.apply_outro(&short),
+            [
+                "dry run stopped on E02 (plan), 1/2 files done:",
+                "to apply 1, already applied 0, by hand 1, not found 0; 0 remuxed, 0 failed",
+                "Finish it with: subcheck apply r --dry-run",
+            ]
+        );
+        assert!(!p.apply_failed());
+    }
+
+    #[test]
+    fn with_no_file_at_a_stage_the_question_and_the_outro_say_where_apply_is() {
+        for dry_run in [false, true] {
+            let noun = if dry_run { "dry run" } else { "apply" };
+            let said = |p: &Progress| (p.apply_question(&short), p.apply_outro(&short)[0].clone());
+            // Before apply has said its files.
+            let mut p = Progress::of_run(&Run {
+                files: vec![
+                    record("/m/E01.mkv", 400, None),
+                    record("/m/E02.mkv", 400, None),
+                ],
+                ..Run::default()
+            });
+            p.start_apply(dry_run, "subcheck apply r".into());
+            assert_eq!(
+                said(&p),
+                (
+                    format!("{noun} is starting — stop it and quit? y/n"),
+                    format!("{noun} stopped before its first file:"),
+                )
+            );
+            // Before the first.
+            let mut p = applying(dry_run);
+            assert_eq!(
+                said(&p),
+                (
+                    format!("{noun} is starting E01, 0/2 — stop it and quit? y/n"),
+                    format!("{noun} stopped before E01, 0/2 files done:"),
+                )
+            );
+            // A file at a stage, as before.
+            p.apply_event(&apply::Event::Stage(
+                "/m/E01.mkv".into(),
+                apply::Stage::Plan,
+            ));
+            assert_eq!(
+                said(&p),
+                (
+                    format!("{noun} is on E01 (plan), 0/2 — stop it and quit? y/n"),
+                    format!("{noun} stopped on E01 (plan), 0/2 files done:"),
+                )
+            );
+            // Between two.
+            p.apply_event(&done("/m/E01.mkv", vec![(1, Outcome::Patched)], false));
+            assert_eq!(
+                said(&p),
+                (
+                    format!("{noun} is starting E02, 1/2 — stop it and quit? y/n"),
+                    format!("{noun} stopped before E02, 1/2 files done:"),
+                )
+            );
+            // After the last.
+            p.apply_event(&done("/m/E02.mkv", vec![(2, Outcome::Patched)], false));
+            assert_eq!(
+                said(&p),
+                (
+                    format!("{noun} is finishing, 2/2 — stop it and quit? y/n"),
+                    format!("{noun} stopped after the last file, 2/2 files done:"),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn the_files_list_writes_a_failures_paths_short_and_the_detail_keeps_them() {
+        let mut p = applying(false);
+        let failed = |path: &str, error: &str| apply::Event::Failed {
+            path: path.into(),
+            error: error.into(),
+            text: String::new(),
+            findings: vec![],
+        };
+        p.apply_event(&failed(
+            "/m/E01.mkv",
+            "/m/E01.mkv.orig exists: an earlier backup is never overwritten",
+        ));
+        p.apply_event(&failed(
+            "/m/E02.mkv",
+            "/m/.E02.mkv.subcheck differs from the original: track 2",
+        ));
+        assert_eq!(
+            p.files[0].list_label('⠙', "E01"),
+            "✗ failed: E01.orig exists: an earlier backup is never overwritten"
+        );
+        assert_eq!(
+            p.files[1].list_label('⠙', "E02"),
+            "✗ failed: .E02.mkv.subcheck differs from the original: track 2"
+        );
+        // The detail pane's label keeps them whole.
+        assert_eq!(
+            p.files[0].label('⠙'),
+            "✗ failed: /m/E01.mkv.orig exists: an earlier backup is never overwritten"
+        );
+    }
+
+    #[test]
+    fn only_paths_in_the_files_folder_are_written_short() {
+        assert_eq!(
+            short_paths(
+                "writing /state/apply/E01.track2.ass: disk full",
+                "/m/E01.mkv",
+                "E01"
+            ),
+            "writing /state/apply/E01.track2.ass: disk full"
+        );
+        // A file at the root has no folder to drop.
+        assert_eq!(
+            short_paths("/E01.mkv.orig exists", "/E01.mkv", "E01"),
+            "E01.orig exists"
+        );
+    }
+
+    #[test]
+    fn the_files_list_label_is_the_label_for_anything_but_an_apply_failure() {
+        let mut p = applying(false);
+        assert_eq!(p.files[0].list_label('⠙', "E01"), "queued");
+        p.apply_event(&apply::Event::Stage(
+            "/m/E01.mkv".into(),
+            apply::Stage::Remux,
+        ));
+        assert_eq!(p.files[0].list_label('⠙', "E01"), "⠙ remux");
+    }
+
+    #[test]
     fn the_outro_keeps_a_failed_file_though_a_scan_checked_it_again() {
         let mut p = applying(false);
         p.apply_event(&apply::Event::Failed {
             path: "/m/E01.mkv".into(),
             error: "disk full".into(),
             text: "/m/E01.mkv\n  failed: disk full\n\n".into(),
+            findings: vec![],
         });
         p.apply_event(&done("/m/E02.mkv", vec![(1, Outcome::Patched)], true));
         p.apply_ended(Ok(Summary {

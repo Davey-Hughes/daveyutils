@@ -572,6 +572,10 @@ mod tests {
             Some(Msg::Quit)
         );
         assert_eq!(
+            map_event(&key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Some(Msg::Quit)
+        );
+        assert_eq!(
             map_event(&key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
             Some(Msg::KillLine)
         );
@@ -934,6 +938,7 @@ mod tests {
             path: e01.clone(),
             error: "disk full".into(),
             text: String::new(),
+            findings: vec![],
         });
         m.progress.apply_ended(Ok(apply::Summary {
             failed: 1,

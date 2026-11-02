@@ -38,6 +38,7 @@ pub fn files_pane(m: &Model, f: &mut Frame, area: Rect) {
 
 /// A file's line: its name in the list and its stage (apply's once apply has reached it),
 /// coloured: done green, failed red, queued grey, under way the terminal's own.
+/// An apply failure's paths are written short ([`FileProgress::list_label`]).
 fn line(m: &Model, file: &FileProgress, spinner: char) -> Line<'static> {
     let fg = |c| Style::default().fg(c);
     // Apply's stage, once apply has reached the file, else the scan's.
@@ -51,10 +52,9 @@ fn line(m: &Model, file: &FileProgress, spinner: char) -> Line<'static> {
             Style::default()
         }
     };
-    Line::styled(
-        format!("{}  {}", m.label(&file.path), file.label(spinner)),
-        style,
-    )
+    let name = m.label(&file.path);
+    let stage = file.list_label(spinner, &name);
+    Line::styled(format!("{name}  {stage}"), style)
 }
 
 /// The detail pane's lines for the selected file: its path, its stage, its log, then what each

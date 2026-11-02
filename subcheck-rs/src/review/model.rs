@@ -83,6 +83,10 @@ pub enum Mark {
     AlreadyApplied,
     WouldBeByHand(String),
     WouldNotBeFound,
+    /// Apply failed on its file, and why: the fix is not in it.
+    Failed(String),
+    /// A dry run failed on its file, and why.
+    WouldFail(String),
 }
 
 impl Mark {
@@ -109,6 +113,8 @@ impl Mark {
             Mark::AlreadyApplied => "already applied",
             Mark::WouldBeByHand(_) => "would be by hand",
             Mark::WouldNotBeFound => "would not be found",
+            Mark::Failed(_) => "failed",
+            Mark::WouldFail(_) => "would fail",
         }
     }
 
@@ -121,14 +127,18 @@ impl Mark {
                 | Mark::AlreadyApplied
                 | Mark::WouldBeByHand(_)
                 | Mark::WouldNotBeFound
+                | Mark::WouldFail(_)
         )
     }
 
-    /// Why the fix is (or would be) left for a hand fix, for the detail pane.
+    /// Why the fix is (or would be) left for a hand fix, or why apply failed on its file, for the
+    /// detail pane.
     pub fn reason(&self) -> Option<String> {
         match self {
             Mark::ByHand(why) => Some(format!("left for a fix by hand: {why}")),
             Mark::WouldBeByHand(why) => Some(format!("would be left for a fix by hand: {why}")),
+            Mark::Failed(why) => Some(format!("apply failed on its file: {why}")),
+            Mark::WouldFail(why) => Some(format!("apply would fail on its file: {why}")),
             _ => None,
         }
     }

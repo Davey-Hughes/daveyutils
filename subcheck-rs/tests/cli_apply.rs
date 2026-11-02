@@ -323,6 +323,11 @@ fn expected(id: usize, ext: &str) -> String {
 /// `apply::run` in process on the setup's run, as `mode` says: what it wrote, every event it
 /// reported, and its summary.
 fn hooked(s: &Setup, mode: &Mode) -> (String, Vec<Event>, apply::Summary) {
+    hooked_with(s, mode, OsStr::new("mkvmerge"))
+}
+
+/// [`hooked`], with `mkvmerge` as the mkvmerge program.
+fn hooked_with(s: &Setup, mode: &Mode, mkvmerge: &OsStr) -> (String, Vec<Event>, apply::Summary) {
     let events = RefCell::new(Vec::new());
     let mut out = Vec::new();
     let summary = apply::run(
@@ -331,7 +336,7 @@ fn hooked(s: &Setup, mode: &Mode) -> (String, Vec<Event>, apply::Summary) {
         &s.root.join("state"),
         mode,
         false,
-        OsStr::new("mkvmerge"),
+        mkvmerge,
         &mut out,
         &|e| events.borrow_mut().push(e),
     )
@@ -440,6 +445,98 @@ fn a_dry_runs_hook_hears_the_plan_alone_and_nothing_is_marked_or_moved() {
     );
     assert!(s.run().applied.is_empty());
     assert_eq!(file_stamp(&s.file).unwrap(), stamp);
+}
+
+#[test]
+fn a_failed_files_hook_gets_why_its_block_and_the_findings_it_was_to_fix() {
+    if !have_mkvmerge() {
+        return;
+    }
+    // Typo fixes and timing fixes in one file.
+    let s = Setup::scanned("timing.mkv");
+    s.add(&s.file, LATE_TYPO);
+    let path = s.file.to_string_lossy().into_owned();
+    std::fs::write(subcheck::apply::backup_path(&s.file), "an earlier backup").unwrap();
+    let (out, events, summary) = hooked(
+        &s,
+        &Mode::Apply {
+            backup: true,
+            full: false,
+        },
+    );
+    let Some(Event::Failed {
+        path: failed,
+        error,
+        text,
+        findings,
+    }) = events.last()
+    else {
+        panic!("no Failed: {events:?}");
+    };
+    assert_eq!(*failed, path);
+    assert!(
+        error.ends_with(".orig exists: an earlier backup is never overwritten"),
+        "{error}"
+    );
+    // The block is all `out` got but the summary line.
+    assert_eq!(
+        format!("{text}{}\n", apply::summary_line(&summary, true)),
+        out
+    );
+    let run = s.run();
+    let mut accepted: Vec<u64> = run
+        .findings
+        .iter()
+        .filter(|f| run.state_of(f.id) == State::Accepted)
+        .map(|f| f.id)
+        .collect();
+    accepted.sort_unstable();
+    let mut findings = findings.clone();
+    findings.sort_unstable();
+    assert_eq!(findings, accepted);
+    assert!(
+        run.findings
+            .iter()
+            .any(|f| f.timing.is_some() && findings.contains(&f.id)),
+        "a timing finding among them"
+    );
+}
+
+#[test]
+fn mkvmerges_warning_reaches_the_hook_and_the_file_is_still_done() {
+    if !have_mkvmerge() {
+        return;
+    }
+    let s = Setup::new();
+    let path = s.file.to_string_lossy().into_owned();
+    // mkvmerge, but the remux (`-o` is its second argument) then warns as mkvmerge does: a line,
+    // and exit status 1.
+    let warns = script(
+        &s.root,
+        "warning-mkvmerge",
+        "mkvmerge \"$@\" || exit $?\n\
+         if [ \"$2\" = -o ]; then echo 'Warning: a stand-in warning'; exit 1; fi\n",
+    );
+    let (_, events, summary) = hooked_with(
+        &s,
+        &Mode::Apply {
+            backup: true,
+            full: false,
+        },
+        warns.as_os_str(),
+    );
+    assert!(
+        events.contains(&Event::Warned {
+            path: path.clone(),
+            text: "Warning: a stand-in warning".into(),
+        }),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(Event::Done { remuxed: true, .. })),
+        "{events:?}"
+    );
+    assert_eq!(summary.failed, 0);
 }
 
 #[test]
@@ -560,6 +657,13 @@ fn apply_remuxes_checks_and_swaps_keeping_the_original() {
             "applied 0, already applied 7, by hand 1, not found 1; 0 remuxed, 0 failed\n"
         ),
         "{text}"
+    );
+    let tracks = s.root.join("state/subcheck/apply");
+    assert_eq!(
+        std::fs::read_dir(&tracks).unwrap().count(),
+        0,
+        "{}",
+        tracks.display()
     );
 }
 
@@ -996,7 +1100,79 @@ fn a_bad_remux_leaves_the_original_and_no_remux_behind() {
     );
     assert!(!subcheck::apply::remux_path(&s.file).exists());
     assert!(!subcheck::apply::backup_path(&s.file).exists());
+    let tracks = s.root.join("state/subcheck/apply");
+    assert_eq!(
+        std::fs::read_dir(&tracks).unwrap().count(),
+        0,
+        "{}",
+        tracks.display()
+    );
     assert_eq!(s.run().applied.len(), 0);
+}
+
+#[test]
+fn a_stop_during_the_remux_leaves_no_track_file_behind() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    if !have_mkvmerge() {
+        return;
+    }
+    let s = Setup::new();
+    let marker = s.root.join("remuxing");
+    // mkvmerge, but the remux (`-o` is its second argument) writes a marker and waits to be
+    // stopped.
+    let slow = script(
+        &s.root,
+        "slow-mkvmerge",
+        &format!(
+            "if [ \"$2\" = -o ]; then : > '{}'; exec sleep 60; fi\nexec mkvmerge \"$@\"\n",
+            marker.display()
+        ),
+    );
+    let mut apply = Command::new(env!("CARGO_BIN_EXE_subcheck"))
+        .arg("apply")
+        .args(["--mkvmerge", slow.to_str().unwrap()])
+        .env("XDG_STATE_HOME", s.root.join("state"))
+        .env("SUBCHECK_DB", s.db())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !marker.exists() {
+        assert!(
+            apply.try_wait().unwrap().is_none(),
+            "apply ended before its remux"
+        );
+        assert!(Instant::now() < deadline, "the remux never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The remux reads the fixed tracks from here: the stop comes while they are there.
+    let tracks = s.root.join("state/subcheck/apply");
+    assert!(std::fs::read_dir(&tracks).unwrap().count() > 0);
+    let pid = rustix::process::Pid::from_child(&apply);
+    rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = apply.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "apply did not end on SIGINT");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{status}");
+    let left: Vec<_> = std::fs::read_dir(&tracks)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "left in {}: {left:?}", tracks.display());
+    assert!(!subcheck::apply::remux_path(&s.file).exists());
+    assert!(!subcheck::apply::backup_path(&s.file).exists());
+    assert_eq!(
+        std::fs::read(&s.file).unwrap(),
+        std::fs::read(fixture("apply.mkv")).unwrap()
+    );
 }
 
 #[test]

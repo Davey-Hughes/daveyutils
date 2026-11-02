@@ -975,37 +975,54 @@ fn start_apply(m: &mut Model, dry_run: bool) -> Vec<Effect> {
 
 /// A step of the screen's apply: the files view follows it. A file done marks its findings (a fix
 /// made, or found made, by the store's mark instead), takes the store's new `applied` marks, and
-/// its record takes the size and mtime its checks moved to, so the view matches the store.
+/// its record takes the size and mtime its checks moved to, so the view matches the store. A file
+/// that failed marks the findings it was to fix `failed` (`would fail`), but for those the store
+/// has as applied: their fix is in the file.
 fn applied(m: &mut Model, event: apply::Event) -> Vec<Effect> {
     m.progress.apply_event(&event);
-    if let apply::Event::Done {
-        path,
-        outcomes,
-        marked,
-        restamped,
-        ..
-    } = event
-    {
-        let dry_run = m.progress.apply.as_ref().is_some_and(|a| a.dry_run);
-        for (id, outcome) in &outcomes {
-            match Mark::of(outcome, dry_run) {
-                Some(mark) => {
-                    m.marks.insert(*id, mark);
+    let dry_run = m.progress.apply.as_ref().is_some_and(|a| a.dry_run);
+    match event {
+        apply::Event::Done {
+            path,
+            outcomes,
+            marked,
+            restamped,
+            ..
+        } => {
+            for (id, outcome) in &outcomes {
+                match Mark::of(outcome, dry_run) {
+                    Some(mark) => {
+                        m.marks.insert(*id, mark);
+                    }
+                    None => {
+                        m.marks.remove(id);
+                    }
                 }
-                None => {
-                    m.marks.remove(id);
+            }
+            m.run.applied.extend(marked);
+            // Every model record for the path takes the new stamp, even if only one check kind
+            // moved: only `file_notes` reads it, and `v` re-reads the store.
+            if let Some((size, mtime)) = restamped {
+                for r in m.run.files.iter_mut().filter(|r| r.path == path) {
+                    r.size = size;
+                    r.mtime = mtime;
                 }
             }
         }
-        m.run.applied.extend(marked);
-        // Every model record for the path takes the new stamp, even if only one check kind moved:
-        // only `file_notes` reads it, and `v` re-reads the store.
-        if let Some((size, mtime)) = restamped {
-            for r in m.run.files.iter_mut().filter(|r| r.path == path) {
-                r.size = size;
-                r.mtime = mtime;
+        apply::Event::Failed {
+            error, findings, ..
+        } => {
+            for id in findings {
+                if m.run.applied.contains(&id) {
+                    m.marks.remove(&id);
+                } else if dry_run {
+                    m.marks.insert(id, Mark::WouldFail(error.clone()));
+                } else {
+                    m.marks.insert(id, Mark::Failed(error.clone()));
+                }
             }
         }
+        _ => {}
     }
     Vec::new()
 }
@@ -3123,6 +3140,45 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_or_ctrl_d_while_applying_asks_as_q_does_and_y_stops_it() {
+        // Ctrl-C and Ctrl-D are both `Msg::Quit` (`map_event`).
+        let applying = || {
+            let mut m = accepted();
+            press(&mut m, 'A');
+            press(&mut m, 'y');
+            update(
+                &mut m,
+                Msg::Apply(apply::Event::Queued(vec![path(1)])),
+                now(),
+            );
+            update(
+                &mut m,
+                Msg::Apply(apply::Event::Stage(path(1), apply::Stage::Remux)),
+                now(),
+            );
+            m
+        };
+        let mut m = applying();
+        update(&mut m, Msg::Quit, now());
+        assert!(!m.should_quit);
+        assert_eq!(
+            m.status_text(Rect::default()).as_deref(),
+            Some("apply is on E01 (remux), 0/1 — stop it and quit? y/n")
+        );
+        press(&mut m, 'n');
+        assert!(!m.should_quit && m.confirm.is_none());
+        update(&mut m, Msg::Quit, now());
+        press(&mut m, 'y');
+        // Quitting while apply runs is what stops it (`review::run` ends its groups).
+        assert!(m.should_quit && m.progress.applying());
+        // A second one, with the question open, quits too.
+        let mut m = applying();
+        update(&mut m, Msg::Quit, now());
+        update(&mut m, Msg::Quit, now());
+        assert!(m.should_quit);
+    }
+
+    #[test]
     fn a_file_done_marks_its_findings_and_takes_the_stores_marks_and_stamp() {
         let mut m = accepted();
         press(&mut m, 'D');
@@ -3182,6 +3238,69 @@ mod tests {
         assert_eq!(m.run.files[1].size, 100, "E02 was not swapped");
     }
 
+    /// Apply failed on the file at `path`, whose job was to fix `findings`: a backup in the way.
+    fn file_failed(path: String, findings: Vec<u64>) -> Msg {
+        Msg::Apply(apply::Event::Failed {
+            error: format!("{path}.orig exists: an earlier backup is never overwritten"),
+            path,
+            text: String::new(),
+            findings,
+        })
+    }
+
+    #[test]
+    fn a_failed_file_marks_its_findings_but_those_applied_already() {
+        // Findings 1 (E01) and 3 (E02) accepted; 3 is in its file already.
+        let mut m = accepted();
+        press(&mut m, 'A');
+        press(&mut m, 'y');
+        update(
+            &mut m,
+            Msg::Apply(apply::Event::Queued(vec![path(1), path(2)])),
+            now(),
+        );
+        update(&mut m, file_failed(path(1), vec![1]), now());
+        update(&mut m, file_failed(path(2), vec![3]), now());
+        let why = format!(
+            "{}.orig exists: an earlier backup is never overwritten",
+            path(1)
+        );
+        assert_eq!(m.marks.get(&1), Some(&Mark::Failed(why)));
+        // Findings 1 and 3 are at indexes 0 and 2.
+        assert_eq!(m.mark(0), Some("failed"));
+        assert_eq!(m.marks.get(&3), None);
+        assert_eq!(m.mark(2), Some("applied"));
+        // A row whose episodes differ counts them. Row 0 is the OP lyric: findings 1 (failed),
+        // 2 (applied, once the store says so) and 4 (no mark).
+        m.run.applied.insert(2);
+        assert_eq!(m.row_mark(0).as_deref(), Some("failed 1 · applied 1"));
+    }
+
+    #[test]
+    fn a_dry_run_marks_a_failed_files_findings_would_fail_and_a_decision_drops_it() {
+        let mut m = accepted();
+        press(&mut m, 'D');
+        update(
+            &mut m,
+            Msg::Apply(apply::Event::Queued(vec![path(1)])),
+            now(),
+        );
+        update(&mut m, file_failed(path(1), vec![1]), now());
+        assert_eq!(m.mark(0), Some("would fail"));
+        update(
+            &mut m,
+            Msg::ApplyEnded(Ok(apply::Summary::default())),
+            now(),
+        );
+        // Row 0 is the OP lyric (findings 1, 2 and 4): `r` rejects its pending 2 and 4, and a
+        // dry run's mark on 2 goes with its old decision.
+        m.marks.insert(2, Mark::WouldFail("disk full".into()));
+        m.selected = 0;
+        let effects = press(&mut m, 'r');
+        written(&mut m, effects);
+        assert_eq!(m.marks.get(&2), None);
+    }
+
     #[test]
     fn a_decision_change_drops_a_dry_run_mark_and_keeps_an_applys() {
         let mut m = accepted();
@@ -3197,6 +3316,40 @@ mod tests {
         let effects = press(&mut m, 'r');
         written(&mut m, effects);
         assert_eq!(m.marks.get(&3), Some(&Mark::ByHand("a karaoke row".into())));
+    }
+
+    #[test]
+    fn a_dry_run_marks_a_fix_not_found_or_left_by_hand_as_would_be() {
+        // Findings 1 (E01) and 3 (E02) accepted, at indexes 0 and 2.
+        let mut m = accepted();
+        press(&mut m, 'D');
+        update(
+            &mut m,
+            Msg::Apply(apply::Event::Queued(vec![path(1), path(2)])),
+            now(),
+        );
+        update(
+            &mut m,
+            file_done(path(1), vec![(1, Outcome::NotFound)], vec![], None),
+            now(),
+        );
+        update(
+            &mut m,
+            file_done(
+                path(2),
+                vec![(3, Outcome::ByHand("a karaoke row".into()))],
+                vec![],
+                None,
+            ),
+            now(),
+        );
+        assert_eq!(m.marks.get(&1), Some(&Mark::WouldNotBeFound));
+        assert_eq!(m.mark(0), Some("would not be found"));
+        assert_eq!(
+            m.marks.get(&3),
+            Some(&Mark::WouldBeByHand("a karaoke row".into()))
+        );
+        assert_eq!(m.mark(2), Some("would be by hand"));
     }
 
     #[test]

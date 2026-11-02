@@ -751,6 +751,53 @@ mod tests {
     }
 
     #[test]
+    fn the_detail_pane_says_why_a_dry_run_would_leave_a_fix_by_hand() {
+        let mut m = sample();
+        m.marks
+            .insert(1, Mark::WouldBeByHand("a karaoke row".into()));
+        m.selected = 0;
+        let text: Vec<String> = detail_lines(&m).iter().map(ToString::to_string).collect();
+        assert!(
+            text.iter()
+                .any(|l| l == "state: pending · would be by hand"),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|l| l == "⚠ would be left for a fix by hand: a karaoke row"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn the_detail_pane_says_why_apply_failed_on_the_file() {
+        let mut m = sample();
+        let why = format!(
+            "{}.orig exists: an earlier backup is never overwritten",
+            path(1)
+        );
+        m.marks.insert(1, Mark::Failed(why.clone()));
+        m.selected = 0;
+        let text: Vec<String> = detail_lines(&m).iter().map(ToString::to_string).collect();
+        assert!(
+            text.iter().any(|l| l == "state: pending · failed"),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|l| *l == format!("⚠ apply failed on its file: {why}")),
+            "{text:?}"
+        );
+        m.marks.insert(1, Mark::WouldFail(why.clone()));
+        let text: Vec<String> = detail_lines(&m).iter().map(ToString::to_string).collect();
+        assert!(
+            text.iter()
+                .any(|l| *l == format!("⚠ apply would fail on its file: {why}")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
     fn the_files_view_shows_apply_on_each_file_and_its_block() {
         let mut m = sample();
         m.progress.start_apply(false, "subcheck apply r".into());
@@ -782,6 +829,37 @@ mod tests {
         assert!(
             text.iter()
                 .any(|l| l == "  remuxed, verified (quick), swapped"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn the_files_list_writes_a_failures_paths_short() {
+        let mut m = sample();
+        m.progress.start_apply(false, "subcheck apply r".into());
+        m.progress.apply_event(&apply::Event::Queued(vec![path(1)]));
+        let error = format!(
+            "{}.orig exists: an earlier backup is never overwritten",
+            path(1)
+        );
+        m.progress.apply_event(&apply::Event::Failed {
+            path: path(1),
+            error: error.clone(),
+            text: format!("{}\n  failed: {error}\n\n", path(1)),
+            findings: vec![1],
+        });
+        key_into_files(&mut m);
+        let screen = render(&m, 140, 20);
+        assert!(
+            screen.contains("E01  ✗ failed: E01.orig exists: an earlier backup is never"),
+            "{screen}"
+        );
+        let text: Vec<String> = files::detail_lines(&m)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            text.iter().any(|l| *l == format!("✗ failed: {error}")),
             "{text:?}"
         );
     }

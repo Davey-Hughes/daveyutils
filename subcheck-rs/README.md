@@ -73,10 +73,11 @@ is a dry run: it asks nothing and writes nothing. Both wait for a scan to end. W
 list's top border and the status line say how far they are, the files view shows each file's
 stage (`queued`, `remux`, `✓ swapped · 3 applied · 1 by hand`), and its detail pane what apply
 wrote for it; `v` and `c` are refused until apply ends. Each row then says what became of its fix:
-`applied` (from the database, so it shows in every later review), `by hand` or `not found` for this
-session, or after a dry run `would apply`, `already applied`, `would be by hand`, `would not be
-found`; a row whose episodes differ counts them (`applied 5 · by hand 1`), and the detail pane gives
-a by-hand fix's reason. `--karaoke` on `review` or `scan` re-spaces per-letter karaoke as `apply
+`applied` (from the database, so it shows in every later review), `by hand`, `not found` or
+`failed` (its file failed) for this session, or after a dry run `would apply`, `already applied`,
+`would be by hand`, `would not be found`, `would fail`; a row whose episodes differ counts them
+(`applied 5 · by hand 1`), and the detail pane gives a by-hand fix's reason, or why its file failed.
+`--karaoke` on `review` or `scan` re-spaces per-letter karaoke as `apply
 --karaoke` does. `q` while apply runs asks first; the file it was on is left as it was, and the
 terminal gets the command that makes the rest (`subcheck apply <view>`).
 
