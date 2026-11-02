@@ -276,6 +276,7 @@ mod tests {
     use rustix::process::{Resource, Rlimit, kill_process, setrlimit};
     use std::io::Read;
     use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
 
     const CHILD: &str = "group::tests::child_that_registers_a_file_and_waits";
     const STARTER: &str = "group::tests::child_that_starts_a_group_slowly";
@@ -447,12 +448,11 @@ mod tests {
         std::thread::sleep(Duration::from_secs(10));
     }
 
-    /// Start the child on `path` the `how` way, send it `sig` once it is ready, and return whether
-    /// it died of it within `limit`.
-    fn signal(path: &Path, how: &str, sig: Signal, limit: Duration) -> bool {
+    /// The child on `path`, started the `how` way and sent `sig` once it is ready.
+    fn signalled(path: &Path, how: &str, sig: Signal) -> Child {
         let child = start(path, how);
         kill_process(Pid::from_child(&child), sig).unwrap();
-        ended_within(child, limit)
+        child
     }
 
     /// Whether `child` ends within `limit`; killed if it does not.
@@ -476,6 +476,128 @@ mod tests {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// How much longer a child that missed its deadline is waited for, so that the report can say
+    /// how long it took after all.
+    const LATE: Duration = Duration::from_secs(30);
+
+    /// `child`'s status if it ends within `limit`; else a report for the assertion: how long it took
+    /// after all (waited for up to `late` more, then killed), its threads and how loaded the
+    /// machine was when the limit passed, and what it wrote to stderr. A child slowed by a machine
+    /// deep in swap and one that hangs read differently.
+    fn ends_in_time(
+        child: &mut Child,
+        limit: Duration,
+        late: Duration,
+    ) -> Result<ExitStatus, String> {
+        let since = Instant::now();
+        if died_within(child, limit) {
+            return Ok(child.wait().unwrap());
+        }
+        let (threads, machine) = (threads(child.id()), machine());
+        let how = if died_within(child, late) {
+            format!("ended after {:.1} s", since.elapsed().as_secs_f64())
+        } else {
+            child.kill().unwrap();
+            format!(
+                "still running after {:.1} s, killed",
+                since.elapsed().as_secs_f64()
+            )
+        };
+        let status = child.wait().unwrap();
+        Err(format!(
+            "did not end within {:.1} s: {how} ({status})\n\
+             when the limit passed, its threads: {threads}\n\
+             machine: {machine}\n\
+             its stderr:\n{}",
+            limit.as_secs_f64(),
+            stderr_of(child)
+        ))
+    }
+
+    /// `child`'s status once it ends within `limit`; else a panic with [`ends_in_time`]'s report.
+    #[track_caller]
+    fn assert_ends(child: &mut Child, limit: Duration) -> ExitStatus {
+        match ends_in_time(child, limit, LATE) {
+            Ok(status) => status,
+            Err(report) => panic!("{report}"),
+        }
+    }
+
+    /// Each of process `pid`'s threads as its state and what it waits in, from `/proc`:
+    /// `S futex_wait_queue, D io_schedule`; `unknown` where there is no `/proc`.
+    fn threads(pid: u32) -> String {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            return "unknown".into();
+        };
+        let mut threads: Vec<String> = tasks
+            .flatten()
+            .map(|task| {
+                let read = |name: &str| {
+                    std::fs::read_to_string(task.path().join(name)).unwrap_or_default()
+                };
+                let stat = read("stat");
+                // The state follows the command's name, which may hold spaces and parentheses.
+                let state = stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .unwrap_or("?");
+                let wchan = read("wchan");
+                format!("{state} {}", wchan.trim())
+            })
+            .collect();
+        threads.sort();
+        threads.join(", ")
+    }
+
+    /// How loaded the machine is, from `/proc`: `load 22.68 21.02 18.74, 15.2 GB memory
+    /// available, 45.1 GB swap used`; `unknown` for what cannot be read.
+    fn machine() -> String {
+        let load = std::fs::read_to_string("/proc/loadavg").map_or_else(
+            |_| "unknown".to_string(),
+            |l| l.split_whitespace().take(3).collect::<Vec<_>>().join(" "),
+        );
+        let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let kb = |key: &str| {
+            meminfo.lines().find_map(|l| {
+                l.strip_prefix(key)?
+                    .strip_prefix(':')?
+                    .trim()
+                    .strip_suffix(" kB")?
+                    .parse::<u64>()
+                    .ok()
+            })
+        };
+        // To a tenth of a GB, in whole numbers.
+        let gb = |kb: u64| format!("{}.{} GB", kb >> 20, ((kb & 0xF_FFFF) * 10) >> 20);
+        let memory = kb("MemAvailable").map_or_else(|| "unknown".into(), gb);
+        let swap = match (kb("SwapTotal"), kb("SwapFree")) {
+            (Some(total), Some(free)) => gb(total.saturating_sub(free)),
+            _ => "unknown".into(),
+        };
+        format!("load {load}, {memory} memory available, {swap} swap used")
+    }
+
+    /// What `child` wrote to stderr, as much as comes within half a second (a group it started may
+    /// hold the pipe on): `(nothing)` for nothing, and a note when the test took the pipe itself.
+    fn stderr_of(child: &mut Child) -> String {
+        if child.stderr.is_none() {
+            return "(read by the test)".into();
+        }
+        let said = pipe_ends(child);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut bytes = Vec::new();
+        while let Ok(Some(chunk)) =
+            said.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            bytes.extend(chunk);
+        }
+        if bytes.is_empty() {
+            "(nothing)".into()
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
         }
     }
 
@@ -519,22 +641,68 @@ mod tests {
         let ready = path.with_extension("mkv.ready");
         let deadline = Instant::now() + Duration::from_secs(5);
         while !ready.exists() {
-            assert!(Instant::now() < deadline, "the child never got ready");
+            assert!(
+                Instant::now() < deadline,
+                "the child never got ready; machine: {}",
+                machine()
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         child
     }
 
     #[test]
+    fn a_child_that_misses_its_deadline_is_reported_with_its_timing_threads_stderr_and_machine() {
+        // Late, but ends within the wait past its deadline.
+        let mut late = Command::new("sh")
+            .args(["-c", "echo on its way >&2; sleep 0.5"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let report = ends_in_time(
+            &mut late,
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        for part in [
+            "did not end within 0.1 s: ended after ",
+            "when the limit passed, its threads: S",
+            "machine: load ",
+            "swap used",
+            "its stderr:\non its way",
+        ] {
+            assert!(report.contains(part), "{part:?} in:\n{report}");
+        }
+        // Still running when the wait past it runs out: killed.
+        let mut stuck = Command::new("sleep")
+            .arg("20")
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let report = ends_in_time(
+            &mut stuck,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(report.contains(", killed ("), "{report}");
+        assert!(report.contains("its stderr:\n(nothing)"), "{report}");
+        // In time: its status.
+        let mut quick = Command::new("true").stderr(Stdio::piped()).spawn().unwrap();
+        assert!(ends_in_time(&mut quick, DIES, LATE).unwrap().success());
+    }
+
+    #[test]
     fn a_second_signal_soon_after_the_first_still_lets_it_clean_up() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("half.mkv");
-        let child = start(&path, "create");
+        let mut child = start(&path, "create");
         let pid = Pid::from_child(&child);
         kill_process(pid, Signal::TERM).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         kill_process(pid, Signal::TERM).unwrap();
-        assert!(ended_within(child, DIES));
+        assert_ends(&mut child, DIES);
         assert!(!path.exists(), "the first signal's cleanup ran");
     }
 
@@ -544,12 +712,12 @@ mod tests {
         // is anyone insisting, so the second does not cut the wait short.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("half.mkv");
-        let child = start(&path, "create-long");
+        let mut child = start(&path, "create-long");
         let pid = Pid::from_child(&child);
         kill_process(pid, Signal::HUP).unwrap();
         std::thread::sleep(Duration::from_millis(200));
         kill_process(pid, Signal::HUP).unwrap();
-        assert!(ended_within(child, DIES));
+        assert_ends(&mut child, DIES);
         assert!(!path.exists(), "the first signal's cleanup ran");
     }
 
@@ -584,7 +752,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("half.mkv");
         std::fs::write(&path, "half a remux").unwrap();
-        assert!(signal(&path, "", Signal::TERM, DIES), "SIGTERM ends it");
+        assert_ends(&mut signalled(&path, "", Signal::TERM), DIES);
         assert!(!path.exists());
     }
 
@@ -607,12 +775,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("half.mkv");
         std::fs::write(&path, "half a remux").unwrap();
-        let mut child = start(&path, "returns");
-        kill_process(Pid::from_child(&child), Signal::TERM).unwrap();
-        if !died_within(&mut child, DIES) {
-            child.kill().unwrap();
-        }
-        let status = child.wait().unwrap();
+        let mut child = signalled(&path, "returns", Signal::TERM);
+        let status = assert_ends(&mut child, DIES);
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{status}");
         assert!(!path.exists(), "the cleanup ran to its end");
     }
@@ -622,12 +786,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("half.mkv");
         std::fs::write(&path, "half a remux").unwrap();
-        let mut child = start(&path, "acts");
-        kill_process(Pid::from_child(&child), Signal::TERM).unwrap();
-        if !died_within(&mut child, DIES) {
-            child.kill().unwrap();
-        }
-        let status = child.wait().unwrap();
+        let mut child = signalled(&path, "acts", Signal::TERM);
+        let status = assert_ends(&mut child, DIES);
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{status}");
         assert!(!path.with_extension("acted").exists(), "the worker went on");
         assert!(!path.exists());
@@ -640,12 +800,8 @@ mod tests {
         std::fs::write(&path, "half a remux").unwrap();
         let mut child = start(&path, "quits");
         let group_ended = pipe_ends(&mut child);
-        let returned = died_within(&mut child, DIES);
-        if !returned {
-            child.kill().unwrap();
-        }
-        let status = child.wait().unwrap();
-        assert!(returned, "the quit returns from main");
+        // The quit returns from main.
+        let status = assert_ends(&mut child, DIES);
         assert!(status.success(), "{status}");
         assert!(ends_within(&group_ended, DIES), "the groups were killed");
         assert!(!path.exists(), "the file was removed");
@@ -656,10 +812,7 @@ mod tests {
     fn a_signal_waits_for_a_file_being_made_and_removes_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("half.mkv");
-        assert!(
-            signal(&path, "create", Signal::TERM, DIES),
-            "SIGTERM ends it"
-        );
+        assert_ends(&mut signalled(&path, "create", Signal::TERM), DIES);
         assert!(!path.exists());
     }
 
@@ -668,10 +821,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kept.mkv");
         std::fs::write(&path, "the original").unwrap();
-        assert!(
-            signal(&path, "forget", Signal::TERM, DIES),
-            "SIGTERM ends it"
-        );
+        assert_ends(&mut signalled(&path, "forget", Signal::TERM), DIES);
         assert!(path.exists());
     }
 
@@ -684,10 +834,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("half.mkv");
         std::fs::write(&path, "half a remux").unwrap();
-        assert!(
-            signal(&path, "no-thread", Signal::TERM, DIES),
-            "SIGTERM ends it"
-        );
+        assert_ends(&mut signalled(&path, "no-thread", Signal::TERM), DIES);
     }
 
     #[test]
@@ -696,7 +843,10 @@ mod tests {
         let path = dir.path().join("half.mkv");
         std::fs::write(&path, "half a remux").unwrap();
         assert!(
-            !signal(&path, "nohup", Signal::HUP, Duration::from_secs(1)),
+            !ended_within(
+                signalled(&path, "nohup", Signal::HUP),
+                Duration::from_secs(1)
+            ),
             "nohup: SIGHUP must not end it"
         );
         assert!(path.exists());
