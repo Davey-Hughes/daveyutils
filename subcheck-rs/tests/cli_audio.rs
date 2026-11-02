@@ -3,10 +3,9 @@
 
 mod common;
 
-use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Output};
 
-use common::{fixture, have_ffmpeg};
+use common::{fixture, have_ffmpeg, script};
 
 fn subcheck(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_subcheck"))
@@ -92,13 +91,11 @@ fn a_missing_ffmpeg_stops_it_before_the_first_file() {
 fn an_ffmpeg_that_fails_fails_its_file_and_the_others_are_still_checked() {
     // Answers -version, refuses everything else.
     let dir = tempfile::tempdir().unwrap();
-    let stub = dir.path().join("ffmpeg");
-    std::fs::write(
-        &stub,
-        "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\necho 'first line' >&2\necho 'Invalid data found' >&2\nexit 1\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let stub = script(
+        dir.path(),
+        "ffmpeg",
+        "[ \"$1\" = -version ] && exit 0\necho 'first line' >&2\necho 'Invalid data found' >&2\nexit 1\n",
+    );
     let out = subcheck(&[
         "audio",
         "--ffmpeg",

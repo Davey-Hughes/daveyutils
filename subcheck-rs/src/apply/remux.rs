@@ -377,6 +377,7 @@ fn read_languages(json: &[u8]) -> Result<Languages, Unread> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::script;
 
     #[test]
     fn mkvmerge_s_reading_is_taken_by_track_uid_tag_first() {
@@ -594,15 +595,6 @@ mod tests {
             .concat(),
         );
         assert_eq!(notes(&statistics), [].into());
-    }
-
-    /// An executable script `name` in `dir`.
-    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
-        path
     }
 
     #[test]

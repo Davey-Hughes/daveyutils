@@ -18,5 +18,7 @@ pub mod review;
 pub mod scan;
 pub mod store;
 pub mod subs;
+#[cfg(test)]
+mod test_support;
 pub mod text;
 pub mod timing;

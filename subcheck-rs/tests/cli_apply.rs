@@ -9,7 +9,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use common::{fixture, have_mkvmerge, patch};
+use common::{fixture, have_mkvmerge, patch, script};
 use subcheck::apply::patch::Outcome;
 use subcheck::apply::{self, Event, Mode, Stage};
 use subcheck::scan::file_stamp;
@@ -1093,14 +1093,6 @@ fn an_earlier_backup_is_never_overwritten() {
         std::fs::read(&s.file).unwrap(),
         std::fs::read(fixture("apply.mkv")).unwrap()
     );
-}
-
-/// An executable script `name` in `dir`.
-fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    path
 }
 
 #[test]

@@ -97,6 +97,30 @@ pub fn have_ffmpeg() -> bool {
     ok
 }
 
+/// An executable script `name` in `dir`: `#!/bin/sh` and `body`. A child writes it, not this
+/// process. Tests run on threads that start processes, and a child forked while this process held
+/// the script open for writing keeps it open until that child execs. Running the script then fails
+/// with "Text file busy" (ETXTBSY).
+#[allow(dead_code)] // only some test files run scripts
+pub fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let path = dir.join(name);
+    let mut sh = Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    sh.stdin
+        .take()
+        .unwrap()
+        .write_all(format!("#!/bin/sh\n{body}").as_bytes())
+        .unwrap();
+    assert!(sh.wait().unwrap().success(), "writing {}", path.display());
+    path
+}
+
 /// A file under tests/fixtures/, built by dev/make-subcheck-fixtures.sh.
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

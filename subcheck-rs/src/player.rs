@@ -407,6 +407,7 @@ impl Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::script;
     use std::os::unix::net::UnixListener;
     use std::thread;
 
@@ -765,15 +766,6 @@ mod tests {
         assert_eq!(player.open(&moment()), Ok(()));
         server.join().unwrap();
         assert_eq!(count(), 4);
-    }
-
-    /// An executable script `name` in `dir`.
-    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
-        path
     }
 
     #[test]
