@@ -6,7 +6,7 @@
 # rustup finds this file from the working directory upward, so it governs every cargo run inside
 # the repository, from the root with --manifest-path or from a crate.
 #
-# To move on: change `channel` here and the four `image: rust:<version>-bookworm` lines in
+# To move on: change `channel` here and the three `image: rust:<version>-bookworm` lines in
 # .forgejo/workflows/ci.yml with it. A mismatch still builds with this version -- rustup honours
 # the file inside the image too -- but every job then downloads it first. An editor's
 # rust-analyzer, through rustup's proxy, needs `rustup component add rust-analyzer` after a bump;

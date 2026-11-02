@@ -24,3 +24,9 @@ packaging/aur/nudge-git/daveyutils/
 # tracked -- they were purged from the history, and leaving them untracked would
 # let a routine `git add -A` put them straight back.
 docs/
+
+# subcheck moved to its own repository (davey/subcheck) on 2026-11-02. A checkout from before then
+# keeps subcheck-rs/target/ (build output git never tracked) once the move is pulled, and the
+# .gitignore that hid it went with the crate. Ignored here so a routine `git add -A` cannot commit
+# gigabytes of it; delete the folder, and bin/subcheck, which still runs the old build from it.
+/subcheck-rs/

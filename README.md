@@ -12,7 +12,9 @@ Random command-line utilities. Each one has a `--help`; run it for usage.
 | `mkvpropedit_set_name` | Set each MKV's title tag from its filename | `mkvpropedit` |
 | `usage` | Show how much of the plan limits is used for every Claude and Codex account, and this month's Claude/OpenAI API spend per Admin key; `usage add` saves more accounts and keys | `curl`, `jq`; `flock` for saved accounts |
 | `nudge` | Rate-limit auto-resumer for AI CLIs in tmux (Rust — see `nudge-rs/`) | `tmux` |
-| `subcheck` | Proofread the text subtitles in MKVs with an LLM and review the fixes; find tracks shifted by whole frames; extract a track without reading the whole file (Rust — see `subcheck-rs/`) | `claude`, `codex` or `ollama` (for `scan`); `mpv` (for `review`) |
+
+`subcheck`, which proofreads the subtitles in MKVs with an LLM, was here until 2026-11-02 and now
+has a repository of its own: [Davey-Hughes/subcheck](https://github.com/Davey-Hughes/subcheck).
 
 ## Install
 
@@ -25,12 +27,12 @@ export PATH="$PWD/bin:$PATH"     # add to your shell rc
 ```
 
 The bash scripts are **symlinked**, so editing one takes effect immediately.
-`nudge` and `subcheck` are built from `nudge-rs/` and `subcheck-rs/`
-(`cargo build --release`) and linked in — and since they are the only utilities
-here that need compiling, bare `make` rebuilds and relinks just them.
+`nudge` is built from `nudge-rs/` (`cargo build --release`) and linked in — and
+since it is the only utility here that needs compiling, bare `make` rebuilds and
+relinks just it.
 
 ```sh
-make          # build nudge and subcheck + link them into ./bin
+make          # build nudge + link it into ./bin
 make all      # that, plus a symlink for every script
 make check    # run the bash and Rust test suites
 make clean    # remove ./bin
@@ -47,33 +49,6 @@ make help     # list targets
   the pane — and which pane, to `<state dir>/nudge.log` (`~/.local/state/nudge/` on Linux,
   `~/Library/Application Support/nudge/` on macOS). That is where to look when a
   nudge did not fire; `--notify` reports the same outcomes at the time.
-- `subcheck-rs/` — the Rust `subcheck`. It reads an MKV's subtitle packets through the file's own
-  index (Cues) instead of reading the whole file. Its test fixtures are small MKVs built by
-  `dev/make-subcheck-fixtures.sh` and committed, with mkvextract's output for each as the oracle.
-  `subcheck scan` sends the English lines to an LLM (`--llm claude`, `gpt` for Codex,
-  `ollama:<model>`, or any command with `--llm-cmd`) and records each suggested fix in a run file
-  under `~/.local/state/subcheck/`, with each track the timing check below finds shifted, and the
-  tokens each LLM call used (and claude's price for it at API rates), which `scan`, `list` and
-  `review` add up. Checks already made of an unchanged file are skipped; `scan --run <run>` adds
-  to that run only the checks it lacks.
-  `subcheck review` steps through a run's fixes to accept, reject or reword each (a fix repeated
-  across episodes is one row, as is a season's track's timing), and `o` opens the moment in mpv,
-  reusing one window: a timing finding paused on the frame that shows the error, which `[` `]` step
-  through a frame at a time.
-  `subcheck list` prints the same as text, and `--mpv` adds a command that opens each one.
-  `subcheck apply` makes the accepted fixes, a file's typos and timing fixes together: mkvmerge
-  remuxes each file beside the original, the remux is checked against it, and then it takes the
-  original's place (kept as `.orig`). A timing fix moves each line by whole frames on the video's
-  frame grid, to the same place in its new frame.
-  `--tracks-only` and `--check` split that up for files to be remuxed elsewhere.
-  Review's keys and mouse, and a KDE window rule that keeps focus in the terminal:
-  `subcheck-rs/README.md`.
-  `subcheck timing` reports subtitle tracks shifted by whole frames against the video (every line
-  a frame late, or part of a track), with the `mkvmerge --sync` that fixes a whole-track shift. A
-  track with too few lines on cuts for a verdict (a Signs/Songs track, say) is timed by the lines
-  it shares with another track of the file. It reads only the index and the subtitles: seconds
-  per file when the subtitles have Cues, as mkvmerge writes them by default. No LLM, nothing
-  recorded.
 - `tests/` — bash test-suite (`bash tests/run.sh`); Rust tests live in each crate.
 - `dev/` — tooling for working on this repo, deliberately NOT in `scripts/`: the Makefile
   links every `scripts/*` onto your PATH, so a dev script placed there would ship as a

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The local mirror of CI (.forgejo/workflows/ci.yml, and its macOS-only counterpart in
-# .github/workflows/tests.yml + nudge-rs.yml + subcheck-rs.yml). Run it before you push a branch and
+# .github/workflows/tests.yml + nudge-rs.yml). Run it before you push a branch and
 # open a PR: CI runs these same jobs there, and this is them several minutes earlier.
 #
 #   dev/check-all.sh            # everything CI gates on
@@ -43,15 +43,12 @@ echo "    $(ls scripts | wc -l) scripts, $(ls tests/*.sh | wc -l) test files, $(
 # As in CI: usage's tests fail, rather than skip, without jq.
 USAGE_NEED_JQ=1 run bash tests/run.sh
 
-# --- the `nudge-rs` and `subcheck-rs` jobs: the same four legs for each crate ---
-crates=(nudge-rs subcheck-rs)
+# --- the `nudge-rs` job: rustfmt, clippy, the tests, the doctests ---
+crates=(nudge-rs)
 if [ "$no_rust" -eq 1 ]; then
   echo; echo "==> SKIPPED: ${crates[*]} (--no-rust)"
   echo "    CI still runs them. Do not land on the strength of this run alone."
 else
-  # As in CI: subcheck's `apply` tests fail, rather than skip, without mkvmerge, and its `audio`
-  # tests without ffmpeg.
-  export SUBCHECK_NEED_MKVMERGE=1 SUBCHECK_NEED_FFMPEG=1
   # As in CI: which Rust this was, in the log (rust-toolchain.toml names it).
   run rustc --version
   for crate in "${crates[@]}"; do

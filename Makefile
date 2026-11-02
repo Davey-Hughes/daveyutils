@@ -1,6 +1,6 @@
 # daveyutils — collect every runnable utility into ./bin (gitignored).
 #
-#   make            build nudge and subcheck and link them into ./bin
+#   make            build nudge and link it into ./bin
 #   make all        that, plus a symlink for every script in scripts/
 #   make clean      remove ./bin
 #   make distclean  remove ./bin and the Rust build artifacts
@@ -11,8 +11,7 @@
 #   export PATH="/path/to/daveyutils/bin:$PATH"
 #
 # The bash scripts are SYMLINKED, so editing one takes effect immediately.
-# `nudge` and `subcheck` are the Rust binaries from nudge-rs/ and subcheck-rs/,
-# built and linked separately below.
+# `nudge` is the Rust binary from nudge-rs/, built and linked separately below.
 
 BIN := bin
 # Pin cargo's output dirs. An inherited CARGO_TARGET_DIR would otherwise put the
@@ -20,12 +19,10 @@ BIN := bin
 # success -- so we pass --target-dir explicitly rather than trusting the default.
 TARGET_DIR := nudge-rs/target
 NUDGE      := $(TARGET_DIR)/release/nudge
-SUBCHECK_TARGET_DIR := subcheck-rs/target
-SUBCHECK            := $(SUBCHECK_TARGET_DIR)/release/subcheck
 SCRIPTS := $(wildcard scripts/*)
-CRATES  := nudge-rs subcheck-rs
+CRATES  := nudge-rs
 
-.PHONY: all bins nudge subcheck link link-nudge link-subcheck link-scripts build-nudge build-subcheck path-hint clean distclean check help
+.PHONY: all bins nudge link link-nudge link-scripts build-nudge path-hint clean distclean check help
 
 # Bare `make` builds and links the compiled utilities only. They are the ones
 # you re-run after a change; the scripts are symlinks that never go stale.
@@ -37,30 +34,22 @@ CRATES  := nudge-rs subcheck-rs
 # would race ahead of the links it is describing.
 .NOTPARALLEL:
 
-## bins: (default) build nudge and subcheck and link them into ./bin
-bins: link-nudge link-subcheck path-hint
+## bins: (default) build nudge and link it into ./bin
+bins: link-nudge path-hint
 
 ## nudge: build nudge alone and link it into ./bin
 nudge: link-nudge path-hint
 
-## subcheck: build subcheck alone and link it into ./bin
-subcheck: link-subcheck path-hint
-
-## all: build both binaries and symlink every utility into ./bin
+## all: build nudge and symlink every utility into ./bin
 all: link
 
 # Kept as the old name for "link everything", so `make link` still works.
-link: link-nudge link-subcheck link-scripts path-hint
+link: link-nudge link-scripts path-hint
 
 link-nudge: build-nudge | $(BIN)
 	@ln -sfn "../$(NUDGE)" "$(BIN)/nudge"
 	@test -e "$(BIN)/nudge" || { printf 'error: %s/nudge is a dangling symlink (no binary at %s)\n' "$(BIN)" "$(NUDGE)" >&2; exit 1; }
 	@echo "  link  $(BIN)/nudge -> ../$(NUDGE)"
-
-link-subcheck: build-subcheck | $(BIN)
-	@ln -sfn "../$(SUBCHECK)" "$(BIN)/subcheck"
-	@test -e "$(BIN)/subcheck" || { printf 'error: %s/subcheck is a dangling symlink (no binary at %s)\n' "$(BIN)" "$(SUBCHECK)" >&2; exit 1; }
-	@echo "  link  $(BIN)/subcheck -> ../$(SUBCHECK)"
 
 link-scripts: | $(BIN)
 	@for s in $(SCRIPTS); do \
@@ -81,11 +70,6 @@ build-nudge:
 	@cargo build --release --manifest-path nudge-rs/Cargo.toml --target-dir "$(TARGET_DIR)"
 	@test -x "$(NUDGE)" || { printf 'error: cargo reported success but there is no binary at %s\n' "$(NUDGE)" >&2; exit 1; }
 
-## build-subcheck: cargo build --release the subcheck binary
-build-subcheck:
-	@cargo build --release --manifest-path subcheck-rs/Cargo.toml --target-dir "$(SUBCHECK_TARGET_DIR)"
-	@test -x "$(SUBCHECK)" || { printf 'error: cargo reported success but there is no binary at %s\n' "$(SUBCHECK)" >&2; exit 1; }
-
 ## clean: remove ./bin (leaves the Rust build cache alone)
 clean:
 	@rm -rf $(BIN)
@@ -94,8 +78,7 @@ clean:
 ## distclean: remove ./bin and the Rust build artifacts
 distclean: clean
 	@cargo clean --manifest-path nudge-rs/Cargo.toml --target-dir "$(TARGET_DIR)"
-	@cargo clean --manifest-path subcheck-rs/Cargo.toml --target-dir "$(SUBCHECK_TARGET_DIR)"
-	@echo "removed nudge-rs and subcheck-rs build artifacts"
+	@echo "removed nudge-rs build artifacts"
 
 ## check: run the bash test-suite and every crate's Rust tests
 #
