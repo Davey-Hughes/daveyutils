@@ -665,9 +665,15 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap_err();
+        // The threads come from /proc, which macOS does not have.
+        let threads = if cfg!(target_os = "linux") {
+            "when the limit passed, its threads: S"
+        } else {
+            "when the limit passed, its threads: unknown"
+        };
         for part in [
             "did not end within 0.1 s: ended after ",
-            "when the limit passed, its threads: S",
+            threads,
             "machine: load ",
             "swap used",
             "its stderr:\non its way",
