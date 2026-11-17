@@ -1141,9 +1141,11 @@ main() {
     # Every time here is UTC. jq 1.6's date functions apply local DST, an hour
     # out for half the year; nothing is ever shown in local time.
     export TZ=UTC
-    # Decided here: the blocks print into a capture, never a terminal.
+    # Decided here: the blocks print into a capture, never a terminal. A TERM
+    # that is dumb, empty or unset says the terminal may show escapes as text.
     COLOR=false
-    if [[ -z "${NO_COLOR:-}" ]] && { [[ -t 1 ]] || [[ "${CLICOLOR_FORCE:-0}" != 0 ]]; }; then
+    if [[ -z "${NO_COLOR:-}" ]] &&
+        { [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb ]] || [[ "${CLICOLOR_FORCE:-0}" != 0 ]]; }; then
         COLOR=true
     fi
 
@@ -1236,10 +1238,31 @@ queue() {
     { "$@" </dev/null > "$JOBS/$JOB_COUNT.out" 2>&1; echo $? > "$JOBS/$JOB_COUNT.rc"; } &
 }
 
-# print_blocks: every queued block, a blank line between each. Grouped as
-# queued; within a group, accounts with weekly room left before full ones, each
-# soonest weekly reset first and no reset pending after; errors (no #sort line)
-# last; ties in queue order. Fails if any block did.
+# Between services: as wide as a full row (2 + 14 + 1 + 20 + 1 + 9 + 17).
+RULE=────────────────────────────────────────────────────────────────
+
+# paint_heads: stdin to stdout, the service name that starts a header or error
+# line made bold in the service's color (not yellow or red, which the bars use,
+# nor green, which would read as "ok"), and the API spend heading bold.
+paint_heads() {
+    local line word code
+    while IFS= read -r line; do
+        case "$line" in
+            "Claude · "*) word=Claude code=173 ;;
+            "Codex · "*) word=Codex code=37 ;;
+            "Antigravity · "*) word=Antigravity code=75 ;;
+            "API spend") printf '\033[1m%s\033[0m\n' "$line"; continue ;;
+            *) printf '%s\n' "$line"; continue ;;
+        esac
+        printf '\033[1;38;5;%sm%s\033[0m%s\n' "$code" "$word" "${line#"$word"}"
+    done
+}
+
+# print_blocks: every queued block, a blank line between the accounts of a
+# service and a rule between services. Grouped as queued; within a group,
+# accounts with weekly room left before full ones, each soonest weekly reset
+# first and no reset pending after; errors (no #sort line) last; ties in queue
+# order. Fails if any block did.
 print_blocks() {
     local n rc=0 first out full reset key group tier class shown=""
     # A block with no status was lost (killed); that counts as a failure.
@@ -1257,12 +1280,20 @@ print_blocks() {
         fi
         printf '%s\t%s\t%s\t%s\t%s\n' "$group" "$tier" "$class" "$key" "$n"
     done | sort -t "$(printf '\t')" -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n | {
-        while IFS=$'\t' read -r _ _ _ _ n; do
+        while IFS=$'\t' read -r group _ _ _ n; do
             out=$(grep -v '^#sort ' "$JOBS/$n.out")
             [[ -n "$out" ]] || continue
-            if [[ -n "$shown" ]]; then echo; fi
-            printf '%s\n' "$out"
-            shown=1
+            # $shown: the group of the last block printed.
+            if [[ -z "$shown" ]]; then :
+            elif [[ "$group" == "$shown" ]]; then echo
+            elif [[ "$COLOR" == true ]]; then printf '\033[2m%s\033[0m\n' "$RULE"
+            else printf '%s\n' "$RULE"; fi
+            if [[ "$COLOR" == true ]]; then
+                printf '%s\n' "$out" | paint_heads
+            else
+                printf '%s\n' "$out"
+            fi
+            shown=$group
         done
     }
     return "$rc"

@@ -218,14 +218,26 @@ EOF
 EOF
 }
 
-# run_usage [args...] -> stdout+stderr in $OUT, status in $RC
+# in_pty <command...>: the command with a terminal as its stdout, through
+# script(1) (util-linux's or BSD's), never reading the caller's terminal.
+in_pty() {
+    if script -V >/dev/null 2>&1; then
+        SHELL=$BASH script -qec "$(printf '%q ' "$@")" /dev/null </dev/null
+    else
+        script -q /dev/null "$@" </dev/null
+    fi
+}
+
+# run_usage [args...] -> stdout+stderr in $OUT, status in $RC. With RUN_IN=in_pty
+# both go to a terminal, and the \r it adds to each line is taken out of $OUT.
 run_usage() {
-    OUT=$(env -u ANTHROPIC_ADMIN_API_KEY -u OPENAI_ADMIN_KEY \
+    OUT=$(${RUN_IN:+"$RUN_IN"} env -u ANTHROPIC_ADMIN_API_KEY -u OPENAI_ADMIN_KEY -u NO_COLOR -u CLICOLOR_FORCE \
         PATH="$STUB:${BASE_PATH:-$PATH}" FIXTURES="$FIXTURES" USAGE_NOW="$NOW" \
         XDG_DATA_HOME="$FIXTURES/data" TZ=America/Los_Angeles \
         CLAUDE_CONFIG_DIR="$FIXTURES/claude" CODEX_HOME="$FIXTURES/codex" \
         "${EXTRA_ENV[@]}" bash "$SCRIPT" "$@" 2>&1)
     RC=$?
+    [[ -z "${RUN_IN:-}" ]] || OUT=${OUT//$'\r'/}
 }
 
 has() { case "$OUT" in *"$1"*) echo yes ;; *) echo no ;; esac; }
@@ -881,16 +893,25 @@ OUT=$(env -u ANTHROPIC_ADMIN_API_KEY -u OPENAI_ADMIN_KEY -u CLAUDE_CONFIG_DIR \
     XDG_DATA_HOME="$FIXTURES/data" CODEX_HOME="$FIXTURES/codex" bash "$SCRIPT" 2>&1)
 check "dedupe: default config dir reads ~/.claude.json" "no" "$(has 'Claude · current login')"
 
-# --- a blank line between accounts ---------------------------------------------
+# --- a blank line between accounts, a rule between services ---------------------
+RULE=$(printf '─%.0s' {1..64})
+# layout: each top-level line's first word, "blank" or "rule" for the others.
+layout() {
+    printf '%s\n' "$OUT" |
+        awk -v r="$RULE" '/^$/ { print "blank"; next } $0 == r { print "rule"; next } /^[^ ]/ { print $1 }' |
+        paste -sd'|' -
+}
+
 setup gaps
 saved_claude home tok-h ref-h $((NOW + 3600)) h@example.com
 saved_claude work tok-w ref-w $((NOW + 3600)) w@example.com
 run_usage
 # Blocks: Claude current, home, work; Codex current (no keys, so no API spend).
-check "gaps: one blank line between each of 4 blocks" "3" "$(printf '%s\n' "$OUT" | grep -c '^$')"
+check "gaps: a blank line between the 3 Claude blocks" "2" "$(printf '%s\n' "$OUT" | grep -c '^$')"
+check "gaps: a rule between Claude and Codex" "1" "$(printf '%s\n' "$OUT" | grep -cxF "$RULE")"
 check "gaps: no blank line first" "Claude · current login (max)" "$(printf '%s\n' "$OUT" | head -1)"
 check "gaps: no blank line last" "no" "$(printf '%s\n' "$OUT" | tail -1 | grep -q '^$' && echo yes || echo no)"
-check "gaps: blank before each of the 3 later blocks" "||" \
+check "gaps: blank before the 2 later Claude blocks, a rule before Codex" "||$RULE" \
     "$(printf '%s\n' "$OUT" | grep -B1 -E '^(Claude|Codex) · [a-z]' | grep -vE '^(Claude|Codex|--)' | paste -sd'|' -)"
 check "gaps: none inside a block" "Claude · home (max) · h@example.com|  session" \
     "$(printf '%s\n' "$OUT" | grep -A1 '^Claude · home' | sed -E 's/^(  [a-z]+).*/\1/' | paste -sd'|' -)"
@@ -901,6 +922,21 @@ saved_claude work tok-w ref-w $((NOW + 3600)) w@example.com
 rm "$FIXTURES/data/usage/accounts/claude/work/.credentials.json"
 run_usage
 check "gaps: error line set apart" "" "$(printf '%s\n' "$OUT" | grep -B1 '^Claude · work: signed out' | head -1)"
+
+# Every service, the API section and an error block at a service's start.
+setup rules
+saved_claude home tok-h ref-h $((NOW + 3600)) h@example.com
+echo 401 > "$FIXTURES/codex.code"
+agy_on; agy_fixtures current
+api_fixtures
+EXTRA_ENV+=(ANTHROPIC_ADMIN_API_KEY=sk-ant-admin-x)
+run_usage
+EXTRA_ENV=()
+check "rules: one between each service, blank lines within" "Claude|blank|Claude|rule|Codex|rule|Antigravity|rule|API" \
+    "$(layout)"
+check "rules: an error block gets one too" "Codex · current login: login expired; run codex to refresh it" \
+    "$(printf '%s\n' "$OUT" | grep -A1 -xF "$RULE" | sed -n 2p)"
+check "rules: plain when not a terminal" "no" "$(printf '%s' "$OUT" | grep -qF "$(printf '\033')" && echo yes || echo no)"
 
 # --- sorted by weekly reset, all queried before anything prints ---------------------
 # claude_weekly <token> <iso|null> [percent]: that token's usage answer, with
@@ -941,7 +977,8 @@ check "sorted: room left first, then full, each by weekly reset; errors last" \
 check "sorted: the sort key never shows" "no" "$(printf '%s' "$OUT" | grep -q '#sort' && echo yes || echo no)"
 check "sorted: rows stay under their account" "Claude · later (max) · l@example.com|  session" \
     "$(printf '%s\n' "$OUT" | grep -A1 '^Claude · later' | sed -E 's/^(  [a-z]+).*/\1/' | paste -sd'|' -)"
-check "sorted: still a gap between each" "8" "$(printf '%s\n' "$OUT" | grep -c '^$')"
+check "sorted: still a gap between each" "7" "$(printf '%s\n' "$OUT" | grep -c '^$')"
+check "sorted: one rule between services" "1" "$(printf '%s\n' "$OUT" | grep -cxF "$RULE")"
 check "sorted: a failed account still fails the run" "1" "$RC"
 
 # Queried together: four answers that each take a second come back in about one.
@@ -983,7 +1020,8 @@ check "bar: no brackets"         "no" "$(printf '%s' "$OUT" | grep -qF '[' && ec
 
 # --- colors ------------------------------------------------------------------------
 # Plain up to half used, yellow past half, red when full. Only in a terminal
-# (the tests force it with CLICOLOR_FORCE), and never with NO_COLOR.
+# whose TERM is set and not dumb, or with CLICOLOR_FORCE (most tests force it
+# that way), and never with NO_COLOR.
 setup colors
 jq '.limits = [
       {"group":"session","percent":0,"resets_at":null},
@@ -1013,6 +1051,62 @@ EXTRA_ENV=()
 check "colors: NO_COLOR wins" "no" "$(printf '%s' "$OUT" | grep -qF "$ESC" && echo yes || echo no)"
 run_usage
 check "colors: none when not a terminal" "no" "$(printf '%s' "$OUT" | grep -qF "$ESC" && echo yes || echo no)"
+
+# Each service's name bold in its own color, at the start of its headers and
+# error lines; API spend bold; the rules dim.
+setup colors-heads
+saved_claude home tok-h ref-h $((NOW + 3600)) h@example.com
+saved_claude work tok-w ref-w $((NOW + 3600)) w@example.com
+echo 500 > "$FIXTURES/claude.tok-w.code"
+echo 401 > "$FIXTURES/codex.code"
+agy_on; agy_fixtures current
+api_fixtures
+EXTRA_ENV+=(ANTHROPIC_ADMIN_API_KEY=sk-ant-admin-x CLICOLOR_FORCE=1)
+run_usage
+hd() { printf '\033[1;38;5;%sm%s\033[0m' "$1" "$2"; }
+# starts <text>: yes when some line of $OUT begins with it.
+starts() { printf '%s\n' "$OUT" | awk -v p="$1" 'index($0, p) == 1 { f = 1 } END { print f ? "yes" : "no" }'; }
+is_line() { printf '%s\n' "$OUT" | grep -qxF -- "$1" && echo yes || echo no; }
+check "colors: Claude header" "yes" "$(is_line "$(hd 173 Claude) · home (max) · h@example.com")"
+check "colors: Claude error line" "yes" "$(starts "$(hd 173 Claude) · work: HTTP 500")"
+check "colors: Codex error line" "yes" \
+    "$(is_line "$(hd 37 Codex) · current login: login expired; run codex to refresh it")"
+check "colors: Antigravity header" "yes" "$(starts "$(hd 75 Antigravity) · current login")"
+check "colors: API spend bold" "yes" "$(is_line "${ESC}[1mAPI spend${ESC}[0m")"
+check "colors: rule dim" "3" "$(printf '%s\n' "$OUT" | grep -cxF "${ESC}[2m${RULE}${ESC}[0m")"
+check "colors: indented names stay plain" "2" \
+    "$(printf '%s\n' "$OUT" | grep -E '^  (Claude and GPT models$|Anthropic API · env)' | grep -cvF "$ESC")"
+check "colors: one escape pair per header" "2" \
+    "$(printf '%s\n' "$OUT" | grep -F '· home (max)' | grep -oF "${ESC}[" | wc -l | tr -d ' ')"
+EXTRA_ENV+=(NO_COLOR=1)
+run_usage
+EXTRA_ENV=()
+check "colors: NO_COLOR keeps the rules" "Claude|blank|Claude|blank|Claude|rule|Codex|rule|Antigravity|rule|API" "$(layout)"
+check "colors: NO_COLOR, no escapes" "no" "$(printf '%s' "$OUT" | grep -qF "$ESC" && echo yes || echo no)"
+
+# In a real terminal: colors, unless TERM is dumb or empty (CLICOLOR_FORCE still
+# forces them).
+if command -v script >/dev/null 2>&1; then
+    RUN_IN=in_pty
+    EXTRA_ENV=(TERM=xterm-256color)
+    run_usage
+    check "colors: on in a terminal" "yes" "$(printf '%s' "$OUT" | grep -qF "$(hd 37 Codex)" && echo yes || echo no)"
+    EXTRA_ENV=(TERM=dumb)
+    run_usage
+    check "colors: off in a dumb terminal" "no" "$(printf '%s' "$OUT" | grep -qF "$ESC" && echo yes || echo no)"
+    # Claude, then Codex (no agy, no API keys): one rule, a whole line.
+    check "colors: a dumb terminal still gets the rule" "1" "$(printf '%s\n' "$OUT" | grep -cxF "$RULE")"
+    EXTRA_ENV=(TERM=)
+    run_usage
+    check "colors: off when TERM is empty" "no" "$(printf '%s' "$OUT" | grep -qF "$ESC" && echo yes || echo no)"
+    EXTRA_ENV=(TERM=dumb CLICOLOR_FORCE=1)
+    run_usage
+    check "colors: CLICOLOR_FORCE beats a dumb terminal" "yes" \
+        "$(printf '%s' "$OUT" | grep -qF "$(hd 37 Codex)" && echo yes || echo no)"
+    RUN_IN="" EXTRA_ENV=()
+else
+    printf '  skip: script(1) not installed, terminal colors untested\n'
+fi
 
 # --- rename ----------------------------------------------------------------------
 setup rename-key
