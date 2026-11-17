@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# usage - how much of your Claude and Codex plan limits is used, and this
-# month's API spend.
+# usage - how much of your Claude, Codex and Antigravity plan limits is used,
+# and this month's API spend.
 #
 # Usage: usage
 #        usage add <kind> <name>
@@ -13,24 +13,41 @@
 #               default ~/.claude; the login keychain on macOS)
 #   Codex       the 5-hour and weekly limits of a ChatGPT plan, read with
 #               Codex's own login ($CODEX_HOME/auth.json, default ~/.codex)
+#   Antigravity the 5-hour and weekly limits of each model group, read by
+#               running `agy -p /usage` (and `/credits`), so it needs agy
 #   API spend   month-to-date spend on the Claude Platform and the OpenAI API
 #               for each Admin key: ANTHROPIC_ADMIN_API_KEY / OPENAI_ADMIN_KEY,
 #               and any saved with `usage add anthropic-api|openai-api <name>`;
 #               shown only once there is a key
 #
 # Kinds: claude, codex (a separate sign-in, made by running the CLI's own
-# login; extra args go to `codex login`, e.g. --device-auth), anthropic-api,
-# openai-api (an Admin key, read from the terminal or stdin). Adding a name
-# again replaces it; removing a login signs it out; renaming keeps the login
-# or key as it is. Names: letters, digits, . _ -, starting with a letter,
-# digit or _. Saved under
+# login; extra args go to `codex login`, e.g. --device-auth), antigravity
+# (signed in with `agy acp --login`, which opens the page in your browser),
+# anthropic-api, openai-api (an Admin key, read from the terminal or stdin).
+# Adding a name again replaces it; removing a Claude or Codex login signs it
+# out; renaming keeps the login or key as it is. Removing an Antigravity login
+# deletes its folder and doesn't revoke it at Google, as that can sign out
+# every agy login of the account; for the same reason, adding its name again
+# leaves the old sign-in valid. Names: letters, digits, . _ -, starting with a
+# letter, digit or _. Saved under
 # ${XDG_DATA_HOME:-~/.local/share}/usage, readable only by you.
 #
 # Every saved account is shown, plus the CLI's current login unless that
-# account is saved too. A saved login is its own session, so usage renews it
-# when it expires, without signing the CLI out; the CLI's own login is only
-# read. Saved accounts need flock (util-linux), which macOS lacks; saved Claude
-# accounts are not supported on macOS at all.
+# account is saved too. A saved login is its own session, renewed when it
+# expires (by usage for Claude and Codex, by agy for Antigravity) without
+# signing the CLI out; usage only reads the CLI's own login. Saved accounts
+# need flock (util-linux), which macOS lacks; saved Claude accounts are not
+# supported on macOS at all, nor are saved Antigravity ones.
+#
+# Antigravity's current login is the one in the system keyring, read with a
+# throwaway HOME, so nothing of agy's own is written. An agy that keeps its
+# login in a file (no Secret Service) has none usage can see: add one with
+# `usage add antigravity <name>`.
+# A saved Antigravity login gets a folder as agy's HOME, with the keyring made
+# unreachable so agy keeps the login in a file there; this relies on
+# undocumented agy behaviour. agy's data dir must be $HOME/.gemini or
+# $XDG_CONFIG_HOME/.gemini: a --gemini_dir wrapper with a literal path breaks
+# the separation between logins.
 #
 # Neither API exposes the remaining prepaid balance; that is only in the
 # consoles. The plan limits come from the undocumented endpoints that Claude
@@ -46,7 +63,7 @@
 # way.
 #
 # Exits 1 when a source that is set up could not be read.
-# Requires: curl, jq
+# Requires: curl, jq (agy for Antigravity)
 
 # Where saved logins are renewed. The client IDs are the CLIs' own, built into
 # every copy of each; they name the app and are not secrets. A refresh token
@@ -208,6 +225,12 @@ with_lock() {
         fi
         return 1
     fi
+    # It may have been removed or renamed while this run waited.
+    if [[ ! -d "$dir" ]]; then
+        exec 9>&-
+        REFRESH_ERROR="account folder is gone"
+        return 1
+    fi
     "$@"
     rc=$?
     exec 9>&-
@@ -280,7 +303,7 @@ renew() {
 }
 
 title() {
-    case "$1" in claude) echo Claude ;; codex) echo Codex ;; esac
+    case "$1" in claude) echo Claude ;; codex) echo Codex ;; antigravity) echo Antigravity ;; esac
 }
 
 signed_out() {
@@ -498,6 +521,260 @@ codex_block() {
     printf '%s\n' "$rows"
 }
 
+# Antigravity's quota is read by running agy and asking it, so only agy ever
+# handles its Google tokens. USAGE_AGY names the agy to run, for the tests.
+agy_cmd() {
+    printf '%s\n' "${USAGE_AGY:-agy}"
+}
+
+# browser_stub <dir> <refuse|open>: an xdg-open in dir. refuse opens nothing,
+# so agy can't start a browser, and puts an open beside it that opens nothing
+# either: agy looks for open on macOS. open runs the real xdg-open in the
+# environment usage itself has (baked in now, so call it before agy_enter
+# changes that), for a sign-in that has to reach the user's own browser.
+browser_stub() {
+    local v
+    # Only its own dir: a parent that is gone (end_jobs ran) stays gone.
+    [[ -d "$1" ]] || mkdir "$1" 2>/dev/null || return 1
+    case "$2" in
+        refuse)
+            printf '#!/bin/sh\nexit 1\n' > "$1/open" && chmod 700 "$1/open" &&
+                printf '#!/bin/sh\nexit 1\n' > "$1/xdg-open" ;;
+        open)
+            # env reads -u only before the first NAME=value.
+            {
+                printf '#!/usr/bin/env bash\nexec env'
+                for v in HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME \
+                    DBUS_SESSION_BUS_ADDRESS BROWSER PATH; do
+                    [[ -n "${!v+x}" ]] || printf ' -u %s' "$v"
+                done
+                for v in HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME \
+                    DBUS_SESSION_BUS_ADDRESS BROWSER PATH; do
+                    [[ -z "${!v+x}" ]] || printf ' %q' "$v=${!v}"
+                done
+                printf ' xdg-open "$@"\n'
+            } > "$1/xdg-open" ;;
+        *) return 1 ;;
+    esac && chmod 700 "$1/xdg-open"
+}
+
+# agy_enter <home> <saved: yes|no> <bin dir>: agy's environment, set in this
+# shell. home is its working directory and HOME, with the XDG dirs inside it,
+# so the files agy keeps land there; bin dir comes first on PATH; BROWSER is
+# unset. A saved login (yes) gets a D-Bus address that leads nowhere, which
+# makes agy keep the login in a file in home rather than the keyring, and no
+# other credential to fall back on.
+agy_enter() {
+    local home=$1
+    cd "$home" || return 1
+    export HOME="$home" XDG_CONFIG_HOME="$home/.config" XDG_DATA_HOME="$home/.local/share" \
+        XDG_STATE_HOME="$home/.local/state" XDG_CACHE_HOME="$home/.cache" PATH="$3:$PATH"
+    unset BROWSER
+    if [[ "$2" == yes ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$home/.no-bus"
+        unset GEMINI_API_KEY GOOGLE_APPLICATION_CREDENTIALS AGY_ADC_AUTH
+    fi
+}
+
+# agy_env <home> <saved: yes|no> <bin dir> <command...>: command, run in
+# agy_enter's environment, without the lock's fd 9: a child it leaves behind
+# must not hold the lock.
+agy_env() {
+    ( agy_enter "$1" "$2" "$3" && shift 3 && exec "$@" 9>&- )
+}
+
+# agy_stop <pid>: TERM, then KILL if it is still there 2 s later.
+agy_stop() {
+    local n=0
+    kill -TERM "$1"
+    while kill -0 "$1" && (( n < 20 )); do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    if kill -0 "$1"; then kill -KILL "$1"; fi
+}
+
+# agy_run <home> <saved: yes|no> <work dir> <command>: agy -p /<command> in
+# agy_env's environment, its answer in <work>/<command>.json, its stderr in
+# .err, its log in .log, its pid in .pid while it runs. 0 agy ended by itself;
+# 1 it could not be started safely; 3 it asked to sign in, which it would wait
+# a minute for; 4 it ran past USAGE_AGY_WAIT (default 30) seconds. On 1, 3 and
+# 4 it is stopped.
+agy_run() {
+    local home=$1 saved=$2 work=$3 cmd=$4 err="$3/$4.err" pid start alive rc=0
+    browser_stub "$work/bin" refuse || return 1
+    # agy_env's subshell, inlined so that agy replaces it: $! is agy itself,
+    # not a shell that would die of the signals and leave agy running.
+    ( agy_enter "$home" "$saved" "$work/bin" &&
+        exec "$(agy_cmd)" -p "/$cmd" --output-format json --log-file "$work/$cmd.log" 9>&- ) \
+        </dev/null >"$work/$cmd.json" 2>"$err" &
+    pid=$!
+    start=$SECONDS
+    # Quietly: bash reports a job that was killed.
+    {
+        # The pid is for end_jobs, which stops agy if usage ends first. One
+        # that can't be written down means end_jobs has already run.
+        printf '%s\n' "$pid" > "$work/$cmd.pid" || rc=1
+        while (( rc == 0 )); do
+            alive=yes
+            kill -0 "$pid" || alive=no
+            # Looked for once more after it ends, so a prompt just before is seen.
+            if grep -q 'Authentication required' "$err"; then rc=3; break; fi
+            [[ "$alive" == yes ]] || break
+            if (( SECONDS - start > ${USAGE_AGY_WAIT:-30} )); then rc=4; break; fi
+            sleep 0.1
+        done
+        if (( rc != 0 )); then agy_stop "$pid"; fi
+        wait "$pid"
+        # Removed as soon as agy has been reaped; only until then could end_jobs
+        # signal a pid that is free again.
+        rm -f "$work/$cmd.pid"
+    } 2>/dev/null
+    return "$rc"
+}
+
+# antigravity_token <home>: where a saved login's token file is. agy keeps it
+# under XDG_CONFIG_HOME when a wrapper points --gemini_dir there, else under
+# HOME; the first that exists, else the HOME one.
+antigravity_token() {
+    local f="antigravity-cli/antigravity-oauth-token"
+    if [[ -e "$1/.config/.gemini/$f" ]]; then
+        printf '%s\n' "$1/.config/.gemini/$f"
+    else
+        printf '%s\n' "$1/.gemini/$f"
+    fi
+}
+
+# antigravity_email <home>: the address of the saved login in home, if any.
+antigravity_email() {
+    jq -r "$JQ_DEFS"'.id_token_email // empty | tostring | clean' "$(antigravity_token "$1")" 2>/dev/null
+}
+
+# antigravity_query <label> <home> <saved: yes|no> <work dir>: antigravity_block
+# from agy's runs on, printing its block. A saved login's is called under its
+# lock.
+antigravity_query() {
+    local home=$2 saved=$3 work=$4 name="Antigravity · $1" defs problem sort_key rows credits="" email rc saved_name
+    agy_run "$home" "$saved" "$work" usage
+    rc=$?
+    case $rc in
+        0) ;;
+        3)
+            if [[ "$saved" == yes ]]; then signed_out antigravity "$1"; return 1; fi
+            echo "$name: not logged in"; return 0 ;;
+        4) echo "$name: agy timed out"; return 1 ;;
+        *) echo "$name: agy failed"; return 1 ;;
+    esac
+
+    # What to say instead of the quota, if anything. No answer at all means agy
+    # gave up before it had one.
+    if ! problem=$(jq -rs "$JQ_DEFS"'
+            if length == 0 then "agy failed"
+            elif length > 1 or (.[0] | type) != "object" then "unexpected response from agy"
+            elif .[0].status != "SUCCESS" then
+                .[0].error // "" | tostring | clean | if . == "" then "agy failed" else . end
+            elif ([(.[0].command.data.groups)?][0] | type) != "array" then "unexpected response from agy"
+            else empty end' "$work/usage.json" 2>/dev/null); then
+        problem="unexpected response from agy"
+    fi
+    if [[ -n "$problem" ]]; then
+        echo "$name: $problem"
+        return 1
+    fi
+
+    # used: a limit's percentage used, kept to 0-100; a missing fraction is 0.
+    # row_label: 5-hour, weekly, or agy's own name for any other limit.
+    defs="$JQ_DEFS"'
+        def used: (1 - (.remaining_fraction | numbers)) * 100 // 0 | [[., 0] | max, 100] | min;
+        def row_label: if .window == "5h" then "5-hour" elif .window == "weekly" then "weekly" else .name end;'
+    # The sort key goes by the weekly limit nearest full, across every group.
+    if ! sort_key=$(jq -r "$defs"'
+            [.command.data.groups[] | (.buckets // [])[] | select(.window == "weekly")] | max_by(used)
+            | "\(if used >= 100 then 1 else 0 end) \(.reset_time | reset_epoch // "-")"' \
+            "$work/usage.json" 2>/dev/null) ||
+        ! rows=$(jq -r --argjson now "$NOW" --argjson color "$COLOR" "$defs"'
+            .command.data.groups[]
+            | "  \(.name | clean)",
+              ((.buckets // []) | sort_by(if .window == "5h" then 0 elif .window == "weekly" then 1 else 2 end)[]
+               | row("  \(row_label)"; used; .reset_time))
+        ' "$work/usage.json" 2>/dev/null); then
+        echo "$name: unexpected response from agy"
+        return 1
+    fi
+    # Every group has a heading, so no rows means no groups: a login with no
+    # plan quota, such as an API key's.
+    if [[ -z "$rows" ]]; then
+        echo "$name: agy reports no quota"
+        return 0
+    fi
+
+    # agy's own login, saved too: shown there, not twice. Judged before
+    # /credits, which would be run for nothing.
+    if [[ "$saved" != yes ]]; then
+        email=$(jq -nRr "$JQ_DEFS"'first(inputs | capture("OAuth: authenticated successfully as (?<e>\\S+)") | .e)
+            // empty | clean' "$work/usage.log" 2>/dev/null)
+        if [[ -n "$email" ]]; then
+            while IFS= read -r saved_name; do
+                if [[ "$(antigravity_email "$(account_dir antigravity "$saved_name")")" == "$email" ]]; then
+                    return 0
+                fi
+            done < <(saved_names "$(data_dir)/accounts/antigravity" dirs)
+        fi
+    fi
+
+    # Shown only when there are some; a failed /credits just leaves it out.
+    if agy_run "$home" "$saved" "$work" credits; then
+        credits=$(jq -r "$JQ_DEFS"'select(.status == "SUCCESS") | .command.data.remaining_credits
+            | numbers | select(. > 0) | "  \("credits" | rpad(14)) \(.) left"' "$work/credits.json" 2>/dev/null)
+    fi
+    if [[ "$saved" == yes ]]; then email=$(antigravity_email "$home"); fi
+    echo "#sort $sort_key"
+    echo "$name${email:+ · $email}"
+    printf '%s\n' "$rows"
+    if [[ -n "$credits" ]]; then printf '%s\n' "$credits"; fi
+}
+
+# antigravity_block <label> <home, or "" for agy's own login> <saved: yes|no>:
+# as claude_block, from agy's own answer. agy's own login is in the keyring,
+# so agy reads it from a throwaway home in $JOBS and writes nothing to the real
+# one. A saved login is run under its folder's lock, and never on macOS, where
+# agy would answer with the Keychain login instead.
+antigravity_block() {
+    local home=$2 saved=$3 name="Antigravity · $1" work rc
+    if [[ "$saved" == yes ]]; then
+        if [[ "$(uname)" == Darwin ]]; then
+            echo "$name: saved Antigravity logins are not supported on macOS"
+            return 1
+        fi
+        if ! command -v "$(agy_cmd)" >/dev/null 2>&1; then
+            echo "$name: agy is required"
+            return 1
+        fi
+        if ! has_login antigravity "$home"; then
+            signed_out antigravity "$1"
+            return 1
+        fi
+    fi
+    work=$(mktemp -d "$JOBS/agy.XXXXXX") || { echo "$name: cannot create a temp dir"; return 1; }
+    if [[ -z "$home" ]]; then
+        home="$work/home"
+        mkdir "$home" || { echo "$name: cannot create a temp dir"; return 1; }
+    fi
+    if [[ "$saved" == yes ]]; then
+        # Both of agy's runs and the email under one hold of the lock, so a
+        # remove, rename or re-add can't land between them.
+        REFRESH_ERROR=""
+        with_lock "$home" antigravity_query "$1" "$home" "$saved" "$work"
+        rc=$?
+        if (( rc != 0 )) && [[ -n "$REFRESH_ERROR" ]]; then
+            echo "$name: $REFRESH_ERROR"
+            return 1
+        fi
+        return "$rc"
+    fi
+    antigravity_query "$1" "$home" "$saved" "$work"
+}
+
 # The start of this month in UTC: <iso> <epoch>
 month_start() {
     jq -nr --argjson now "$NOW" \
@@ -597,8 +874,8 @@ usage_error() { printf '%s\n' "$*" >&2; exit 2; }
 # check_kind_name <kind> <name>: exits 2 unless both are acceptable.
 check_kind_name() {
     case "$1" in
-        claude|codex|anthropic-api|openai-api) ;;
-        *) usage_error "unknown kind: $1 (claude, codex, anthropic-api or openai-api)" ;;
+        claude|codex|antigravity|anthropic-api|openai-api) ;;
+        *) usage_error "unknown kind: $1 (claude, codex, antigravity, anthropic-api or openai-api)" ;;
     esac
     if [[ "$2" == env && "$1" == *-api ]]; then
         usage_error "env is reserved: it labels the key from the environment variable"
@@ -630,14 +907,25 @@ account_dir() {
     printf '%s/accounts/%s/%s\n' "$(data_dir)" "$1" "$2"
 }
 
-# run_login <claude|codex> <dir> [codex login args...]: the CLI's own login,
-# with its config in dir rather than the CLI's usual one.
+# run_login <claude|codex|antigravity> <dir> [codex login args...]: the CLI's
+# own login, with its config in dir rather than the CLI's usual one.
 run_login() {
-    local kind=$1 dir=$2
+    local kind=$1 dir=$2 bin rc
     shift 2
     case "$kind" in
         claude) CLAUDE_CONFIG_DIR="$dir" claude auth login --claudeai ;;
         codex) CODEX_HOME="$dir" codex login -c 'cli_auth_credentials_store="file"' "$@" ;;
+        antigravity)
+            # agy lives in dir with its keyring out of reach, so it opens the
+            # sign-in page through an xdg-open that reaches the real browser.
+            # Interactive: stdin stays the terminal, for a pasted code. The
+            # helper dir sits in dir, so every way this ends removes it too.
+            bin=$(mktemp -d "$dir/.bin.XXXXXX") && browser_stub "$bin" open || return 1
+            agy_env "$dir" yes "$bin" "$(agy_cmd)" acp --login
+            rc=$?
+            rm -rf "${bin:?}"
+            return "$rc"
+            ;;
     esac
 }
 
@@ -645,14 +933,16 @@ run_logout() {
     case "$1" in
         claude) CLAUDE_CONFIG_DIR="$2" claude auth logout ;;
         codex) CODEX_HOME="$2" codex logout -c 'cli_auth_credentials_store="file"' ;;
+        antigravity) ;;
     esac
 }
 
-# has_login <claude|codex> <dir>: dir holds a usable login.
+# has_login <claude|codex|antigravity> <dir>: dir holds a usable login.
 has_login() {
     case "$1" in
         claude) jq -e '.claudeAiOauth.accessToken | strings | length > 0' "$2/.credentials.json" ;;
         codex) jq -e '.tokens.access_token | strings | length > 0' "$2/auth.json" ;;
+        antigravity) jq -e '.token.refresh_token | strings | length > 0' "$(antigravity_token "$2")" ;;
     esac >/dev/null 2>&1
 }
 
@@ -677,19 +967,24 @@ swap_login() {
     fi
 }
 
-# add_login <claude|codex> <name> [codex login args...]
+# add_login <claude|codex|antigravity> <name> [codex login args...]
 #
 # A new name logs in in place; an existing one logs in to a staging dir that
 # replaces it only once the login worked, so a failed re-add keeps the old one.
 # Either way a failed login leaves nothing behind.
 add_login() {
-    local kind=$1 name=$2 dir stage target
+    local kind=$1 name=$2 cli what dir stage target
     shift 2
     if [[ "$kind" == claude && "$(uname)" == Darwin ]]; then
         die "saved Claude accounts are not supported on macOS yet"
     fi
+    if [[ "$kind" == antigravity && "$(uname)" == Darwin ]]; then
+        die "saved Antigravity accounts are not supported on macOS"
+    fi
     command -v flock >/dev/null 2>&1 || die "flock is required for saved accounts (util-linux)."
-    command -v "$kind" >/dev/null 2>&1 || die "$kind is required to add a $kind login."
+    cli=$kind what="a $kind login"
+    if [[ "$kind" == antigravity ]]; then cli=$(agy_cmd) what="an Antigravity login"; fi
+    command -v "$cli" >/dev/null 2>&1 || die "$cli is required to add $what."
     command -v jq >/dev/null 2>&1 || die "jq is required."
     dir=$(account_dir "$kind" "$name")
     (umask 077 && mkdir -p "${dir%/*}") || die "could not create ${dir%/*}"
@@ -753,6 +1048,10 @@ cmd_add() {
             add_key "$kind" "$name"
             ;;
         claude|codex) add_login "$kind" "$name" "$@" ;;
+        antigravity)
+            [[ $# -eq 0 ]] || usage_error "usage: usage add antigravity <name>"
+            add_login "$kind" "$name"
+            ;;
     esac
 }
 
@@ -766,13 +1065,25 @@ cmd_remove() {
             [[ -e "$path" ]] || die "no saved $kind key named $name"
             rm -f "$path"
             ;;
+        antigravity)
+            path=$(account_dir "$kind" "$name")
+            [[ -d "$path" ]] || die "no saved $kind login named $name"
+            # Under the login's lock: agy may be renewing its token there, and
+            # would write it back into a folder removed meanwhile.
+            if command -v flock >/dev/null 2>&1; then
+                REFRESH_ERROR=""
+                with_lock "$path" rm -rf "${path:?}" || die "could not remove $kind $name: ${REFRESH_ERROR:-could not delete the folder}"
+            else
+                rm -rf "${path:?}"
+            fi
+            ;;
         claude|codex)
             path=$(account_dir "$kind" "$name")
             [[ -d "$path" ]] || die "no saved $kind login named $name"
             if ! command -v "$kind" >/dev/null 2>&1 || ! run_logout "$kind" "$path"; then
                 echo "warning: could not sign $kind $name out; removing it anyway" >&2
             fi
-            rm -rf "$path"
+            rm -rf "${path:?}"
             ;;
     esac
     echo "removed $kind $name"
@@ -794,14 +1105,14 @@ cmd_rename() {
     check_kind_name "$kind" "$new"
     case "$kind" in
         anthropic-api|openai-api) from="$(data_dir)/keys/$kind/$old" to="$(data_dir)/keys/$kind/$new" ;;
-        claude|codex) from=$(account_dir "$kind" "$old") to=$(account_dir "$kind" "$new") ;;
+        claude|codex|antigravity) from=$(account_dir "$kind" "$old") to=$(account_dir "$kind" "$new") ;;
     esac
     [[ -e "$from" ]] || die "no saved $kind named $old"
     [[ ! -e "$to" ]] || die "a saved $kind named $new already exists"
     REFRESH_ERROR=""
     case "$kind" in
         anthropic-api|openai-api) move_entry "$from" "$to" ;;
-        claude|codex)
+        claude|codex|antigravity)
             command -v flock >/dev/null 2>&1 || die "flock is required for saved accounts (util-linux)."
             with_lock "$from" move_entry "$from" "$to"
             ;;
@@ -839,11 +1150,12 @@ main() {
     local rc=0
     # Every account is queried at once; nothing prints until all have answered.
     JOBS=$(mktemp -d "${TMPDIR:-/tmp}/usage.XXXXXX") || die "could not create a temp dir"
-    trap 'rm -rf "$JOBS"' EXIT
+    trap end_jobs EXIT
     JOB_COUNT=0
     show_tool 0 claude "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
     show_tool 1 codex "${CODEX_HOME:-$HOME/.codex}"
-    queue 2 api_section
+    show_antigravity 2
+    queue 3 api_section
     wait
     print_blocks || rc=1
     exit "$rc"
@@ -887,6 +1199,31 @@ show_tool() {
     for name in ${names[@]+"${names[@]}"}; do
         queue "$group" "${kind}_block" "$name" "$(account_dir "$kind" "$name")" yes
     done
+}
+
+# show_antigravity <group>: queue agy's own login, when agy is installed, then
+# every saved login by name (agy missing is reported under each).
+show_antigravity() {
+    local name
+    if command -v "$(agy_cmd)" >/dev/null 2>&1; then
+        queue "$1" antigravity_block "current login" "" no
+    fi
+    while IFS= read -r name; do
+        queue "$1" antigravity_block "$name" "$(account_dir antigravity "$name")" yes
+    done < <(saved_names "$(data_dir)/accounts/antigravity" dirs)
+}
+
+# end_jobs: main's exit trap. A signal that ends usage (Ctrl-C, which agy
+# ignores, or one sent to usage alone) leaves its jobs running, so every agy
+# still running is sent TERM before $JOBS goes: with its stub dir gone, agy
+# would find the real xdg-open, and its watchdog could no longer see a sign-in
+# prompt.
+end_jobs() {
+    local f pid
+    for f in "$JOBS"/agy.*/*.pid; do
+        { read -r pid < "$f" && kill -TERM "$pid"; } 2>/dev/null
+    done
+    rm -rf "${JOBS:?}"
 }
 
 # queue <group> <command...>: run command in the background, its output and

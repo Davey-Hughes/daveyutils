@@ -81,6 +81,113 @@ STUB
 chmod +x "$STUB/uname"
 mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>&1; }
 
+# Every test runs without Antigravity unless it points USAGE_AGY at the stub:
+# the dev machine has a real agy.
+export USAGE_AGY="$WORK/no-agy"
+
+cat > "$STUB/xdg-open" <<'STUB'
+#!/usr/bin/env bash
+printf '%s|%s\n' "$HOME" "$*" >> "$FIXTURES/browser.log"
+printf '%s\n' "${BROWSER-unset}" > "$FIXTURES/browser.env"
+STUB
+cat > "$STUB/agy" <<'EOF'
+#!/usr/bin/env bash
+# Stands in for agy. Logs what it was given; answers `-p /usage` and `-p /credits`
+# from $FIXTURES/agy/<key>.<command>.json, <key> being a saved login's name (the
+# last part of its HOME) or "current". Per key: .signin prints agy's sign-in
+# prompt (after .signin's content in seconds, if any) and waits; .hang waits,
+# and .<command>.hang only for that command; .noterm also ignores SIGTERM; .email is the address agy logs on sign-in;
+# .fail exits 1 with nothing on stdout. `acp --login` opens the sign-in page and
+# saves a token under HOME (see the fixture flags login-fails, agy-login-quiet,
+# agy-login-config).
+echo $$ >> "$FIXTURES/agy.pids"
+case "$HOME" in */accounts/antigravity/*) key=${HOME##*/} ;; *) key=current ;; esac
+cmd="" log="" prev=""
+for a in "$@"; do
+    case "$prev" in -p) cmd=${a#/} ;; --log-file) log=$a ;; esac
+    prev=$a
+done
+fd9=$( { true >&9; } 2>/dev/null && echo open || echo closed)
+# macOS's opener: logged as found, with its status when it sits beside the
+# xdg-open of a query, which usage made to open nothing.
+opener=$(command -v open)
+xdg=$(command -v xdg-open)
+if [ "$1" = -p ] && [ -n "$opener" ] && [ "${opener%/*}" = "${xdg%/*}" ]; then
+    "$opener" https://accounts.example/sign-in >/dev/null 2>&1
+    opener="$opener:$?"
+fi
+printf 'key=%s cmd=%s home=%s dbus=%s config=%s cwd=%s xdg-open=%s open=%s browser=%s gemini=%s fd9=%s args=%s\n' \
+    "$key" "$cmd" "$HOME" "${DBUS_SESSION_BUS_ADDRESS-unset}" "${XDG_CONFIG_HOME-unset}" "$PWD" \
+    "$xdg" "$opener" "${BROWSER-unset}" "${GEMINI_API_KEY-unset}" "$fd9" "$*" >> "$FIXTURES/agy.log"
+# <key>.waiter: another usage run, queued on the account's lock from the time
+# /usage starts; $FIXTURES/agy.gap says if it got the lock before /credits.
+if [ "$cmd" = usage ] && [ -e "$FIXTURES/agy/$key.waiter" ]; then
+    ( flock -w 5 "$HOME/.usage.lock" touch "$FIXTURES/got-lock" ) </dev/null >/dev/null 2>&1 &
+fi
+[ "$cmd" = credits ] && [ -e "$FIXTURES/got-lock" ] && echo "lock released between runs: $key" >> "$FIXTURES/agy.gap"
+if [ "$1 $2" = "acp --login" ]; then
+    xdg-open https://accounts.example/sign-in >/dev/null 2>&1
+    [ -e "$FIXTURES/login-fails" ] && exit 1
+    [ -e "$FIXTURES/agy-login-quiet" ] && exit 0
+    n=$(( $(cat "$FIXTURES/logins" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FIXTURES/logins"
+    # agy-login-config: agy runs through a wrapper that keeps its files under
+    # XDG_CONFIG_HOME/.gemini.
+    base=$HOME; [ -e "$FIXTURES/agy-login-config" ] && base=$XDG_CONFIG_HOME
+    mkdir -p "$base/.gemini/antigravity-cli"
+    printf '{"token":{"access_token":"agy-%s","refresh_token":"ref-%s"},"auth_method":"consumer","id_token_email":"g%s@example.com"}\n' \
+        "$n" "$n" "$n" > "$base/.gemini/antigravity-cli/antigravity-oauth-token"
+    exit 0
+fi
+F="$FIXTURES/agy/$key"
+[ -n "$log" ] && [ -e "$F.email" ] &&
+    printf 'I1117 server_oauth.go:226] OAuth: authenticated successfully as %s\n' "$(cat "$F.email")" > "$log"
+[ -e "$F.noterm" ] && trap '' TERM
+if [ -e "$F.signin" ]; then
+    sleep "$(cat "$F.signin")" 2>/dev/null
+    xdg-open "https://accounts.example/sign-in" >/dev/null 2>&1
+    echo "Authentication required. Please visit the URL to log in:" >&2
+    sleep 30; exit 1
+fi
+[ -e "$F.hang" ] && { sleep 30; exit 1; }
+[ -e "$F.$cmd.hang" ] && { sleep 30; exit 1; }
+[ -e "$F.fail" ] && { echo "agy: boom" >&2; exit 1; }
+cat "$F.$cmd.json" 2>/dev/null || echo '{"status":"ERROR","error":"no fixture"}'
+EOF
+chmod +x "$STUB/xdg-open" "$STUB/agy"
+
+# agy_fixtures <key>: agy's answers to /usage and /credits for that login, in
+# agy's own shape and order (a group's weekly limit before its 5-hour one).
+agy_fixtures() {
+    mkdir -p "$FIXTURES/agy"
+    cat > "$FIXTURES/agy/$1.usage.json" <<'EOF'
+{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[
+ {"name":"Gemini Models","description":"Gemini models","buckets":[
+  {"id":"gemini-weekly","name":"Weekly limit","window":"weekly","remaining_fraction":1,"reset_time":"2026-11-01T22:00:00Z"},
+  {"id":"gemini-5h","name":"5-hour limit","window":"5h","remaining_fraction":1,"reset_time":"2026-10-26T03:54:00Z"}]},
+ {"name":"Claude and GPT models","description":"Claude and GPT models","buckets":[
+  {"id":"3p-weekly","name":"Weekly limit","window":"weekly","remaining_fraction":0.8358259797096252,"reset_time":"2026-11-01T22:00:00Z"},
+  {"id":"3p-5h","name":"5-hour limit","window":"5h","remaining_fraction":0.6836367845535278,"reset_time":"2026-10-26T03:54:00Z"}]},
+ {"name":"Gemini 4 Argon","description":"Gemini 4 Argon","buckets":[
+  {"id":"argon-weekly","name":"Weekly limit","window":"weekly","remaining_fraction":1,"reset_time":"2026-11-01T22:00:00Z"}]}]}}}
+EOF
+    echo '{"status":"SUCCESS","command":{"name":"credits","data":{"remaining_credits":0}}}' > "$FIXTURES/agy/$1.credits.json"
+}
+# agy_on: the next run_usage has agy (the stub), and its temp files go in
+# $FIXTURES/tmp, where a test can look.
+agy_on() {
+    mkdir -p "$FIXTURES/tmp"
+    EXTRA_ENV=(USAGE_AGY="$STUB/agy" TMPDIR="$FIXTURES/tmp")
+}
+# agy_line <group> <label>: the first row with label under the group's heading,
+# before the next line indented by just two spaces; squeezed.
+agy_line() {
+    printf '%s\n' "$OUT" | awk -v g="  $1" -v l="$2" '
+        $0 == g { on = 1; next }
+        on && /^  [^ ]/ { exit }
+        on && index($0, l) { print; exit }' | tr -s ' '
+}
+agy_logged() { grep -qF -- "$1" "$FIXTURES/agy.log" 2>/dev/null && echo yes || echo no; }
+
 # setup: fresh fixture dir, logged-in Claude and Codex, no admin keys.
 setup() {
     FIXTURES="$WORK/fx.$1"
@@ -1300,6 +1407,615 @@ run_usage
 check "C1 controls: none reach the terminal" "no" "$(printf '%s' "$OUT" | grep -q "$(printf '\302\233')" && echo yes || echo no)"
 check "C1 controls: text kept" "yes" "$(has 'Codex · current login (plus) · a@example.com')"
 
+# --- Antigravity: the CLI's own login ---------------------------------------------------
+# agy_gone: agy ran, and every one the stub started has ended.
+agy_gone() {
+    local p
+    [ -s "$FIXTURES/agy.pids" ] || { echo "never ran"; return; }
+    while IFS= read -r p; do
+        if kill -0 "$p" 2>/dev/null; then echo no; return; fi
+    done < "$FIXTURES/agy.pids"
+    echo yes
+}
+# within <seconds>: the last run_usage took no longer (from $start).
+within() { (( SECONDS - start <= $1 )) && echo yes || echo no; }
+
+setup agy-off
+run_usage
+check "antigravity: nothing shown without agy" "no" "$(has 'Antigravity')"
+
+setup agy
+agy_on; agy_fixtures current; echo d@example.com > "$FIXTURES/agy/current.email"
+EXTRA_ENV+=(DBUS_SESSION_BUS_ADDRESS=unix:path=/test-bus BROWSER=firefox)
+run_usage
+EXTRA_ENV=()
+check "antigravity: header with the logged email" "yes" "$(has 'Antigravity · current login · d@example.com')"
+check "antigravity: group headings in agy's order" "  Gemini Models|  Claude and GPT models|  Gemini 4 Argon" \
+    "$(printf '%s\n' "$OUT" | grep -E '^  [A-Z]' | paste -sd'|' -)"
+check "antigravity: rows line up with the others" "    5-hour       ██████░░░░░░░░░░░░░░  32% used  resets in 4h54m" \
+    "$(printf '%s\n' "$OUT" | grep -F '32% used')"
+check "antigravity: weekly row" " weekly ███░░░░░░░░░░░░░░░░░ 16% used resets in 6d23h" "$(agy_line 'Claude and GPT models' weekly)"
+check "antigravity: 5-hour before weekly" "5-hour|weekly" \
+    "$(printf '%s\n' "$OUT" | sed -n '/^  Gemini Models$/,/^  Claude/p' | awk '/^    /{print $1}' | paste -sd'|' -)"
+check "antigravity: no credits row at 0" "no" "$(has 'credits')"
+check "antigravity: after Codex" "yes" "$(printf '%s\n' "$OUT" | grep -E '^(Codex|Antigravity)' | tail -1 | grep -q '^Antigravity' && echo yes || echo no)"
+check "antigravity: asked for /usage then /credits" "usage|credits" \
+    "$(sed -n 's/.*cmd=\([a-z]*\) .*/\1/p' "$FIXTURES/agy.log" | paste -sd'|' -)"
+check "antigravity: json output, own log file" "yes" "$(agy_logged 'args=-p /usage --output-format json --log-file ')"
+check "antigravity: throwaway HOME under TMPDIR" "yes" "$(agy_logged "home=$FIXTURES/tmp/usage.")"
+check "antigravity: throwaway HOME gone after" "" "$(find "$FIXTURES/tmp" -mindepth 1 2>/dev/null)"
+check "antigravity: XDG dirs follow it" "yes" \
+    "$(sed -n 's/.* home=\([^ ]*\) dbus=[^ ]* config=\([^ ]*\) .*/\1 \2/p' "$FIXTURES/agy.log" | head -1 | awk '{print ($2 == $1 "/.config") ? "yes" : "no"}')"
+check "antigravity: real D-Bus kept for the keyring" "yes" "$(agy_logged 'dbus=unix:path=/test-bus ')"
+check "antigravity: xdg-open is usage's stub" "yes" "$(agy_logged "xdg-open=$FIXTURES/tmp/usage.")"
+# agy opens a page with open on macOS.
+check "antigravity: open is usage's stub, and fails" "yes" \
+    "$(case "$(sed -n 's/.* open=\([^ ]*\) browser=.*/\1/p' "$FIXTURES/agy.log" | head -1)" in
+        "$FIXTURES/tmp/usage."*/open:1) echo yes ;; *) echo no ;; esac)"
+check "antigravity: BROWSER unset" "yes" "$(agy_logged 'browser=unset ')"
+check "antigravity: lock fd closed" "yes" "$(agy_logged 'fd9=closed ')"
+check "antigravity: exits 0" "0" "$RC"
+
+setup agy-credits
+agy_on; agy_fixtures current
+jq '.command.data.remaining_credits = 120' "$FIXTURES/agy/current.credits.json" > "$FIXTURES/c.json" &&
+    mv "$FIXTURES/c.json" "$FIXTURES/agy/current.credits.json"
+run_usage
+EXTRA_ENV=()
+check "antigravity: credits left" "  credits        120 left" "$(printf '%s\n' "$OUT" | grep -F 'credits')"
+
+# A failed /credits just leaves the row out.
+setup agy-credits-error
+agy_on; agy_fixtures current
+rm "$FIXTURES/agy/current.credits.json"
+run_usage
+EXTRA_ENV=()
+check "antigravity: failed /credits, no row" "no" "$(has 'credits')"
+check "antigravity: failed /credits is no failure" "0" "$RC"
+
+# So does a /credits that runs out of time, once /usage has answered.
+setup agy-credits-hang
+agy_on; agy_fixtures current
+jq '.command.data.remaining_credits = 120' "$FIXTURES/agy/current.credits.json" > "$FIXTURES/c.json" &&
+    mv "$FIXTURES/c.json" "$FIXTURES/agy/current.credits.json"
+touch "$FIXTURES/agy/current.credits.hang"
+EXTRA_ENV+=(USAGE_AGY_WAIT=1)
+run_usage
+EXTRA_ENV=()
+check "antigravity /credits timed out: quota still shown" "yes" "$(has 'Antigravity · current login')"
+check "antigravity /credits timed out: weekly row" " weekly ███░░░░░░░░░░░░░░░░░ 16% used resets in 6d23h" \
+    "$(agy_line 'Claude and GPT models' weekly)"
+check "antigravity /credits timed out: no credits row" "no" "$(has 'credits')"
+check "antigravity /credits timed out: no bash error" "no" "$(has 'unbound variable')"
+check "antigravity /credits timed out: no failure" "0" "$RC"
+check "antigravity /credits timed out: agy ended" "yes" "$(agy_gone)"
+
+# With no login, agy asks to sign in, opens a browser and waits a minute.
+setup agy-signin
+agy_on; agy_fixtures current
+: > "$FIXTURES/agy/current.signin"
+start=$SECONDS
+run_usage
+EXTRA_ENV=()
+check "antigravity signing in: not logged in" "yes" "$(has 'Antigravity · current login: not logged in')"
+check "antigravity signing in: no failure" "0" "$RC"
+check "antigravity signing in: stopped at once" "yes" "$(within 5)"
+check "antigravity signing in: no browser" "no" "$(exists "$FIXTURES/browser.log")"
+check "antigravity signing in: agy ended" "yes" "$(agy_gone)"
+
+# A slow keyring can hold the prompt back for seconds.
+setup agy-signin-late
+agy_on; agy_fixtures current
+echo 3 > "$FIXTURES/agy/current.signin"
+start=$SECONDS
+run_usage
+EXTRA_ENV=()
+check "antigravity late sign-in prompt: still caught" "yes" "$(has 'Antigravity · current login: not logged in')"
+check "antigravity late sign-in prompt: no long wait" "yes" "$(within 8)"
+
+setup agy-hang
+agy_on; agy_fixtures current
+touch "$FIXTURES/agy/current.hang"
+EXTRA_ENV+=(USAGE_AGY_WAIT=1)
+start=$SECONDS
+run_usage
+EXTRA_ENV=()
+check "antigravity hang: says so" "yes" "$(has 'Antigravity · current login: agy timed out')"
+check "antigravity hang: fails the run" "1" "$RC"
+check "antigravity hang: stopped in time" "yes" "$(within 5)"
+check "antigravity hang: agy ended" "yes" "$(agy_gone)"
+
+# An agy that ignores SIGTERM gets SIGKILL.
+setup agy-noterm
+agy_on; agy_fixtures current
+touch "$FIXTURES/agy/current.hang" "$FIXTURES/agy/current.noterm"
+EXTRA_ENV+=(USAGE_AGY_WAIT=1)
+start=$SECONDS
+run_usage
+EXTRA_ENV=()
+check "antigravity deaf to TERM: says so" "yes" "$(has 'Antigravity · current login: agy timed out')"
+check "antigravity deaf to TERM: stopped in time" "yes" "$(within 8)"
+check "antigravity deaf to TERM: agy ended" "yes" "$(agy_gone)"
+check "antigravity deaf to TERM: no bash noise" "no" "$(has 'Killed')"
+
+# usage stopped by a signal stops the agy it started, before removing the stub
+# dir that keeps agy from a browser: a signal to usage alone (or Ctrl-C, which
+# agy ignores) leaves its jobs running. This agy asks to sign in after 1 s.
+setup agy-usage-stopped
+mkdir -p "$FIXTURES/tmp"
+agy_fixtures current
+echo 1 > "$FIXTURES/agy/current.signin"
+env PATH="$STUB:$PATH" FIXTURES="$FIXTURES" USAGE_NOW="$NOW" XDG_DATA_HOME="$FIXTURES/data" \
+    TMPDIR="$FIXTURES/tmp" CLAUDE_CONFIG_DIR="$FIXTURES/claude" CODEX_HOME="$FIXTURES/codex" \
+    USAGE_AGY="$STUB/agy" bash "$SCRIPT" > "$FIXTURES/out" 2>&1 &
+pid=$!
+await "$FIXTURES/agy.pids"
+kill -TERM "$pid"
+wait "$pid"
+rc=$?
+for _ in $(seq 50); do [ "$(agy_gone)" = yes ] && break; sleep 0.1; done
+check "usage stopped: its agy ended too" "yes" "$(agy_gone)"
+# Past the sign-in prompt, had agy lived to show it.
+for _ in $(seq 20); do [ -e "$FIXTURES/browser.log" ] && break; sleep 0.1; done
+check "usage stopped: no browser" "no" "$(exists "$FIXTURES/browser.log")"
+check "usage stopped: exits 143" "143" "$rc"
+check "usage stopped: no noise from stopping agy" "no" "$(grep -q 'No such process' "$FIXTURES/out" && echo yes || echo no)"
+# Whatever happened, none of this test's own stub agys is left running.
+while IFS= read -r p; do kill "$p" 2>/dev/null; done < "$FIXTURES/agy.pids"
+
+# A pid that can't be written down means usage's exit trap has run: agy is
+# stopped at once, not left to its watchdog.
+setup agy-pid-unrecorded
+agy_fixtures current
+touch "$FIXTURES/agy/current.hang"
+AW="$FIXTURES/work"
+mkdir -p "$AW/home" "$AW/usage.pid"
+start=$SECONDS
+check "agy pid not recorded: reported as not run safely" "1" \
+    "$(PATH="$STUB:$PATH" FIXTURES="$FIXTURES" USAGE_AGY="$STUB/agy" USAGE_AGY_WAIT=5 \
+        bash -c 'source "$1"; agy_run "$2/home" no "$2" usage; echo "$?"' _ "$SCRIPT" "$AW" 2>&1)"
+check "agy pid not recorded: stopped at once" "yes" "$(within 3)"
+
+# A work dir that is gone (end_jobs removed $JOBS) is not rebuilt for agy:
+# agy never runs, and nothing is left behind.
+setup agy-work-gone
+agy_fixtures current
+AW="$FIXTURES/gone/work"
+mkdir -p "$FIXTURES/home"
+# shellcheck disable=SC2016 # the single quotes are bash -c's script
+check "agy work dir gone: reported as not run safely" "1" \
+    "$(env PATH="$STUB:$PATH" FIXTURES="$FIXTURES" USAGE_AGY="$STUB/agy" \
+        bash -c 'source "$1"; agy_run "$2/home" no "$3" usage; echo "$?"' _ "$SCRIPT" "$FIXTURES" "$AW" 2>&1)"
+check "agy work dir gone: agy not run" "no" "$(exists "$FIXTURES/agy.log")"
+check "agy work dir gone: nothing rebuilt" "no" "$(exists "$FIXTURES/gone")"
+
+setup agy-error
+agy_on; agy_fixtures current
+echo '{"status":"ERROR","error":"quota service down"}' > "$FIXTURES/agy/current.usage.json"
+run_usage
+EXTRA_ENV=()
+check "antigravity error: agy's reason" "yes" "$(has 'Antigravity · current login: quota service down')"
+check "antigravity error: fails the run" "1" "$RC"
+
+setup agy-fail
+agy_on; agy_fixtures current
+touch "$FIXTURES/agy/current.fail"
+run_usage
+EXTRA_ENV=()
+check "antigravity no answer: agy failed" "yes" "$(has 'Antigravity · current login: agy failed')"
+check "antigravity no answer: fails the run" "1" "$RC"
+
+setup agy-not-json
+agy_on; agy_fixtures current
+echo 'not json' > "$FIXTURES/agy/current.usage.json"
+run_usage
+EXTRA_ENV=()
+check "antigravity not JSON: unexpected" "yes" "$(has 'Antigravity · current login: unexpected response from agy')"
+check "antigravity not JSON: no jq noise" "no" "$(has 'jq: error')"
+check "antigravity not JSON: fails the run" "1" "$RC"
+
+setup agy-no-groups
+agy_on; agy_fixtures current
+echo '{"status":"SUCCESS","command":{"data":{}}}' > "$FIXTURES/agy/current.usage.json"
+run_usage
+EXTRA_ENV=()
+check "antigravity without groups: unexpected" "yes" "$(has 'Antigravity · current login: unexpected response from agy')"
+check "antigravity without groups: fails the run" "1" "$RC"
+
+# An API-key or enterprise login has no plan quota.
+setup agy-no-quota
+agy_on; agy_fixtures current
+jq '.command.data.groups = []' "$FIXTURES/agy/current.usage.json" > "$FIXTURES/c.json" &&
+    mv "$FIXTURES/c.json" "$FIXTURES/agy/current.usage.json"
+run_usage
+EXTRA_ENV=()
+check "antigravity no quota: one line" "Antigravity · current login: agy reports no quota" \
+    "$(printf '%s\n' "$OUT" | sed -n '/^Antigravity/,$p')"
+check "antigravity no quota: no failure" "0" "$RC"
+
+setup agy-out-of-range
+agy_on; agy_fixtures current
+jq '.command.data.groups[0].buckets[0].remaining_fraction = 1.2
+    | .command.data.groups[0].buckets[1].remaining_fraction = -0.5' \
+    "$FIXTURES/agy/current.usage.json" > "$FIXTURES/c.json" && mv "$FIXTURES/c.json" "$FIXTURES/agy/current.usage.json"
+run_usage
+EXTRA_ENV=()
+check "antigravity more than all left: 0% used" " weekly ░░░░░░░░░░░░░░░░░░░░ 0% used resets in 6d23h" \
+    "$(agy_line 'Gemini Models' weekly)"
+check "antigravity less than none left: 100% used" " 5-hour ████████████████████ 100% used resets in 4h54m" \
+    "$(agy_line 'Gemini Models' 5-hour)"
+
+setup agy-control-chars
+agy_on; agy_fixtures current
+jq '.command.data.groups[0].name = "Evil\u001b[31mGroup"' "$FIXTURES/agy/current.usage.json" > "$FIXTURES/c.json" &&
+    mv "$FIXTURES/c.json" "$FIXTURES/agy/current.usage.json"
+run_usage
+EXTRA_ENV=()
+check "antigravity control chars: stripped from a group's name" "yes" \
+    "$(printf '%s\n' "$OUT" | grep -qxF '  Evil[31mGroup' && echo yes || echo no)"
+check "antigravity control chars: none reach the terminal" "no" \
+    "$(printf '%s' "$OUT" | grep -qF "$(printf '\033')" && echo yes || echo no)"
+
+# agy logged no address: no email in the header.
+setup agy-no-email
+agy_on; agy_fixtures current
+run_usage
+EXTRA_ENV=()
+check "antigravity without an email: bare header" "Antigravity · current login" "$(printf '%s\n' "$OUT" | grep '^Antigravity')"
+
+# --- Antigravity: saved logins ----------------------------------------------------------
+# saved_agy <name> <email> [refresh token]: a saved login, and agy's answers for it.
+saved_agy() {
+    local d="$FIXTURES/data/usage/accounts/antigravity/$1/.gemini/antigravity-cli"
+    mkdir -p "$d" && chmod 700 "$FIXTURES/data/usage/accounts" "$FIXTURES/data/usage/accounts/antigravity" \
+        "$FIXTURES/data/usage/accounts/antigravity/$1"
+    jq -n --arg e "$2" --arg r "${3-r-$1}" --arg a "a-$1" \
+        '{token: {access_token: $a, refresh_token: $r, expiry: "2026-10-26T00:00:00Z"},
+          auth_method: "consumer", id_token_email: $e}' > "$d/antigravity-oauth-token"
+    chmod 600 "$d/antigravity-oauth-token"
+    agy_fixtures "$1"
+}
+
+# Querying a saved login takes its lock, so these need flock.
+if [ "$HAVE_FLOCK" = yes ]; then
+    setup agy-saved
+    agy_on; agy_fixtures current; echo d@example.com > "$FIXTURES/agy/current.email"
+    saved_agy work w@example.com
+    W="$FIXTURES/data/usage/accounts/antigravity/work"
+    EXTRA_ENV+=(GEMINI_API_KEY=k-test)
+    run_usage
+    EXTRA_ENV=()
+    check "agy saved: shown with its email" "yes" "$(has 'Antigravity · work · w@example.com')"
+    check "agy saved: HOME is the account" "yes" "$(agy_logged "key=work cmd=usage home=$W ")"
+    check "agy saved: keyring out of reach" "yes" "$(agy_logged "dbus=unix:path=$W/.no-bus ")"
+    check "agy saved: XDG inside the account" "yes" "$(agy_logged "config=$W/.config ")"
+    check "agy saved: runs in the account folder" "yes" "$(agy_logged "cwd=$W ")"
+    check "agy saved: no API key to fall back on" "yes" "$(grep 'key=work' "$FIXTURES/agy.log" | grep -q 'gemini=unset ' && echo yes || echo no)"
+    check "agy saved: lock fd closed in its run" "yes" \
+        "$(grep 'key=work' "$FIXTURES/agy.log" | grep -q 'fd9=closed ' && echo yes || echo no)"
+    check "agy saved: current login still shown" "yes" "$(has 'Antigravity · current login · d@example.com')"
+    check "agy saved: exits 0" "0" "$RC"
+
+    # The same account as the current login: shown once, under its name.
+    setup agy-saved-dedupe
+    agy_on; agy_fixtures current; echo w@example.com > "$FIXTURES/agy/current.email"
+    saved_agy work w@example.com
+    run_usage
+    EXTRA_ENV=()
+    check "agy saved, same account: current login not repeated" "no" "$(has 'Antigravity · current login')"
+    check "agy saved, same account: shown under its name" "yes" "$(has 'Antigravity · work · w@example.com')"
+    check "agy saved, same account: exits 0" "0" "$RC"
+    check "agy saved, same account: /credits not run for the current login" "no" \
+        "$(agy_logged 'key=current cmd=credits')"
+else
+    printf '  skip: querying saved Antigravity logins (no flock)\n'
+fi
+
+setup agy-saved-no-token
+agy_on; agy_fixtures current
+saved_agy work w@example.com
+rm "$FIXTURES/data/usage/accounts/antigravity/work/.gemini/antigravity-cli/antigravity-oauth-token"
+run_usage
+EXTRA_ENV=()
+check "agy saved without a token file: signed out" "yes" \
+    "$(has 'Antigravity · work: signed out; run usage add antigravity work to sign in again')"
+check "agy saved without a token file: not run" "no" "$(agy_logged 'key=work')"
+check "agy saved without a token file: exits 1" "1" "$RC"
+
+setup agy-saved-no-refresh
+agy_on; agy_fixtures current
+saved_agy work w@example.com ""
+run_usage
+EXTRA_ENV=()
+check "agy saved with no refresh token: signed out" "yes" \
+    "$(has 'Antigravity · work: signed out; run usage add antigravity work to sign in again')"
+check "agy saved with no refresh token: not run" "no" "$(agy_logged 'key=work')"
+
+if [ "$HAVE_FLOCK" = yes ]; then
+    # A wrapper that points agy's --gemini_dir at XDG_CONFIG_HOME keeps the token there.
+    setup agy-saved-config-token
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    W="$FIXTURES/data/usage/accounts/antigravity/work"
+    mkdir -p "$W/.config/.gemini" && mv "$W/.gemini/antigravity-cli" "$W/.config/.gemini/" && rmdir "$W/.gemini"
+    run_usage
+    EXTRA_ENV=()
+    check "agy saved, token under .config: shown with its email" "yes" "$(has 'Antigravity · work · w@example.com')"
+    check "agy saved, token under .config: queried" "yes" "$(agy_logged 'key=work cmd=usage ')"
+    check "agy saved, token under .config: not signed out" "no" "$(has 'signed out')"
+
+    setup agy-saved-signin
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    touch "$FIXTURES/agy/work.signin"
+    start=$SECONDS
+    run_usage
+    EXTRA_ENV=()
+    check "agy saved asks to sign in: signed out" "yes" \
+        "$(has 'Antigravity · work: signed out; run usage add antigravity work to sign in again')"
+    check "agy saved asks to sign in: exits 1" "1" "$RC"
+    check "agy saved asks to sign in: no long wait" "yes" "$(within 5)"
+else
+    printf '  skip: saved Antigravity token under .config, sign-in prompt (no flock)\n'
+fi
+
+# agy missing: each saved login says so, and no current login is shown.
+setup agy-saved-no-agy
+saved_agy work w@example.com
+run_usage
+check "agy saved without agy: says agy is required" "yes" "$(has 'Antigravity · work: agy is required')"
+check "agy saved without agy: no current login" "no" "$(has 'Antigravity · current login')"
+check "agy saved without agy: exits 1" "1" "$RC"
+
+# Review Focus 5: the Keychain would answer under the saved name.
+setup agy-saved-macos
+agy_on; agy_fixtures current
+saved_agy work w@example.com
+echo Darwin > "$FIXTURES/uname"
+run_usage
+EXTRA_ENV=()
+check "agy saved on macOS: reported, not supported" "yes" \
+    "$(has 'Antigravity · work: saved Antigravity logins are not supported on macOS')"
+check "agy saved on macOS: never run for it" "no" "$(agy_logged 'key=work')"
+check "agy saved on macOS: exits 1" "1" "$RC"
+
+if [ "$HAVE_FLOCK" = yes ]; then
+    setup agy-saved-lock
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    W="$FIXTURES/data/usage/accounts/antigravity/work"
+    ( flock 9; touch "$FIXTURES/locked"; sleep 3 ) 9>"$W/.usage.lock" &
+    await "$FIXTURES/locked"
+    EXTRA_ENV+=(USAGE_LOCK_WAIT=1)
+    run_usage
+    EXTRA_ENV=()
+    wait
+    check "agy saved, lock held: gives up" "yes" "$(has 'Antigravity · work: timed out waiting for another usage run')"
+    check "agy saved, lock held: not run" "no" "$(agy_logged 'key=work')"
+    check "agy saved, lock held: exits 1" "1" "$RC"
+fi
+
+# One hold of the lock covers /usage and /credits: a run queued on it gets it
+# only when both are done.
+if [ "$HAVE_FLOCK" = yes ]; then
+    setup agy-saved-one-hold
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    touch "$FIXTURES/agy/work.waiter"
+    run_usage
+    EXTRA_ENV=()
+    # The waiter did get the lock in the end, so the check below is not
+    # vacuous: it was just not first.
+    check "agy saved: the queued run got the lock after" "yes" "$(await "$FIXTURES/got-lock" && echo yes || echo no)"
+    check "agy saved, one hold: exits 0" "0" "$RC"
+    check "agy saved, one hold: shown" "yes" "$(has 'Antigravity · work · w@example.com')"
+    check "agy saved: both runs happened" "yes" "$(agy_logged 'key=work cmd=credits')"
+    check "agy saved: lock kept from /usage to /credits" "no" "$(exists "$FIXTURES/agy.gap")"
+
+    # The folder is removed while a run waits for its lock.
+    setup agy-saved-removed-while-waiting
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    W="$FIXTURES/data/usage/accounts/antigravity/work"
+    # Deleted once usage's flock is waiting (seen by pgrep, bounded), so the
+    # folder is there for has_login and gone only after the lock is won.
+    ( flock 9; touch "$FIXTURES/locked"
+      for _ in $(seq 200); do pgrep -f '^flock -w [0-9]+ 9$' >/dev/null && break; sleep 0.05; done
+      rm -rf "${W:?}" ) 9>"$W/.usage.lock" &
+    await "$FIXTURES/locked"
+    run_usage
+    EXTRA_ENV=()
+    wait
+    check "agy saved, removed while waiting: says so" "yes" "$(has 'Antigravity · work: account folder is gone')"
+    check "agy saved, removed while waiting: not run" "no" "$(agy_logged 'key=work')"
+else
+    printf '  skip: saved Antigravity login held across both runs, removed while waited for (no flock)\n'
+fi
+
+# Removing a saved login takes its lock: agy may be renewing the token there,
+# and would write it back into a folder that was just removed.
+if [ "$HAVE_FLOCK" = yes ]; then
+    setup agy-remove-lock
+    saved_agy work w@example.com
+    W="$FIXTURES/data/usage/accounts/antigravity/work"
+    ( flock 9; touch "$FIXTURES/locked"; sleep 3 ) 9>"$W/.usage.lock" &
+    await "$FIXTURES/locked"
+    EXTRA_ENV=(USAGE_LOCK_WAIT=1)
+    run_usage remove antigravity work
+    EXTRA_ENV=()
+    wait
+    check "remove antigravity, lock held: gives up" "yes" "$(has 'timed out waiting for another usage run')"
+    check "remove antigravity, lock held: exits 1" "1" "$RC"
+    check "remove antigravity, lock held: login kept" "yes" "$(exists "$W")"
+else
+    printf '  skip: removing a locked Antigravity login (no flock)\n'
+fi
+
+setup agy-saved-no-flock
+agy_on; agy_fixtures current
+saved_agy work w@example.com
+BASE_PATH=$NOFLOCK run_usage
+EXTRA_ENV=()
+check "agy saved without flock: says so" "yes" "$(has 'Antigravity · work: flock is required')"
+check "agy saved without flock: exits 1" "1" "$RC"
+
+if [ "$HAVE_FLOCK" = yes ]; then
+    # home is queued before work, so only the sort puts it last: one of its
+    # weekly limits is full.
+    setup agy-saved-sort
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    saved_agy home h@example.com
+    jq '.command.data.groups[1].buckets[0].remaining_fraction = 0' "$FIXTURES/agy/home.usage.json" > "$FIXTURES/h.json" &&
+        mv "$FIXTURES/h.json" "$FIXTURES/agy/home.usage.json"
+    jq '.command.data.groups[].buckets[] |= (if .window == "weekly" then .remaining_fraction = 0.5 else . end)' \
+        "$FIXTURES/agy/work.usage.json" > "$FIXTURES/w.json" && mv "$FIXTURES/w.json" "$FIXTURES/agy/work.usage.json"
+    run_usage
+    EXTRA_ENV=()
+    check "agy saved: the login with room first" "Antigravity · current login|Antigravity · work · w@example.com|Antigravity · home · h@example.com" \
+        "$(printf '%s\n' "$OUT" | grep '^Antigravity' | paste -sd'|' -)"
+else
+    printf '  skip: sorting saved Antigravity logins (no flock)\n'
+fi
+
+# --- Antigravity: add, remove, rename ---------------------------------------------------
+# The real xdg-open is out of reach in these tests: the logging stub stands in
+# for it, found on the PATH usage was started with.
+setup agy-add
+ACC="$FIXTURES/data/usage/accounts"
+if [ "$HAVE_FLOCK" = yes ]; then
+    D="$ACC/antigravity/work"
+    EXTRA_ENV=(USAGE_AGY="$STUB/agy")
+    run_usage add antigravity work
+    EXTRA_ENV=()
+    check "add antigravity: exits 0" "0" "$RC"
+    check "add antigravity: signed in with agy acp --login" "yes" \
+        "$(agy_logged "home=$D dbus=unix:path=$D/.no-bus ")"
+    check "add antigravity: token saved in the account" "agy-1" \
+        "$(jq -r .token.access_token "$D/.gemini/antigravity-cli/antigravity-oauth-token" 2>&1)"
+    check "add antigravity: sign-in page opened in the real session" "$HOME|https://accounts.example/sign-in" \
+        "$(cat "$FIXTURES/browser.log" 2>&1)"
+    check "add antigravity: dir 0700" "700" "$(mode "$D")"
+    check "add antigravity: no sign-in helper left in the account" "" \
+        "$(find "$D" -mindepth 1 -maxdepth 1 -name 'xdg-open*' -o -mindepth 1 -maxdepth 1 -name '.bin*')"
+    EXTRA_ENV=(USAGE_AGY="$STUB/agy")
+    run_usage add antigravity work --device-auth
+    EXTRA_ENV=()
+    check "add antigravity: extra args refused" "2" "$RC"
+    run_usage add antigravity noagy
+    check "add antigravity without agy: says so" "yes" "$(has 'is required to add an Antigravity login.')"
+    check "add antigravity without agy: exits 1" "1" "$RC"
+    check "add antigravity without agy: nothing made" "no" "$(exists "$ACC/antigravity/noagy")"
+
+    touch "$FIXTURES/login-fails"
+    EXTRA_ENV=(USAGE_AGY="$STUB/agy")
+    run_usage add antigravity broken
+    EXTRA_ENV=()
+    check "failed antigravity add: exits 1" "1" "$RC"
+    check "failed antigravity add: no account left behind" "no" "$(exists "$ACC/antigravity/broken")"
+    cp "$D/.gemini/antigravity-cli/antigravity-oauth-token" "$FIXTURES/before.json"
+    EXTRA_ENV=(USAGE_AGY="$STUB/agy")
+    run_usage add antigravity work
+    EXTRA_ENV=()
+    check "failed antigravity re-add: exits 1" "1" "$RC"
+    check "failed antigravity re-add: old login kept" "yes" \
+        "$(cmp -s "$D/.gemini/antigravity-cli/antigravity-oauth-token" "$FIXTURES/before.json" && echo yes || echo no)"
+    rm "$FIXTURES/login-fails"
+    EXTRA_ENV=(USAGE_AGY="$STUB/agy")
+    run_usage add antigravity work
+    EXTRA_ENV=()
+    check "antigravity re-add: new login replaces the old" "agy-2" \
+        "$(jq -r .token.access_token "$D/.gemini/antigravity-cli/antigravity-oauth-token" 2>&1)"
+    check "antigravity re-add: no staging dir left" "" "$(find "$ACC/antigravity" -mindepth 1 -maxdepth 1 -name '.*')"
+    check "antigravity re-add: no logout run" "no" "$(agy_logged logout)"
+
+    # A sign-in that exits 0 without writing a token is not a saved login.
+    touch "$FIXTURES/agy-login-quiet"
+    EXTRA_ENV=(USAGE_AGY="$STUB/agy")
+    run_usage add antigravity empty
+    EXTRA_ENV=()
+    rm "$FIXTURES/agy-login-quiet"
+    check "antigravity add with no token written: exits 1" "1" "$RC"
+    check "antigravity add with no token written: nothing kept" "no" "$(exists "$ACC/antigravity/empty")"
+
+    # Through a wrapper that points --gemini_dir at XDG_CONFIG_HOME.
+    touch "$FIXTURES/agy-login-config"
+    agy_on; agy_fixtures current
+    run_usage add antigravity wrapped
+    EXTRA_ENV=()
+    check "antigravity add through a wrapper: exits 0" "0" "$RC"
+    check "antigravity add through a wrapper: token under .config" "yes" \
+        "$(exists "$ACC/antigravity/wrapped/.config/.gemini/antigravity-cli/antigravity-oauth-token")"
+    rm "$FIXTURES/agy-login-config"
+    agy_fixtures wrapped
+    agy_on
+    run_usage
+    EXTRA_ENV=()
+    check "antigravity add through a wrapper: shown with its email" "yes" \
+        "$(has 'Antigravity · wrapped · g')"
+
+    # Variables unset in usage's own environment stay unset for the real
+    # xdg-open, and the page still opens.
+    : > "$FIXTURES/browser.log"
+    EXTRA_ENV=(env -u XDG_STATE_HOME -u DBUS_SESSION_BUS_ADDRESS USAGE_AGY="$STUB/agy")
+    run_usage add antigravity bare
+    EXTRA_ENV=()
+    check "add antigravity with XDG_STATE_HOME and D-Bus unset: exits 0" "0" "$RC"
+    check "add antigravity with XDG_STATE_HOME and D-Bus unset: page opened" "$HOME|https://accounts.example/sign-in" \
+        "$(cat "$FIXTURES/browser.log" 2>&1)"
+
+    : > "$FIXTURES/agy.log"
+    EXTRA_ENV=(USAGE_AGY="$STUB/agy")
+    run_usage rename antigravity work main
+    EXTRA_ENV=()
+    check "rename antigravity: exits 0" "0" "$RC"
+    check "rename antigravity: token file moved" "yes" \
+        "$(exists "$ACC/antigravity/main/.gemini/antigravity-cli/antigravity-oauth-token")"
+    check "rename antigravity: old name gone" "no" "$(exists "$ACC/antigravity/work")"
+    EXTRA_ENV=(USAGE_AGY="$STUB/agy")
+    run_usage remove antigravity main
+    EXTRA_ENV=()
+    check "remove antigravity: exits 0" "0" "$RC"
+    check "remove antigravity: dir gone" "no" "$(exists "$ACC/antigravity/main")"
+    check "remove antigravity: no warning" "no" "$(has warning)"
+    check "remove antigravity: agy not run" "no" "$(agy_logged key=)"
+
+    # BROWSER is unset for agy but kept for the real xdg-open, which falls
+    # back on it (WSL, a bare window manager).
+    setup agy-add-browser
+    ACC="$FIXTURES/data/usage/accounts"
+    rm -f "$FIXTURES/browser.env"
+    EXTRA_ENV=(BROWSER=wslview USAGE_AGY="$STUB/agy")
+    run_usage add antigravity withbrowser
+    EXTRA_ENV=()
+    check "add antigravity with BROWSER set: exits 0" "0" "$RC"
+    check "add antigravity with BROWSER set: the opener sees it" "wslview" "$(cat "$FIXTURES/browser.env" 2>&1)"
+    check "add antigravity with BROWSER set: agy does not" "yes" "$(agy_logged 'browser=unset ')"
+    rm -f "$FIXTURES/browser.env"
+    EXTRA_ENV=(env -u BROWSER USAGE_AGY="$STUB/agy")
+    run_usage add antigravity nobrowser
+    EXTRA_ENV=()
+    check "add antigravity with BROWSER unset: exits 0" "0" "$RC"
+    check "add antigravity with BROWSER unset: stays unset for the opener" "unset" "$(cat "$FIXTURES/browser.env" 2>&1)"
+else
+    printf '  skip: saving Antigravity logins (no flock)\n'
+fi
+EXTRA_ENV=(USAGE_AGY="$STUB/agy")
+run_usage remove antigravity nosuch
+EXTRA_ENV=()
+check "remove unknown antigravity login: exits 1" "1" "$RC"
+run_usage add bogus x
+check "unknown kind names antigravity" "yes" "$(has '(claude, codex, antigravity, anthropic-api or openai-api)')"
+
+setup agy-add-macos
+echo Darwin > "$FIXTURES/uname"
+EXTRA_ENV=(USAGE_AGY="$STUB/agy")
+run_usage add antigravity mac
+EXTRA_ENV=()
+check "add antigravity on macOS: refused" "yes" "$(has 'saved Antigravity accounts are not supported on macOS')"
+check "add antigravity on macOS: exits 1" "1" "$RC"
+check "add antigravity on macOS: agy not run" "no" "$(exists "$FIXTURES/agy.log")"
+
 # --- help -----------------------------------------------------------------------------
 setup help-notes
 run_usage --help
@@ -1309,6 +2025,15 @@ check "help: names Anthropic's terms" "yes" "$(has 'code.claude.com/docs/en/lega
 check "help: calls it the Claude Code usage policy" "yes" "$(has "Claude Code usage policy")"
 check "help: the note is its own paragraph" "" \
     "$(printf '%s\n' "$OUT" | grep -A1 '^way\.$' | tail -1)"
+check "help: Antigravity is shown" "yes" "$(has 'Antigravity')"
+check "help: antigravity is a kind" "yes" "$(has 'antigravity')"
+check "help: remove doesn't revoke at Google" "yes" "$(has "doesn't revoke")"
+check "help: the current login is the keyring's" "yes" "$(has 'keyring')"
+check "help: a --gemini_dir wrapper keeps logins apart only with the right path" "yes" "$(has 'gemini_dir')"
+check "help: a login agy keeps in a file can be saved" "yes" "$(has 'usage add antigravity <name>')"
+check "help: only Claude and Codex logins are signed out when removed" "yes" "$(has 'removing a Claude or Codex login')"
+check "help: re-adding an Antigravity login leaves the old one signed in" "yes" "$(has 'leaves the old sign-in valid')"
+check "help: agy renews saved Antigravity logins" "yes" "$(has 'by agy for Antigravity')"
 
 # --- arguments ----------------------------------------------------------------
 setup args
