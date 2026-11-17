@@ -154,11 +154,11 @@ fn cancel_over_ipc_removes_the_job() {
     assert_eq!(queue.lock().unwrap().all(), []);
 }
 
-fn noon() -> jiff::Zoned {
+fn noon() -> jiff::ZonedDateTime {
     use jiff::{civil::date, tz::TimeZone};
     date(2026, 7, 13)
         .at(12, 0, 0, 0)
-        .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+        .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
         .unwrap()
 }
 

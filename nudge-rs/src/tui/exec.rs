@@ -30,7 +30,7 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
             let weekly = std::env::var("NUDGE_WEEKLY_PATTERN").ok();
             match TmuxTarget::new(&pane).capture_escaped() {
                 Ok(raw) => {
-                    let now = jiff::Zoned::now();
+                    let now = jiff::ZonedDateTime::now();
                     let detection = detect_reset(
                         &raw,
                         &now,

@@ -46,7 +46,7 @@ pub enum InjectOutcome {
 pub fn run_injection(
     target: &dyn Target,
     job: &Job,
-    now: &jiff::Zoned,
+    now: &jiff::ZonedDateTime,
     clock_ext: Option<&str>,
     dur_ext: Option<&str>,
     weekly_ext: Option<&str>,
@@ -275,10 +275,10 @@ mod tests {
     use jiff::{civil::date, tz::TimeZone};
     use std::cell::RefCell;
 
-    fn now() -> jiff::Zoned {
+    fn now() -> jiff::ZonedDateTime {
         date(2026, 7, 13)
             .at(10, 0, 0, 0)
-            .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+            .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
             .unwrap()
     }
 

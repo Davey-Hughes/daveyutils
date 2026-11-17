@@ -405,7 +405,7 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     // pure function of the text (relative specs resolve against `now`, but
     // whether it parses does not depend on `now`), so it's fine to do here.
     if form.when == WhenMode::Manual && !form.manual_time.is_empty() {
-        let now_zoned = model.now.to_zoned(model.defaults.tz.clone());
+        let now_zoned = model.now.to_zoned_datetime(model.defaults.tz.clone());
         if crate::timespec::parse_timespec(&form.manual_time, &now_zoned).is_err() {
             let value_len = cols(form.manual_time.chars().count());
             let vstart = cols(when_txt.chars().count()).saturating_sub(value_len);

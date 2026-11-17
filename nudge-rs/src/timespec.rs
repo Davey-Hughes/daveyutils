@@ -1,6 +1,6 @@
-//! Parse user time-spec strings into an absolute `jiff::Zoned`.
+//! Parse user time-spec strings into an absolute `jiff::ZonedDateTime`.
 
-use jiff::{Span, ToSpan, Zoned};
+use jiff::{Span, ToSpan, ZonedDateTime};
 use regex::Regex;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -12,7 +12,7 @@ pub enum TimespecError {
 }
 
 /// Parse `input` relative to `now`. See module tests for the accepted forms.
-pub fn parse_timespec(input: &str, now: &Zoned) -> Result<Zoned, TimespecError> {
+pub fn parse_timespec(input: &str, now: &ZonedDateTime) -> Result<ZonedDateTime, TimespecError> {
     let s = input.trim();
     if s.is_empty() {
         return Err(TimespecError::Empty);
@@ -30,7 +30,7 @@ pub fn parse_timespec(input: &str, now: &Zoned) -> Result<Zoned, TimespecError> 
 }
 
 /// "now + 45 min", "in 90m", "45m", "2h", "1h30m" -> now + span.
-fn parse_relative(s: &str, now: &Zoned) -> Option<Zoned> {
+fn parse_relative(s: &str, now: &ZonedDateTime) -> Option<ZonedDateTime> {
     let lower = s.to_lowercase();
     // Normalize the "now +"/"in" prefixes away, then require a duration body.
     let body = lower
@@ -53,7 +53,7 @@ fn parse_relative(s: &str, now: &Zoned) -> Option<Zoned> {
 }
 
 /// "noon" / "midnight".
-fn parse_named(s: &str, now: &Zoned) -> Option<Zoned> {
+fn parse_named(s: &str, now: &ZonedDateTime) -> Option<ZonedDateTime> {
     match s.to_lowercase().as_str() {
         "noon" => at_clock(now, 12, 0),
         "midnight" => at_clock(now, 0, 0),
@@ -70,7 +70,7 @@ fn parse_named(s: &str, now: &Zoned) -> Option<Zoned> {
 /// arbitrary text scheduled a real job at a time the user never asked for.
 /// Callers pass an already-isolated token (`detect::find_clock_token` extracts
 /// one; `--time` is a whole argument), so nothing legitimate needs the slack.
-fn parse_clock(s: &str, now: &Zoned) -> Option<Zoned> {
+fn parse_clock(s: &str, now: &ZonedDateTime) -> Option<ZonedDateTime> {
     let (hour, minute) = clock_hm(s)?;
     at_clock(now, hour, minute)
 }
@@ -115,19 +115,19 @@ fn clock_hm(s: &str) -> Option<(i8, i8)> {
 }
 
 /// Build today's `hour:minute` in now's zone; if it's already past, roll to tomorrow.
-fn at_clock(now: &Zoned, hour: i8, minute: i8) -> Option<Zoned> {
+fn at_clock(now: &ZonedDateTime, hour: i8, minute: i8) -> Option<ZonedDateTime> {
     let tz = now.time_zone().clone();
     let today = now
         .date()
         .at(hour, minute, 0, 0)
-        .to_zoned(tz.clone())
+        .to_zoned_datetime(tz.clone())
         .ok()?;
     if &today <= now {
         now.date()
             .tomorrow()
             .ok()?
             .at(hour, minute, 0, 0)
-            .to_zoned(tz)
+            .to_zoned_datetime(tz)
             .ok()
     } else {
         Some(today)
@@ -486,16 +486,20 @@ pub fn parse_day(s: &str) -> Option<DaySpec> {
 /// `order` breaks a tie between the two readings of an all-numeric date, and is
 /// consulted only after the calendar and the weekly window have both failed to.
 pub fn resolve_day_clock(
-    now: &Zoned,
+    now: &ZonedDateTime,
     day: DaySpec,
     clock_token: &str,
     order: DateOrder,
-) -> Option<Zoned> {
+) -> Option<ZonedDateTime> {
     let (hour, minute) = clock_hm(clock_token)?;
     let tz = now.time_zone().clone();
     match day {
         DaySpec::Today => {
-            let z = now.date().at(hour, minute, 0, 0).to_zoned(tz).ok()?;
+            let z = now
+                .date()
+                .at(hour, minute, 0, 0)
+                .to_zoned_datetime(tz)
+                .ok()?;
             (&z > now).then_some(z)
         }
         DaySpec::Tomorrow => now
@@ -503,10 +507,14 @@ pub fn resolve_day_clock(
             .tomorrow()
             .ok()?
             .at(hour, minute, 0, 0)
-            .to_zoned(tz)
+            .to_zoned_datetime(tz)
             .ok(),
         DaySpec::Weekday(target) => {
-            let today_at = now.date().at(hour, minute, 0, 0).to_zoned(tz).ok()?;
+            let today_at = now
+                .date()
+                .at(hour, minute, 0, 0)
+                .to_zoned_datetime(tz)
+                .ok()?;
             // Today counts only if its hour is still ahead; otherwise the reset
             // is a full week out, NOT tomorrow.
             if now.weekday() == target && &today_at > now {
@@ -546,7 +554,7 @@ pub fn resolve_day_clock(
 /// day that have gone by are read as next year's, which is what
 /// [`resolve_day_clock`] does before refusing it for being past the horizon —
 /// and the relative days never name the past at all.
-pub fn day_clock_has_passed(now: &Zoned, day: DaySpec, clock_token: &str) -> bool {
+pub fn day_clock_has_passed(now: &ZonedDateTime, day: DaySpec, clock_token: &str) -> bool {
     let DaySpec::MonthDay {
         month,
         day,
@@ -562,7 +570,7 @@ pub fn day_clock_has_passed(now: &Zoned, day: DaySpec, clock_token: &str) -> boo
         .ok()
         .and_then(|date| {
             date.at(hour, minute, 0, 0)
-                .to_zoned(now.time_zone().clone())
+                .to_zoned_datetime(now.time_zone().clone())
                 .ok()
         })
         .is_some_and(|moment| &moment <= now)
@@ -577,11 +585,11 @@ pub fn day_clock_has_passed(now: &Zoned, day: DaySpec, clock_token: &str) -> boo
 /// one eight-day window. The locale arm below is therefore a backstop, live only
 /// if [`WEEKLY_WINDOW_DAYS`] is ever widened past the length of a weekly limit.
 fn pick_reading(
-    month_first: Zoned,
-    day_first: Zoned,
-    window: &Zoned,
+    month_first: ZonedDateTime,
+    day_first: ZonedDateTime,
+    window: &ZonedDateTime,
     order: DateOrder,
-) -> Option<Zoned> {
+) -> Option<ZonedDateTime> {
     // "8/8" reads the same both ways. That is not an ambiguity to resolve, and
     // sending it to the locale would refuse a date nothing was ever unclear
     // about on a machine whose locale happens to be unset.
@@ -611,13 +619,13 @@ fn pick_reading(
 /// reset, and the filter that lets [`DaySpec::Numeric`] rule out a field order
 /// instead of guessing at one.
 fn month_day_at(
-    now: &Zoned,
+    now: &ZonedDateTime,
     month: i8,
     day: i8,
     year: Option<i16>,
     hour: i8,
     minute: i8,
-) -> Option<Zoned> {
+) -> Option<ZonedDateTime> {
     let tz = now.time_zone().clone();
     // With no year stated, take the first one that puts the date in the future:
     // this year normally, next year when the date has already gone by (a reset
@@ -632,7 +640,7 @@ fn month_day_at(
         let Ok(d) = jiff::civil::Date::new(year, month, day) else {
             continue;
         };
-        let Ok(z) = d.at(hour, minute, 0, 0).to_zoned(tz.clone()) else {
+        let Ok(z) = d.at(hour, minute, 0, 0).to_zoned_datetime(tz.clone()) else {
             continue;
         };
         if &z > now {
@@ -651,14 +659,14 @@ mod tests {
     use jiff::{civil::date, tz::TimeZone};
 
     // A fixed reference "now": 2026-07-13 10:00:00 in a fixed zone.
-    fn now() -> jiff::Zoned {
+    fn now() -> jiff::ZonedDateTime {
         date(2026, 7, 13)
             .at(10, 0, 0, 0)
-            .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+            .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
             .unwrap()
     }
 
-    fn hm(z: &jiff::Zoned) -> (i8, i8) {
+    fn hm(z: &jiff::ZonedDateTime) -> (i8, i8) {
         (z.hour(), z.minute())
     }
 
@@ -1024,7 +1032,7 @@ mod tests {
     fn a_month_day_just_past_new_year_rolls_to_the_next_year() {
         let dec30 = date(2026, 12, 30)
             .at(10, 0, 0, 0)
-            .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+            .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
             .unwrap();
         let z = resolve_day_clock(&dec30, on(1, 2), "8am", DateOrder::Unknown).unwrap();
         assert_eq!(z.date(), date(2027, 1, 2));
@@ -1038,7 +1046,7 @@ mod tests {
     fn a_month_day_that_can_only_be_a_year_out_is_unresolvable() {
         let jul28 = date(2026, 7, 28)
             .at(10, 0, 0, 0)
-            .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+            .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
             .unwrap();
         assert_eq!(
             resolve_day_clock(&jul28, on(7, 28), "8am", DateOrder::Unknown),
@@ -1062,7 +1070,7 @@ mod tests {
     fn a_leap_day_skips_years_that_do_not_have_one() {
         let feb2028 = date(2028, 2, 20)
             .at(10, 0, 0, 0)
-            .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+            .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
             .unwrap();
         let z = resolve_day_clock(&feb2028, on(2, 29), "8am", DateOrder::Unknown).unwrap();
         assert_eq!(z.date(), date(2028, 2, 29));
@@ -1070,7 +1078,7 @@ mod tests {
         // 2026 has no Feb 29 and 2027's is far outside the horizon.
         let feb2026 = date(2026, 2, 20)
             .at(10, 0, 0, 0)
-            .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+            .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
             .unwrap();
         assert_eq!(
             resolve_day_clock(&feb2026, on(2, 29), "8am", DateOrder::Unknown),
@@ -1141,7 +1149,7 @@ mod tests {
         // plausible weekly reset.
         let jul7 = date(2026, 7, 7)
             .at(10, 0, 0, 0)
-            .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+            .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
             .unwrap();
         let z = resolve_day_clock(&jul7, num(7, 8), "8am", DateOrder::Unknown).unwrap();
         assert_eq!(z.date(), date(2026, 7, 8));
@@ -1159,7 +1167,7 @@ mod tests {
     fn a_date_that_reads_the_same_both_ways_needs_no_locale() {
         let aug5 = date(2026, 8, 5)
             .at(10, 0, 0, 0)
-            .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+            .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
             .unwrap();
         let z = resolve_day_clock(&aug5, num(8, 8), "8am", DateOrder::Unknown).unwrap();
         assert_eq!(z.date(), date(2026, 8, 8));
@@ -1172,7 +1180,7 @@ mod tests {
     fn the_locale_arm_picks_by_convention_and_refuses_without_one() {
         let at = |d: jiff::civil::Date| {
             d.at(8, 0, 0, 0)
-                .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+                .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
                 .unwrap()
         };
         let month_first = at(date(2026, 7, 8));

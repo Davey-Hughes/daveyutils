@@ -109,7 +109,7 @@ fn a_verify_skip_lands_in_the_daemon_log() {
     // and no rate-limit banner: the daemon's first pass fires it, the banner
     // check finds nothing, and the outcome is a skip. `notify: false` is the
     // point -- this is the default configuration, the one that was silent.
-    let fire_at = jiff::Zoned::now()
+    let fire_at = jiff::ZonedDateTime::now()
         .checked_sub(jiff::ToSpan::second(1))
         .unwrap()
         .timestamp();

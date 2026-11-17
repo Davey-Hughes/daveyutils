@@ -86,7 +86,7 @@ pub struct ScheduleDefaults {
     pub retries: i64,
     /// The system/local time zone, read once at the impure edge (`tui::run`).
     /// `submit` resolves manual clock times ("3pm") in this zone so the TUI
-    /// matches the CLI's `Zoned::now()`-based resolution.
+    /// matches the CLI's `ZonedDateTime::now()`-based resolution.
     pub tz: jiff::tz::TimeZone,
 }
 

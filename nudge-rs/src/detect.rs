@@ -1,7 +1,7 @@
 //! Detect an AI-CLI rate-limit banner in captured pane text and compute the
 //! absolute reset time (with safety padding).
 
-use jiff::{ToSpan, Zoned};
+use jiff::{ToSpan, ZonedDateTime};
 use regex::Regex;
 
 use crate::timespec::{DayWords, parse_timespec};
@@ -148,7 +148,7 @@ enum Shape {
 
 /// What `detect_reset` concluded about a pane.
 ///
-/// `Option<Zoned>` cannot express the third outcome. A weekly banner whose reset
+/// `Option<ZonedDateTime>` cannot express the third outcome. A weekly banner whose reset
 /// day we cannot read is not "no banner" — reporting it as such prints `no
 /// rate-limit banner detected in <pane>`, blaming the pane for a gap in this
 /// parser. It is a distinct answer with a distinct remedy, so it gets a variant.
@@ -157,7 +157,7 @@ pub enum Detection {
     /// No rate-limit banner in the pane.
     None,
     /// A banner, and the padded absolute reset time it names.
-    Reset(Zoned),
+    Reset(ZonedDateTime),
     /// A dated banner whose reset day this parser does not understand.
     /// Carries the offending text verbatim so the report *is* the bug capture.
     Unreadable { banner: String, gap: String },
@@ -172,7 +172,7 @@ pub enum Detection {
 /// present.
 pub fn detect_reset(
     pane_text: &str,
-    now: &Zoned,
+    now: &ZonedDateTime,
     clock_ext: Option<&str>,
     dur_ext: Option<&str>,
     weekly_ext: Option<&str>,
@@ -348,7 +348,7 @@ pub fn detect_reset(
 fn read_codex(
     after: &str,
     banner: &str,
-    now: &Zoned,
+    now: &ZonedDateTime,
     order: crate::timespec::DateOrder,
 ) -> Option<Detection> {
     let m = find_clock_token_match(after)?;
@@ -428,7 +428,7 @@ fn find_zone_token(text: &str) -> Option<String> {
 /// unresolvable name warns and degrades to local; it must never panic, because
 /// this runs on the daemon's scheduler thread where a panic kills every pending
 /// job, and a banner is free to name a zone this build's tzdb has never heard of.
-fn now_in_zone(now: &Zoned, zone: Option<&str>) -> Zoned {
+fn now_in_zone(now: &ZonedDateTime, zone: Option<&str>) -> ZonedDateTime {
     let Some(name) = zone else {
         return now.clone();
     };
@@ -522,15 +522,15 @@ mod tests {
     use super::*;
     use jiff::{civil::date, tz::TimeZone};
 
-    fn now() -> jiff::Zoned {
+    fn now() -> jiff::ZonedDateTime {
         date(2026, 7, 13)
             .at(10, 0, 0, 0)
-            .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+            .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
             .unwrap()
     }
 
     /// Unwrap a `Detection::Reset`, or fail naming what came back instead.
-    fn reset_of(d: Detection) -> jiff::Zoned {
+    fn reset_of(d: Detection) -> jiff::ZonedDateTime {
         match d {
             Detection::Reset(z) => z,
             other => panic!("expected Detection::Reset, got {other:?}"),
@@ -1218,7 +1218,7 @@ mod tests {
             › Ask Codex to do anything";
         let now = date(2026, 10, 12)
             .at(21, 58, 0, 0)
-            .to_zoned(TimeZone::fixed(jiff::tz::offset(-7)))
+            .to_zoned_datetime(TimeZone::fixed(jiff::tz::offset(-7)))
             .unwrap();
         let z = reset_of(detect_reset(pane, &now, None, None, None));
         // 01:40 the next morning + 2 minutes padding.
@@ -1409,7 +1409,7 @@ mod tests {
         let pane = format!("{CODEX} Oct\n13th, 2026 1:40 AM.{CODEX_COMPOSER}");
         let now = date(2026, 10, 13)
             .at(2, 0, 0, 0)
-            .to_zoned(TimeZone::fixed(jiff::tz::offset(-7)))
+            .to_zoned_datetime(TimeZone::fixed(jiff::tz::offset(-7)))
             .unwrap();
         match detect_reset(&pane, &now, None, None, None) {
             Detection::Elapsed { time, .. } => assert_eq!(time, "Oct 13th, 2026 1:40 AM"),

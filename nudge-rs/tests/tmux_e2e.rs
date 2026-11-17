@@ -156,10 +156,10 @@ impl Drop for Server {
     }
 }
 
-fn fixed_now() -> jiff::Zoned {
+fn fixed_now() -> jiff::ZonedDateTime {
     date(2026, 7, 13)
         .at(10, 0, 0, 0)
-        .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+        .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
         .unwrap()
 }
 

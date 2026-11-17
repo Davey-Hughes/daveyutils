@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use jiff::{Span, Zoned};
+use jiff::{Span, ZonedDateTime};
 
 use crate::inject::run_injection;
 use crate::paths::Paths;
@@ -115,7 +115,7 @@ pub fn run_with(
     std::thread::spawn(move || on_serve_exit(crate::ipc::server::serve(&socket, &q_ipc)));
 
     loop {
-        let now = Zoned::now();
+        let now = ZonedDateTime::now();
 
         // 1. Snapshot due jobs and stale ids under the lock.
         let plan_now = {

@@ -129,7 +129,7 @@ fn daemon_fires_a_due_job_into_the_pane() {
 
     // Write a DUE job straight into the queue file so the daemon fires it on
     // its first pass (catch-up), not after waiting out a poll interval.
-    let fire_at = jiff::Zoned::now()
+    let fire_at = jiff::ZonedDateTime::now()
         .checked_sub(1.second())
         .unwrap()
         .timestamp();

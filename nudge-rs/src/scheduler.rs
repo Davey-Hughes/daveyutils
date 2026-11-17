@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use jiff::{Span, Zoned};
+use jiff::{Span, ZonedDateTime};
 
 use crate::inject::InjectOutcome;
 use crate::job::Job;
@@ -21,7 +21,7 @@ pub struct Plan {
 
 /// Partition jobs at `now`: due jobs within `grace` are fired; due jobs older
 /// than `grace` are dropped (stale catch-up); future jobs are left alone.
-pub fn plan(jobs: &[Job], now: &Zoned, grace: &Span) -> Plan {
+pub fn plan(jobs: &[Job], now: &ZonedDateTime, grace: &Span) -> Plan {
     let now_ts = now.timestamp();
     let cutoff = now.checked_sub(*grace).map_or(now_ts, |z| z.timestamp());
     let mut fire = Vec::new();
@@ -81,7 +81,7 @@ pub fn apply_outcome(
 }
 
 /// How long to sleep before the next pass, capped at `max`.
-pub fn next_wake(jobs: &[Job], now: &Zoned, max: Duration) -> Duration {
+pub fn next_wake(jobs: &[Job], now: &ZonedDateTime, max: Duration) -> Duration {
     let now_ts = now.timestamp();
     match jobs.iter().map(|j| j.fire_at).min() {
         None => max,
@@ -101,10 +101,10 @@ mod tests {
     use crate::queue::Queue;
     use jiff::{ToSpan, civil::date, tz::TimeZone};
 
-    fn now() -> jiff::Zoned {
+    fn now() -> jiff::ZonedDateTime {
         date(2026, 7, 13)
             .at(12, 0, 0, 0)
-            .to_zoned(TimeZone::fixed(jiff::tz::Offset::UTC))
+            .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
             .unwrap()
     }
 

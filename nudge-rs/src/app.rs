@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::CommandFactory;
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 
 use crate::cli::{Cli, resolve_options, tri};
 use crate::config::Toggles;
@@ -161,7 +161,7 @@ fn snapshot_gate(
 }
 
 /// Determine the fire time: explicit `-m`, else auto-detect from the pane.
-pub fn fire_time(cli: &Cli, pane: &str, now: &Zoned) -> anyhow::Result<jiff::Timestamp> {
+pub fn fire_time(cli: &Cli, pane: &str, now: &ZonedDateTime) -> anyhow::Result<jiff::Timestamp> {
     if let Some(t) = &cli.time {
         return Ok(parse_timespec(t, now)
             .map_err(|e| anyhow::anyhow!("could not parse time '{t}': {e}"))?
@@ -381,7 +381,7 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
         panes: std::collections::HashMap::from([(loc.id, loc.position)]),
     };
     let opts = resolve_options(cli);
-    let now = Zoned::now();
+    let now = ZonedDateTime::now();
     let fire_at = fire_time(cli, &pane, &now)?;
     // Snapshot last, and only for --verify: this is the "before" the fire-time
     // gate compares against, so it wants to be as close to the user's actual
@@ -485,7 +485,7 @@ fn job_summary(
     now: jiff::Timestamp,
 ) -> String {
     let pane = named_label(&spec.target, positions);
-    let when = spec.fire_at.to_zoned(tz.clone());
+    let when = spec.fire_at.to_zoned_datetime(tz.clone());
     let countdown = human_countdown(spec.fire_at.duration_since(now).as_secs());
     let what = match spec.messages.len() {
         1 => format!("{:?}", spec.messages[0]),
@@ -605,7 +605,7 @@ pub fn merge_edit(
     job: &Job,
     cli: &Cli,
     server: Option<String>,
-    now: &Zoned,
+    now: &ZonedDateTime,
     default_retries: i64,
     snapshot: &dyn Fn(&str, &Toggles) -> Option<crate::verify::Baseline>,
 ) -> anyhow::Result<JobSpec> {
@@ -712,7 +712,7 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
         server = loc.server;
         cli.pane = Some(loc.id);
     }
-    let now = Zoned::now();
+    let now = ZonedDateTime::now();
     let spec = merge_edit(
         &job,
         &cli,
@@ -898,7 +898,7 @@ mod tests {
     }
 
     /// The summary renders in the caller's zone, not UTC. `nudge -a` prints it
-    /// with `Zoned::now()`'s zone, and a user in UTC+2 reading a UTC clock time
+    /// with `ZonedDateTime::now()`'s zone, and a user in UTC+2 reading a UTC clock time
     /// would think the nudge fires two hours off.
     #[test]
     fn the_summary_renders_the_fire_time_in_the_callers_zone() {

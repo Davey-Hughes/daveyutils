@@ -964,7 +964,7 @@ fn prev_word(chars: &[char], i: usize) -> usize {
 /// successful reply lands us — an edit always returns to the Jobs tab you
 /// reached it from, whichever key saved it.
 fn submit(model: &mut Model, after: AfterSubmit) -> Vec<Effect> {
-    let now_zoned = model.now.to_zoned(model.defaults.tz.clone());
+    let now_zoned = model.now.to_zoned_datetime(model.defaults.tz.clone());
     let Some(pane) = model.form.selected_pane().map(|p| p.id.clone()) else {
         model
             .status
@@ -1264,7 +1264,7 @@ mod tests {
         m.form.detected = Some(Detection::Reset(
             jiff::Timestamp::from_str("2026-07-16T15:00:00Z")
                 .unwrap()
-                .to_zoned(jiff::tz::TimeZone::UTC),
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC),
         ));
         m.form.preview = Some("stale screen".into());
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Right));
@@ -1735,7 +1735,7 @@ mod tests {
         m.form.detected = Some(Detection::Reset(
             jiff::Timestamp::from_str("2026-07-16T15:00:00Z")
                 .unwrap()
-                .to_zoned(jiff::tz::TimeZone::UTC),
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC),
         ));
         m.form.focus = FormField::Submit;
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
@@ -2073,7 +2073,7 @@ mod tests {
         m.form.detected = Some(Detection::Reset(
             jiff::Timestamp::from_str("2026-07-16T15:00:00Z")
                 .unwrap()
-                .to_zoned(jiff::tz::TimeZone::UTC),
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC),
         ));
         m.form.focus = FormField::Submit;
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
@@ -2115,7 +2115,7 @@ mod tests {
         m.form.detected = Some(Detection::Reset(
             t0().checked_add(jiff::ToSpan::hours(2))
                 .unwrap()
-                .to_zoned(jiff::tz::TimeZone::UTC),
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC),
         ));
         let fx = update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
         assert!(matches!(fx.as_slice(), [Effect::Schedule { .. }]));
@@ -2136,7 +2136,7 @@ mod tests {
         m.form.detected = Some(Detection::Reset(
             t0().checked_add(jiff::ToSpan::hours(2))
                 .unwrap()
-                .to_zoned(jiff::tz::TimeZone::UTC),
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC),
         ));
         let fx = update(&mut m, Msg::SubmitStay);
         assert!(matches!(fx.as_slice(), [Effect::Schedule { .. }]));
