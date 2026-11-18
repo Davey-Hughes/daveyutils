@@ -598,11 +598,11 @@ agy_stop() {
 # agy_env's environment, its answer in <work>/<command>.json, its stderr in
 # .err, its log in .log, its pid in .pid while it runs. 0 agy ended by itself;
 # 1 it could not be started safely; 3 it asked to sign in, which it would wait
-# a minute for; 4 it ran past USAGE_AGY_WAIT (default 30) seconds. On 1, 3 and
-# 4 it is stopped.
+# a minute for; 4 it ran past USAGE_AGY_WAIT (default 30) seconds; 5 a
+# <work>/<command>.stop file appeared. On 1, 3, 4 and 5 it is stopped.
 agy_run() {
     local home=$1 saved=$2 work=$3 cmd=$4 err="$3/$4.err" pid start alive rc=0
-    browser_stub "$work/bin" refuse || return 1
+    [[ -x "$work/bin/xdg-open" ]] || browser_stub "$work/bin" refuse || return 1
     # agy_env's subshell, inlined so that agy replaces it: $! is agy itself,
     # not a shell that would die of the signals and leave agy running.
     ( agy_enter "$home" "$saved" "$work/bin" &&
@@ -621,6 +621,7 @@ agy_run() {
             # Looked for once more after it ends, so a prompt just before is seen.
             if grep -q 'Authentication required' "$err"; then rc=3; break; fi
             [[ "$alive" == yes ]] || break
+            if [[ -e "$work/$cmd.stop" ]]; then rc=5; break; fi
             if (( SECONDS - start > ${USAGE_AGY_WAIT:-30} )); then rc=4; break; fi
             sleep 0.1
         done
@@ -650,10 +651,40 @@ antigravity_email() {
     jq -r "$JQ_DEFS"'.id_token_email // empty | tostring | clean' "$(antigravity_token "$1")" 2>/dev/null
 }
 
+# antigravity_token_lasts <home>: the saved login in home has a token good for
+# five more minutes, well past agy's time limit, so no agy run will renew it.
+# Counted from this moment: NOW is older by however long the lock took.
+antigravity_token_lasts() {
+    jq -e --argjson now "$((NOW + SECONDS))" "$JQ_DEFS"'.token.expiry | strings | epoch > $now + 300' \
+        "$(antigravity_token "$1")" >/dev/null 2>&1
+}
+
 # antigravity_query <label> <home> <saved: yes|no> <work dir>: antigravity_block
 # from agy's runs on, printing its block. A saved login's is called under its
-# lock.
+# lock. /credits runs beside /usage when no agy will renew the token, since two
+# renewing at once would both rewrite its file; usage can't tell for agy's own
+# login, which is in the keyring.
 antigravity_query() {
+    local work=$4 credits_job="" rc
+    if [[ "$3" == yes ]] && antigravity_token_lasts "$2"; then
+        # Made here, or the two runs would race to make it.
+        browser_stub "$work/bin" refuse || { echo "Antigravity · $1: agy failed"; return 1; }
+        agy_run "$2" "$3" "$work" credits &
+        credits_job=$!
+    fi
+    antigravity_answer "$@"
+    rc=$?
+    # Still set only when /usage's answer ended the query before /credits was read.
+    if [[ -n "$credits_job" ]]; then
+        { : > "$work/credits.stop"; } 2>/dev/null
+        wait "$credits_job"
+    fi
+    return "$rc"
+}
+
+# antigravity_answer <as antigravity_query>: agy's answers turned into the block.
+# antigravity_query's credits_job is the /credits already running, if any.
+antigravity_answer() {
     local home=$2 saved=$3 work=$4 name="Antigravity · $1" defs problem sort_key rows credits="" email rc saved_name
     agy_run "$home" "$saved" "$work" usage
     rc=$?
@@ -723,7 +754,15 @@ antigravity_query() {
     fi
 
     # Shown only when there are some; a failed /credits just leaves it out.
-    if agy_run "$home" "$saved" "$work" credits; then
+    if [[ -n "$credits_job" ]]; then
+        wait "$credits_job"
+        rc=$?
+        credits_job=""
+    else
+        agy_run "$home" "$saved" "$work" credits
+        rc=$?
+    fi
+    if (( rc == 0 )); then
         credits=$(jq -r "$JQ_DEFS"'select(.status == "SUCCESS") | .command.data.remaining_credits
             | numbers | select(. > 0) | "  \("credits" | rpad(14)) \(.) left"' "$work/credits.json" 2>/dev/null)
     fi

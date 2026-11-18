@@ -97,7 +97,9 @@ cat > "$STUB/agy" <<'EOF'
 # last part of its HOME) or "current". Per key: .signin prints agy's sign-in
 # prompt (after .signin's content in seconds, if any) and waits; .hang waits,
 # and .<command>.hang only for that command; .noterm also ignores SIGTERM; .email is the address agy logs on sign-in;
-# .fail exits 1 with nothing on stdout. `acp --login` opens the sign-in page and
+# .fail exits 1 with nothing on stdout; .<command>.after names the command to let
+# start first (2 s at most); .<command>.sleep delays the answer by its content in
+# seconds. $FIXTURES/agy.events lists each run's start and end, in order. `acp --login` opens the sign-in page and
 # saves a token under HOME (see the fixture flags login-fails, agy-login-quiet,
 # agy-login-config).
 echo $$ >> "$FIXTURES/agy.pids"
@@ -139,6 +141,16 @@ if [ "$1 $2" = "acp --login" ]; then
     exit 0
 fi
 F="$FIXTURES/agy/$key"
+touch "$FIXTURES/agy.started.$key.$cmd"
+echo "$key $cmd start" >> "$FIXTURES/agy.events"
+trap 'echo "$key $cmd end" >> "$FIXTURES/agy.events"' EXIT
+if [ -e "$F.$cmd.after" ]; then
+    for _ in $(seq 40); do [ -e "$FIXTURES/agy.started.$key.$(cat "$F.$cmd.after")" ] && break; sleep 0.05; done
+fi
+if [ -e "$F.$cmd.sleep" ]; then
+    sleep "$(cat "$F.$cmd.sleep")"
+    [ -e "$FIXTURES/got-lock" ] && echo "lock released before /$cmd answered: $key" >> "$FIXTURES/agy.gap"
+fi
 [ -n "$log" ] && [ -e "$F.email" ] &&
     printf 'I1117 server_oauth.go:226] OAuth: authenticated successfully as %s\n' "$(cat "$F.email")" > "$log"
 [ -e "$F.noterm" ] && trap '' TERM
@@ -1924,6 +1936,174 @@ if [ "$HAVE_FLOCK" = yes ]; then
     check "agy saved, removed while waiting: not run" "no" "$(agy_logged 'key=work')"
 else
     printf '  skip: saved Antigravity login held across both runs, removed while waited for (no flock)\n'
+fi
+
+# agy_expiry <name> <JSON>: when the saved login's token runs out.
+agy_expiry() {
+    local t="$FIXTURES/data/usage/accounts/antigravity/$1/.gemini/antigravity-cli/antigravity-oauth-token"
+    jq --argjson e "$2" '.token.expiry = $e' "$t" > "$t.new" && mv "$t.new" "$t"
+}
+# agy_order <key>: that login's runs starting and ending, in order.
+agy_order() { sed -n "s/^$1 //p" "$FIXTURES/agy.events" | paste -sd'|' -; }
+# agy_overlap <key>: /credits started before /usage ended.
+agy_overlap() {
+    awk -v k="$1" '$1 == k && $2 == "credits" && $3 == "start" { c = NR }
+        $1 == k && $2 == "usage" && $3 == "end" { u = NR }
+        END { print (c && u && c < u) ? "yes" : "no" }' "$FIXTURES/agy.events"
+}
+
+# agy's own login is in the keyring, where usage can't see when it runs out.
+setup agy-current-one-at-a-time
+agy_on; agy_fixtures current
+echo 0.5 > "$FIXTURES/agy/current.usage.sleep"
+run_usage
+EXTRA_ENV=()
+check "agy current login: one run at a time" "usage start|usage end|credits start|credits end" \
+    "$(agy_order current)"
+
+# A saved login whose token outlasts both runs has /usage and /credits asked at
+# once: agy won't renew the token, so neither rewrites the file under the other.
+if [ "$HAVE_FLOCK" = yes ]; then
+    # agy's own format for the time, and /credits answering after /usage.
+    setup agy-saved-together
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    agy_expiry work '"2026-10-25T23:30:00.972993806Z"'
+    jq '.command.data.remaining_credits = 120' "$FIXTURES/agy/work.credits.json" > "$FIXTURES/c.json" &&
+        mv "$FIXTURES/c.json" "$FIXTURES/agy/work.credits.json"
+    echo credits > "$FIXTURES/agy/work.usage.after"
+    echo 1 > "$FIXTURES/agy/work.credits.sleep"
+    run_usage
+    EXTRA_ENV=()
+    check "agy saved, token good: /credits starts before /usage ends" "yes" "$(agy_overlap work)"
+    check "agy saved, token good: the later answer is still shown" "  credits        120 left" \
+        "$(printf '%s\n' "$OUT" | grep -F 'credits')"
+    check "agy saved, token good: exits 0" "0" "$RC"
+
+    setup agy-saved-token-lasting
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    agy_expiry work '"2026-10-25T23:06:00Z"'
+    echo credits > "$FIXTURES/agy/work.usage.after"
+    run_usage
+    EXTRA_ENV=()
+    check "agy saved, token good for 6 minutes: asked at once" "yes" "$(agy_overlap work)"
+
+    # agy may renew a token near its end, or one it can't date.
+    n=0
+    for expiry in '"2026-10-25T23:04:00Z"' '"2026-10-25T22:00:00Z"' null '"soon"' 1792969200000 '{"at":1}'; do
+        n=$((n + 1))
+        setup "agy-saved-token-ending-$n"
+        agy_on; agy_fixtures current
+        saved_agy work w@example.com
+        agy_expiry work "$expiry"
+        # Long enough that a /credits started beside it would show in the order.
+        echo 0.5 > "$FIXTURES/agy/work.usage.sleep"
+        run_usage
+        EXTRA_ENV=()
+        check "agy saved, token expiry $expiry: one run at a time" "usage start|usage end|credits start|credits end" \
+            "$(agy_order work)"
+        check "agy saved, token expiry $expiry: shown" "yes" "$(has 'Antigravity · work · w@example.com')"
+    done
+
+    # The five minutes count from when the lock is won, not from when usage started.
+    setup agy-saved-token-ends-during-wait
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    W="$FIXTURES/data/usage/accounts/antigravity/work"
+    agy_expiry work '"2026-10-25T23:05:02Z"'
+    echo 0.5 > "$FIXTURES/agy/work.usage.sleep"
+    # Held for 3 s once usage is known to be running; the token has 2 s to spare.
+    ( flock 9; touch "$FIXTURES/locked"; await "$FIXTURES/curl-started"; sleep 3 ) 9>"$W/.usage.lock" &
+    await "$FIXTURES/locked"
+    run_usage
+    EXTRA_ENV=()
+    wait
+    check "agy saved, token nearer its end after waiting for the lock: one run at a time" \
+        "usage start|usage end|credits start|credits end" "$(agy_order work)"
+
+    # /usage failing ends the wait: the /credits beside it is stopped.
+    setup agy-saved-usage-fails
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    echo '{"status":"ERROR","error":"quota service down"}' > "$FIXTURES/agy/work.usage.json"
+    echo credits > "$FIXTURES/agy/work.usage.after"
+    touch "$FIXTURES/agy/work.credits.hang"
+    start=$SECONDS
+    run_usage
+    EXTRA_ENV=()
+    check "agy saved, /usage fails: /credits had started" "yes" "$(agy_logged 'key=work cmd=credits')"
+    check "agy saved, /usage fails: says why" "yes" "$(has 'Antigravity · work: quota service down')"
+    check "agy saved, /usage fails: no wait for /credits" "yes" "$(within 5)"
+    check "agy saved, /usage fails: agy ended" "yes" "$(agy_gone)"
+    check "agy saved, /usage fails: exits 1" "1" "$RC"
+
+    setup agy-saved-credits-hang
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    touch "$FIXTURES/agy/work.credits.hang"
+    EXTRA_ENV+=(USAGE_AGY_WAIT=1)
+    start=$SECONDS
+    run_usage
+    EXTRA_ENV=()
+    check "agy saved, /credits hangs: quota still shown" "yes" "$(has 'Antigravity · work · w@example.com')"
+    check "agy saved, /credits hangs: no credits row" "no" "$(has 'credits')"
+    check "agy saved, /credits hangs: stopped in time" "yes" "$(within 6)"
+    check "agy saved, /credits hangs: agy ended" "yes" "$(agy_gone)"
+    check "agy saved, /credits hangs: exits 0" "0" "$RC"
+
+    # The lock is held until the slower of the two has answered.
+    setup agy-saved-together-lock
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    touch "$FIXTURES/agy/work.waiter"
+    echo 1 > "$FIXTURES/agy/work.credits.sleep"
+    run_usage
+    EXTRA_ENV=()
+    check "agy saved, asked at once: the queued run got the lock after" "yes" \
+        "$(await "$FIXTURES/got-lock" && echo yes || echo no)"
+    check "agy saved, asked at once: lock kept until /credits answers" "no" "$(exists "$FIXTURES/agy.gap")"
+
+    # Both runs share one stub dir; neither may trip over the other making it.
+    setup agy-saved-together-repeat
+    agy_on; agy_fixtures current
+    saved_agy work w@example.com
+    jq '.command.data.remaining_credits = 120' "$FIXTURES/agy/work.credits.json" > "$FIXTURES/c.json" &&
+        mv "$FIXTURES/c.json" "$FIXTURES/agy/work.credits.json"
+    missed=0
+    for _ in 1 2 3 4 5 6 7 8; do
+        run_usage
+        case "$OUT" in
+            *'Antigravity · work · w@example.com'*'120 left'*) ;;
+            *) missed=$((missed + 1)) ;;
+        esac
+    done
+    EXTRA_ENV=()
+    check "agy saved, asked at once: every run answered" "0" "$missed"
+
+    # usage stopped by a signal stops both.
+    setup agy-saved-usage-stopped
+    mkdir -p "$FIXTURES/tmp"
+    agy_fixtures current
+    saved_agy work w@example.com
+    touch "$FIXTURES/agy/work.hang"
+    env PATH="$STUB:$PATH" FIXTURES="$FIXTURES" USAGE_NOW="$NOW" XDG_DATA_HOME="$FIXTURES/data" \
+        TMPDIR="$FIXTURES/tmp" CLAUDE_CONFIG_DIR="$FIXTURES/claude" CODEX_HOME="$FIXTURES/codex" \
+        USAGE_AGY="$STUB/agy" bash "$SCRIPT" > "$FIXTURES/out" 2>&1 &
+    pid=$!
+    await "$FIXTURES/agy.started.work.usage"
+    await "$FIXTURES/agy.started.work.credits"
+    check "agy saved, usage stopped: both were running" "yes" "$(exists "$FIXTURES/agy.started.work.credits")"
+    sleep 0.3
+    kill -TERM "$pid"
+    wait "$pid"
+    rc=$?
+    for _ in $(seq 50); do [ "$(agy_gone)" = yes ] && break; sleep 0.1; done
+    check "agy saved, usage stopped: both agy ended" "yes" "$(agy_gone)"
+    check "agy saved, usage stopped: exits 143" "143" "$rc"
+    while IFS= read -r p; do kill "$p" 2>/dev/null; done < "$FIXTURES/agy.pids"
+else
+    printf '  skip: saved Antigravity logins asked at once (no flock)\n'
 fi
 
 # Removing a saved login takes its lock: agy may be renewing the token there,
