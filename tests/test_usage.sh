@@ -1004,6 +1004,47 @@ run_usage
 check "parallel: four 1s queries take under 3s" "yes" "$( (( SECONDS - start < 3 )) && echo yes || echo no)"
 check "parallel: all four shown" "4" "$(printf '%s\n' "$OUT" | grep -c '^Claude')"
 
+# Admin keys too: Anthropic's answers come last here, yet their lines stay first.
+setup api-parallel
+api_fixtures
+run_usage add anthropic-api work <<<'sk-ant-admin-a'
+run_usage add openai-api personal <<<'sk-admin-b'
+echo 3 > "$FIXTURES/anthropic.sleep"
+echo 1 > "$FIXTURES/openai.sleep"
+EXTRA_ENV=(ANTHROPIC_ADMIN_API_KEY=sk-ant-admin-x OPENAI_ADMIN_KEY=sk-admin-y)
+start=$SECONDS
+run_usage
+EXTRA_ENV=()
+check "api parallel: 3s, 3s, 1s and 1s queries take under 5s" "yes" "$( (( SECONDS - start < 5 )) && echo yes || echo no)"
+check "api parallel: lines keep their order" \
+    "Anthropic API · env|Anthropic API · work|OpenAI API · env|OpenAI API · personal" \
+    "$(printf '%s\n' "$OUT" | sed -nE 's/^  ((Anthropic|OpenAI) API · [a-z]+).*/\1/p' | paste -sd'|' -)"
+check "api parallel: one heading" "1" "$(printf '%s\n' "$OUT" | grep -cx 'API spend')"
+
+# A refused key fails the run, whichever key answers last.
+setup api-parallel-refused
+api_fixtures
+run_usage add openai-api good <<<'sk-admin-good'
+echo 401 > "$FIXTURES/openai.sk-admin-bad.code"
+echo '{"error":{"message":"bad key"}}' > "$FIXTURES/openai.sk-admin-bad.json"
+EXTRA_ENV=(OPENAI_ADMIN_KEY=sk-admin-bad)
+run_usage
+EXTRA_ENV=()
+check "api parallel: refused key says why" "  OpenAI API · env: HTTP 401: bad key" "$(printf '%s\n' "$OUT" | grep -F 'OpenAI API · env')"
+check "api parallel: the other key still shown" " OpenAI API · good \$3.56 spent this month" "$(line 'OpenAI API · good')"
+check "api parallel: refused key fails the run" "1" "$RC"
+
+# The status counts even when something in the temp dir is in the way.
+setup api-parallel-temp-dir-blocked
+api_fixtures
+echo 401 > "$FIXTURES/openai.sk-admin-bad.code"
+echo '{"error":{"message":"bad key"}}' > "$FIXTURES/openai.sk-admin-bad.json"
+mkdir -p "$FIXTURES/jobs/api.out"
+check "api parallel: refused key fails the run with the temp dir blocked" "1" \
+    "$(env -u ANTHROPIC_ADMIN_API_KEY PATH="$STUB:$PATH" FIXTURES="$FIXTURES" XDG_DATA_HOME="$FIXTURES/data" \
+        OPENAI_ADMIN_KEY=sk-admin-bad bash -c 'source "$1"; NOW=$2; JOBS=$3; api_section > /dev/null 2>&1; echo "$?"' \
+        _ "$SCRIPT" "$NOW" "$FIXTURES/jobs")"
+
 # --- the bar: 20 whole cells on a faint track -------------------------------------
 setup bars
 jq '.limits = [

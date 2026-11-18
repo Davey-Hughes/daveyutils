@@ -876,31 +876,42 @@ saved_names() {
     done
 }
 
-# api_kind <kind> <env var> <line function>: a line per Admin key of a kind,
-# the env var's first; nothing when there are none.
-api_kind() {
-    local kind=$1 var=$2 line=$3 dir name rc=0
-    dir="$(data_dir)/keys/$kind"
-    if [[ -n "${!var:-}" ]]; then
-        "$line" env "${!var}" </dev/null || rc=1
-    fi
-    while IFS= read -r name; do
-        "$line" "$name" "$(cat "$dir/$name")" </dev/null || rc=1
-    done < <(saved_names "$dir" files)
-    return "$rc"
+# api_job <line function> <label> <admin key>: that key's line, in the
+# background, its output and status kept in $JOBS for api_section.
+api_job() {
+    local line=$1
+    shift
+    API_JOBS=$((API_JOBS + 1))
+    { "$line" "$@" </dev/null > "$JOBS/api.$API_JOBS.out"; echo $? > "$JOBS/api.$API_JOBS.rc"; } &
 }
 
-# api_section: month-to-date spend per Admin key, or nothing at all when none
-# are set up (--help says how).
+# api_kind <kind> <env var> <line function>: start a line per Admin key of a
+# kind, the env var's first; nothing when there are none.
+api_kind() {
+    local kind=$1 var=$2 line=$3 dir name
+    dir="$(data_dir)/keys/$kind"
+    if [[ -n "${!var:-}" ]]; then
+        api_job "$line" env "${!var}"
+    fi
+    while IFS= read -r name; do
+        api_job "$line" "$name" "$(cat "$dir/$name")"
+    done < <(saved_names "$dir" files)
+}
+
+# api_section: month-to-date spend per Admin key, every key queried at once and
+# the lines in the order they were started, or nothing at all when none are set
+# up (--help says how). A line with no status was lost (killed), which counts as
+# a failure.
 api_section() {
-    local lines rc
-    lines=$(
-        r=0
-        api_kind anthropic-api ANTHROPIC_ADMIN_API_KEY anthropic_api_line || r=1
-        api_kind openai-api OPENAI_ADMIN_KEY openai_api_line || r=1
-        exit "$r"
-    )
-    rc=$?
+    local n lines rc=0
+    API_JOBS=0
+    api_kind anthropic-api ANTHROPIC_ADMIN_API_KEY anthropic_api_line
+    api_kind openai-api OPENAI_ADMIN_KEY openai_api_line
+    wait
+    for (( n = 1; n <= API_JOBS; n++ )); do
+        [[ "$(cat "$JOBS/api.$n.rc" 2>/dev/null)" == 0 ]] || rc=1
+    done
+    lines=$(for (( n = 1; n <= API_JOBS; n++ )); do cat "$JOBS/api.$n.out" 2>/dev/null; done)
     if [[ -n "$lines" ]]; then
         echo "API spend"
         printf '%s\n' "$lines"
@@ -1189,7 +1200,8 @@ main() {
     fi
 
     local rc=0
-    # Every account is queried at once; nothing prints until all have answered.
+    # Every account and Admin key is queried at once; nothing prints until all
+    # have answered.
     JOBS=$(mktemp -d "${TMPDIR:-/tmp}/usage.XXXXXX") || die "could not create a temp dir"
     trap end_jobs EXIT
     JOB_COUNT=0
