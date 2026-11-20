@@ -17,7 +17,6 @@
 mod common;
 
 use std::path::Path;
-use std::process::Child;
 use std::time::{Duration, Instant};
 
 use jiff::ToSpan;
@@ -31,15 +30,6 @@ fn os() -> Os {
         Os::Macos
     } else {
         Os::Linux
-    }
-}
-
-/// Kills the daemon we spawned, on any exit path.
-struct DaemonGuard(Child);
-impl Drop for DaemonGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 
@@ -71,7 +61,7 @@ fn due_job(session: &str, messages: &[&str], delay: f64) -> JobSpec {
 /// The tmux server and daemon one test runs against. Fields drop in order,
 /// so the daemon is killed before the server it types into.
 struct Rig {
-    daemon: DaemonGuard,
+    daemon: common::DaemonGuard,
     tmux: common::TmuxServer,
     /// The daemon's log, where it says why it stopped.
     log: std::path::PathBuf,
@@ -92,7 +82,11 @@ impl Rig {
             if screen.contains(marker) {
                 return;
             }
-            let exited = self.daemon.0.try_wait().ok().flatten();
+            let exited = self
+                .daemon
+                .has_exited()
+                .then(|| self.daemon.stop())
+                .flatten();
             if exited.is_some() || Instant::now() >= deadline {
                 let log = std::fs::read_to_string(&self.log).unwrap_or_default();
                 panic!(
@@ -137,9 +131,7 @@ fn jobs_waiting_their_turn_can_be_cancelled_or_edited() {
         std::env::set_var("HOME", &home);
         std::env::set_var("XDG_STATE_HOME", home.join("state"));
         std::env::set_var("XDG_RUNTIME_DIR", home.join("run"));
-        std::env::set_var("TMUX_TMPDIR", &tmux_tmpdir);
-        std::env::remove_var("TMUX");
-        std::env::remove_var("TMUX_PANE");
+        common::keep_this_process_off_the_developers_panes(&home);
     }
 
     let tmux = common::TmuxServer::start(&tmux_tmpdir, "slow");
@@ -187,7 +179,7 @@ fn jobs_waiting_their_turn_can_be_cancelled_or_edited() {
     assert_eq!((slow_id, cancel_id, edit_id), (1, 2, 3));
     drop(queue);
 
-    let daemon = DaemonGuard(
+    let daemon = common::DaemonGuard::new(
         nudge::app::spawn_daemon(Path::new(env!("CARGO_BIN_EXE_nudge")), &paths)
             .expect("spawn the daemon"),
     );

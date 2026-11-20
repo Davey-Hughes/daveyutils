@@ -22,7 +22,6 @@ use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nudge::ipc::server;
 use nudge::job::{JobSpec, TargetSpec};
 use nudge::paths::{Os, Paths, resolve_from};
 use nudge::queue::Queue;
@@ -75,7 +74,12 @@ fn spec() -> JobSpec {
 /// `queue` on the socket after `DAEMON_START_DELAY`.
 struct Fixture {
     home: PathBuf,
+    // Above `_tmp` and `_lock`, so that it is dropped first: see
+    // `common::Descendants`.
+    cli: common::Descendants,
     queue: Arc<Mutex<Queue>>,
+    // Above `_tmp`, so that it is dropped first: see `common::StandInDaemon`.
+    _daemon: common::StandInDaemon,
     _tmp: tempfile::TempDir,
     _lock: std::fs::File,
 }
@@ -99,24 +103,26 @@ fn fixture() -> Fixture {
     let queue = Arc::new(Mutex::new(Queue::load(paths.queue.clone()).unwrap()));
     queue.lock().unwrap().add(spec()).unwrap();
 
-    let q = Arc::clone(&queue);
-    let socket = paths.socket.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(DAEMON_START_DELAY);
-        let _ = server::serve(&socket, &q);
-    });
+    let daemon =
+        common::StandInDaemon::start_after(DAEMON_START_DELAY, &paths.socket, Arc::clone(&queue));
 
     Fixture {
         home,
+        cli: common::Descendants::new(),
         queue,
+        _daemon: daemon,
         _tmp: tmp,
         _lock: lock,
     }
 }
 
-fn run_nudge(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_nudge"))
-        .args(args)
+fn run_nudge(f: &Fixture, args: &[&str]) -> Output {
+    let home = &f.home;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nudge"));
+    f.cli.follow(&mut cmd);
+    // The job list labels its panes from every pane tmux and herdr can list.
+    common::keep_off_the_developers_panes(&mut cmd, home);
+    cmd.args(args)
         .env("HOME", home)
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_RUNTIME_DIR", home.join("run"))
@@ -139,7 +145,7 @@ fn cancel_works_with_no_daemon_running() {
     // still fires. Pre-fix this died with "No such file or directory (os error
     // 2)" and job 1 stayed in the queue, ready to fire on the next daemon start.
     let f = fixture();
-    let out = run_nudge(&f.home, &["--cancel", "1"]);
+    let out = run_nudge(&f, &["--cancel", "1"]);
 
     assert!(out.status.success(), "{}", report("cancel", &out));
     assert!(
@@ -156,7 +162,7 @@ fn cancel_works_with_no_daemon_running() {
 #[test]
 fn list_works_with_no_daemon_running() {
     let f = fixture();
-    let out = run_nudge(&f.home, &["--list"]);
+    let out = run_nudge(&f, &["--list"]);
 
     assert!(out.status.success(), "{}", report("list", &out));
     assert!(
@@ -169,7 +175,7 @@ fn list_works_with_no_daemon_running() {
 #[test]
 fn edit_works_with_no_daemon_running() {
     let f = fixture();
-    let out = run_nudge(&f.home, &["--edit", "1", "-m", "now + 3 hours"]);
+    let out = run_nudge(&f, &["--edit", "1", "-m", "now + 3 hours"]);
 
     assert!(out.status.success(), "{}", report("edit", &out));
     assert!(

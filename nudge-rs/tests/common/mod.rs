@@ -97,6 +97,365 @@ pub fn assert_socket_path_fits(socket: &Path) {
     );
 }
 
+/// An in-process server standing in for a nudge daemon that is still
+/// starting: it binds the socket only after a delay, so the CLI under test
+/// finds nothing listening at first, and then answers from a queue the test
+/// holds.
+///
+/// Dropping it holds it back for good, so declare it above the fixture's
+/// `TempDir`: fields drop in the order they are declared, and it must go
+/// first. A test can end before the delay is up. The thread this replaced
+/// then called `server::serve`, which creates the socket's directory before
+/// binding, and so put back a tempdir the test had already removed, with
+/// `run/nudge.sock` in it and nothing left to remove it (seen 2026-11-20: one
+/// `/tmp/nudge-XXXXXX` per run of `cli_job_summary`).
+pub struct StandInDaemon {
+    /// Set once the fixture is going. The thread binds while holding this
+    /// lock and `Drop` sets it under the same lock, so a bind either finished
+    /// before the tempdir began to go, and its socket goes with the rest, or
+    /// never happens. A check without the lock would leave room for the
+    /// socket to appear in a directory already being emptied, which then
+    /// cannot be removed.
+    gone: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+impl StandInDaemon {
+    /// After `delay`, bind `socket` and answer requests from `queue`, one
+    /// connection at a time. `socket`'s directory must already exist: this
+    /// never creates it.
+    pub fn start_after(
+        delay: std::time::Duration,
+        socket: &Path,
+        queue: std::sync::Arc<std::sync::Mutex<nudge::queue::Queue>>,
+    ) -> Self {
+        let gone = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let fixture_gone = std::sync::Arc::clone(&gone);
+        let socket = socket.to_path_buf();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let listener = {
+                let gone = fixture_gone.lock().unwrap();
+                if *gone {
+                    return;
+                }
+                match std::os::unix::net::UnixListener::bind(&socket) {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        eprintln!("stand-in daemon: bind {}: {e}", socket.display());
+                        return;
+                    }
+                }
+            };
+            // Loops forever, as a daemon does, and is reaped when the test
+            // binary exits. One connection's error is that client's affair,
+            // but an `accept` that keeps failing, as it does once the test
+            // binary is out of file descriptors, must not spin.
+            loop {
+                if nudge::ipc::server::serve_once(&listener, &queue).is_err() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        });
+        StandInDaemon { gone }
+    }
+}
+
+impl Drop for StandInDaemon {
+    fn drop(&mut self) {
+        // A poisoned lock still holds the flag. Panicking here would abort a
+        // test that is already unwinding.
+        *self
+            .gone
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    }
+}
+
+/// Kills a daemon a test started, on any exit path, along with whatever the
+/// daemon had started itself.
+///
+/// A daemon types into a pane by running `tmux`. Killing the daemon alone
+/// leaves a `tmux` it had just started to run on, and the test's tmux server
+/// and tempdir are the next things to go: a `tmux` that looks for its server
+/// after that finds `TMUX_TMPDIR` missing and falls back to the developer's
+/// own (see [`TmuxServer::env`]). So the daemon's whole process group is
+/// killed. A daemon from production `spawn_daemon` leads a session, and with
+/// it a group that its children stay in. One a test starts itself needs
+/// `process_group(0)` for this to reach its children.
+///
+/// The daemon is kept in here, out of reach, so that nothing waits for it
+/// before [`DaemonGuard::stop`] does. Until it has been waited for, its pid
+/// is its own, even once it has exited, and so is the group of that number.
+/// Afterwards the number can pass to some other process, whose group a kill
+/// would then take.
+pub struct DaemonGuard {
+    daemon: std::process::Child,
+    /// Set by the first [`DaemonGuard::stop`], which is the only one to act.
+    stopped: bool,
+    /// How the daemon ended, once stopped.
+    ended: Option<std::process::ExitStatus>,
+}
+
+impl DaemonGuard {
+    pub fn new(daemon: std::process::Child) -> Self {
+        DaemonGuard {
+            daemon,
+            stopped: false,
+            ended: None,
+        }
+    }
+
+    /// The daemon's process id.
+    pub fn pid(&self) -> libc::pid_t {
+        libc::pid_t::try_from(self.daemon.id()).expect("a process id is a pid_t")
+    }
+
+    /// Whether the daemon has exited. This only looks. `Child::try_wait`
+    /// would also collect the daemon, and its group could then no longer be
+    /// killed (see the type's doc), though a daemon that died on its own is
+    /// the one most likely to have left a `tmux` behind.
+    pub fn has_exited(&self) -> bool {
+        self.stopped || matches!(self.look(), Seen::Exited | Seen::NotOurs)
+    }
+
+    /// What `waitid` says of the daemon, without collecting it.
+    fn look(&self) -> Seen {
+        // SAFETY: `info` is a plain struct of integers that `waitid` fills
+        // in, and zeroes are a valid one.
+        let (answered, info) = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+            let answered = libc::waitid(libc::P_PID, self.daemon.id(), &raw mut info, options);
+            (answered, info)
+        };
+        if answered == 0 {
+            if info.si_signo == libc::SIGCHLD {
+                Seen::Exited
+            } else {
+                Seen::Running
+            }
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+            Seen::NotOurs
+        } else {
+            // `waitid` could not say, and the daemon may well be running:
+            // calling it exited would have a test kill it and then blame it
+            // for dying.
+            Seen::Running
+        }
+    }
+
+    /// Kill the daemon and everything in its group, and say how the daemon
+    /// ended: with its own exit status if it had already exited, which is
+    /// what a test that found it dead wants to show.
+    pub fn stop(&mut self) -> Option<std::process::ExitStatus> {
+        if self.stopped {
+            return self.ended;
+        }
+        self.stopped = true;
+        // Collected by something other than this guard: its pid may already
+        // be another process's (see the type's doc), so nothing is killed
+        // and nobody knows how it ended.
+        if self.look() == Seen::NotOurs {
+            return None;
+        }
+        let pid = self.pid();
+        // 0 and -1 name the caller's own group and every process there is.
+        // No child has pid 0 or 1, but nothing here should rest on that.
+        if pid > 1 {
+            // SAFETY: `kill` takes ids and no pointers. A group numbered
+            // after the daemon's pid can only be one the daemon leads (see
+            // the type's doc). A daemon that leads none, having been started
+            // in the test's own group, has no such group, and this fails
+            // with ESRCH and touches nothing.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        let _ = self.daemon.kill();
+        self.ended = self.daemon.wait().ok();
+        self.ended
+    }
+}
+
+/// What [`DaemonGuard`] can see of its daemon.
+#[derive(PartialEq)]
+enum Seen {
+    Running,
+    /// Exited, and still this process's to collect.
+    Exited,
+    /// No child of this process any more: something else collected it.
+    NotOurs,
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// How long a fixture waits, as it is dropped, for what its commands started.
+/// A failure deadline, not a delay: a daemon that loses the singleton lock
+/// exits in milliseconds, long before the test that started it ends.
+const DESCENDANT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Knows when every process a fixture's commands started has exited, down to
+/// those that outlived the command that started them.
+///
+/// The CLI suites run a `nudge` that starts a daemon and does not wait for
+/// it. The daemon is meant to lose the singleton lock the fixture holds and
+/// exit, but taking the lock creates its directory first. One that got there
+/// after the fixture's tempdir had been removed would put the directory back,
+/// win a lock nobody holds any more, and run on. Dropping this waits for all
+/// of them, so declare it above the fixture's `TempDir` and above the lock
+/// it holds: fields drop in the order they are declared, and both must
+/// still be there while a late daemon finds out that it lost.
+///
+/// Each command followed is handed the writing end of a pipe, which it passes
+/// on to whatever it starts. The pipe reaches its end once the last of them
+/// has exited. Nothing else gets a copy: the descriptor is close-on-exec here,
+/// and only a followed command clears that, in its own process, before it
+/// runs.
+///
+/// One exception, on a system that cannot make a pipe close-on-exec in one
+/// step (macOS): a process some other test starts in the moment between the
+/// two steps keeps a copy. The wait then lasts as long as that process does,
+/// or until the patience above runs out, and the warning it prints is false.
+pub struct Descendants {
+    writer: Option<std::io::PipeWriter>,
+    reader: Option<std::io::PipeReader>,
+    /// Hears from the thread reading the pipe once it has reached the end.
+    ended: Option<std::sync::mpsc::Receiver<()>>,
+    gone: bool,
+}
+
+impl Descendants {
+    pub fn new() -> Self {
+        let (reader, writer) = std::io::pipe().expect("create a pipe");
+        Descendants {
+            writer: Some(writer),
+            reader: Some(reader),
+            ended: None,
+            gone: false,
+        }
+    }
+
+    /// Count `cmd`, once it is started, and everything it starts in turn.
+    /// Start it before this is dropped or waited on: afterwards the
+    /// descriptor it would pass on is closed, and its number may be some
+    /// other file's.
+    pub fn follow(&self, cmd: &mut std::process::Command) {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let fd = self
+            .writer
+            .as_ref()
+            .expect("follow a command before waiting for the rest")
+            .as_raw_fd();
+        // SAFETY: the closure runs in the child between fork and exec, where
+        // only async-signal-safe calls are allowed. `fcntl` is one, and
+        // reading errno allocates nothing. It clears close-on-exec in the
+        // child alone: descriptor flags are not shared across a fork.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    /// Wait up to `patience` for every one of them to exit. `false` if some
+    /// were still running by then. No command can be followed after this.
+    pub fn wait_until_gone(&mut self, patience: std::time::Duration) -> bool {
+        if self.gone {
+            return true;
+        }
+        // This end first, or the pipe would never reach its own.
+        drop(self.writer.take());
+        if let Some(mut reader) = self.reader.take() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut nothing = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut reader, &mut nothing);
+                let _ = tx.send(());
+            });
+            self.ended = Some(rx);
+        }
+        self.gone = self
+            .ended
+            .as_ref()
+            .is_some_and(|ended| ended.recv_timeout(patience).is_ok());
+        self.gone
+    }
+}
+
+impl Drop for Descendants {
+    fn drop(&mut self) {
+        // Said, not panicked: a panic here would abort a test that is
+        // already unwinding.
+        if !self.wait_until_gone(DESCENDANT_PATIENCE) {
+            eprintln!(
+                "warning: something a test's command started was still running \
+                 after {DESCENDANT_PATIENCE:?}; it may put the test's tempdir back"
+            );
+        }
+    }
+}
+
+/// Leave `cmd` no way to the developer's own tmux or herdr, for a `nudge`
+/// run under a fixture whose home is `home`.
+///
+/// nudge labels the panes in its job list and its confirmations from every
+/// tmux and herdr pane it can list, and the session running the tests may
+/// itself sit in a tmux or herdr pane. So every `HERDR_*`, `TMUX` and
+/// `TMUX_PANE` goes, and `TMUX_TMPDIR` and `XDG_CONFIG_HOME` point inside
+/// the fixture, where no tmux server runs unless the test starts one there
+/// (`home/tmux`) and herdr keeps no session.
+///
+/// `TMUX_TMPDIR` is created here, and that is the point of doing this in one
+/// place: tmux skips a `TMUX_TMPDIR` that does not exist and falls back to
+/// its default socket directory, where the developer's server lives. Two
+/// suites set the variable and never made the directory, and two set
+/// nothing, so their `list-panes` went to that server (seen 2026-11-20).
+pub fn keep_off_the_developers_panes(cmd: &mut std::process::Command, home: &Path) {
+    let tmux_tmpdir = home.join("tmux");
+    std::fs::create_dir_all(&tmux_tmpdir).expect("create the fixture's TMUX_TMPDIR");
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("HERDR_")) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env("TMUX_TMPDIR", tmux_tmpdir)
+        .env("XDG_CONFIG_HOME", home.join("config"));
+}
+
+/// [`keep_off_the_developers_panes`] for this process, and so for a daemon it
+/// starts with production `spawn_daemon`, which inherits its environment.
+///
+/// # Safety
+///
+/// Nothing else may read or write the environment while this runs: call it
+/// from the only test in its binary, before that test starts a thread.
+pub unsafe fn keep_this_process_off_the_developers_panes(home: &Path) {
+    let tmux_tmpdir = home.join("tmux");
+    std::fs::create_dir_all(&tmux_tmpdir).expect("create the fixture's TMUX_TMPDIR");
+    // SAFETY: the caller's, as above.
+    unsafe {
+        for (key, _) in std::env::vars_os() {
+            if key.to_str().is_some_and(|k| k.starts_with("HERDR_")) {
+                std::env::remove_var(key);
+            }
+        }
+        std::env::remove_var("TMUX");
+        std::env::remove_var("TMUX_PANE");
+        std::env::set_var("TMUX_TMPDIR", tmux_tmpdir);
+        std::env::set_var("XDG_CONFIG_HOME", home.join("config"));
+    }
+}
+
 /// A tmux server private to one test, living under its own `TMUX_TMPDIR`.
 ///
 /// `TMUX_TMPDIR` rather than `-L`, because the point is usually a child `nudge`

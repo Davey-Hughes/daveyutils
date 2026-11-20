@@ -254,26 +254,15 @@ fn fixture() -> Fixture {
 /// Run `nudge args` with `env` set and nothing inherited that could lead it
 /// to the developer's tmux or herdr.
 ///
-/// The session running these tests may sit in a herdr pane inside tmux, so
-/// every `HERDR_*`, `TMUX` and `TMUX_PANE` goes. `TMUX_TMPDIR` and
-/// `XDG_CONFIG_HOME` point inside the fixture, where no tmux server runs and
-/// herdr keeps no session, so a tmux or herdr command that does run finds
-/// nothing of the developer's.
+/// A tmux or herdr command that does run finds nothing of the developer's
+/// (see `common::keep_off_the_developers_panes`).
 fn run_nudge(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nudge"));
-    for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(|k| k.starts_with("HERDR_")) {
-            cmd.env_remove(key);
-        }
-    }
+    common::keep_off_the_developers_panes(&mut cmd, home);
     cmd.args(args)
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
         .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
-        .env("XDG_RUNTIME_DIR", home.join("run"))
-        .env("TMUX_TMPDIR", home.join("tmux"));
+        .env("XDG_RUNTIME_DIR", home.join("run"));
     for (k, v) in env {
         cmd.env(k, v);
     }

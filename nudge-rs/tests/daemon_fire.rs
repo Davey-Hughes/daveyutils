@@ -1,131 +1,113 @@
 //! End-to-end: the daemon fires a due job into a real tmux pane. Self-skips
 //! without tmux.
 //!
-//! `TargetSpec::Tmux` carries no socket yet (increment 3b), so
-//! `job.target.connect()` always builds a `TmuxTarget` on tmux's *default*
-//! socket. To reach it hermetically without disturbing the developer's real
-//! tmux usage, this test starts a uniquely-named throwaway *session* on the
-//! default server (sharing the server, touching only that one session) and
-//! kills exactly that session (never the server) on drop.
+//! Hermetic in the way `daemon_batch.rs` is, because the daemon types into a
+//! tmux pane:
+//! - The daemon is the real `nudge --daemon`, started by production
+//!   `spawn_daemon` and killed on drop, before the tmux server it types into
+//!   is stopped. It used to be `nudge::daemon::run` on a thread of the test,
+//!   which nothing can stop: a test that failed midway took its tmux server
+//!   and tempdir away from under a daemon still firing, and tmux then falls
+//!   back to the developer's own server (see `common::TmuxServer::env`).
+//!   The price is the one `daemon_batch.rs` pays: a run that is interrupted
+//!   rather than failed drops nothing, and leaves the daemon running beside
+//!   its private tmux server, where the thread died with the test.
+//! - HOME/XDG_* point at a tempdir, so the queue and socket are ours.
+//! - `TMUX_TMPDIR` points at a private tmux server, and `TMUX`/`TMUX_PANE`
+//!   are removed, so neither the daemon nor this test can reach the
+//!   developer's own server. The job names no socket, so the daemon finds
+//!   its pane the way a real one does: on the server its environment leads
+//!   to.
 //!
-//! State (queue/socket) lives in a tempdir; `nudge::daemon::run` is spawned on
-//! a thread that loops forever and is reaped at process exit.
+//! Single test in this file on purpose: it sets process-wide env, which the
+//! daemon inherits and which no sibling test may race.
 
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use jiff::ToSpan;
 use nudge::job::{JobSpec, TargetSpec};
-use nudge::paths::Paths;
+use nudge::paths::{Os, Paths, resolve_from};
 use nudge::queue::Queue;
 
-fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
+/// The session the job is fired into, which is also how its pane is named:
+/// a bare session name is that session's current pane.
+const SESSION: &str = "fire";
 
-/// Owns a uniquely-named throwaway session on the *default* tmux server; kills
-/// only that session (not the server) on drop, since other tests/tmux usage
-/// share the default server.
-struct Session {
-    name: String,
-}
-
-impl Session {
-    fn start(name: &str) -> Self {
-        let ok = Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sh",
-            ])
-            .status()
-            .expect("spawn tmux")
-            .success();
-        assert!(ok, "failed to start throwaway tmux session {name}");
-        Session {
-            name: name.to_string(),
-        }
-    }
-
-    /// The pane spec addressing this session's active pane. Deliberately just
-    /// the session name (not `"<name>:0.0"`): tmux's `base-index`/
-    /// `pane-base-index` options are user-configurable (this host's default
-    /// server has `base-index 1`, so window `0` doesn't exist there), and a
-    /// bare session name always resolves to that session's current pane
-    /// regardless of index configuration.
-    fn pane(&self) -> String {
-        self.name.clone()
-    }
-
-    fn capture(&self) -> String {
-        let out = Command::new("tmux")
-            .args(["capture-pane", "-p", "-t", &self.pane()])
-            .output()
-            .expect("capture-pane");
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        // Kill the SESSION by name, not the server: the default tmux server
-        // may be shared by other tests or by the developer's real tmux.
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &self.name])
-            .status();
+fn os() -> Os {
+    if cfg!(target_os = "macos") {
+        Os::Macos
+    } else {
+        Os::Linux
     }
 }
 
 #[test]
 fn daemon_fires_a_due_job_into_the_pane() {
-    // Declared before the early return, not beside its first use: a `static` in
-    // a function body exists from the start of the scope regardless, so putting
-    // it mid-body only makes it read as if it were per-call state.
-    static N: AtomicU64 = AtomicU64::new(0);
-
-    if !tmux_available() {
+    if !common::tmux_available() {
         eprintln!("skipping: tmux not installed");
         return;
     }
 
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let session_name = format!("nudge_daemon_{}_{}", std::process::id(), n);
-    let session = Session::start(&session_name);
+    // common::short_tempdir, for the socket path's length on macOS (see
+    // cli_daemon_log.rs).
+    //
+    // What follows is declared in the order tempdir, tmux server, daemon, and
+    // so dropped in the reverse: the daemon is killed before the server it
+    // types into is stopped, and the server is stopped before its directory
+    // goes.
+    let tmp = common::short_tempdir();
+    let home = tmp.path().to_path_buf();
+    let tmux_tmpdir = home.join("tmux");
+    std::fs::create_dir_all(&tmux_tmpdir).unwrap();
+
+    // Set before anything is spawned: the daemon inherits all of it, resolves
+    // its own state dir from it, and runs its tmux calls under it.
+    //
+    // SAFETY: nothing else reads the environment while it changes. This is the
+    // only test in its binary (see the module doc), and it has started no
+    // thread of its own yet.
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_STATE_HOME", home.join("state"));
+        std::env::set_var("XDG_RUNTIME_DIR", home.join("run"));
+        common::keep_this_process_off_the_developers_panes(&home);
+    }
+
+    let tmux = common::TmuxServer::start(&tmux_tmpdir, SESSION);
+    // The server this test and its daemon reach is the one in the tempdir.
+    // tmux resolves the directory before naming its socket, and macOS's /tmp
+    // is a link, hence `canonicalize`.
+    let socket = tmux.run(&["display-message", "-p", "#{socket_path}"]);
+    let ours = std::fs::canonicalize(&home).unwrap();
+    assert!(
+        Path::new(&socket).starts_with(&ours),
+        "the test's tmux server is at {socket}, outside {}",
+        ours.display()
+    );
 
     // Stage a rate-limit banner for realism, even though this job uses
     // `verify: false` so the banner isn't required for the send to happen.
-    Command::new("tmux")
-        .args([
-            "send-keys",
-            "-t",
-            &session_name,
-            "-l",
-            "printf 'quota reached. Resets in 45m\\n'",
-        ])
-        .status()
-        .unwrap();
-    Command::new("tmux")
-        .args(["send-keys", "-t", &session_name, "Enter"])
-        .status()
-        .unwrap();
+    tmux.run(&[
+        "send-keys",
+        "-t",
+        SESSION,
+        "-l",
+        "printf 'quota reached. Resets in 45m\\n'",
+    ]);
+    tmux.run(&["send-keys", "-t", SESSION, "Enter"]);
 
-    // Hermetic daemon state: queue + socket in a tempdir.
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths {
-        state_dir: dir.path().to_path_buf(),
-        queue: dir.path().join("queue.json"),
-        socket: dir.path().join("nudge.sock"),
-    };
+    let paths: Paths = resolve_from(
+        &home,
+        Some(&home.join("state")),
+        Some(&home.join("run")),
+        os(),
+    );
+    common::assert_socket_path_fits(&paths.socket);
+    std::fs::create_dir_all(&paths.state_dir).unwrap();
+    std::fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
 
     // Write a DUE job straight into the queue file so the daemon fires it on
     // its first pass (catch-up), not after waiting out a poll interval.
@@ -137,7 +119,7 @@ fn daemon_fires_a_due_job_into_the_pane() {
     queue
         .add(JobSpec {
             target: TargetSpec::Tmux {
-                pane: session.pane(),
+                pane: SESSION.into(),
                 server: None,
             },
             messages: vec!["echo daemon_marker_$((6*7))".into()],
@@ -155,27 +137,45 @@ fn daemon_fires_a_due_job_into_the_pane() {
         .unwrap();
     drop(queue); // done writing; the daemon will `Queue::load` its own handle
 
-    // Spawn the daemon: loops forever, reaped at process exit.
-    let daemon_paths = paths.clone();
-    std::thread::spawn(move || {
-        let _ = nudge::daemon::run(&daemon_paths, None, None, None, 6.hours());
+    let mut daemon = common::DaemonGuard::new(
+        nudge::app::spawn_daemon(Path::new(env!("CARGO_BIN_EXE_nudge")), &paths)
+            .expect("spawn the daemon"),
+    );
+    let log = paths.state_dir.join("nudge.log");
+
+    // Poll until `done` holds, or fail saying `what` never happened. A daemon
+    // that has exited fails it at once, with its log: a wait that only times
+    // out says nothing about why.
+    let mut wait = |what: &str, done: &dyn Fn() -> Result<(), String>| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let Err(seen) = done() else { return };
+            let exited = daemon.has_exited().then(|| daemon.stop()).flatten();
+            if exited.is_some() || Instant::now() >= deadline {
+                let log = std::fs::read_to_string(&log).unwrap_or_default();
+                panic!("{what} (daemon exit: {exited:?}); {seen}\ndaemon log:\n{log}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    // The injected echo has actually run.
+    wait("the daemon never fired the due job into the pane", &|| {
+        let screen = tmux.run(&["capture-pane", "-p", "-t", SESSION]);
+        if screen.contains("daemon_marker_42") {
+            Ok(())
+        } else {
+            Err(format!("last capture:\n{screen}"))
+        }
     });
 
-    // Poll the pane until the injected echo has actually run.
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let screen = loop {
-        let screen = session.capture();
-        if screen.contains("daemon_marker_42") {
-            break screen;
+    // A fired job leaves the queue.
+    wait("the fired job never left the queue", &|| {
+        let left = Queue::load(paths.queue.clone()).unwrap().all().to_vec();
+        if left.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("still queued: {left:?}"))
         }
-        assert!(
-            Instant::now() < deadline,
-            "daemon never fired the due job into the pane; last capture:\n{screen}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    assert!(
-        screen.contains("daemon_marker_42"),
-        "pane missing the marker after daemon fired; got:\n{screen}"
-    );
+    });
 }

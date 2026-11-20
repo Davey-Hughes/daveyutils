@@ -10,10 +10,20 @@ use std::time::{Duration, Instant};
 use nudge::ipc::{Request, Response, client, server};
 use nudge::queue::Queue;
 
+/// Wait until the server takes a connection.
+///
+/// Not until the socket's file appears: binding creates the file, and only
+/// the `listen` that follows makes it take connections. A client that
+/// connects between the two is refused, as one was on macOS on 2026-11-20
+/// (`ConnectionRefused` from the test's first connect). The connection made
+/// here is dropped unused, which the server must survive anyway.
 fn wait_for_socket(path: &std::path::Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !path.exists() {
-        assert!(Instant::now() < deadline, "socket never appeared");
+    while UnixStream::connect(path).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the server never took a connection"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }

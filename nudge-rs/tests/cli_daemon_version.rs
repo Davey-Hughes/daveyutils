@@ -137,8 +137,9 @@ fn with_old_daemon(pong: &'static str) -> Fixture {
 }
 
 fn run_nudge(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_nudge"))
-        .args(args)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nudge"));
+    common::keep_off_the_developers_panes(&mut cmd, home);
+    cmd.args(args)
         .env("HOME", home)
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_RUNTIME_DIR", home.join("run"))

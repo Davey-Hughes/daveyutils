@@ -27,6 +27,8 @@ fn tmux_available() -> bool {
 /// Owns a private tmux server; kills it on drop (even on panic).
 struct Server {
     socket: String,
+    /// The socket's file, as tmux names it once the server is up.
+    socket_path: Option<std::path::PathBuf>,
 }
 
 /// Start a detached 80x24 session `s` running a plain shell on `socket`,
@@ -48,6 +50,11 @@ fn new_session(socket: &str) -> std::process::Output {
             "24",
             "sh",
         ])
+        // The server starts with this command's environment and hands it to
+        // every pane. An empty HISTFILE stops a pane's `sh` from writing what
+        // these tests type into the developer's `~/.bash_history` as it exits
+        // (see `common::TmuxServer::env`).
+        .env("HISTFILE", "")
         .output()
         .expect("spawn tmux")
 }
@@ -59,6 +66,21 @@ fn assert_started(out: &std::process::Output, what: &str) {
         "failed to {what} private tmux session: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
+}
+
+/// Whether tmux turned a client away because no server is listening on the
+/// socket: `no server running on` or `error connecting to`.
+fn refused(out: &std::process::Output) -> bool {
+    let said = String::from_utf8_lossy(&out.stderr);
+    !out.status.success()
+        && (said.contains("no server running") || said.contains("error connecting to"))
+}
+
+/// Whether tmux turned a client away with `no server running`, which it says
+/// when the connection is refused: the socket's file is there and nothing
+/// listens on it.
+fn no_server_running(out: &std::process::Output) -> bool {
+    !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("no server running")
 }
 
 impl Server {
@@ -80,12 +102,7 @@ impl Server {
                 Command::new("tmux")
                     .args(["-L", &self.socket, "list-sessions"])
                     .output()
-                    .is_ok_and(|o| {
-                        let said = String::from_utf8_lossy(&o.stderr);
-                        !o.status.success()
-                            && (said.contains("no server running")
-                                || said.contains("error connecting to"))
-                    })
+                    .is_ok_and(|o| refused(&o))
             },
             "a client to find no server",
         );
@@ -110,8 +127,9 @@ impl Server {
         // Construct the guard before the fallible spawn so that if `new-session`
         // fails after tmux has already started the private server process, the
         // guard's `Drop` still kills it instead of leaking it.
-        let server = Server {
+        let mut server = Server {
             socket: socket.clone(),
+            socket_path: None,
         };
         // `-L` gives us a private *server*; `-f /dev/null` gives us a
         // private *config*, and the second is not optional. Without it a
@@ -121,8 +139,28 @@ impl Server {
         // made these the slowest tests in the suite: sourcing one real
         // config (plugin manager, shell-outs) measured 5.3s per server,
         // against 0.02s for a bare one, and every test starts one.
-        assert_started(&new_session(&socket), "start");
+        let started = new_session(&socket);
+        // Before the assertion: a `new-session` that failed may have left a
+        // server all the same, and `Drop` needs the path to clear up after it.
+        server.socket_path = server.find_socket_path();
+        assert_started(&started, "start");
         server
+    }
+    /// Where tmux put this server's socket, if a server is there to say.
+    fn find_socket_path(&self) -> Option<std::path::PathBuf> {
+        let out = Command::new("tmux")
+            .args([
+                "-L",
+                &self.socket,
+                "display-message",
+                "-p",
+                "#{socket_path}",
+            ])
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().into())
     }
     fn target(&self) -> TmuxTarget {
         TmuxTarget::with_socket("s", &self.socket)
@@ -152,9 +190,48 @@ impl Server {
 }
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
+        // `start` asks once. If that got no answer, ask again while there is
+        // still a server to give one.
+        let path = self.socket_path.clone().or_else(|| self.find_socket_path());
+        let killed = Command::new("tmux")
             .args(["-L", &self.socket, "kill-server"])
-            .status();
+            .output();
+        // Killed just now, or already gone, as after `stop`: tmux says `no
+        // server running` when the connection is refused, which is what a
+        // socket file with nothing listening on it does. A `kill-server`
+        // that failed some other way may have lost its connection to a
+        // server on its way down, and a client asking straight after can
+        // meet the same (see `stop`), so more clients ask, for a second at
+        // most. If none is refused, the server may still be running, with
+        // its socket the one way left to reach it.
+        let mut stopped = killed.is_ok_and(|out| out.status.success() || no_server_running(&out));
+        // Only for a file that is there: with none, there is nothing to
+        // remove, and tmux's answer is not `no server running`.
+        let there = path.as_ref().is_some_and(|path| path.exists());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while there && !stopped && Instant::now() < deadline {
+            stopped = Command::new("tmux")
+                .args(["-L", &self.socket, "list-sessions"])
+                .output()
+                .is_ok_and(|out| no_server_running(&out));
+            if !stopped {
+                thread::sleep(TICK);
+            }
+        }
+        // `kill-server` leaves the socket's file behind (tmux 3.8, seen
+        // 2026-11-20). Only here and not in `stop`: a stopped server's file
+        // lying where it was is what `wrong_pane` meets after a real one
+        // dies, and `restart` binds the same path again. Only a file named
+        // after this server's socket, so that a path tmux reported oddly is
+        // left alone rather than removed.
+        if stopped
+            && let Some(path) = &path
+            && path
+                .file_name()
+                .is_some_and(|name| name == self.socket.as_str())
+        {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -987,4 +1064,68 @@ fn a_pane_id_still_reaches_its_pane_after_the_windows_renumber() {
         "landed_42",
         "the id must still name the pane that was window 2",
     );
+}
+
+// ---- what a server leaves on the developer's machine ----
+
+/// A pane's `sh` writes what was typed into it to `$HOME/.bash_history` as it
+/// exits, and these servers run under the developer's own `HOME`: every run
+/// of this file put the lines it had staged into that file (500 of them by
+/// 2026-11-20).
+#[test]
+fn a_panes_shell_keeps_no_history() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+
+    // The line as typed shows `${HISTFILE-unset}`, so only what the shell
+    // prints can match.
+    server.stage("echo \"HISTFILE=[${HISTFILE-unset}]\"");
+
+    wait_for_text(
+        &server.target(),
+        "HISTFILE=[]",
+        "the pane's shell must have an empty HISTFILE",
+    );
+}
+
+/// tmux 3.8's `kill-server` leaves the socket's file where it was, so each
+/// server started here left one in tmux's socket directory (660 in
+/// `/tmp/tmux-1000` by 2026-11-20).
+#[test]
+fn a_stopped_server_leaves_no_socket_file() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let path = server.socket_path.clone().expect("tmux names its socket");
+    assert!(
+        path.exists(),
+        "{} should be the live socket",
+        path.display()
+    );
+
+    drop(server);
+
+    assert!(!path.exists(), "{} was left behind", path.display());
+}
+
+/// The same after `stop`, when the `kill-server` in `Drop` finds no server
+/// left to kill.
+#[test]
+fn a_server_stopped_before_it_is_dropped_leaves_no_socket_file() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let path = server.socket_path.clone().expect("tmux names its socket");
+
+    server.stop();
+    drop(server);
+
+    assert!(!path.exists(), "{} was left behind", path.display());
 }

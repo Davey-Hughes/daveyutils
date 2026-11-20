@@ -15,8 +15,9 @@
 mod common;
 
 use std::fmt::Write as _;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nudge::ipc::{Request, Response, client};
@@ -57,27 +58,13 @@ fn nudge_env(home: &Path) -> Vec<(&'static str, PathBuf)> {
 }
 
 /// `nudge` with [`nudge_env`], aimed at `server`, and with nothing inherited
-/// that could lead it to the developer's herdr.
+/// that could lead it to the developer's tmux or herdr.
 fn nudge(home: &Path, server: &TmuxServer) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nudge"));
-    for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(|k| k.starts_with("HERDR_")) {
-            cmd.env_remove(key);
-        }
-    }
+    common::keep_off_the_developers_panes(&mut cmd, home);
     server.env(&mut cmd);
     cmd.envs(nudge_env(home));
     cmd
-}
-
-/// Kills the daemon this test started, on any exit path.
-struct DaemonGuard(Child);
-
-impl Drop for DaemonGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 /// A private tmux server whose first pane is a decoy, so that a fallback to
@@ -127,16 +114,22 @@ fn fixture() -> Fixture {
 
 impl Fixture {
     /// Start a daemon for this home, and wait until it answers.
-    fn daemon(&self) -> DaemonGuard {
+    ///
+    /// In a process group of its own, so that the guard can kill a `tmux`
+    /// the daemon has in flight along with it (see `common::DaemonGuard`).
+    /// That also puts it out of reach of a Ctrl-C at the terminal, which
+    /// goes to the test's group: an interrupted run leaves it running.
+    fn daemon(&self) -> common::DaemonGuard {
         let log = std::fs::File::create(self.home.join("daemon.log")).unwrap();
         let child = nudge(&self.home, &self.server)
             .arg("--daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
+            .process_group(0)
             .spawn()
             .expect("spawn the daemon");
-        let guard = DaemonGuard(child);
+        let guard = common::DaemonGuard::new(child);
         wait_until(
             || {
                 matches!(

@@ -20,7 +20,6 @@ use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nudge::ipc::server;
 use nudge::job::{JobSpec, TargetSpec};
 use nudge::paths::{Os, Paths, resolve_from};
 use nudge::queue::Queue;
@@ -68,6 +67,11 @@ fn seed() -> JobSpec {
 
 struct Fixture {
     home: PathBuf,
+    // Above `_tmp` and `_lock`, so that it is dropped first: see
+    // `common::Descendants`.
+    cli: common::Descendants,
+    // Above `_tmp`, so that it is dropped first: see `common::StandInDaemon`.
+    _daemon: common::StandInDaemon,
     _tmp: tempfile::TempDir,
     _lock: std::fs::File,
 }
@@ -84,39 +88,28 @@ fn fixture(seeded: &[JobSpec]) -> Fixture {
     for spec in seeded {
         queue.lock().unwrap().add(spec.clone()).unwrap();
     }
-    let socket = paths.socket.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(DAEMON_START_DELAY);
-        let _ = server::serve(&socket, &queue);
-    });
+    let daemon = common::StandInDaemon::start_after(DAEMON_START_DELAY, &paths.socket, queue);
     Fixture {
         home,
+        cli: common::Descendants::new(),
+        _daemon: daemon,
         _tmp: tmp,
         _lock: lock,
     }
 }
 
-fn run_nudge(home: &Path, args: &[&str]) -> Output {
+fn run_nudge(f: &Fixture, args: &[&str]) -> Output {
+    let home = &f.home;
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nudge"));
-    // Off the developer's herdr too: an edit's confirmation labels its pane
-    // from every herdr session it can list. With no `HERDR_*` and a config
-    // dir of its own, herdr has none to list.
-    for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(|k| k.starts_with("HERDR_")) {
-            cmd.env_remove(key);
-        }
-    }
+    f.cli.follow(&mut cmd);
+    // A test that wants a pane starts one with `two_panes`, and every other
+    // tmux call finds no server.
+    common::keep_off_the_developers_panes(&mut cmd, home);
     cmd.args(args)
         .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_RUNTIME_DIR", home.join("run"))
         .env("TZ", "UTC")
-        // Off the developer's tmux, always: a test that wants a pane starts
-        // one with `two_panes`, and every other tmux call finds no server.
-        .env("TMUX_TMPDIR", home.join("tmux"))
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
         .output()
         .expect("failed to run the nudge binary")
 }
@@ -176,7 +169,7 @@ fn a_scheduled_job_is_confirmed_with_its_pane_message_and_flags() {
     let f = fixture(&[]);
     let _tmux = two_panes(&f.home);
     let out = run_nudge(
-        &f.home,
+        &f,
         &[
             "-p",
             "bot:0.1",
@@ -205,7 +198,7 @@ fn a_scheduled_job_is_confirmed_with_its_pane_message_and_flags() {
 #[test]
 fn an_edited_job_is_confirmed_with_what_the_merge_carried_forward() {
     let f = fixture(&[seed()]);
-    let out = run_nudge(&f.home, &["--edit", "1", "-m", "now + 2 hours"]);
+    let out = run_nudge(&f, &["--edit", "1", "-m", "now + 2 hours"]);
 
     let stdout = stdout_of("edit", &out);
     assert!(
@@ -231,7 +224,7 @@ fn a_scheduled_job_stores_its_panes_id_not_its_position() {
     let tmux = two_panes(&f.home);
     let id = tmux.run(&["display-message", "-p", "-t", "bot:0.1", "#{pane_id}"]);
 
-    let out = run_nudge(&f.home, &["-p", "bot:0.1", "-m", "now + 2 hours"]);
+    let out = run_nudge(&f, &["-p", "bot:0.1", "-m", "now + 2 hours"]);
 
     let stdout = stdout_of("schedule", &out);
     let jobs = queued(&f.home);
@@ -260,11 +253,11 @@ fn the_confirmation_and_the_list_name_the_session_in_the_pane() {
 
     let named = stdout_of(
         "schedule",
-        &run_nudge(&f.home, &["-p", "bot:0.1", "-m", "now + 2 hours"]),
+        &run_nudge(&f, &["-p", "bot:0.1", "-m", "now + 2 hours"]),
     );
     let unnamed = stdout_of(
         "schedule",
-        &run_nudge(&f.home, &["-p", "bot:0.0", "-m", "now + 2 hours"]),
+        &run_nudge(&f, &["-p", "bot:0.0", "-m", "now + 2 hours"]),
     );
 
     assert!(
@@ -272,7 +265,7 @@ fn the_confirmation_and_the_list_name_the_session_in_the_pane() {
         "{named}"
     );
     assert!(!unnamed.contains(&host), "{unnamed}");
-    let list = stdout_of("list", &run_nudge(&f.home, &["--list"]));
+    let list = stdout_of("list", &run_nudge(&f, &["--list"]));
     assert!(
         list.contains(&format!("warmer-sessions bot:0.1 ({id})")),
         "{list}"
@@ -296,13 +289,13 @@ fn the_job_list_follows_the_pane_when_the_windows_renumber() {
     let id = tmux.run(&["display-message", "-p", "-t", "bot:2.0", "#{pane_id}"]);
     stdout_of(
         "schedule",
-        &run_nudge(&f.home, &["-p", "bot:2.0", "-m", "now + 2 hours"]),
+        &run_nudge(&f, &["-p", "bot:2.0", "-m", "now + 2 hours"]),
     );
 
     tmux.run(&["kill-window", "-t", "bot:1"]);
 
     assert_eq!(pane_of(&queued(&f.home)[0]), id);
-    let list = stdout_of("list", &run_nudge(&f.home, &["--list"]));
+    let list = stdout_of("list", &run_nudge(&f, &["--list"]));
     assert!(
         list.contains(&format!("bot:1.0 ({id})")),
         "the list shows where the pane is now:\n{list}"
@@ -320,7 +313,7 @@ fn scheduling_into_a_pane_that_does_not_exist_fails_and_queues_nothing() {
     let f = fixture(&[]);
     let _tmux = two_panes(&f.home);
 
-    let out = run_nudge(&f.home, &["-p", "bot:7.0", "-m", "now + 2 hours"]);
+    let out = run_nudge(&f, &["-p", "bot:7.0", "-m", "now + 2 hours"]);
 
     assert!(
         !out.status.success(),
@@ -342,7 +335,7 @@ fn an_edit_that_moves_the_job_stores_the_new_panes_id() {
     let tmux = two_panes(&f.home);
     let id = tmux.run(&["display-message", "-p", "-t", "bot:0.0", "#{pane_id}"]);
 
-    let out = run_nudge(&f.home, &["--edit", "1", "-p", "bot:0.0"]);
+    let out = run_nudge(&f, &["--edit", "1", "-p", "bot:0.0"]);
 
     let stdout = stdout_of("edit", &out);
     let jobs = queued(&f.home);

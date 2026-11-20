@@ -27,7 +27,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use nudge::job::{JobSpec, TargetSpec};
@@ -48,15 +48,6 @@ fn os() -> Os {
         Os::Macos
     } else {
         Os::Linux
-    }
-}
-
-/// Kills the daemon we spawned, on any exit path.
-struct DaemonGuard(Child);
-impl Drop for DaemonGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 
@@ -88,8 +79,7 @@ fn a_verify_skip_lands_in_the_daemon_log() {
         std::env::set_var("HOME", &home);
         std::env::set_var("XDG_STATE_HOME", home.join("state"));
         std::env::set_var("XDG_RUNTIME_DIR", home.join("run"));
-        std::env::set_var("TMUX_TMPDIR", &tmux_tmpdir);
-        std::env::remove_var("TMUX");
+        common::keep_this_process_off_the_developers_panes(&home);
     }
 
     let session = format!("nudgelog_{}", std::process::id());
@@ -136,12 +126,12 @@ fn a_verify_skip_lands_in_the_daemon_log() {
     drop(queue);
 
     // Production spawn, production stderr wiring, the real nudge binary.
-    let daemon = DaemonGuard(
+    let daemon = common::DaemonGuard::new(
         nudge::app::spawn_daemon(Path::new(env!("CARGO_BIN_EXE_nudge")), &paths)
             .expect("spawn the daemon"),
     );
     // In a session of its own, which a herdr popup closing does not reach.
-    let pid = libc::pid_t::try_from(daemon.0.id()).unwrap();
+    let pid = daemon.pid();
     // SAFETY: getsid only reads the session id of a process; 0 means this one.
     let (theirs, ours) = unsafe { (libc::getsid(pid), libc::getsid(0)) };
     assert_eq!(theirs, pid, "the daemon must lead a session of its own");

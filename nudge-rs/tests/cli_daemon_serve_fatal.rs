@@ -19,6 +19,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Kills the daemon on any exit path, including the assertion failures below.
+///
+/// Its own, and not `common::DaemonGuard`, which kills what a daemon started
+/// as well: this daemon has no job to fire, so it starts nothing, and the test
+/// has to wait for it and read its stderr.
 struct DaemonGuard(Child);
 impl Drop for DaemonGuard {
     fn drop(&mut self) {

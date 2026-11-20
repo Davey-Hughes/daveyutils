@@ -44,10 +44,16 @@ fn spec(pane: &str) -> JobSpec {
 /// copy.
 const SEEN: &str = r#"{"fire_at":"2026-07-13T15:00:00Z","retries_left":0}"#;
 
+/// Wait until the server takes a connection, not until the socket's file
+/// appears: binding creates the file, and a client that connects before the
+/// `listen` that follows is refused (see `daemon_ipc.rs`).
 fn wait_for_socket(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !path.exists() {
-        assert!(Instant::now() < deadline, "socket never appeared");
+    while UnixStream::connect(path).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the server never took a connection"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }

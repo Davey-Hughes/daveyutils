@@ -66,6 +66,8 @@ fn fixture() -> Fixture {
 
 fn run_nudge(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nudge"));
+    // A pattern that passes the check lets nudge go on to look for its pane.
+    common::keep_off_the_developers_panes(&mut cmd, home);
     cmd.args(args)
         .env("HOME", home)
         .env("XDG_STATE_HOME", home.join("state"))
