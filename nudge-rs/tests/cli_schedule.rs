@@ -37,11 +37,14 @@ fn tmux(pane: &str, server: Option<&str>) -> TargetSpec {
 
 fn a_baseline() -> Baseline {
     Baseline {
-        fingerprint: nudge::verify::fingerprint("⏸ session limit reached · resets 3:00am"),
-        dims: PaneDims {
-            width: 80,
-            height: 24,
-        },
+        recency: Some((
+            nudge::verify::fingerprint("⏸ session limit reached · resets 3:00am"),
+            PaneDims {
+                width: 80,
+                height: 24,
+            },
+        )),
+        banner: true,
     }
 }
 
@@ -54,8 +57,9 @@ fn build_spec_stores_the_pane_snapshot_when_verify_is_on() {
     let ts = "2026-07-13T15:00:00Z".parse().unwrap();
     let spec = build_spec(tmux("bot:0.1", None), ts, &c, &opts, Some(a_baseline()));
     assert!(spec.verify);
-    assert_eq!(spec.verify_fingerprint, Some(a_baseline().fingerprint));
-    assert_eq!(spec.verify_dims, Some(a_baseline().dims));
+    let (fingerprint, dims) = a_baseline().recency.unwrap();
+    assert_eq!(spec.verify_fingerprint, Some(fingerprint));
+    assert_eq!(spec.verify_dims, Some(dims));
 }
 
 /// A pane that would not answer arms no gate -- and, above all, still schedules
@@ -173,14 +177,13 @@ fn the_pane_snapshot_survives_the_schedule_request_and_queue_json() {
 
     // Survived the IPC hop.
     let job = queue.lock().unwrap().all()[0].clone();
-    assert_eq!(job.verify_fingerprint, Some(a_baseline().fingerprint));
-    assert_eq!(job.verify_dims, Some(a_baseline().dims));
+    assert_eq!(job.verify_baseline(), a_baseline().recency);
 
     // ...and the disk hop, as the daemon would reload it after a restart.
     let reloaded = Queue::load(queue_path).unwrap();
     assert_eq!(
         reloaded.all()[0].verify_baseline(),
-        Some((a_baseline().fingerprint, a_baseline().dims)),
+        a_baseline().recency,
         "a daemon restarted between schedule and fire must still hold the baseline"
     );
 }

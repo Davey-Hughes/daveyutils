@@ -226,6 +226,7 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         }
     }
 

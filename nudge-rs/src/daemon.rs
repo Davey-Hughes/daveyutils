@@ -330,6 +330,7 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         }
     }
 
@@ -523,6 +524,14 @@ mod tests {
         spent.auto_retry = true;
         spent.retries_left = 0;
         assert!(notification(&spent, "p", &err()).is_some());
+        // A verify job whose pane showed no banner gets no retries, whatever
+        // -r says, so its failure is the end of it.
+        let mut once = job(true);
+        once.auto_retry = true;
+        once.retries_left = -1;
+        once.verify = true;
+        once.verify_no_banner = true;
+        assert!(notification(&once, "p", &err()).is_some());
     }
 
     #[test]

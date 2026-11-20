@@ -16,6 +16,24 @@
 
 use crate::target::{PaneDims, Target};
 
+/// Whether `screen` shows a rate-limit banner, for `--verify`.
+///
+/// One test for both ends of a job's life: the snapshot taken when it is
+/// scheduled and the banner check when it fires. A banner whose reset day
+/// cannot be read, or whose time has passed, is still a banner.
+pub fn shows_banner(
+    screen: &str,
+    now: &jiff::ZonedDateTime,
+    clock_ext: Option<&str>,
+    dur_ext: Option<&str>,
+    weekly_ext: Option<&str>,
+) -> bool {
+    !matches!(
+        crate::detect::detect_reset(screen, now, clock_ext, dur_ext, weekly_ext),
+        crate::detect::Detection::None
+    )
+}
+
 /// Canonicalize a capture before hashing: strip trailing whitespace per line
 /// and drop trailing blank lines.
 ///
@@ -55,7 +73,7 @@ pub fn fingerprint(capture: &str) -> String {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Recency {
     /// Byte-identical to the snapshot, at the same size: the user has not
-    /// touched it. Proceed to the banner check.
+    /// touched it. Proceed to the banner check, if the job has one.
     Unchanged,
     /// Same size, different content: something happened here since we
     /// scheduled. The user resumed. Skip.
@@ -66,21 +84,27 @@ pub enum Recency {
     /// **Fails open** to the banner check, i.e. exactly what nudge did before
     /// this gate existed. This variant is the design's whole safety margin:
     /// every way of being unsure lands here, and landing here can only cost a
-    /// stray inject, never a silent never-fire.
+    /// stray inject, never a silent never-fire. A job whose pane showed no
+    /// banner when scheduled (`Job::verify_no_banner`) has no banner check, so
+    /// for it Unknown means inject, with nothing behind it.
     Unknown,
 }
 
 /// A pane snapshot taken when a `--verify` job was scheduled.
 pub struct Baseline {
-    pub fingerprint: String,
-    pub dims: PaneDims,
+    /// The capture's fingerprint and the size it was taken at, for the
+    /// recency gate; `None` when the pane would not report its size.
+    pub recency: Option<(String, PaneDims)>,
+    /// The capture showed a rate-limit banner ([`shows_banner`]).
+    pub banner: bool,
 }
 
 /// Snapshot `target` for a job being scheduled, or `None` if it cannot be
-/// snapshotted.
+/// captured.
 ///
-/// Infallible by construction: a pane that will not capture, or will not report
-/// its size, yields no baseline, and a job with no baseline fails open at fire
+/// Infallible by construction: a pane that will not capture yields no
+/// baseline, and one that will not report its size (a zoomed herdr tab) yields
+/// one with no `recency`. A job with no recency half fails open at fire
 /// time. Scheduling must not fail because the recency gate could not arm — the
 /// user asked for a nudge, and a nudge with a degraded `--verify` is strictly
 /// better than no job at all.
@@ -99,15 +123,40 @@ pub struct Baseline {
 ///
 /// So a resize racing this function can only ever produce a baseline that
 /// fails open, never one that skips. Reading dims twice here would be safe too
-/// (disagreement → no baseline → fail open), but it buys nothing the ordering
+/// (disagreement → no `recency` → fail open), but it buys nothing the ordering
 /// does not already guarantee.
-pub fn capture_baseline(target: &dyn Target) -> Option<Baseline> {
-    let dims = target.dims()?;
+///
+/// Whether the pane showed a banner is read off the same capture, with the
+/// `NUDGE_*_PATTERN` extensions the caller passes, so the snapshot costs no
+/// extra call to tmux or herdr.
+pub fn capture_baseline(
+    target: &dyn Target,
+    now: &jiff::ZonedDateTime,
+    clock_ext: Option<&str>,
+    dur_ext: Option<&str>,
+    weekly_ext: Option<&str>,
+) -> Option<Baseline> {
+    let dims = target.dims();
     let text = target.capture().ok()?;
     Some(Baseline {
-        fingerprint: fingerprint(&text),
-        dims,
+        recency: dims.map(|dims| (fingerprint(&text), dims)),
+        banner: shows_banner(&text, now, clock_ext, dur_ext, weekly_ext),
     })
+}
+
+/// [`capture_baseline`] now, with the user's `NUDGE_*_PATTERN` extensions:
+/// what the CLI and the dashboard take when they schedule a `--verify` job.
+pub fn capture_baseline_now(target: &dyn Target) -> Option<Baseline> {
+    let clock_ext = std::env::var("NUDGE_CLOCK_PATTERN").ok();
+    let dur_ext = std::env::var("NUDGE_DURATION_PATTERN").ok();
+    let weekly_ext = std::env::var("NUDGE_WEEKLY_PATTERN").ok();
+    capture_baseline(
+        target,
+        &jiff::ZonedDateTime::now(),
+        clock_ext.as_deref(),
+        dur_ext.as_deref(),
+        weekly_ext.as_deref(),
+    )
 }
 
 /// Compare a job's snapshot against the pane as it is now.
@@ -144,6 +193,70 @@ pub fn recency(
 mod tests {
     use super::*;
     use crate::target::PaneDims;
+
+    /// A pane that shows a screen at a size (or none it will report), and is
+    /// only ever read.
+    struct Showing(&'static str, Option<PaneDims>);
+
+    impl Target for Showing {
+        fn capture(&self) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
+        }
+        fn capture_styled(&self) -> anyhow::Result<String> {
+            self.capture()
+        }
+        fn send_line(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!("a snapshot only reads")
+        }
+        fn send_key(&self, _: crate::target::Key) -> anyhow::Result<()> {
+            unreachable!("a snapshot only reads")
+        }
+        fn wrong_pane(&self) -> anyhow::Result<Option<crate::target::WrongPane>> {
+            Ok(None)
+        }
+        fn settle(&self) {}
+        fn dims(&self) -> Option<PaneDims> {
+            self.1
+        }
+    }
+
+    const DIMS: PaneDims = PaneDims {
+        width: 80,
+        height: 24,
+    };
+
+    fn snapshot_of(pane: &Showing) -> Option<Baseline> {
+        let now = jiff::civil::date(2026, 7, 13)
+            .at(23, 0, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .unwrap();
+        capture_baseline(pane, &now, None, None, None)
+    }
+
+    fn snapshot(screen: &'static str) -> Baseline {
+        snapshot_of(&Showing(screen, Some(DIMS))).expect("a readable pane")
+    }
+
+    #[test]
+    fn a_snapshot_of_a_pane_with_a_banner_says_so() {
+        assert!(snapshot("⏸ session limit reached · resets 3:00am").banner);
+    }
+
+    #[test]
+    fn a_snapshot_of_a_pane_without_one_says_so() {
+        assert!(!snapshot("● Done.\n\n❯ ").banner);
+    }
+
+    /// A zoomed herdr tab reports no size. The recency gate cannot arm, but
+    /// the pane's text still says whether it showed a banner, and without
+    /// that answer a job on a pane with none would keep the banner check and
+    /// never fire.
+    #[test]
+    fn a_pane_whose_size_cannot_be_read_still_says_whether_it_showed_a_banner() {
+        let b = snapshot_of(&Showing("● Done.\n\n❯ ", None)).expect("its text was read");
+        assert_eq!(b.recency, None);
+        assert!(!b.banner);
+    }
 
     #[test]
     fn normalize_strips_trailing_space_and_trailing_blank_lines() {

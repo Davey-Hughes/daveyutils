@@ -76,15 +76,23 @@ pub fn route(cli: &Cli, is_tty: bool) -> Route {
     }
 }
 
-/// Split a `--verify` snapshot into the two fields a `JobSpec` stores.
+/// Split a `--verify` snapshot into the three fields a `JobSpec` stores:
+/// fingerprint, dims, and `verify_no_banner`.
 ///
-/// `None` in, `None`s out — a pane that could not be snapshotted arms no
+/// `None` in, `None`s and `false` out — a pane that could not be read arms no
 /// recency gate, and a job with no snapshot fails open at fire time to the
-/// banner check nudge has always done. Scheduling never fails over this.
-fn baseline_fields(b: Option<crate::verify::Baseline>) -> (Option<String>, Option<PaneDims>) {
+/// banner check nudge has always done. A pane read without its size arms no
+/// recency gate either, but still says whether it showed a banner.
+/// Scheduling never fails over this.
+pub(crate) fn baseline_fields(
+    b: Option<crate::verify::Baseline>,
+) -> (Option<String>, Option<PaneDims>, bool) {
     match b {
-        Some(b) => (Some(b.fingerprint), Some(b.dims)),
-        None => (None, None),
+        Some(b) => {
+            let (fingerprint, dims) = b.recency.unzip();
+            (fingerprint, dims, !b.banner)
+        }
+        None => (None, None, false),
     }
 }
 
@@ -110,7 +118,8 @@ pub fn build_spec(
     };
     // Without --verify nothing ever reads these, and storing a snapshot for a
     // job that will not consult one is just a stale fingerprint in queue.json.
-    let (verify_fingerprint, verify_dims) = baseline_fields(baseline.filter(|_| opts.verify));
+    let (verify_fingerprint, verify_dims, verify_no_banner) =
+        baseline_fields(baseline.filter(|_| opts.verify));
     JobSpec {
         target,
         messages,
@@ -123,6 +132,7 @@ pub fn build_spec(
         settle_secs: opts.settle_secs,
         verify_fingerprint,
         verify_dims,
+        verify_no_banner,
     }
 }
 
@@ -135,7 +145,7 @@ pub fn build_spec(
 /// user's nudge does not get scheduled at all.
 fn snapshot_pane(target: &TargetSpec, opts: &Toggles) -> Option<crate::verify::Baseline> {
     snapshot_gate(opts, || {
-        crate::verify::capture_baseline(target.connect().as_ref())
+        crate::verify::capture_baseline_now(target.connect().as_ref())
     })
 }
 
@@ -505,13 +515,6 @@ pub fn asks(cli: &Cli, stdin_tty: bool, stdout_tty: bool) -> bool {
 /// the retry count (`-r`) and the settle time it does not show, so they ride
 /// in the defaults the form schedules with. `opts` is `resolve_options(cli)`,
 /// so the `NUDGE_*` defaults apply as they would to `-a -m`.
-///
-/// Except verify, on a pane with no banner. Verify skips a job whose pane
-/// shows no banner when it comes due (see `inject`), so ticked there it would
-/// almost certainly mean the nudge never fires. The form opens with it off
-/// and says so on the status line, and ticking it back is the user's call.
-/// The other reasons for no time are a banner on screen, which verify can
-/// still check, so they keep it.
 pub fn ask_form(
     cli: &Cli,
     opts: &Toggles,
@@ -526,21 +529,12 @@ pub fn ask_form(
         retries: opts.retries,
         ..base
     };
-    let verify_dropped = opts.verify && matches!(why, NoTime::NoBanner { .. });
-    let reason = if verify_dropped {
-        format!(
-            "{}; verify starts off, since it skips a pane with no banner",
-            why.headline()
-        )
-    } else {
-        why.headline()
-    };
     let ask = crate::tui::model::Ask {
         panes,
         pane,
-        reason,
+        reason: why.headline(),
         message: cli.input.first().cloned(),
-        verify: opts.verify && !verify_dropped,
+        verify: opts.verify,
         notify: opts.notify,
         auto_retry: opts.auto_retry,
     };
@@ -731,7 +725,9 @@ fn job_summary(
     if spec.notify {
         flags.push("notify".to_string());
     }
-    if spec.auto_retry {
+    if spec.auto_retry && spec.one_try() {
+        flags.push("no retries (no banner to check)".to_string());
+    } else if spec.auto_retry {
         flags.push(format!("auto-retry ({})", spec.retries_left));
     }
     let flags = if flags.is_empty() {
@@ -895,7 +891,7 @@ pub fn merge_edit(
     // `build_spec` filters: `snapshot` is a parameter, so "no snapshot when
     // --verify is off" is this function's own invariant to keep and not one to
     // borrow from whatever the caller happened to pass.
-    let (verify_fingerprint, verify_dims) =
+    let (verify_fingerprint, verify_dims, verify_no_banner) =
         baseline_fields(snapshot(&target, &opts).filter(|_| opts.verify));
     Ok(JobSpec {
         target,
@@ -909,6 +905,7 @@ pub fn merge_edit(
         settle_secs: opts.settle_secs,
         verify_fingerprint,
         verify_dims,
+        verify_no_banner,
     })
 }
 
@@ -1284,13 +1281,11 @@ mod tests {
         );
     }
 
-    /// Verify skips a job whose pane shows no banner when it comes due, so
-    /// with it ticked on a pane that shows none now, the nudge would almost
-    /// certainly never fire. The form opens with it off and says so; ticking
-    /// it back is the user's call. A banner nudge cannot read, or one whose
-    /// time has passed, is still a banner to verify, so those keep it.
+    /// A verify job on a pane that shows no banner fires unless the pane
+    /// changes (see `inject`), so the form opens with verify as the flags and
+    /// `NUDGE_VERIFY` set it, whatever the reason the pane gave no time.
     #[test]
-    fn ask_form_opens_with_verify_off_on_a_pane_with_no_banner() {
+    fn ask_form_keeps_verify_on_a_pane_with_no_banner() {
         let no_banner = NoTime::NoBanner {
             pane: "s:0.1 (%1)".into(),
         };
@@ -1307,13 +1302,8 @@ mod tests {
         };
 
         let a = form(true, &no_banner);
-        assert!(!a.verify);
-        assert_eq!(
-            a.reason,
-            "no rate-limit banner detected in s:0.1 (%1); verify starts off, since it \
-             skips a pane with no banner",
-            "'starts': the line stays put if the user ticks verify back on"
-        );
+        assert!(a.verify);
+        assert_eq!(a.reason, "no rate-limit banner detected in s:0.1 (%1)");
 
         let a = form(false, &no_banner);
         assert!(!a.verify);
@@ -1355,6 +1345,7 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         }
     }
 
@@ -1389,6 +1380,28 @@ mod tests {
             s,
             "nudge: scheduled job 7 for 2026-07-16 14:14 (in 2h 14m)\n       \
              bot:0.1 · \"please continue\" · notify, auto-retry (2)"
+        );
+    }
+
+    /// The daemon will not retry a verify job whose pane showed no banner, so
+    /// the confirmation must not promise the retries `-r` asked for.
+    #[test]
+    fn the_summary_says_a_no_banner_verify_job_will_not_retry() {
+        let mut spec = a_spec("bot:0.1", &["please continue"], "2026-07-16T14:14:00Z");
+        spec.verify = true;
+        spec.verify_no_banner = true;
+        spec.auto_retry = true;
+        spec.retries_left = 2;
+        let s = schedule_summary(
+            7,
+            &spec,
+            &Positions::new(),
+            &jiff::tz::TimeZone::UTC,
+            "2026-07-16T12:00:00Z".parse().unwrap(),
+        );
+        assert!(
+            s.ends_with("· verify, no retries (no banner to check)"),
+            "{s}"
         );
     }
 
@@ -1653,13 +1666,7 @@ mod tests {
         let taken = std::cell::Cell::new(false);
         let out = snapshot_gate(&toggles(false), || {
             taken.set(true);
-            Some(crate::verify::Baseline {
-                fingerprint: "x".into(),
-                dims: PaneDims {
-                    width: 80,
-                    height: 24,
-                },
-            })
+            Some(baseline(true))
         });
         assert!(
             !taken.get(),
@@ -1677,19 +1684,16 @@ mod tests {
         let taken = std::cell::Cell::new(false);
         let out = snapshot_gate(&toggles(true), || {
             taken.set(true);
-            Some(crate::verify::Baseline {
-                fingerprint: "abc".into(),
-                dims: PaneDims {
-                    width: 80,
-                    height: 24,
-                },
-            })
+            Some(baseline(true))
         });
         assert!(
             taken.get(),
             "--verify is on: the snapshot is the gate's whole input"
         );
-        assert_eq!(out.map(|b| b.fingerprint), Some("abc".to_string()));
+        assert_eq!(
+            out.and_then(|b| b.recency).map(|(fp, _)| fp),
+            Some("abc".to_string())
+        );
     }
 
     /// `0.1.0` is the last version whose `JobSpec` has no `verify_fingerprint`
@@ -1764,6 +1768,83 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spec.target, job.target);
+    }
+
+    fn baseline(banner: bool) -> crate::verify::Baseline {
+        crate::verify::Baseline {
+            recency: Some((
+                "abc".into(),
+                PaneDims {
+                    width: 80,
+                    height: 24,
+                },
+            )),
+            banner,
+        }
+    }
+
+    /// Only a snapshot that was taken, for a job that will read it, and that
+    /// showed no banner marks the job. No snapshot means nothing is known about
+    /// the screen, so the banner check stays.
+    #[test]
+    fn build_spec_marks_a_job_whose_snapshot_showed_no_banner() {
+        let no_banner = |opts: &Toggles, b: Option<crate::verify::Baseline>| {
+            build_spec(
+                TargetSpec::Tmux {
+                    pane: "%1".into(),
+                    server: None,
+                },
+                "2026-07-13T15:00:00Z".parse().unwrap(),
+                &cli(&["nudge", "-p", "%1", "-m", "5m"]),
+                opts,
+                b,
+            )
+            .verify_no_banner
+        };
+        assert!(no_banner(&toggles(true), Some(baseline(false))));
+        assert!(!no_banner(&toggles(true), Some(baseline(true))));
+        assert!(!no_banner(&toggles(true), None));
+        assert!(!no_banner(&toggles(false), Some(baseline(false))));
+        // A pane whose size could not be read: no recency gate, but the
+        // banner answer still counts.
+        let sizeless = crate::verify::Baseline {
+            recency: None,
+            banner: false,
+        };
+        assert!(no_banner(&toggles(true), Some(sizeless)));
+    }
+
+    /// An edit re-snapshots, so the flag follows the pane as it is at the
+    /// edit, in both directions.
+    #[test]
+    fn an_edit_takes_the_no_banner_flag_from_the_new_snapshot() {
+        let job = |no_banner: bool| {
+            JobSpec {
+                verify: true,
+                verify_fingerprint: Some("old".into()),
+                verify_dims: Some(PaneDims {
+                    width: 80,
+                    height: 24,
+                }),
+                verify_no_banner: no_banner,
+                ..a_spec("%1", &["go"], "2026-07-13T15:00:00Z")
+            }
+            .into_job(1)
+        };
+        let edit = |job: &Job, banner: bool| {
+            merge_edit(
+                job,
+                &cli(&["nudge", "--edit", "1", "-m", "6pm"]),
+                None,
+                &noon(),
+                2,
+                &|_: &TargetSpec, _: &Toggles| Some(baseline(banner)),
+            )
+            .unwrap()
+            .verify_no_banner
+        };
+        assert!(!edit(&job(true), true));
+        assert!(edit(&job(false), false));
     }
 
     #[test]

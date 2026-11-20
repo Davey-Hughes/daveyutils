@@ -86,13 +86,11 @@ story — pass `-m` to set the time yourself.
 
 With `--ask`, nudge opens the dashboard's form for that pane instead, with the
 cursor in the time and the reason on the bottom line. Type a time (`5m`,
-`14:30`) and press Enter. `-i`, `-v`, `-n` and `-r` carry over, except that a
-pane with no banner opens with verify off, since verify skips a job whose pane
-still shows no banner when it comes due. `--ask` does nothing when the pane does show a
-time, and needs `-a` or `-p`. It falls back to the error when nobody is at a
-terminal, when more than one `-i` or a blank one is given (the form holds one
-message, and sends its default for a blank one), or when the pane is not in
-the form's list.
+`14:30`) and press Enter. `-i`, `-v`, `-n` and `-r` carry over. `--ask` does
+nothing when the pane does show a time, and needs `-a` or `-p`. It falls back
+to the error when nobody is at a terminal, when more than one `-i` or a blank
+one is given (the form holds one message, and sends its default for a blank
+one), or when the pane is not in the form's list.
 
 It composes with the other scheduling flags (`-m`, `-i`, `-v`, `-n`, `-r`), and
 conflicts with `-p` and with `--list`/`--cancel`/`--edit`.
@@ -332,8 +330,8 @@ while. The time is also read on your machine's clock, so a Codex running in
 another time zone, over ssh for instance, needs `-m`.
 
 `try again later`, which Codex prints when it has no reset to quote, names no
-time and is not detected. Use `-m`, and leave `-v` off for that job: with no
-banner it recognises, the verify gate would skip it.
+time and is not detected. Use `-m`. With `-v`, that job fires if the pane is
+unchanged, since there is no banner for nudge to look for (see `--verify`).
 
 If Codex's Vim keys are on and you left the composer in Normal mode, typed text
 would be read as commands: `please continue` arrives as `se continue`. nudge
@@ -381,6 +379,14 @@ meantime the pane has moved, and nudge stands down and says so. Checking only
 for a banner is not enough: the banner that made you schedule the nudge is still
 sitting there hours later, so it would happily inject into the session you are
 in the middle of using.
+
+A pane that shows no banner nudge recognises when you schedule (Codex's `try
+again later`, or a layout nudge does not know) would show none at fire time
+either. For that job nudge drops the banner check and injects if the pane is
+unchanged, or if it cannot tell (the window was resized, or a herdr tab is
+zoomed), with no banner check to fall back on. It gets one try, whatever `-r`
+says, and the confirmation says so: after nudge has typed into the pane,
+nothing would be left to tell whether you had come back.
 
 Anything it cannot judge, it injects. Resizing the window reflows the pane, a
 job scheduled by an older build carries no fingerprint, and a pane that will not

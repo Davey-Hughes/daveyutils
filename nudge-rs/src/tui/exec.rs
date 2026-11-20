@@ -58,8 +58,9 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
             snapshot_pane,
         } => {
             attach_baseline(&mut spec, snapshot_pane);
+            let no_banner = spec.verify_no_banner;
             match client::request(socket, &Request::Schedule(spec)) {
-                Ok(Response::Scheduled(id)) => Msg::Scheduled(id),
+                Ok(Response::Scheduled(id)) => Msg::Scheduled { id, no_banner },
                 Ok(Response::Error(e)) => {
                     Msg::ActionFailed(format!("daemon rejected the job: {e}"))
                 }
@@ -89,15 +90,19 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
     }
 }
 
-/// Fill in the `--verify` recency baseline when the form asked for one. Never
+/// Fill in the `--verify` recency baseline when the form asked for one, and
+/// whether the pane showed a banner (`verify_no_banner`). Never
 /// fails the schedule: a pane that will not snapshot arms no gate and fails open
 /// at fire time, exactly as `app::snapshot_pane` does for the CLI.
 fn attach_baseline(spec: &mut crate::job::JobSpec, snapshot_pane: Option<TargetSpec>) {
     if let Some(pane) = snapshot_pane
-        && let Some(b) = crate::verify::capture_baseline(pane.connect().as_ref())
+        && let Some(b) = crate::verify::capture_baseline_now(pane.connect().as_ref())
     {
-        spec.verify_fingerprint = Some(b.fingerprint);
-        spec.verify_dims = Some(b.dims);
+        (
+            spec.verify_fingerprint,
+            spec.verify_dims,
+            spec.verify_no_banner,
+        ) = crate::app::baseline_fields(Some(b));
     }
 }
 
@@ -126,6 +131,7 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         }
     }
 

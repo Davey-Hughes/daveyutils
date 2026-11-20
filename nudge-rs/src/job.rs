@@ -84,6 +84,10 @@ impl TargetSpec {
     }
 }
 
+// struct_excessive_bools: each bool is a key of queue.json and of the
+// Schedule request, read by daemons across versions. Grouping them into a
+// sub-struct or an enum would change that format for no gain in clarity.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Job {
     pub id: u64,
@@ -100,6 +104,13 @@ pub struct Job {
     pub verify_fingerprint: Option<String>,
     /// The size the fingerprinted capture was taken at.
     pub verify_dims: Option<PaneDims>,
+    /// The `--verify` snapshot showed no rate-limit banner, so the banner
+    /// check is skipped when the job fires: a pane nudge found no banner in
+    /// then will show none it recognises later either. The recency check
+    /// still applies. Absent in a job from 0.9.x or earlier, which keeps the
+    /// banner check, and not written when off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify_no_banner: bool,
 }
 
 impl Job {
@@ -114,16 +125,29 @@ impl Job {
         Some((self.verify_fingerprint.clone()?, self.verify_dims?))
     }
 
-    /// Whether a failed send is tried again: `--auto-retry` is on and the
-    /// retries are not used up (`-1` is without end). The scheduler's removal
-    /// of the job and the daemon's notification both go by this, so a job is
-    /// never removed unannounced.
+    /// Whether a failed send is tried again: `--auto-retry` is on, the
+    /// retries are not used up (`-1` is without end), and the job is not
+    /// [`one_try`](Self::one_try). The scheduler's removal of the job and the
+    /// daemon's notification both go by this, so a job is never removed
+    /// unannounced.
     pub fn will_retry(&self) -> bool {
-        self.auto_retry && self.retries_left != 0
+        self.auto_retry && self.retries_left != 0 && !self.one_try()
+    }
+
+    /// A `--verify` job whose pane showed no banner gets one try, whatever
+    /// `-r` says. A retry would have neither of verify's checks: the
+    /// reschedule drops the snapshot, and there is no banner to look for. So
+    /// nothing could stop it typing into a session the user had resumed, and
+    /// that holds after a failed send too, since with several messages some
+    /// may have gone in before the error.
+    pub fn one_try(&self) -> bool {
+        self.verify && self.verify_no_banner
     }
 }
 
 /// What a caller supplies to `Queue::add` (everything but the id).
+// struct_excessive_bools: as for `Job`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct JobSpec {
     pub target: TargetSpec,
@@ -139,9 +163,17 @@ pub struct JobSpec {
     /// or the pane could not be snapshotted.
     pub verify_fingerprint: Option<String>,
     pub verify_dims: Option<PaneDims>,
+    /// See [`Job::verify_no_banner`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify_no_banner: bool,
 }
 
 impl JobSpec {
+    /// See [`Job::one_try`].
+    pub fn one_try(&self) -> bool {
+        self.verify && self.verify_no_banner
+    }
+
     pub fn into_job(self, id: u64) -> Job {
         Job {
             id,
@@ -156,6 +188,7 @@ impl JobSpec {
             settle_secs: self.settle_secs,
             verify_fingerprint: self.verify_fingerprint,
             verify_dims: self.verify_dims,
+            verify_no_banner: self.verify_no_banner,
         }
     }
 }
@@ -211,6 +244,7 @@ mod tests {
                 width: 80,
                 height: 24,
             }),
+            verify_no_banner: false,
         };
         let json = serde_json::to_string(&job).unwrap();
         let back: Job = serde_json::from_str(&json).unwrap();
@@ -256,6 +290,48 @@ mod tests {
             None,
             "no snapshot means not comparable, which must fail open to the banner check"
         );
+        assert!(
+            !job.verify_no_banner,
+            "an older job keeps the banner check it was scheduled with"
+        );
+    }
+
+    /// The flag crosses the socket and survives a daemon restart. Off, it is
+    /// not written at all, so a queue.json of jobs that never set it reads
+    /// as an older build wrote it.
+    #[test]
+    fn the_no_banner_flag_round_trips_and_is_not_written_when_off() {
+        let off = JobSpec {
+            target: TargetSpec::Tmux {
+                pane: "p".into(),
+                server: None,
+            },
+            messages: vec!["go".into()],
+            send_delay_secs: 0.0,
+            fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
+            notify: false,
+            verify: true,
+            auto_retry: false,
+            retries_left: 0,
+            settle_secs: 5.0,
+            verify_fingerprint: Some("deadbeef".into()),
+            verify_dims: Some(PaneDims {
+                width: 80,
+                height: 24,
+            }),
+            verify_no_banner: false,
+        }
+        .into_job(1);
+        let on = Job {
+            verify_no_banner: true,
+            ..off.clone()
+        };
+
+        let json = serde_json::to_string(&on).unwrap();
+        assert_eq!(serde_json::from_str::<Job>(&json).unwrap(), on);
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(!json.contains("verify_no_banner"), "{json}");
+        assert_eq!(serde_json::from_str::<Job>(&json).unwrap(), off);
     }
 
     /// The halves are written together and must be read together.
@@ -277,6 +353,7 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: Some("deadbeef".into()),
             verify_dims: None,
+            verify_no_banner: false,
         };
         assert_eq!(j.verify_baseline(), None, "fingerprint without dims");
         j.verify_fingerprint = None;

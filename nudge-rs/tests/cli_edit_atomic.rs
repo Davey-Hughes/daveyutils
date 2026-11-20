@@ -69,6 +69,7 @@ fn job_on(target: TargetSpec) -> nudge::job::Job {
         settle_secs: 5.0,
         verify_fingerprint: None,
         verify_dims: None,
+        verify_no_banner: false,
     }
     .into_job(1)
 }

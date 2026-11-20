@@ -171,7 +171,9 @@ fn jobs_view(model: &Model, f: &mut Frame, area: Rect) {
             .enumerate()
             .map(|(i, ((j, name), label))| {
                 let delta = j.fire_at.duration_since(model.now).as_secs();
-                let flags: String = [(j.verify, 'v'), (j.notify, 'n'), (j.auto_retry, 'a')]
+                // `a` only for a job the daemon will retry: not one whose
+                // retries are used up, nor a one-try job, whatever -r said.
+                let flags: String = [(j.verify, 'v'), (j.notify, 'n'), (j.will_retry(), 'a')]
                     .iter()
                     .filter(|(on, _)| *on)
                     .map(|(_, c)| *c)
@@ -701,12 +703,30 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         };
         j.messages = vec!["please continue".into()];
-        m.jobs = vec![j];
+        m.jobs = vec![j.clone()];
         let out = render(&m);
         assert!(out.contains("bot:0.1"), "{out}");
         assert!(out.contains("2h 14m"), "{out}");
+        assert!(out.contains(" va "), "verify and auto-retry: {out}");
+
+        // A verify job whose pane showed no banner gets one try, so the row
+        // does not show the auto-retry its -r asked for.
+        j.verify_no_banner = true;
+        m.jobs = vec![j.clone()];
+        let out = render(&m);
+        assert!(!out.contains(" va "), "{out}");
+        assert!(out.contains(" v "), "{out}");
+
+        // Nor for one whose retries are used up: `a` follows the daemon's
+        // own rule, `Job::will_retry`.
+        j.verify_no_banner = false;
+        j.retries_left = 0;
+        m.jobs = vec![j];
+        let out = render(&m);
+        assert!(!out.contains(" va "), "{out}");
     }
 
     /// A job names its pane by tmux's id, and the row says where that pane
@@ -731,6 +751,7 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         }];
         m.positions.panes = [("%19".to_string(), "main:11.0".to_string())].into();
         let out = render(&m);
@@ -754,6 +775,7 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         }
     }
 
@@ -843,6 +865,7 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         }];
         m.positions.panes = [("%142".to_string(), "subcheck-review:3.0".to_string())].into();
         let out = render(&m);
@@ -871,6 +894,7 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         }];
         m.positions.panes = [("%1".to_string(), format!("{}:1.0", "x".repeat(60)))].into();
         let out = render(&m);

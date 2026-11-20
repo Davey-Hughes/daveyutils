@@ -4,7 +4,6 @@
 use anyhow::Result;
 
 use crate::composer::{BoxKind, ClaudeMode, InputBox};
-use crate::detect::detect_reset;
 use crate::job::Job;
 use crate::target::{Key, Target, WrongPane};
 
@@ -40,7 +39,8 @@ pub enum InjectOutcome {
 ///
 /// With `job.verify`, the pane is gated twice before anything is typed: it must
 /// not have moved since the job was scheduled (the recency gate), and it must
-/// still show a rate-limit banner. Otherwise each message is typed and
+/// still show a rate-limit banner, unless it showed none when the job was
+/// scheduled (`job.verify_no_banner`). Otherwise each message is typed and
 /// submitted, pausing `job.send_delay_secs` between messages. A pane that is no
 /// longer the one scheduled for gets nothing (`WrongPane`).
 pub fn run_injection(
@@ -111,10 +111,14 @@ pub fn run_injection(
         // Detection::Elapsed does too, and is no ambiguity at all: a nudge fires
         // after the time its banner named, so for a Codex pane still parked at
         // its limit this is the answer every single time.
-        if matches!(
-            detect_reset(&screen, now, clock_ext, dur_ext, weekly_ext),
-            crate::detect::Detection::None
-        ) {
+        //
+        // A job whose pane showed no banner when it was scheduled skips this
+        // check. Usually that pane's banner is one nudge cannot recognise, so
+        // it would find none now either and the job could never fire. The
+        // recency gate above still stops it if the user resumed.
+        if !job.verify_no_banner
+            && !crate::verify::shows_banner(&screen, now, clock_ext, dur_ext, weekly_ext)
+        {
             return Ok(InjectOutcome::SkippedNoBanner);
         }
     }
@@ -428,6 +432,7 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         }
     }
 
@@ -1135,5 +1140,78 @@ mod tests {
             run_injection(&t, &j, &now(), None, None, None).unwrap(),
             InjectOutcome::Sent(1)
         );
+    }
+
+    // ---- a pane that showed no banner when it was scheduled ----
+
+    /// Parked at a limit whose banner nudge cannot recognise: to nudge, a pane
+    /// with no banner at all.
+    const NO_BANNER: &str = "● Done.\n\n❯ ";
+
+    /// `job_snapshotted_at`, for a pane whose snapshot showed no banner.
+    fn no_banner_job_snapshotted_at(screen: &str) -> Job {
+        Job {
+            verify_no_banner: true,
+            ..job_snapshotted_at(screen, &["go"])
+        }
+    }
+
+    /// The bug itself. The banner check would find no banner at fire time,
+    /// as it found none at schedule time, and skip: the job could never fire.
+    #[test]
+    fn verify_sends_into_an_untouched_pane_that_showed_no_banner_when_scheduled() {
+        let t = FakeTarget::new(NO_BANNER);
+        let out = run_injection(
+            &t,
+            &no_banner_job_snapshotted_at(NO_BANNER),
+            &now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, InjectOutcome::Sent(1));
+        assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
+    }
+
+    /// Skipping the banner check leaves the recency check in place: the
+    /// user resuming by hand still stops the nudge.
+    #[test]
+    fn verify_still_skips_a_no_banner_pane_the_user_resumed() {
+        let t = FakeTarget::new("● Done.\n● Resumed by hand.\n\n❯ ");
+        let out = run_injection(
+            &t,
+            &no_banner_job_snapshotted_at(NO_BANNER),
+            &now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, InjectOutcome::SkippedResumed);
+        assert!(t.sent.borrow().is_empty());
+    }
+
+    /// A resize makes recency Unknown, which fails open. With the banner check
+    /// skipped too, nothing is left to stop it: the nudge fires.
+    #[test]
+    fn verify_fails_open_on_a_resized_no_banner_pane() {
+        let t = FakeTarget::resized(
+            NO_BANNER,
+            crate::target::PaneDims {
+                width: 100,
+                height: 24,
+            },
+        );
+        let out = run_injection(
+            &t,
+            &no_banner_job_snapshotted_at(NO_BANNER),
+            &now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, InjectOutcome::Sent(1));
     }
 }

@@ -36,6 +36,7 @@ fn spec(pane: &str) -> JobSpec {
         settle_secs: 5.0,
         verify_fingerprint: None,
         verify_dims: None,
+        verify_no_banner: false,
     }
 }
 
@@ -261,6 +262,7 @@ fn merge_edit_preserves_options_not_passed() {
         settle_secs: 9.0,
         verify_fingerprint: None,
         verify_dims: None,
+        verify_no_banner: false,
     }
     .into_job(1);
 
@@ -304,6 +306,7 @@ fn verify_job_snapshotted_at(pane: &str, screen: &str) -> nudge::job::Job {
         settle_secs: 5.0,
         verify_fingerprint: Some(nudge::verify::fingerprint(screen)),
         verify_dims: Some(dims(80)),
+        verify_no_banner: false,
     }
     .into_job(1)
 }
@@ -320,8 +323,11 @@ fn edit_resnapshots_the_pane_instead_of_inheriting_the_old_baseline() {
             .unwrap();
     let fresh = |_t: &TargetSpec, _o: &Toggles| {
         Some(Baseline {
-            fingerprint: nudge::verify::fingerprint("the pane at edit time"),
-            dims: dims(80),
+            recency: Some((
+                nudge::verify::fingerprint("the pane at edit time"),
+                dims(80),
+            )),
+            banner: true,
         })
     };
     let spec = nudge::app::merge_edit(&job, &cli, None, &noon(), 2, &fresh).unwrap();
@@ -385,8 +391,8 @@ fn edit_with_no_verify_drops_the_snapshot() {
             .unwrap();
     let always_snapshots = |_t: &TargetSpec, _o: &Toggles| {
         Some(Baseline {
-            fingerprint: "x".into(),
-            dims: dims(80),
+            recency: Some(("x".into(), dims(80))),
+            banner: true,
         })
     };
     let spec = nudge::app::merge_edit(&job, &cli, None, &noon(), 2, &always_snapshots).unwrap();

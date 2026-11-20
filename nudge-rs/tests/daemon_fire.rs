@@ -150,6 +150,7 @@ fn daemon_fires_a_due_job_into_the_pane() {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         })
         .unwrap();
     drop(queue); // done writing; the daemon will `Queue::load` its own handle

@@ -69,6 +69,9 @@ pub fn apply_outcome(
         // Silently dropping the job on one transient tmux hiccup -- the server
         // restarting, the pane briefly unavailable -- was the worse failure,
         // because nothing said it had happened.
+        //
+        // A `--verify` job whose pane showed no banner never retries
+        // (`Job::one_try`), sent or failed.
         Ok(InjectOutcome::Sent(_)) | Err(_) if job.will_retry() => {
             let left = if job.retries_left > 0 {
                 job.retries_left - 1
@@ -127,6 +130,7 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         }
         .into_job(id)
     }
@@ -188,6 +192,7 @@ mod tests {
             settle_secs: job.settle_secs,
             verify_fingerprint: job.verify_fingerprint.clone(),
             verify_dims: job.verify_dims,
+            verify_no_banner: job.verify_no_banner,
         })
         .unwrap();
         (dir, q)
@@ -212,6 +217,26 @@ mod tests {
         let job = q.get(1).unwrap();
         assert_eq!(job.retries_left, 1);
         assert_eq!(job.fire_at, retry_at);
+    }
+
+    /// A `--verify` job on a pane that showed no banner gets one try. A retry
+    /// has no snapshot, since the reschedule drops it, and no banner to look
+    /// for, so nothing could stop it typing into a session the user resumed.
+    /// That holds after a failed send too: with several messages, some may
+    /// have been typed before the error.
+    #[test]
+    fn a_verify_job_that_saw_no_banner_never_retries() {
+        let j = Job {
+            verify: true,
+            verify_no_banner: true,
+            ..job(1, "2026-07-13T11:59:00Z", true, -1)
+        };
+        for outcome in [Ok(InjectOutcome::Sent(1)), inject_err()] {
+            let (_d, mut q) = q_with(&j);
+            let cur = q.get(1).unwrap().clone();
+            apply_outcome(&mut q, &cur, &outcome, now().timestamp()).unwrap();
+            assert!(q.get(1).is_none(), "{outcome:?}: done despite -r -1");
+        }
     }
 
     #[test]

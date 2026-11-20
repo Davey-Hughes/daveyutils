@@ -130,6 +130,7 @@ fn a_verify_skip_lands_in_the_daemon_log() {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         })
         .unwrap();
     drop(queue);

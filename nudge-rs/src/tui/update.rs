@@ -37,7 +37,13 @@ pub enum Msg {
         screen: Option<String>,
         detection: Detection,
     },
-    Scheduled(u64),
+    /// The daemon took the job as `id`. `no_banner` is what the `--verify`
+    /// snapshot `exec` took found: a pane showing no rate-limit banner, which
+    /// the spec `submit` stashed could not know yet.
+    Scheduled {
+        id: u64,
+        no_banner: bool,
+    },
     Cancelled(bool),
     Replaced(Option<u64>),
     ActionFailed(String),
@@ -113,7 +119,10 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             model.form.detected = Some(detection);
             vec![]
         }
-        Msg::Scheduled(id) => finish_submit(model, id, "scheduled job"),
+        Msg::Scheduled { id, no_banner } => {
+            note_no_banner(model, no_banner);
+            finish_submit(model, id, "scheduled job")
+        }
         Msg::Replaced(Some(id)) => finish_submit(model, id, "edited — now job"),
         Msg::Replaced(None) => {
             model.pending_spec = None;
@@ -180,6 +189,15 @@ fn panes_loaded(model: &mut Model, panes: Vec<Pane>, default_idx: usize) -> Vec<
         return capture_selected(&mut model.form, model.now);
     }
     vec![]
+}
+
+/// Copy what the `--verify` snapshot found into the stashed spec, which was
+/// built before `exec` took it, so the summary describes the job the daemon
+/// holds.
+fn note_no_banner(model: &mut Model, no_banner: bool) {
+    if let Some(spec) = &mut model.pending_spec {
+        spec.verify_no_banner = no_banner;
+    }
 }
 
 /// Land a successful schedule/replace, per the destination the submitting key
@@ -1126,6 +1144,7 @@ fn build_spec(model: &Model, pane: &Pane, fire_at: Timestamp) -> JobSpec {
         settle_secs,
         verify_fingerprint: None,
         verify_dims: None,
+        verify_no_banner: false,
     }
 }
 
@@ -1207,6 +1226,7 @@ mod tests {
             settle_secs: 5.0,
             verify_fingerprint: None,
             verify_dims: None,
+            verify_no_banner: false,
         }
     }
 
@@ -2249,7 +2269,13 @@ mod tests {
                 .to_zoned_datetime(jiff::tz::TimeZone::UTC),
         ));
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
-        update(&mut m, Msg::Scheduled(12));
+        update(
+            &mut m,
+            Msg::Scheduled {
+                id: 12,
+                no_banner: false,
+            },
+        );
         let summary = m.exit_summary.as_ref().expect("a summary to print");
         assert!(
             summary.contains("ra-scan · herdr:default:w7:pX"),
@@ -2501,13 +2527,48 @@ mod tests {
         assert!(matches!(fx.as_slice(), [Effect::Schedule { .. }]));
         assert_eq!(m.after_submit, AfterSubmit::Quit);
 
-        let fx = update(&mut m, Msg::Scheduled(12));
+        let fx = update(
+            &mut m,
+            Msg::Scheduled {
+                id: 12,
+                no_banner: false,
+            },
+        );
         assert!(m.should_quit, "a plain Enter is done with the dashboard");
         assert!(fx.is_empty(), "nothing left to poll for — we're leaving");
         let summary = m.exit_summary.as_ref().expect("a summary to print");
         assert!(summary.contains("job 12"), "{summary}");
         assert!(summary.contains("s:0.1 (%1)"), "{summary}");
         assert!(summary.contains("in 2h 0m"), "{summary}");
+    }
+
+    /// The snapshot that decides whether the pane showed a banner is taken
+    /// after the form stashed its spec, so the reply carries the answer. A
+    /// verify job on a pane with none gets one try, and the summary printed
+    /// on the way out must not promise the retries the form asked for.
+    #[test]
+    fn the_exit_summary_of_a_one_try_job_says_it_will_not_retry() {
+        let mut m = form_model();
+        m.form.verify = true;
+        m.form.auto_retry = true;
+        m.form.detected = Some(Detection::Reset(
+            t0().checked_add(jiff::ToSpan::hours(2))
+                .unwrap()
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC),
+        ));
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
+        update(
+            &mut m,
+            Msg::Scheduled {
+                id: 12,
+                no_banner: true,
+            },
+        );
+        let summary = m.exit_summary.as_ref().expect("a summary to print");
+        assert!(
+            summary.contains("no retries (no banner to check)"),
+            "{summary}"
+        );
     }
 
     #[test]
@@ -2522,7 +2583,13 @@ mod tests {
         assert!(matches!(fx.as_slice(), [Effect::Schedule { .. }]));
         assert_eq!(m.after_submit, AfterSubmit::Jobs);
 
-        let fx = update(&mut m, Msg::Scheduled(12));
+        let fx = update(
+            &mut m,
+            Msg::Scheduled {
+                id: 12,
+                no_banner: false,
+            },
+        );
         assert!(!m.should_quit);
         assert!(m.exit_summary.is_none(), "nothing to print — we stayed");
         assert_eq!(m.tab, Tab::Jobs);
@@ -3082,7 +3149,13 @@ mod tests {
             spec.send_delay_secs
         );
 
-        update(&mut m, Msg::Scheduled(7));
+        update(
+            &mut m,
+            Msg::Scheduled {
+                id: 7,
+                no_banner: false,
+            },
+        );
         assert!(m.should_quit);
         let summary = m.exit_summary.as_deref().expect("a summary to print");
         assert!(summary.contains("scheduled job 7"), "{summary}");

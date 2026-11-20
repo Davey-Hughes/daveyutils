@@ -443,6 +443,7 @@ fn end_to_end_injection_verifies_then_sends() {
         settle_secs: 5.0,
         verify_fingerprint: None,
         verify_dims: None,
+        verify_no_banner: false,
     };
 
     let out = run_injection(&target, &job, &fixed_now(), None, None, None).unwrap();
@@ -557,7 +558,8 @@ fn end_to_end_verify_skips_a_pane_that_moved_after_the_snapshot() {
     wait_until_quiet(&target);
 
     // Schedule time: snapshot the pane parked at its banner.
-    let base = nudge::verify::capture_baseline(&target).expect("a live pane must snapshot");
+    let base = nudge::verify::capture_baseline(&target, &fixed_now(), None, None, None)
+        .expect("a live pane must snapshot");
 
     // The user resumes by hand: real output lands, and the banner scrolls up but
     // stays on screen -- which is the whole of finding I19.
@@ -587,8 +589,9 @@ fn end_to_end_verify_skips_a_pane_that_moved_after_the_snapshot() {
         auto_retry: false,
         retries_left: 0,
         settle_secs: 5.0,
-        verify_fingerprint: Some(base.fingerprint),
-        verify_dims: Some(base.dims),
+        verify_fingerprint: base.recency.clone().map(|(fp, _)| fp),
+        verify_dims: base.recency.map(|(_, dims)| dims),
+        verify_no_banner: !base.banner,
     };
     let out = run_injection(&target, &job, &fixed_now(), None, None, None).unwrap();
     assert_eq!(out, InjectOutcome::SkippedResumed);
@@ -639,7 +642,8 @@ fn end_to_end_verify_still_fires_into_a_pane_nobody_touched() {
     // true: a baseline taken mid-render differs from the pane a moment later,
     // and the gate reads that difference as the user having resumed.
     wait_until_quiet(&target);
-    let base = nudge::verify::capture_baseline(&target).expect("a live pane must snapshot");
+    let base = nudge::verify::capture_baseline(&target, &fixed_now(), None, None, None)
+        .expect("a live pane must snapshot");
 
     let job = Job {
         id: 1,
@@ -655,8 +659,9 @@ fn end_to_end_verify_still_fires_into_a_pane_nobody_touched() {
         auto_retry: false,
         retries_left: 0,
         settle_secs: 5.0,
-        verify_fingerprint: Some(base.fingerprint),
-        verify_dims: Some(base.dims),
+        verify_fingerprint: base.recency.clone().map(|(fp, _)| fp),
+        verify_dims: base.recency.map(|(_, dims)| dims),
+        verify_no_banner: !base.banner,
     };
     let out = run_injection(&target, &job, &fixed_now(), None, None, None).unwrap();
     assert_eq!(
@@ -669,6 +674,56 @@ fn end_to_end_verify_still_fires_into_a_pane_nobody_touched() {
         &target,
         "nudge_fired_42",
         "the message must reach a pane the gate cleared to fire into",
+    );
+}
+
+/// A pane parked at a limit whose banner nudge cannot recognise. The
+/// snapshot notes that it showed no banner, so at fire time only the
+/// recency gate applies, and an untouched pane gets the nudge. Before, the
+/// banner check skipped it: such a job could never fire.
+#[test]
+fn end_to_end_verify_fires_into_an_untouched_pane_that_showed_no_banner() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let target = server.target();
+    server.stage("printf 'try again %s\\n' later");
+    wait_for_text(
+        &target,
+        "try again later",
+        "the pane must be drawn before it is snapshotted",
+    );
+    wait_until_quiet(&target);
+    let base = nudge::verify::capture_baseline(&target, &fixed_now(), None, None, None)
+        .expect("a live pane must snapshot");
+    assert!(!base.banner, "'try again later' names no time to detect");
+
+    let job = Job {
+        id: 1,
+        target: TargetSpec::Tmux {
+            pane: "s".into(),
+            server: None,
+        },
+        messages: vec!["echo nudge_fired_$((6*7))".into()],
+        send_delay_secs: 0.0,
+        fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
+        notify: false,
+        verify: true,
+        auto_retry: false,
+        retries_left: 0,
+        settle_secs: 5.0,
+        verify_fingerprint: base.recency.clone().map(|(fp, _)| fp),
+        verify_dims: base.recency.map(|(_, dims)| dims),
+        verify_no_banner: !base.banner,
+    };
+    let out = run_injection(&target, &job, &fixed_now(), None, None, None).unwrap();
+    assert_eq!(out, InjectOutcome::Sent(1));
+    wait_for_text(
+        &target,
+        "nudge_fired_42",
+        "the message must reach an untouched pane that showed no banner",
     );
 }
 
@@ -832,6 +887,7 @@ fn a_pane_id_from_a_restarted_server_is_refused() {
         settle_secs: 5.0,
         verify_fingerprint: None,
         verify_dims: None,
+        verify_no_banner: false,
     };
     let target = TmuxTarget::with_socket(&loc.id, &server.socket).expecting_server(loc.server);
     let out = run_injection(&target, &job, &fixed_now(), None, None, None).unwrap();
