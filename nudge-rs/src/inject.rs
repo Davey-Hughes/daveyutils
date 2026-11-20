@@ -131,15 +131,26 @@ pub fn run_injection(
         // A capture that fails here is not an error: not knowing the mode is no
         // reason to withhold the nudge, and if the pane is truly gone the send
         // below is what will say so.
+        //
+        // A Claude box answers for itself, and Codex's status line is not read
+        // on its pane: Claude Code lists its running agents under its box, and
+        // a task ending in "Vim: Normal" reads like Codex's mode. Anywhere else,
+        // a Codex box or one nudge cannot read, Codex's status line decides.
         if let Ok(screen) = target.capture_styled() {
-            if crate::composer::vim_normal(&screen) {
-                codex_insert_mode(target)?;
-            } else if let Some(before) = crate::composer::input_box(&screen)
-                && let BoxKind::Claude {
-                    mode: mode @ (ClaudeMode::Visual | ClaudeMode::Unlabelled),
-                } = before.kind
-            {
-                claude_insert_mode(target, &before, mode)?;
+            let claude = crate::composer::input_box(&screen)
+                .filter(|b| matches!(b.kind, BoxKind::Claude { .. }));
+            match &claude {
+                Some(
+                    before @ InputBox {
+                        kind:
+                            BoxKind::Claude {
+                                mode: mode @ (ClaudeMode::Visual | ClaudeMode::Unlabelled),
+                            },
+                        ..
+                    },
+                ) => claude_insert_mode(target, before, *mode)?,
+                None if crate::composer::vim_normal(&screen) => codex_insert_mode(target)?,
+                _ => {}
             }
         }
         target.send_line(msg)?;
@@ -505,6 +516,29 @@ mod tests {
         assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
     }
 
+    /// The bottom of a Codex pane from a live session on 2026-11-19, in Normal
+    /// mode, which Codex named on its hints line with more after it (the path
+    /// abridged).
+    const VIM_NORMAL_WITH_WARNING: &str = "\
+› Ask Codex to do anything
+
+  GPT-6.1-Sol xhigh · ~/src
+  ← for agents · ? for shortcuts             Vim: Normal · ⚠ 1 warning · f2 to view
+";
+
+    /// The same as the first case on that layout. Missed there, the nudge was
+    /// typed as Normal-mode commands. The read after the `A` shows Insert mode
+    /// on the same kind of line, so no `i` follows.
+    #[test]
+    fn a_mode_followed_by_a_warning_count_still_gets_an_a() {
+        let insert = VIM_NORMAL_WITH_WARNING.replace("Vim: Normal", "Vim: Insert");
+        let t = FakeTarget::showing(&[VIM_NORMAL_WITH_WARNING, &insert]);
+        let out = run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Sent(1));
+        assert_eq!(*t.keys.borrow(), vec![(0, Key::Char('A'))]);
+        assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
+    }
+
     /// A Codex with `A` remapped, or one too old to have it, stays in Normal
     /// mode. `i` is the key seen working live on 2026-10-12.
     #[test]
@@ -646,6 +680,20 @@ mod tests {
         assert_eq!(out, InjectOutcome::Sent(1));
         assert_eq!(*t.keys.borrow(), vec![(0, Key::Char('A'))]);
         assert_eq!(*t.sent.borrow(), vec!["please continue".to_string()]);
+    }
+
+    /// Codex's Vim mode is read only off a Codex box. Claude Code lists its
+    /// running agents under its box, and one whose task ends in "Vim: Normal"
+    /// looks like Codex's status line; read as one, it would have an `A` and
+    /// an `i` typed into a box in Insert mode.
+    #[test]
+    fn a_claude_agent_row_naming_the_mode_is_not_codex_normal_mode() {
+        let pane = format!("{CLAUDE_INSERT}  ◯ general-purpose  Check Vim: Normal  2m 13s\n");
+        let t = FakeTarget::new(&pane);
+        let out = run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
+        assert_eq!(out, InjectOutcome::Sent(1));
+        assert_eq!(*t.keys.borrow(), vec![]);
+        assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
     }
 
     /// A box with no Vim keys types the `A`, which then has to come out

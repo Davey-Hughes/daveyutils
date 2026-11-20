@@ -5,6 +5,9 @@
 ///
 /// Codex draws it under the composer, with a blank line between them and at
 /// most a line of key hints beneath: it is the last line or the one above.
+/// On 2026-11-19 Codex named the mode on the hints line itself, the last line,
+/// so the mode is in one of the two either way.
+///
 /// Looking no higher is the point. The words "Vim: Normal" further up are
 /// conversation -- a transcript quoting them, or a draft that ends in them --
 /// and not the state of the input box. Blank lines count toward the distance,
@@ -14,18 +17,21 @@ const STATUS_LINES: usize = 2;
 /// The modes Codex's status line names when its Vim keys are on.
 const VIM_MODES: [&str; 3] = ["Normal", "Insert", "Replace"];
 
+/// What comes before the mode on Codex's status line.
+const VIM_LABEL: &str = "Vim: ";
+
 /// Whether the pane's composer is waiting in Vim Normal mode.
 ///
 /// In Normal mode what is typed is read as commands: seen live, "please
 /// continue" pasted, moved the cursor, and from its first "a" on was inserted,
-/// leaving "se continue". The lowest line that ends in a mode is the status
+/// leaving "se continue". The lowest line that names a mode is the status
 /// line, and it alone decides.
 pub fn vim_normal(screen: &str) -> bool {
     vim_mode(screen) == Some("Normal")
 }
 
 /// The Vim mode Codex's status line names, if it names one: `Normal`,
-/// `Insert` or `Replace`. The lowest line that ends in a mode is the status
+/// `Insert` or `Replace`. The lowest line that names a mode is the status
 /// line, and it alone decides.
 pub fn vim_mode(screen: &str) -> Option<&'static str> {
     let captured = read_styled(screen);
@@ -38,13 +44,41 @@ pub fn vim_mode(screen: &str) -> Option<&'static str> {
         .iter()
         .rev()
         .find_map(|line| {
-            VIM_MODES.iter().find(|mode| {
-                line.strip_suffix(*mode)
-                    .and_then(|rest| rest.strip_suffix("Vim: "))
-                    .is_some_and(|before| before.is_empty() || before.ends_with(' '))
-            })
+            let named = mode_label(line)?;
+            VIM_MODES.iter().copied().find(|known| *known == named)
         })
-        .copied()
+}
+
+/// The items of a status line. Codex separates them with `·`, or with
+/// padding: a single space is inside an item, as in `Vim: Normal`.
+fn status_items(line: &str) -> impl Iterator<Item = &str> {
+    line.split('·')
+        .flat_map(|part| part.split("  "))
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+}
+
+/// The word `line` gives as the Vim mode, whether nudge knows it or not: the
+/// word after `Vim: ` at the end of one of its items, with the label starting
+/// the item or following a space.
+///
+/// Codex puts the mode last, or follows it with more items, such as
+/// `· ⚠ 1 warning` (seen 2026-11-19), and with no room for padding a single
+/// space can come before it. Where several items end in one, the last counts:
+/// Codex puts the mode after the model and the path.
+///
+/// The end of an item and nothing less, because the bottom lines of a pane
+/// hold more than Codex's status line: Claude Code lists its running agents
+/// under its box, and an agent's task can mention the mode mid-sentence. An
+/// `A` typed there is text.
+fn mode_label(line: &str) -> Option<&str> {
+    status_items(line)
+        .filter_map(|item| {
+            let (before, word) = item.rsplit_once(VIM_LABEL)?;
+            let label_starts = before.is_empty() || before.ends_with(' ');
+            (label_starts && !word.contains(char::is_whitespace)).then_some(word)
+        })
+        .last()
 }
 
 /// A CLI's input box, read off a pane captured with its styling
@@ -348,12 +382,88 @@ mod tests {
         assert!(!vim_normal(pane));
     }
 
-    /// And on the status line they must be its last word, where Codex puts
+    /// And on the status line they must be a whole item, where Codex puts
     /// them, not something a path or a branch name happens to contain.
     #[test]
-    fn the_words_must_end_the_status_line() {
+    fn the_words_must_be_a_whole_status_item() {
         let pane = "› \n\n  GPT-6.1-Sol · ~/notes/Vim: Normal mode.md       Vim: Insert\n";
         assert!(!vim_normal(pane));
+    }
+
+    /// The bottom of a Codex pane from a live session on 2026-11-19, after Esc
+    /// had left its composer in Normal mode. Codex had moved the mode down to
+    /// the hints line and put a warning count after it, so the mode did not
+    /// end the line, and nudge typed "nudge live check one" as commands: its
+    /// first "i" started Insert mode, and Codex got "ve check one". Verbatim
+    /// but for the path, which is abridged.
+    const NORMAL_WITH_WARNING: &str = "\
+› Ask Codex to do anything
+
+  GPT-6.1-Sol xhigh · ~/src
+  ← for agents · ? for shortcuts             Vim: Normal · ⚠ 1 warning · f2 to view
+";
+
+    /// The mode is one of the status line's items, which Codex separates with
+    /// ` · `. It can be followed by others, however they are spaced.
+    #[test]
+    fn a_mode_followed_by_more_status_items_is_still_the_mode() {
+        assert_eq!(vim_mode(NORMAL_WITH_WARNING), Some("Normal"));
+        assert_eq!(
+            vim_mode(&NORMAL_WITH_WARNING.replace("Vim: Normal", "Vim: Insert")),
+            Some("Insert")
+        );
+        let padded = NORMAL_WITH_WARNING.replace(" · ⚠", "  ⚠");
+        assert_eq!(vim_mode(&padded), Some("Normal"));
+    }
+
+    /// Words that merely mention the mode, mid-item, are not one, even on the
+    /// bottom line: Claude Code lists its running agents under its box, and an
+    /// agent's task can say anything. An `A` sent there is typed as text.
+    #[test]
+    fn a_mention_inside_an_item_is_not_a_mode() {
+        let pane = "❯\u{a0}\n\n  ◯ general-purpose  Fix Vim: Normal detection in nudge\n";
+        assert_eq!(vim_mode(pane), None);
+    }
+
+    /// With too little room for padding, a single space can be all that comes
+    /// before the mode. 0.9.0 read that, and so does this.
+    #[test]
+    fn a_mode_after_a_single_space_still_ends_its_item() {
+        let pane = "› \n\n  GPT-6.1-Sol xhigh · ~/some/long/path Vim: Normal\n";
+        assert_eq!(vim_mode(pane), Some("Normal"));
+    }
+
+    /// A bottom line whose last word after `Vim: ` is no mode nudge knows
+    /// leaves the line above to decide, as 0.9.0 did: an agent row ending in
+    /// "see Vim: docs" does not hide the status line.
+    #[test]
+    fn an_unknown_word_on_the_bottom_line_leaves_the_line_above_to_decide() {
+        let pane = "› \n\n  GPT-6.1-Sol · ~/src     Vim: Normal\n  ◯ agent  see Vim: docs\n";
+        assert_eq!(vim_mode(pane), Some("Normal"));
+    }
+
+    /// Where the last item names no mode nudge knows, an earlier mention is
+    /// not taken for one.
+    #[test]
+    fn an_unknown_mode_does_not_fall_back_to_an_earlier_mention() {
+        let pane = "› \n\n  GPT-6.1-Sol · ~/my Vim: Normal     Vim: Visual\n";
+        assert_eq!(vim_mode(pane), None);
+    }
+
+    /// Codex puts the mode after the model and the path, so where a line names
+    /// two, the last one is the mode.
+    #[test]
+    fn the_last_mode_on_the_line_is_the_one_it_is_in() {
+        let pane = "› \n\n  GPT-6.1-Sol · ~/Vim: Normal notes/     Vim: Insert · f2 to view\n";
+        assert_eq!(vim_mode(pane), Some("Insert"));
+    }
+
+    /// Followed by anything but a separator, the words are still text that
+    /// happens to contain them.
+    #[test]
+    fn the_words_followed_by_other_text_are_not_a_mode() {
+        let pane = "› \n\n  ← for agents · ? for shortcuts      Vim: Normality · f2 to view\n";
+        assert_eq!(vim_mode(pane), None);
     }
 
     // ---- the input box ----

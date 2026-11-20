@@ -30,7 +30,10 @@ name = "nudge"
 # pane (`"kind": "Herdr"`), which a 0.8.0 daemon cannot read. A 0.8.0 daemon
 # also types into a pane that now runs herdr's client, which hands the text to
 # whichever herdr pane has focus.
-version = "0.9.0"
+# 0.9.1 is load-bearing for the daemon's behavior: a 0.9.0 daemon misses
+# Codex's Vim Normal mode when the status line shows more after it (a warning
+# count), and types the nudge as commands.
+version = "0.9.1"
 edition = "2024"
 description = "Rate-limit auto-resumer for AI CLIs in tmux or herdr"
 license = "GPL-3.0-or-later"

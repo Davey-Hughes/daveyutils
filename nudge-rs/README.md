@@ -323,13 +323,16 @@ banner it recognises, the verify gate would skip it.
 
 If Codex's Vim keys are on and you left the composer in Normal mode, typed text
 would be read as commands: `please continue` arrives as `se continue`. nudge
-checks for a status line ending in `Vim: Normal` and presses `A` first, which
-puts the message after a draft left in the composer rather than inside it. If
-the status line still says Normal after that (a remapped `A`, or a Codex
-without it), nudge presses `i`. It looks only at the last two lines of the
-pane, where Codex draws that line, so a pane that merely mentions those words,
-or a draft that ends in them, is left alone. This relies on the Vim mode being
-shown in Codex's status line.
+looks in the last two lines of the pane, where Codex draws its status line,
+for an item that ends in `Vim: Normal`. Codex separates the items with `·` or
+with padding, and can show more after the mode, such as a warning count.
+If it is there, nudge presses `A` first, which puts the message after a draft
+left in the composer rather than inside it. If the status line still says
+Normal after that (a remapped `A`, or a Codex without it), nudge presses `i`.
+A pane that merely mentions those words, higher up or inside other text such
+as a draft or an agent's task, is left alone, and a pane showing Claude Code's
+box is never read for Codex's mode. This relies on the Vim mode being shown in
+Codex's status line.
 
 When a nudge fires, nudge waits half a second between typing the message and
 pressing Enter. Codex treats keystrokes that arrive faster than anyone types as
