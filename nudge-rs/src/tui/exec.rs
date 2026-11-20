@@ -8,12 +8,29 @@ use super::update::{Effect, Msg};
 use crate::detect::detect_reset;
 use crate::ipc::{Request, Response, client};
 use crate::job::TargetSpec;
+use crate::panes::Positions;
 
 pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
+    run_effect_with(effect, socket, |targets| {
+        crate::panes::positions_for(targets)
+    })
+}
+
+/// [`run_effect`], given how to find where panes sit: `positions_of` is
+/// handed the pane of each job the daemon lists. That is the one thing
+/// [`Effect::PollJobs`] asks tmux and herdr, and a test that left it to
+/// [`run_effect`] would be asking the tmux server of whoever runs it.
+fn run_effect_with(
+    effect: Effect,
+    socket: &Path,
+    positions_of: impl FnOnce(Vec<&TargetSpec>) -> Positions,
+) -> Msg {
     match effect {
         Effect::PollJobs => match client::request(socket, &Request::List) {
             Ok(Response::Jobs(jobs)) => {
-                let positions = crate::panes::positions_for(jobs.iter().map(|j| &j.target));
+                // Asked even with no job listed: the answer also names the
+                // tmux server, which the dashboard keeps for its form.
+                let positions = positions_of(jobs.iter().map(|j| &j.target).collect());
                 Msg::JobsLoaded(jobs, positions)
             }
             Ok(other) => Msg::ActionFailed(format!("unexpected response: {other:?}")),
@@ -156,34 +173,83 @@ mod tests {
         std::thread::spawn(move || {
             let _ = server::serve(&s, &q);
         });
-        // Give the server a beat to bind.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Until it takes a connection, not until its socket's file appears:
+        // binding makes the file, and only the `listen` after it accepts.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server never took a connection"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         (socket, tmp)
     }
 
+    /// [`run_effect`] for an effect that never asks where panes sit: this
+    /// fails if it does. That covers [`Effect::Cancel`], and
+    /// [`Effect::PollJobs`] when the daemon does not answer with its jobs.
+    ///
+    /// It keeps a test off the tmux server of whoever runs it for that one
+    /// lookup only. [`Effect::ListPanes`], [`Effect::CapturePane`] and a
+    /// [`Effect::Schedule`] or [`Effect::Replace`] with a `snapshot_pane`
+    /// reach tmux and herdr on their own, here as in [`run_effect`], and no
+    /// test runs them.
+    fn run(effect: Effect, socket: &Path) -> Msg {
+        run_effect_with(effect, socket, |_| {
+            panic!("this effect should not ask where panes sit")
+        })
+    }
+
     #[test]
-    fn poll_jobs_returns_the_served_queue() {
+    fn poll_jobs_returns_the_served_queue_and_where_its_panes_sit() {
         let (socket, _tmp) = serving_queue(true);
-        match run_effect(Effect::PollJobs, &socket) {
-            Msg::JobsLoaded(jobs, _) => assert_eq!(jobs.len(), 1),
+        let mut sits = Positions::new();
+        sits.insert(&spec().target, "bot:0.1", Some("fix the build".into()));
+
+        let msg = run_effect_with(Effect::PollJobs, &socket, |asked| {
+            assert_eq!(asked, [&spec().target], "asked about the served job's pane");
+            sits.clone()
+        });
+
+        match msg {
+            Msg::JobsLoaded(jobs, positions) => {
+                assert_eq!(jobs.len(), 1);
+                assert_eq!(positions, sits);
+            }
             other => panic!("expected JobsLoaded, got {other:?}"),
         }
+    }
+
+    /// The dashboard keeps the tmux server the lookup names, for its form, so
+    /// an empty queue must not skip the lookup.
+    #[test]
+    fn poll_jobs_asks_where_panes_sit_even_with_no_job() {
+        let (socket, _tmp) = serving_queue(false);
+        let found = Positions {
+            server: Some("1795158974-5645".into()),
+            ..Positions::new()
+        };
+
+        let msg = run_effect_with(Effect::PollJobs, &socket, |asked| {
+            assert!(asked.is_empty(), "no job, so no pane to ask about");
+            found.clone()
+        });
+
+        assert_eq!(msg, Msg::JobsLoaded(Vec::new(), found));
     }
 
     #[test]
     fn cancel_of_a_missing_job_reports_false_not_an_error() {
         let (socket, _tmp) = serving_queue(false);
-        assert_eq!(
-            run_effect(Effect::Cancel(999), &socket),
-            Msg::Cancelled(false)
-        );
+        assert_eq!(run(Effect::Cancel(999), &socket), Msg::Cancelled(false));
     }
 
     #[test]
     fn a_dead_socket_becomes_action_failed_not_a_panic() {
         let socket = std::path::Path::new("/tmp/nudge-does-not-exist.sock");
         assert!(matches!(
-            run_effect(Effect::PollJobs, socket),
+            run(Effect::PollJobs, socket),
             Msg::ActionFailed(_)
         ));
     }
