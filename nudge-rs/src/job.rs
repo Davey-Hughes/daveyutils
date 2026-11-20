@@ -1,5 +1,7 @@
 //! The persisted job value type and its target descriptor.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::target::PaneDims;
@@ -15,6 +17,19 @@ pub enum TargetSpec {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         server: Option<String>,
     },
+    Herdr {
+        /// herdr's id for the pane (`w7:pX`), which is stable across restarts of
+        /// the session as long as the pane lives.
+        pane: String,
+        /// The API socket of the herdr session that holds `pane`: every session
+        /// numbers its own panes, so the id alone does not say which.
+        socket: PathBuf,
+        /// The agent session `pane` held when the job was queued, so a job does
+        /// not type into a pane that has since been given another conversation.
+        /// A job queued without one fires as it always did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_session: Option<String>,
+    },
 }
 
 impl TargetSpec {
@@ -23,8 +38,32 @@ impl TargetSpec {
     /// before jobs kept their server, or a server tmux would not name, is no
     /// evidence either way.
     pub fn from_earlier_server(&self, current: Option<&str>) -> bool {
-        let TargetSpec::Tmux { server, .. } = self;
+        let TargetSpec::Tmux { server, .. } = self else {
+            return false;
+        };
         matches!((server.as_deref(), current), (Some(then), Some(now)) if then != now)
+    }
+
+    /// Whether `self` and `other` name the same pane, whatever each was
+    /// stamped with when it was queued: a tmux pane by its id, a herdr pane by
+    /// its id and the session's socket.
+    pub fn same_pane(&self, other: &TargetSpec) -> bool {
+        match (self, other) {
+            (TargetSpec::Tmux { pane: a, .. }, TargetSpec::Tmux { pane: b, .. }) => a == b,
+            (
+                TargetSpec::Herdr {
+                    pane: a,
+                    socket: sa,
+                    ..
+                },
+                TargetSpec::Herdr {
+                    pane: b,
+                    socket: sb,
+                    ..
+                },
+            ) => a == b && sa == sb,
+            _ => false,
+        }
     }
 
     /// Build the live, connectable target this descriptor names.
@@ -32,6 +71,14 @@ impl TargetSpec {
         match self {
             TargetSpec::Tmux { pane, server } => Box::new(
                 crate::target::tmux::TmuxTarget::new(pane.clone()).expecting_server(server.clone()),
+            ),
+            TargetSpec::Herdr {
+                pane,
+                socket,
+                agent_session,
+            } => Box::new(
+                crate::target::herdr::HerdrTarget::new(pane.clone(), socket.clone())
+                    .expecting_session(agent_session.clone()),
             ),
         }
     }
@@ -65,6 +112,14 @@ impl Job {
     /// safely, so it is no baseline at all, and no baseline fails open.
     pub fn verify_baseline(&self) -> Option<(String, PaneDims)> {
         Some((self.verify_fingerprint.clone()?, self.verify_dims?))
+    }
+
+    /// Whether a failed send is tried again: `--auto-retry` is on and the
+    /// retries are not used up (`-1` is without end). The scheduler's removal
+    /// of the job and the daemon's notification both go by this, so a job is
+    /// never removed unannounced.
+    pub fn will_retry(&self) -> bool {
+        self.auto_retry && self.retries_left != 0
     }
 }
 
@@ -230,6 +285,56 @@ mod tests {
             height: 24,
         });
         assert_eq!(j.verify_baseline(), None, "dims without fingerprint");
+    }
+
+    #[test]
+    fn a_herdr_target_round_trips() {
+        let t = TargetSpec::Herdr {
+            pane: "w7:pX".into(),
+            socket: "/s/herdr.sock".into(),
+            agent_session: Some("abc".into()),
+        };
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(j.contains(r#""kind":"Herdr""#));
+        assert_eq!(serde_json::from_str::<TargetSpec>(&j).unwrap(), t);
+        let bare = TargetSpec::Herdr {
+            pane: "w7:pX".into(),
+            socket: "/s/herdr.sock".into(),
+            agent_session: None,
+        };
+        assert!(
+            !serde_json::to_string(&bare)
+                .unwrap()
+                .contains("agent_session")
+        );
+    }
+
+    #[test]
+    fn same_pane_ignores_stamps() {
+        let tmux = |server: &str| TargetSpec::Tmux {
+            pane: "%3".into(),
+            server: Some(server.into()),
+        };
+        let herdr = |socket: &str, stamp: Option<&str>| TargetSpec::Herdr {
+            pane: "w1:p1".into(),
+            socket: socket.into(),
+            agent_session: stamp.map(String::from),
+        };
+        assert!(tmux("a").same_pane(&tmux("b")));
+        assert!(herdr("/a", Some("x")).same_pane(&herdr("/a", None)));
+        assert!(!herdr("/a", None).same_pane(&herdr("/b", None)));
+        assert!(!herdr("/a", None).same_pane(&tmux("a")));
+        assert!(!tmux("a").same_pane(&herdr("/a", None)));
+    }
+
+    #[test]
+    fn a_herdr_job_is_never_from_an_earlier_tmux_server() {
+        let t = TargetSpec::Herdr {
+            pane: "w1:p1".into(),
+            socket: "/a".into(),
+            agent_session: None,
+        };
+        assert!(!t.from_earlier_server(Some("200-2")));
     }
 
     fn target(server: Option<&str>) -> TargetSpec {

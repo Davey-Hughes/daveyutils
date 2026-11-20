@@ -96,9 +96,18 @@ fn fixture(seeded: &[JobSpec]) -> Fixture {
 }
 
 fn run_nudge(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_nudge"))
-        .args(args)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nudge"));
+    // Off the developer's herdr too: an edit's confirmation labels its pane
+    // from every herdr session it can list. With no `HERDR_*` and a config
+    // dir of its own, herdr has none to list.
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("HERDR_")) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.args(args)
         .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_RUNTIME_DIR", home.join("run"))
         .env("TZ", "UTC")
@@ -124,7 +133,9 @@ fn queued(home: &Path) -> Vec<nudge::job::Job> {
 }
 
 fn pane_of(job: &nudge::job::Job) -> &str {
-    let TargetSpec::Tmux { pane, .. } = &job.target;
+    let TargetSpec::Tmux { pane, .. } = &job.target else {
+        panic!("expected a tmux target")
+    };
     pane
 }
 

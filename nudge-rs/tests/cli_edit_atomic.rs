@@ -26,7 +26,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use nudge::ipc::Response;
+use nudge::ipc::{Request, Response};
 use nudge::job::{JobSpec, TargetSpec};
 use nudge::paths::{Os, Paths, resolve_from};
 
@@ -49,11 +49,16 @@ fn child_paths(home: &Path) -> Paths {
 }
 
 fn job() -> nudge::job::Job {
+    job_on(TargetSpec::Tmux {
+        pane: "bot:0.1".into(),
+        server: None,
+    })
+}
+
+/// Job 1, on `target`.
+fn job_on(target: TargetSpec) -> nudge::job::Job {
     JobSpec {
-        target: TargetSpec::Tmux {
-            pane: "bot:0.1".into(),
-            server: None,
-        },
+        target,
         messages: vec!["go".into()],
         send_delay_secs: 0.75,
         fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
@@ -68,15 +73,16 @@ fn job() -> nudge::job::Job {
     .into_job(1)
 }
 
-/// A stand-in daemon that records the `op` of every request it is sent.
+/// A stand-in daemon that lists `listed` as its only job and records every
+/// request it is sent, as the line it arrived as.
 ///
 /// It reads the op out of the raw JSON and answers Replace with a raw line, so
 /// this test compiles — and fails, recording Schedule and Cancel — against a
 /// CLI that has never heard of an atomic replace.
-fn recording_daemon(socket: &Path) -> Arc<Mutex<Vec<String>>> {
-    let ops: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+fn recording_daemon(socket: &Path, listed: nudge::job::Job) -> Arc<Mutex<Vec<String>>> {
+    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let listener = UnixListener::bind(socket).unwrap();
-    let recorded = Arc::clone(&ops);
+    let recorded = Arc::clone(&lines);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let mut line = String::new();
@@ -88,7 +94,7 @@ fn recording_daemon(socket: &Path) -> Arc<Mutex<Vec<String>>> {
                 Err(_) => continue,
             };
             let op = v["op"].as_str().unwrap_or("?").to_string();
-            recorded.lock().unwrap().push(op.clone());
+            recorded.lock().unwrap().push(line.trim_end().to_string());
 
             let reply = match op.as_str() {
                 // A stand-in for THIS build, so it answers the versioned
@@ -98,7 +104,7 @@ fn recording_daemon(socket: &Path) -> Arc<Mutex<Vec<String>>> {
                     version: nudge::VERSION.to_string(),
                 })
                 .unwrap(),
-                "List" => serde_json::to_string(&Response::Jobs(vec![job()])).unwrap(),
+                "List" => serde_json::to_string(&Response::Jobs(vec![listed.clone()])).unwrap(),
                 // The daemon's answer to an atomic replace: the new job's id.
                 "Replace" => r#"{"Replaced":6}"#.to_string(),
                 // Schedule/Cancel land here: an edit that reaches them has
@@ -109,50 +115,105 @@ fn recording_daemon(socket: &Path) -> Arc<Mutex<Vec<String>>> {
             let _ = writeln!(&stream, "{reply}");
         }
     });
-    ops
+    lines
 }
 
-#[test]
-fn edit_mutates_the_queue_in_one_atomic_request() {
+/// The `op` of each request line `recording_daemon` recorded.
+fn ops(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["op"].as_str().unwrap_or("?").to_string()
+        })
+        .collect()
+}
+
+/// A home of its own for one `nudge --edit`, with a stand-in daemon on its
+/// socket listing `listed`.
+struct Fixture {
+    home: std::path::PathBuf,
+    lines: Arc<Mutex<Vec<String>>>,
+    _tmp: tempfile::TempDir,
+    _lock: std::fs::File,
+}
+
+fn fixture(listed: nudge::job::Job) -> Fixture {
     // common::short_tempdir, not tempfile::tempdir: this test binds a real
     // socket under a HOME rooted at the tempdir, and macOS's $TMPDIR is long
     // enough that resolve_from's "Library/Application Support/nudge" suffix
     // overflows SUN_LEN there.
     let tmp = common::short_tempdir();
-    let home = tmp.path();
-    let paths = child_paths(home);
+    let home = tmp.path().to_path_buf();
+    let paths = child_paths(&home);
     common::assert_socket_path_fits(&paths.socket);
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     std::fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(home.join("config")).unwrap();
 
     // Leak-proof by construction, as cli_no_daemon.rs already is: hold the
     // singleton lock so that a daemon this test never means to start cannot
     // survive being started. The stand-in answering Ping is what stops one
     // being spawned; this is what stops that being the only thing.
-    let _lock = nudge::daemon::acquire_singleton_lock(&paths.state_dir).unwrap();
+    let lock = nudge::daemon::acquire_singleton_lock(&paths.state_dir).unwrap();
 
-    let ops = recording_daemon(&paths.socket);
+    let lines = recording_daemon(&paths.socket, listed);
+    Fixture {
+        home,
+        lines,
+        _tmp: tmp,
+        _lock: lock,
+    }
+}
 
-    let out = Command::new(env!("CARGO_BIN_EXE_nudge"))
-        .args(["--edit", "1", "-m", "now + 3 hours"])
+/// Run `nudge args` against the fixture's daemon, with nothing inherited
+/// that could lead it to the developer's tmux or herdr.
+///
+/// The confirmation an edit prints labels panes from every tmux and herdr
+/// pane it can list. The session running these tests may sit in a herdr pane
+/// inside tmux, so every `HERDR_*`, `TMUX` and `TMUX_PANE` goes, and
+/// `TMUX_TMPDIR` and `XDG_CONFIG_HOME` point inside the fixture, where no tmux
+/// server runs and herdr keeps no session.
+fn run_nudge(home: &Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nudge"));
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("HERDR_")) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.args(args)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
         .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_RUNTIME_DIR", home.join("run"))
+        .env("TMUX_TMPDIR", home.join("tmux"))
         .output()
-        .expect("failed to run the nudge binary");
+        .expect("failed to run the nudge binary")
+}
 
-    let report = format!(
+fn report(out: &std::process::Output) -> String {
+    format!(
         "status {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
         out.status.code(),
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
-    );
+    )
+}
+
+#[test]
+fn edit_mutates_the_queue_in_one_atomic_request() {
+    let f = fixture(job());
+
+    let out = run_nudge(&f.home, &["--edit", "1", "-m", "now + 3 hours"]);
+    let report = report(&out);
 
     // THE POINT: exactly one mutating request, and it is the atomic swap.
     // Schedule followed by Cancel is the two-step that leaves both jobs live
     // whenever the second step doesn't land.
     assert_eq!(
-        *ops.lock().unwrap(),
+        ops(&f.lines.lock().unwrap()),
         vec![
             "Ping".to_string(),
             "List".to_string(),
@@ -163,6 +224,45 @@ fn edit_mutates_the_queue_in_one_atomic_request() {
     assert!(out.status.success(), "{report}");
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("edited job 1 -> 6"),
+        "{report}"
+    );
+}
+
+/// An edit that names no pane leaves a herdr job in its pane, and keeps the
+/// conversation it was stamped with. Stamped again now, the job would vouch
+/// for whatever the pane holds at the edit, which may be another
+/// conversation than the one the user scheduled it for.
+#[test]
+fn editing_a_herdr_job_keeps_its_pane_and_stamp() {
+    let f = fixture(job_on(TargetSpec::Herdr {
+        pane: "w7:pX".into(),
+        socket: "/nonexistent/herdr/herdr.sock".into(),
+        agent_session: Some("abc".into()),
+    }));
+
+    let out = run_nudge(&f.home, &["--edit", "1", "-m", "now + 3 hours"]);
+    let report = report(&out);
+
+    assert!(out.status.success(), "{report}");
+    let lines = f.lines.lock().unwrap();
+    let replace = lines
+        .iter()
+        .find_map(|l| match serde_json::from_str(l) {
+            Ok(Request::Replace { spec, .. }) => Some(spec),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no Replace request was made\n{report}"));
+    assert_eq!(
+        replace.target,
+        TargetSpec::Herdr {
+            pane: "w7:pX".into(),
+            socket: "/nonexistent/herdr/herdr.sock".into(),
+            agent_session: Some("abc".into()),
+        },
+        "{report}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("herdr:default:w7:pX"),
         "{report}"
     );
 }

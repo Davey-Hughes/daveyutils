@@ -6,7 +6,7 @@ use anyhow::Result;
 use crate::composer::{BoxKind, ClaudeMode, InputBox};
 use crate::detect::detect_reset;
 use crate::job::Job;
-use crate::target::Target;
+use crate::target::{Key, Target, WrongPane};
 
 /// The result of an injection attempt.
 ///
@@ -30,10 +30,10 @@ pub enum InjectOutcome {
     /// box afterwards. `submitted` messages went before it; none were typed
     /// after it, since they would only have joined it in the box.
     Unsubmitted { submitted: usize },
-    /// The job's pane id was read from a tmux server that has since
-    /// restarted, so the id now names some other pane, or none. Nothing was
-    /// typed.
-    ServerRestarted,
+    /// The job's pane is no longer the one it was scheduled for, for the
+    /// reason given: its tmux server restarted, it holds another conversation,
+    /// or it runs the other multiplexer's client. Nothing was typed.
+    WrongPane(WrongPane),
 }
 
 /// Execute `job`'s injection against `target`.
@@ -41,8 +41,8 @@ pub enum InjectOutcome {
 /// With `job.verify`, the pane is gated twice before anything is typed: it must
 /// not have moved since the job was scheduled (the recency gate), and it must
 /// still show a rate-limit banner. Otherwise each message is typed and
-/// submitted, pausing `job.send_delay_secs` between messages. A pane from a
-/// tmux server that has since restarted gets nothing (`ServerRestarted`).
+/// submitted, pausing `job.send_delay_secs` between messages. A pane that is no
+/// longer the one scheduled for gets nothing (`WrongPane`).
 pub fn run_injection(
     target: &dyn Target,
     job: &Job,
@@ -53,10 +53,13 @@ pub fn run_injection(
 ) -> Result<InjectOutcome> {
     // First, before the gate below reads some other pane's screen. A new tmux
     // server hands out pane ids from `%0` again, so after a reboot the id a job
-    // stored names whichever new pane took it. A check that cannot be made is
-    // an Err like any unreachable pane, retried or reported by the caller.
-    if target.server_restarted()? {
-        return Ok(InjectOutcome::ServerRestarted);
+    // stored names whichever new pane took it. And a pane that now runs the
+    // other multiplexer's client passes whatever is typed into it on to that
+    // client's focused pane, which could be any of them. A check that cannot
+    // be made is an Err like any unreachable pane, retried or reported by the
+    // caller.
+    if let Some(why) = target.wrong_pane()? {
+        return Ok(InjectOutcome::WrongPane(why));
     }
     if job.verify {
         // Dims either side of the capture, believed only when they agree.
@@ -211,7 +214,7 @@ fn reread<T>(
 /// pressed on it could be typed as text, so one stale Normal frame followed by
 /// such reads earns no `i`.
 fn codex_insert_mode(target: &dyn Target) -> Result<()> {
-    target.send_key("A")?;
+    target.send_key(Key::Char('A'))?;
     let mut last = None;
     let left = reread_screen(target, |screen| {
         last = screen.and_then(crate::composer::vim_mode);
@@ -221,7 +224,7 @@ fn codex_insert_mode(target: &dyn Target) -> Result<()> {
         }
     });
     if left.is_none() && last == Some("Normal") {
-        target.send_key("i")?;
+        target.send_key(Key::Char('i'))?;
     }
     Ok(())
 }
@@ -241,9 +244,9 @@ fn codex_insert_mode(target: &dyn Target) -> Result<()> {
 /// mode is escaped from first, since an `A` there is no way into Insert mode.
 fn claude_insert_mode(target: &dyn Target, before: &InputBox, mode: ClaudeMode) -> Result<()> {
     if mode == ClaudeMode::Visual {
-        target.send_key("Escape")?;
+        target.send_key(Key::Escape)?;
     }
-    target.send_key("A")?;
+    target.send_key(Key::Char('A'))?;
     // Only the `A` itself is taken back: typed, it is one more `A` than the
     // box held, wherever the cursor put it. A box whose text changed some
     // other way keeps every character. Nothing changing at all is Normal mode
@@ -263,7 +266,7 @@ fn claude_insert_mode(target: &dyn Target, before: &InputBox, mode: ClaudeMode) 
         }
     });
     if typed == Some(true) {
-        target.send_key("BSpace")?;
+        target.send_key(Key::Backspace)?;
     }
     Ok(())
 }
@@ -293,11 +296,11 @@ mod tests {
         dims_reads: RefCell<Vec<Option<crate::target::PaneDims>>>,
         sent: RefCell<Vec<String>>,
         /// Each lone key pressed, with how many lines had been sent before it.
-        keys: RefCell<Vec<(usize, String)>>,
+        keys: RefCell<Vec<(usize, Key)>>,
         /// Whether `capture()` fails, as it does for a pane tmux cannot read.
         capture_fails: bool,
-        /// What `server_restarted()` answers.
-        server_restarted: bool,
+        /// What `wrong_pane()` answers.
+        wrong_pane: Option<WrongPane>,
     }
     impl FakeTarget {
         fn new(screen: &str) -> Self {
@@ -307,7 +310,7 @@ mod tests {
                 sent: RefCell::new(Vec::new()),
                 keys: RefCell::new(Vec::new()),
                 capture_fails: false,
-                server_restarted: false,
+                wrong_pane: None,
             }
         }
         /// A pane that shows each of `screens` in turn, one per capture.
@@ -379,13 +382,13 @@ mod tests {
             self.capture()
         }
         fn settle(&self) {}
-        fn send_key(&self, key: &str) -> anyhow::Result<()> {
+        fn send_key(&self, key: Key) -> anyhow::Result<()> {
             let lines_before = self.sent.borrow().len();
-            self.keys.borrow_mut().push((lines_before, key.to_string()));
+            self.keys.borrow_mut().push((lines_before, key));
             Ok(())
         }
-        fn server_restarted(&self) -> anyhow::Result<bool> {
-            Ok(self.server_restarted)
+        fn wrong_pane(&self) -> anyhow::Result<Option<WrongPane>> {
+            Ok(self.wrong_pane)
         }
         fn dims(&self) -> Option<crate::target::PaneDims> {
             let mut reads = self.dims_reads.borrow_mut();
@@ -498,7 +501,7 @@ mod tests {
         let t = FakeTarget::showing(&[VIM_NORMAL, &vim_insert()]);
         let out = run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
         assert_eq!(out, InjectOutcome::Sent(1));
-        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+        assert_eq!(*t.keys.borrow(), vec![(0, Key::Char('A'))]);
         assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
     }
 
@@ -510,7 +513,7 @@ mod tests {
         run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
         assert_eq!(
             *t.keys.borrow(),
-            vec![(0, "A".to_string()), (0, "i".to_string())]
+            vec![(0, Key::Char('A')), (0, Key::Char('i'))]
         );
     }
 
@@ -520,7 +523,7 @@ mod tests {
     fn a_composer_slow_to_leave_normal_mode_gets_no_i() {
         let t = FakeTarget::showing(&[VIM_NORMAL, VIM_NORMAL, &vim_insert()]);
         run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
-        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+        assert_eq!(*t.keys.borrow(), vec![(0, Key::Char('A'))]);
     }
 
     /// Reads that show no mode at all are no evidence the `A` failed, so they
@@ -529,7 +532,7 @@ mod tests {
     fn a_composer_whose_mode_disappears_after_a_gets_no_i() {
         let t = FakeTarget::showing(&[VIM_NORMAL, "mid-redraw, no status line"]);
         run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
-        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+        assert_eq!(*t.keys.borrow(), vec![(0, Key::Char('A'))]);
     }
 
     /// One stale frame showing Normal mode, followed by reads with no mode,
@@ -538,7 +541,7 @@ mod tests {
     fn a_stale_normal_read_followed_by_no_mode_gets_no_i() {
         let t = FakeTarget::showing(&[VIM_NORMAL, VIM_NORMAL, "mid-redraw, no status line"]);
         run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
-        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+        assert_eq!(*t.keys.borrow(), vec![(0, Key::Char('A'))]);
     }
 
     /// Everywhere else an `A` is a stray letter on the front of the message.
@@ -564,7 +567,7 @@ mod tests {
         // typed: "Atwo".
         let t = FakeTarget::showing(&[VIM_NORMAL, &vim_insert()]);
         run_injection(&t, &job(false, &["one", "two"]), &now(), None, None, None).unwrap();
-        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+        assert_eq!(*t.keys.borrow(), vec![(0, Key::Char('A'))]);
         assert_eq!(*t.sent.borrow(), vec!["one".to_string(), "two".to_string()]);
     }
 
@@ -579,18 +582,27 @@ mod tests {
         assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
     }
 
-    /// After a reboot the id names whichever new pane took it. Nothing is
-    /// read or typed there, not even a key for its Vim mode.
+    /// After a reboot the id names whichever new pane took it, and a pane
+    /// running the other multiplexer's client would hand the nudge to
+    /// whichever of its panes has focus. Nothing is read or typed there, not
+    /// even a key for its Vim mode.
     #[test]
-    fn a_pane_from_a_restarted_server_gets_nothing() {
-        let t = FakeTarget {
-            server_restarted: true,
-            ..FakeTarget::new(VIM_NORMAL)
-        };
-        let out = run_injection(&t, &job(true, &["go"]), &now(), None, None, None).unwrap();
-        assert_eq!(out, InjectOutcome::ServerRestarted);
-        assert!(t.sent.borrow().is_empty());
-        assert!(t.keys.borrow().is_empty());
+    fn a_wrong_pane_gets_nothing() {
+        for why in [
+            WrongPane::ServerRestarted,
+            WrongPane::OtherConversation,
+            WrongPane::RunsHerdr,
+            WrongPane::RunsTmux,
+        ] {
+            let t = FakeTarget {
+                wrong_pane: Some(why),
+                ..FakeTarget::new(VIM_NORMAL)
+            };
+            let out = run_injection(&t, &job(true, &["go"]), &now(), None, None, None).unwrap();
+            assert_eq!(out, InjectOutcome::WrongPane(why));
+            assert!(t.sent.borrow().is_empty());
+            assert!(t.keys.borrow().is_empty());
+        }
     }
 
     // ---- a Claude Code box in Vim Normal mode ----
@@ -632,7 +644,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, InjectOutcome::Sent(1));
-        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+        assert_eq!(*t.keys.borrow(), vec![(0, Key::Char('A'))]);
         assert_eq!(*t.sent.borrow(), vec!["please continue".to_string()]);
     }
 
@@ -648,7 +660,7 @@ mod tests {
         run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
         assert_eq!(
             *t.keys.borrow(),
-            vec![(0, "A".to_string()), (0, "BSpace".to_string())]
+            vec![(0, Key::Char('A')), (0, Key::Backspace)]
         );
         assert_eq!(*t.sent.borrow(), vec!["go".to_string()]);
     }
@@ -667,7 +679,7 @@ mod tests {
         run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
         assert_eq!(
             *t.keys.borrow(),
-            vec![(0, "A".to_string()), (0, "BSpace".to_string())]
+            vec![(0, Key::Char('A')), (0, Key::Backspace)]
         );
     }
 
@@ -680,7 +692,7 @@ mod tests {
             CLAUDE_INSERT,
         ]);
         run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
-        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+        assert_eq!(*t.keys.borrow(), vec![(0, Key::Char('A'))]);
     }
 
     /// Only the `A` itself, typed at the end of what the box held, is taken
@@ -690,7 +702,7 @@ mod tests {
     fn a_box_that_changed_some_other_way_keeps_its_text() {
         let t = FakeTarget::showing(&[&claude_unlabelled("draft"), &claude_unlabelled("drafts")]);
         run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
-        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+        assert_eq!(*t.keys.borrow(), vec![(0, Key::Char('A'))]);
     }
 
     /// A box with no Vim keys types the `A` wherever its cursor is, which is
@@ -701,7 +713,7 @@ mod tests {
         run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
         assert_eq!(
             *t.keys.borrow(),
-            vec![(0, "A".to_string()), (0, "BSpace".to_string())]
+            vec![(0, Key::Char('A')), (0, Key::Backspace)]
         );
     }
 
@@ -712,7 +724,7 @@ mod tests {
     fn a_key_that_changes_nothing_on_screen_is_not_taken_back() {
         let t = FakeTarget::new(&claude_unlabelled("draft"));
         run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
-        assert_eq!(*t.keys.borrow(), vec![(0, "A".to_string())]);
+        assert_eq!(*t.keys.borrow(), vec![(0, Key::Char('A'))]);
     }
 
     /// In Visual mode an `A` is no way into Insert mode. Escape first goes
@@ -724,7 +736,7 @@ mod tests {
         run_injection(&t, &job(false, &["go"]), &now(), None, None, None).unwrap();
         assert_eq!(
             *t.keys.borrow(),
-            vec![(0, "Escape".to_string()), (0, "A".to_string())]
+            vec![(0, Key::Escape), (0, Key::Char('A'))]
         );
     }
 

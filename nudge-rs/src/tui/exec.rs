@@ -7,28 +7,27 @@ use std::path::Path;
 use super::update::{Effect, Msg};
 use crate::detect::detect_reset;
 use crate::ipc::{Request, Response, client};
-use crate::target::tmux::TmuxTarget;
+use crate::job::TargetSpec;
 
 pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
     match effect {
         Effect::PollJobs => match client::request(socket, &Request::List) {
-            Ok(Response::Jobs(jobs)) => Msg::JobsLoaded(jobs, crate::tmux_panes::positions()),
+            Ok(Response::Jobs(jobs)) => {
+                let positions = crate::panes::positions_for(jobs.iter().map(|j| &j.target));
+                Msg::JobsLoaded(jobs, positions)
+            }
             Ok(other) => Msg::ActionFailed(format!("unexpected response: {other:?}")),
             Err(e) => Msg::ActionFailed(format!("daemon request failed: {e}")),
         },
-        Effect::ListPanes => match crate::tmux_panes::list() {
-            Ok((panes, default_idx, server)) => Msg::PanesLoaded {
-                panes,
-                default_idx,
-                server,
-            },
-            Err(e) => Msg::ActionFailed(format!("{e}")),
+        Effect::ListPanes => match crate::panes::list() {
+            Ok((panes, default_idx)) => Msg::PanesLoaded { panes, default_idx },
+            Err(e) => Msg::ActionFailed(format!("{e:#}")),
         },
-        Effect::CapturePane { pane } => {
+        Effect::CapturePane { target } => {
             let clock = std::env::var("NUDGE_CLOCK_PATTERN").ok();
             let dur = std::env::var("NUDGE_DURATION_PATTERN").ok();
             let weekly = std::env::var("NUDGE_WEEKLY_PATTERN").ok();
-            match TmuxTarget::new(&pane).capture_escaped() {
+            match target.connect().capture_styled() {
                 Ok(raw) => {
                     let now = jiff::ZonedDateTime::now();
                     let detection = detect_reset(
@@ -93,9 +92,9 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
 /// Fill in the `--verify` recency baseline when the form asked for one. Never
 /// fails the schedule: a pane that will not snapshot arms no gate and fails open
 /// at fire time, exactly as `app::snapshot_pane` does for the CLI.
-fn attach_baseline(spec: &mut crate::job::JobSpec, snapshot_pane: Option<String>) {
+fn attach_baseline(spec: &mut crate::job::JobSpec, snapshot_pane: Option<TargetSpec>) {
     if let Some(pane) = snapshot_pane
-        && let Some(b) = crate::verify::capture_baseline(&TmuxTarget::new(&pane))
+        && let Some(b) = crate::verify::capture_baseline(pane.connect().as_ref())
     {
         spec.verify_fingerprint = Some(b.fingerprint);
         spec.verify_dims = Some(b.dims);
@@ -108,7 +107,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::ipc::server;
-    use crate::job::{JobSpec, TargetSpec};
+    use crate::job::JobSpec;
     use crate::queue::Queue;
 
     fn spec() -> JobSpec {

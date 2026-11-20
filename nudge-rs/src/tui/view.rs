@@ -128,13 +128,13 @@ fn jobs_view(model: &Model, f: &mut Frame, area: Rect) {
         return;
     }
     // As wide as the longest label, so the id at the end of one is not cut.
-    let (labels, widest) = crate::tmux_panes::job_labels(&model.jobs, &model.positions);
+    let (labels, widest) = crate::panes::job_labels(&model.jobs, &model.positions);
     let pane_width = u16::try_from(widest + 1).unwrap_or(u16::MAX).max(22);
     // The names get what the other columns leave, up to the longest one. They
     // get no column when no job has one, or when fewer cells are left than
     // the header needs. A name cut short still says which session it is; a
     // pane id cut short names another pane.
-    let (names, widest_name) = crate::tmux_panes::job_names(&model.jobs, &model.positions);
+    let (names, widest_name) = crate::panes::job_names(&model.jobs, &model.positions);
     // Which columns show, and how wide: one list for the header, the widths
     // and every row. NAME's width is worked out from the others.
     let mut columns = [
@@ -907,10 +907,13 @@ mod tests {
     #[test]
     fn the_form_shows_a_pane_preview_on_top() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
-        m.form.panes = vec![crate::tmux_panes::Pane {
-            id: "%1".into(),
+        m.form.panes = vec![crate::panes::Pane {
             target: "bot:0.1".into(),
             title: String::new(),
+            spec: TargetSpec::Tmux {
+                pane: "%1".into(),
+                server: None,
+            },
         }];
         m.form.preview = Some("current session limit · resets 3:00pm".into());
         let out = render(&m); // NewNudge is the default tab
@@ -931,10 +934,13 @@ mod tests {
     fn the_picker_list_scrolls_to_keep_the_highlight_visible() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
         m.form.panes = (0..30)
-            .map(|i| crate::tmux_panes::Pane {
-                id: format!("%{i}"),
+            .map(|i| crate::panes::Pane {
                 target: format!("s:0.{i}"),
                 title: format!("pane{i}"),
+                spec: TargetSpec::Tmux {
+                    pane: format!("%{i}"),
+                    server: None,
+                },
             })
             .collect();
         m.form.picker = Some(super::super::model::Picker {
@@ -967,10 +973,13 @@ mod tests {
     #[test]
     fn the_picker_renders_the_query_and_matches() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
-        m.form.panes = vec![crate::tmux_panes::Pane {
-            id: "%1".into(),
+        m.form.panes = vec![crate::panes::Pane {
             target: "bot:0.1".into(),
             title: "claude".into(),
+            spec: TargetSpec::Tmux {
+                pane: "%1".into(),
+                server: None,
+            },
         }];
         m.form.picker = Some(super::super::model::Picker {
             query: "cl".into(),
@@ -982,6 +991,50 @@ mod tests {
         assert!(out.contains("pick a pane"), "{out}");
         assert!(out.contains("> cl"), "{out}");
         assert!(out.contains("claude"), "{out}");
+    }
+
+    fn a_herdr_pane() -> crate::panes::Pane {
+        crate::panes::Pane {
+            target: "herdr:w7:pX".into(),
+            title: "ra-scan".into(),
+            spec: TargetSpec::Herdr {
+                pane: "w7:pX".into(),
+                socket: "/h/.config/herdr/herdr.sock".into(),
+                agent_session: None,
+            },
+        }
+    }
+
+    /// A herdr pane is listed by its label, with its title beside it, in the
+    /// same columns as a tmux pane's position and title.
+    #[test]
+    fn a_herdr_pane_is_listed_in_the_picker_by_its_label() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.form.panes = vec![a_herdr_pane()];
+        m.form.picker = Some(super::super::model::Picker {
+            query: String::new(),
+            matches: vec![0],
+            highlight: 0,
+            mode: super::super::model::VimMode::Insert,
+        });
+        let out = render(&m);
+        assert!(out.contains("preview: herdr:w7:pX"), "{out}");
+        let row = out
+            .lines()
+            .find(|l| l.contains("▶ "))
+            .unwrap_or_else(|| panic!("no highlighted row: {out}"));
+        assert!(
+            row.contains(&format!("▶ {:<20} ra-scan", "herdr:w7:pX")),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn the_form_shows_a_herdr_pane_by_its_label() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.form.panes = vec![a_herdr_pane()];
+        let out = render(&m);
+        assert!(out.contains("Pane:    herdr:w7:pX"), "{out}");
     }
 
     #[test]
@@ -1008,10 +1061,13 @@ mod tests {
     #[test]
     fn the_picker_puts_the_cursor_after_the_query() {
         let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
-        m.form.panes = vec![crate::tmux_panes::Pane {
-            id: "%1".into(),
+        m.form.panes = vec![crate::panes::Pane {
             target: "bot:0.1".into(),
             title: "claude".into(),
+            spec: TargetSpec::Tmux {
+                pane: "%1".into(),
+                server: None,
+            },
         }];
         m.form.picker = Some(super::super::model::Picker {
             query: "cl".into(),

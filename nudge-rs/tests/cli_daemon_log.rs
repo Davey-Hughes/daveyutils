@@ -135,10 +135,16 @@ fn a_verify_skip_lands_in_the_daemon_log() {
     drop(queue);
 
     // Production spawn, production stderr wiring, the real nudge binary.
-    let _daemon = DaemonGuard(
+    let daemon = DaemonGuard(
         nudge::app::spawn_daemon(Path::new(env!("CARGO_BIN_EXE_nudge")), &paths)
             .expect("spawn the daemon"),
     );
+    // In a session of its own, which a herdr popup closing does not reach.
+    let pid = libc::pid_t::try_from(daemon.0.id()).unwrap();
+    // SAFETY: getsid only reads the session id of a process; 0 means this one.
+    let (theirs, ours) = unsafe { (libc::getsid(pid), libc::getsid(0)) };
+    assert_eq!(theirs, pid, "the daemon must lead a session of its own");
+    assert_ne!(theirs, ours, "the daemon must not share the test's session");
 
     let log = paths.state_dir.join("nudge.log");
     let deadline = Instant::now() + Duration::from_secs(10);

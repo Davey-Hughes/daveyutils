@@ -1,5 +1,5 @@
 class Nudge < Formula
-  desc "Rate-limit auto-resumer for AI CLIs in tmux"
+  desc "Rate-limit auto-resumer for AI CLIs in tmux or herdr"
   homepage "https://github.com/Davey-Hughes/daveyutils"
   license "GPL-3.0-or-later"
   head "https://github.com/Davey-Hughes/daveyutils.git", branch: "main"

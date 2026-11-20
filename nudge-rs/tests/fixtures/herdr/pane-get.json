@@ -1,0 +1,34 @@
+{
+  "id": "cli:pane:get",
+  "result": {
+    "pane": {
+      "agent": "claude",
+      "agent_session": {
+        "agent": "claude",
+        "kind": "id",
+        "source": "herdr:claude",
+        "value": "00000000-0000-4000-8000-000000000002"
+      },
+      "agent_status": "working",
+      "cwd": "/home/user/project",
+      "focused": false,
+      "foreground_cwd": "/home/user/project",
+      "pane_id": "w24:p1",
+      "revision": 11,
+      "scroll": {
+        "max_offset_from_bottom": 0,
+        "offset_from_bottom": 0,
+        "viewport_rows": 37
+      },
+      "tab_id": "w24:t1",
+      "terminal_id": "term_660a17fbeffd258",
+      "terminal_title": "✳ fixture-session",
+      "terminal_title_stripped": "fixture-session",
+      "tokens": {
+        "session": "fixture-session"
+      },
+      "workspace_id": "w24"
+    },
+    "type": "pane_info"
+  }
+}

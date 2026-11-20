@@ -2,21 +2,17 @@
 
 use anyhow::{Context, Result, bail};
 use std::process::{Command, Output};
-use std::time::Duration;
 
-use super::{PaneDims, Target};
+use super::{KEYPRESS_PAUSE, Key, PaneDims, Target, WrongPane};
 
-/// How long to leave between typed text and a key that has to be read as a
-/// keypress of its own: the Enter after a message, or a key pressed before one.
-///
-/// Codex reads keystrokes that arrive faster than anyone types as a paste, and
-/// for 120ms after the last of them (`PASTE_ENTER_SUPPRESS_WINDOW` in codex-rs
-/// `tui/src/bottom_pane/paste_burst.rs`) takes Enter as a newline inside that
-/// paste rather than a submit. `send-keys -l` delivers the whole message at
-/// once and the Enter followed it by about 2ms, so in Codex the nudge sat in
-/// the composer, unsent. Several times that window, and still nothing a person
-/// waiting on a rate limit would notice.
-const KEYPRESS_PAUSE: Duration = Duration::from_millis(500);
+/// tmux's name for `key`, as `send-keys` takes it without `-l`.
+pub fn tmux_key_name(key: Key) -> String {
+    match key {
+        Key::Char(c) => c.to_string(),
+        Key::Escape => "Escape".to_string(),
+        Key::Backspace => "BSpace".to_string(),
+    }
+}
 
 /// What a tmux server is asked for to tell it from any other, as
 /// `#{start_time}-#{pid}`: `1793226261-4820`.
@@ -54,7 +50,7 @@ pub struct PaneLocation {
     /// if tmux would not say.
     pub server: Option<String>,
     /// The session in the pane, as
-    /// [`session_name`](crate::tmux_panes::session_name) reads its title.
+    /// [`session_name`](crate::panes::session_name) reads its title.
     pub name: Option<String>,
 }
 
@@ -78,8 +74,9 @@ impl TmuxTarget {
     }
 
     /// Expect the pane to be on `server` (see [`SERVER_FORMAT`]), so that
-    /// [`Target::server_restarted`] asks tmux. With `None` there is nothing to
-    /// compare, as for a job queued before jobs kept their server.
+    /// [`Target::wrong_pane`] asks tmux whether it restarted. With `None`
+    /// there is nothing to compare, as for a job queued before jobs kept their
+    /// server.
     #[must_use]
     pub fn expecting_server(mut self, server: Option<String>) -> Self {
         self.server = server;
@@ -106,8 +103,7 @@ impl TmuxTarget {
     /// window would be stored as the id of whatever pane you happen to be in.
     /// `capture-pane` fails on the same target, so it checks the pane exists.
     pub fn locate(&self) -> Result<PaneLocation> {
-        self.run(&["capture-pane", "-p", "-t", &self.pane, "-S", "0", "-E", "0"])
-            .with_context(|| format!("no tmux pane {}", self.pane))?;
+        self.require_pane()?;
         let out = self.run(&[
             "display-message",
             "-p",
@@ -126,10 +122,64 @@ impl TmuxTarget {
                 id: id.to_string(),
                 position: position.to_string(),
                 server: parse_server(server),
-                name: fields.next().and_then(crate::tmux_panes::session_name),
+                name: fields.next().and_then(crate::panes::session_name),
             }),
             _ => bail!("no tmux pane {}", self.pane),
         }
+    }
+
+    /// The name of the program in the pane's foreground, as tmux reads it for
+    /// `#{pane_current_command}`: `sh`, `claude`, `herdr`.
+    ///
+    /// The pane is checked for first, as [`locate`](Self::locate) checks it
+    /// and for the same reason: `display-message -t` on a window that is gone
+    /// answers for the current pane and exits 0, so it would name the program
+    /// in some other pane.
+    pub fn current_command(&self) -> Result<String> {
+        self.require_pane()?;
+        let out = self.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &self.pane,
+            "#{pane_current_command}",
+        ])?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    }
+
+    /// Fail unless the pane exists. `capture-pane` is what can tell, since it
+    /// fails on a pane that is gone where `display-message` does not.
+    fn require_pane(&self) -> Result<()> {
+        self.run(&["capture-pane", "-p", "-t", &self.pane, "-S", "0", "-E", "0"])
+            .with_context(|| format!("no tmux pane {}", self.pane))?;
+        Ok(())
+    }
+
+    /// Whether the server that gave the pane its id has since been replaced,
+    /// so that the id now belongs to some other pane. No server running at
+    /// all counts as restarted, since the one that gave the id is gone. A
+    /// pane with no server to expect has nothing to compare, so it has not.
+    fn server_restarted(&self) -> Result<bool> {
+        let Some(expected) = &self.server else {
+            return Ok(false);
+        };
+        // No `-t`: the start time and PID belong to the server and read the
+        // same from any pane, and the pane the job names may not exist here.
+        let out = match self.run(&["display-message", "-p", SERVER_FORMAT]) {
+            Ok(out) => out,
+            // The server that issued the id cannot be gone and still be
+            // running, so for a stamped target "no server at all" proves the
+            // stamped one is gone. tmux says so two ways: a killed server
+            // leaves its socket behind (`no server running on
+            // /tmp/tmux-1000/default`), and a reboot removes it (`error
+            // connecting to /tmp/tmux-1000/default (No such file or
+            // directory)`).
+            Err(e) if no_server_running(&format!("{e:#}")) => return Ok(true),
+            Err(e) => return Err(e),
+        };
+        let now = parse_server(&String::from_utf8_lossy(&out.stdout))
+            .context("tmux would not say when its server started")?;
+        Ok(&now != expected)
     }
 
     /// Capture the pane WITH SGR escape sequences (`-e`), for a colored preview.
@@ -189,38 +239,30 @@ impl Target for TmuxTarget {
         Ok(())
     }
 
-    fn server_restarted(&self) -> Result<bool> {
-        let Some(expected) = &self.server else {
-            return Ok(false);
-        };
-        // No `-t`: the start time and PID belong to the server and read the
-        // same from any pane, and the pane the job names may not exist here.
-        let out = match self.run(&["display-message", "-p", SERVER_FORMAT]) {
-            Ok(out) => out,
-            // The server that issued the id cannot be gone and still be
-            // running, so for a stamped target "no server at all" proves the
-            // stamped one is gone. tmux says so two ways: a killed server
-            // leaves its socket behind (`no server running on
-            // /tmp/tmux-1000/default`), and a reboot removes it (`error
-            // connecting to /tmp/tmux-1000/default (No such file or
-            // directory)`).
-            Err(e) if no_server_running(&format!("{e:#}")) => return Ok(true),
-            Err(e) => return Err(e),
-        };
-        let now = parse_server(&String::from_utf8_lossy(&out.stdout))
-            .context("tmux would not say when its server started")?;
-        Ok(&now != expected)
+    fn wrong_pane(&self) -> Result<Option<WrongPane>> {
+        // The restart first: on a new server the id may name no pane at all,
+        // and asking that pane for its command would fail rather than say why.
+        if self.server_restarted()? {
+            return Ok(Some(WrongPane::ServerRestarted));
+        }
+        // herdr's client passes what it is sent on to whichever herdr pane
+        // has focus, so a nudge typed into the tmux pane holding it could land
+        // in any of them.
+        if self.current_command()? == "herdr" {
+            return Ok(Some(WrongPane::RunsHerdr));
+        }
+        Ok(None)
     }
 
     fn settle(&self) {
         std::thread::sleep(KEYPRESS_PAUSE);
     }
 
-    fn send_key(&self, key: &str) -> Result<()> {
-        // A key name, so no `-l`: `BSpace` is Backspace, not seven letters.
+    fn send_key(&self, key: Key) -> Result<()> {
+        // A key name, so no `-l`: `BSpace` is Backspace, not six letters.
         // The pause comes after the key, so that the caller's next send cannot
         // run into it.
-        self.run(&["send-keys", "-t", &self.pane, "--", key])?;
+        self.run(&["send-keys", "-t", &self.pane, "--", &tmux_key_name(key)])?;
         std::thread::sleep(KEYPRESS_PAUSE);
         Ok(())
     }
@@ -249,7 +291,16 @@ impl Target for TmuxTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::{no_server_running, parse_server};
+    use super::{no_server_running, parse_server, tmux_key_name};
+    use crate::target::Key;
+
+    #[test]
+    fn tmux_names_each_key() {
+        assert_eq!(tmux_key_name(Key::Char('A')), "A");
+        assert_eq!(tmux_key_name(Key::Char('i')), "i");
+        assert_eq!(tmux_key_name(Key::Escape), "Escape");
+        assert_eq!(tmux_key_name(Key::Backspace), "BSpace");
+    }
 
     #[test]
     fn parses_a_server_start_time_and_pid() {

@@ -2,7 +2,7 @@
 pkgname=nudge
 pkgver=0.2.0
 pkgrel=1
-pkgdesc="Rate-limit auto-resumer for AI CLIs in tmux"
+pkgdesc="Rate-limit auto-resumer for AI CLIs in tmux or herdr"
 arch=('x86_64' 'aarch64')
 url="https://github.com/Davey-Hughes/daveyutils"
 license=('GPL-3.0-or-later')

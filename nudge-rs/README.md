@@ -1,12 +1,12 @@
 # nudge
 
 Rate-limit auto-resumer for AI CLIs (Claude Code, Codex, Antigravity) running in
-tmux.
+tmux or herdr.
 
-nudge watches a tmux pane for a rate-limit banner ("resets 3:00pm" / "try again
-at 6:26 PM" / "resets in 1h30m"), and re-injects your messages when the limit
-clears — via a small resident daemon it manages itself. No `at`, no `fzf`, no
-coreutils; Linux + macOS.
+nudge watches a tmux or herdr pane for a rate-limit banner ("resets 3:00pm" /
+"try again at 6:26 PM" / "resets in 1h30m"), and re-injects your messages when
+the limit clears — via a small resident daemon it manages itself. No `at`, no
+`fzf`, no coreutils; Linux + macOS.
 
 ## Install
 
@@ -36,6 +36,7 @@ nudge -a                         # no prompts: last pane, its reset time, defaul
 nudge -p bot:0.1                 # auto-detect the reset time from the pane
 nudge -p bot:0.1 -m "14:30"      # explicit time
 nudge -p bot:0.1 --auto-retry -r -1 -v   # retry forever, verify before each send
+nudge -p herdr:w7:pX             # a herdr pane (see herdr below for which session)
 nudge                            # interactive pane picker
 nudge --list                     # pending jobs
 nudge --cancel 3 / --edit 3      # manage a job
@@ -49,7 +50,7 @@ its pane until the pane closes or the tmux server stops. A new server numbers
 its panes from `%0` again, so a job also remembers which server its pane was on
 (the server's start time and PID). One that comes due on a different server,
 after a reboot or a `kill-server`, types nothing: the log says
-`ServerRestarted`, `--notify` says so, `--list` shows its pane as
+`WrongPane(ServerRestarted)`, `--notify` says so, `--list` shows its pane as
 `%19 (earlier tmux server)`, and the dashboard won't edit it. A job queued
 before 0.7.0 has no record of its server, so cancel any of those left over from
 before a reboot. The confirmation, `--list` and the dashboard show both, as
@@ -71,15 +72,16 @@ terminal is too narrow for it.
 
 `nudge -a` schedules without asking anything. It targets the pane you were last
 in — the same one the dashboard preselects, the last-active pane of nudge's own
-tmux window — reads the reset time off it, and queues the default message
-(`please continue`).
+tmux window, or the pane under nudge's popup — reads the reset time off it, and
+queues the default message (`please continue`). The table under
+[herdr](#herdr) below covers every place nudge can run.
 
-It refuses rather than guesses. If nudge is not running inside tmux, or that
-window has no other recently-used pane, `--auto` says so and names `-p`; it will
-not fall back to an arbitrary pane, because unlike the dashboard's preselection
-nobody sees its choice before the message is delivered. A pane with no
-recognisable rate-limit banner is the same story — pass `-m` to set the time
-yourself.
+It refuses rather than guesses. If nudge is running inside neither tmux nor
+herdr, or in a herdr split, or its tmux window has no other recently-used pane,
+`--auto` says so and names `-p`; it will not fall back to an arbitrary pane,
+because unlike the dashboard's preselection nobody sees its choice before the
+message is delivered. A pane with no recognisable rate-limit banner is the same
+story — pass `-m` to set the time yourself.
 
 It composes with the other scheduling flags (`-m`, `-i`, `-v`, `-n`, `-r`), and
 conflicts with `-p` and with `--list`/`--cancel`/`--edit`.
@@ -87,6 +89,102 @@ conflicts with `-p` and with `--list`/`--cancel`/`--edit`.
 > **Note** — `-a` used to be short for `--auto-retry`, which is now long-only.
 > `-r <n>` still implies it. Anything passing `-p <pane> -a` together will now
 > fail to parse rather than change meaning.
+
+### herdr
+
+nudge types into [herdr](https://herdr.dev) panes as well as tmux panes. Name
+one by herdr's id for it after a `herdr:` prefix, and put the herdr session it
+is in between the two when that needs saying:
+
+```sh
+nudge -p herdr:w7:pX             # w7:pX in the herdr session nudge runs in, or herdr's default session
+nudge -p herdr:beaver:w1:p2      # w1:p2 in the herdr session named beaver, wherever nudge runs
+```
+
+The prefix is required, because `w7:pX` is also a tmux target (session `w7`,
+window `pX`).
+
+With no session in it, `herdr:<pane>` means the herdr session nudge is
+running in when nudge runs in a herdr pane or popup, and herdr's default
+session anywhere else: outside herdr, and also in a tmux running inside a
+herdr pane. A tmux pane carries the herdr variables its tmux server was
+started with, which can name a herdr long gone, so nudge does not go by them.
+`herdr:<session>:<pane>` names the session outright; herdr calls its default
+session `default`. In a herdr pane or popup that has lost `HERDR_SOCKET_PATH`,
+nudge cannot tell its session, and refuses `herdr:<pane>` and `-a` rather than
+guess the default session: every session numbers its panes from `w1:p1`. Name
+the session then.
+
+The confirmation, `--list`, the dashboard and the log show a herdr pane with
+its session always named, `herdr:default:w7:pX` for the default session's, so a
+label works as `-p` from anywhere, inside a named herdr session or out. The
+picker and the dashboard list the panes of every running herdr session beside
+tmux's.
+
+For `nudge -a`, bind it to a popup in herdr's `config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+u"
+type = "popup"
+command = "nudge -a"
+width = "60%"
+height = "40%"
+```
+
+What `-a` targets depends on where nudge is running:
+
+| nudge runs in | `-a` targets |
+|---|---|
+| a tmux pane | the last-active pane of its tmux window |
+| a tmux popup (`display-popup`) | the pane under the popup |
+| a herdr popup | the pane under the popup |
+| a herdr split | nothing: herdr does not say which pane had focus before, so `-a` refuses and names the popup and `-p` |
+| neither | nothing: `-a` refuses and names `-p` |
+
+A pane that runs the other multiplexer's client passes whatever is typed into
+it on to a pane of its own, so `-a` looks through it, once, to that pane:
+
+- A tmux pane running herdr means the pane that has focus in that herdr. So
+  `-a` from a tmux split beside herdr, or from a tmux popup over it, finds the
+  agent you were looking at in herdr. A herdr client started with `--remote`
+  or `--machine` shows a herdr on another machine, which nudge does not reach,
+  and is refused.
+- A herdr pane running tmux means the active pane of that tmux client. Only a
+  client of the default tmux server: a job stores no tmux socket, so a client
+  started with `-L` or `-S` is refused.
+
+`-p` looks through a client the same way: `-p main:1.0`, naming the tmux pane
+that runs herdr, schedules for the herdr pane focused behind it. Either way the
+job stores the pane behind the client, never the client's own pane, and the
+picker leaves client panes out.
+
+A popup closes as soon as its command exits, and would take nudge's
+confirmation or error with it. So in a tmux or herdr popup, nudge prints it and
+waits with `Press any key to close`.
+
+When a job comes due, nudge checks that its pane is still the one you
+scheduled for before typing anything:
+
+- A pane that now runs the other multiplexer's client gets nothing. What nudge
+  typed would land in whichever pane that client shows.
+- A herdr job also remembers the conversation its pane held when you scheduled
+  it (herdr's `agent_session` for the pane). If the pane holds a different
+  conversation when the job comes due, it gets nothing. If herdr reports no
+  conversation for the pane, nudge cannot tell and treats it as a failed send:
+  retried with `-r`, and without `-r` dropped, with a notification (under
+  `--notify`) and a log line that say why. A `/clear` in
+  that pane counts, and so does quitting the agent and starting another. herdr
+  keeps a pane's id and its conversation across a restart, so a plain herdr
+  restart does not drop the job; the check is there because a closed
+  workspace's id can be handed to a new one after a restart. A pane herdr knew
+  no conversation for when you scheduled gets no check.
+
+Each of these ends the job like a tmux restart does: the log says
+`WrongPane(RunsHerdr)`, `WrongPane(RunsTmux)` or
+`WrongPane(OtherConversation)` (and `WrongPane(ServerRestarted)` for a tmux
+restart), `--notify` says why in words, and the job is removed, even with
+`--auto-retry -r -1`.
 
 ### Dashboard
 
@@ -293,7 +391,9 @@ cargo test
 cargo run -- --help
 ```
 
-`cargo test` drives a real `tmux` server, so tmux must be installed.
+`cargo test` drives a real `tmux` server, so tmux must be installed. The herdr
+tests start a private herdr server of their own, and skip themselves where
+herdr is not installed.
 
 This started life as a bash script at `scripts/nudge`. That original was kept as
 a reference oracle for the duration of the port and removed once the rewrite

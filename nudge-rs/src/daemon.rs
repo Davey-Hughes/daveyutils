@@ -7,10 +7,10 @@ use std::time::Duration;
 use jiff::{Span, ZonedDateTime};
 
 use crate::inject::run_injection;
+use crate::panes::Positions;
 use crate::paths::Paths;
 use crate::queue::Queue;
 use crate::scheduler::{MAX_POLL, apply_outcome, next_wake, plan};
-use crate::tmux_panes::Positions;
 
 /// A retry never lands sooner than this, so a sub-second `settle_secs` can't
 /// create a fire-storm (esp. with infinite retries).
@@ -134,11 +134,13 @@ pub fn run_with(
         }
 
         // 3. Fire each due job WITHOUT the lock, applying results under it.
-        // Where each pane sits is read once, before any of them fires.
+        // Where each pane sits is read once, before any of them fires, and
+        // herdr is asked only if one of them is a herdr pane: a herdr that
+        // has stopped answering must not hold up tmux's jobs.
         let positions = if plan_now.fire.is_empty() {
             Positions::new()
         } else {
-            crate::tmux_panes::positions()
+            crate::panes::positions_for(plan_now.fire.iter().map(|job| &job.target))
         };
         for job in &plan_now.fire {
             let pane = describe_pane(job, &positions);
@@ -216,11 +218,11 @@ fn log_outcome(
     outcome: &anyhow::Result<crate::inject::InjectOutcome>,
 ) {
     match outcome {
-        // Typed but never sent, or never typed because the pane is gone with
-        // the server that issued its id: either way the nudge did not go out.
+        // Typed but never sent, or never typed because the pane is no longer
+        // the one scheduled for: either way the nudge did not go out.
         Ok(
             o @ (crate::inject::InjectOutcome::Unsubmitted { .. }
-            | crate::inject::InjectOutcome::ServerRestarted),
+            | crate::inject::InjectOutcome::WrongPane(_)),
         ) => {
             tracing::warn!("nudge: job {} -> {o:?} in {pane}", job.id);
         }
@@ -236,7 +238,7 @@ fn log_outcome(
 /// notification text: the session's name, where its pane sits now, and the id
 /// the job stores.
 fn describe_pane(job: &crate::job::Job, positions: &Positions) -> String {
-    crate::tmux_panes::named_label(&job.target, positions)
+    crate::panes::named_label(&job.target, positions)
 }
 
 /// What to tell the user about firing `job`, or `None` for nothing.
@@ -250,8 +252,11 @@ fn describe_pane(job: &crate::job::Job, positions: &Positions) -> String {
 /// own and there was nothing to do; "the pane changed" means you resumed it
 /// yourself, and is also the sentence that explains an unexpected skip.
 ///
-/// An `Err` stays silent: it is logged at warn, it may still be retried, and a
-/// notification would announce a job as finished when it is not.
+/// An `Err` is logged at warn. While the scheduler will retry it
+/// ([`Job::will_retry`]) it stays silent, because a notification would
+/// announce a job as finished when it is not. Once it will not be retried the
+/// job is removed, and that is announced with the error's text: it may have
+/// come after part of a message was typed, so it does not say nothing was sent.
 ///
 /// `pane` is how to name the job's pane, from [`describe_pane`].
 pub fn notification(
@@ -260,8 +265,9 @@ pub fn notification(
     outcome: &anyhow::Result<crate::inject::InjectOutcome>,
 ) -> Option<String> {
     use crate::inject::InjectOutcome::{
-        Sent, ServerRestarted, SkippedNoBanner, SkippedResumed, Unsubmitted,
+        Sent, SkippedNoBanner, SkippedResumed, Unsubmitted, WrongPane,
     };
+    use crate::target::WrongPane::{OtherConversation, RunsHerdr, RunsTmux, ServerRestarted};
     if !job.notify {
         return None;
     }
@@ -278,12 +284,25 @@ pub fn notification(
         Ok(Unsubmitted { .. }) => Some(format!(
             "nudge typed into {pane}, but the message is still in its input box, unsent"
         )),
-        Ok(ServerRestarted) => Some(format!(
+        Ok(WrongPane(ServerRestarted)) => Some(format!(
             "nudge sent nothing to {pane}: that pane was on a tmux server that is not \
              the one running now (tmux restarted since you scheduled it, or the pane is \
              on another tmux socket)"
         )),
-        Err(_) => None,
+        Ok(WrongPane(OtherConversation)) => Some(format!(
+            "nudge sent nothing to {pane}: that pane now holds a different conversation \
+             than the one you scheduled for"
+        )),
+        Ok(WrongPane(RunsHerdr)) => Some(format!(
+            "nudge sent nothing to {pane}: that tmux pane now runs herdr, so a nudge \
+             there would land in whichever herdr pane has focus"
+        )),
+        Ok(WrongPane(RunsTmux)) => Some(format!(
+            "nudge sent nothing to {pane}: that herdr pane now runs tmux, so a nudge \
+             there would land in whichever tmux pane is active"
+        )),
+        Err(_) if job.will_retry() => None,
+        Err(e) => Some(format!("nudge gave up on {pane}: {e:#}")),
     }
 }
 
@@ -293,6 +312,7 @@ mod tests {
     use crate::inject::InjectOutcome;
     use crate::job::{JobSpec, TargetSpec};
     use crate::queue::Queue;
+    use crate::target::WrongPane;
 
     fn spec(notify: bool) -> JobSpec {
         JobSpec {
@@ -472,13 +492,43 @@ mod tests {
         );
     }
 
-    /// An error is not a skip. It is already logged at warn, it may still be
-    /// retried, and dressing it up as a notification would tell the user the job
-    /// is finished when it is not.
+    /// An error the scheduler will retry is not the end of the job, and
+    /// announcing it would say the job is finished when it is not.
     #[test]
-    fn a_failure_is_not_notified() {
+    fn a_failure_that_will_be_retried_is_not_notified() {
+        let mut j = job(true);
+        j.auto_retry = true;
+        for left in [-1, 2] {
+            j.retries_left = left;
+            assert_eq!(
+                notification(&j, "p", &Err(anyhow::anyhow!("boom"))),
+                None,
+                "retries_left {left}"
+            );
+        }
+    }
+
+    /// Without a retry the job is removed after an error, and a removal
+    /// nobody was told of is a job that vanished.
+    #[test]
+    fn a_failure_that_will_not_be_retried_is_notified_with_its_error() {
+        let err = || Err(anyhow::anyhow!("boom").context("herdr said no"));
+        let plain = job(true);
+        let said = notification(&plain, "p", &err()).expect("no notification");
+        assert!(
+            said.contains("gave up on p") && said.contains("herdr said no: boom"),
+            "{said}"
+        );
+        let mut spent = job(true);
+        spent.auto_retry = true;
+        spent.retries_left = 0;
+        assert!(notification(&spent, "p", &err()).is_some());
+    }
+
+    #[test]
+    fn a_failure_is_not_notified_without_notify() {
         assert_eq!(
-            notification(&job(true), "p", &Err(anyhow::anyhow!("boom"))),
+            notification(&job(false), "p", &Err(anyhow::anyhow!("boom"))),
             None
         );
     }
@@ -527,18 +577,37 @@ mod tests {
         assert!(msg.contains("input box"), "{msg}");
     }
 
-    /// A nudge refused because tmux restarted did not go out either, and is
-    /// said out loud the same way.
+    /// A nudge refused because its pane is no longer the one scheduled for did
+    /// not go out either, and is said out loud the same way.
     #[test]
-    fn a_pane_from_a_restarted_server_is_a_warning_and_a_notification() {
-        let gone = Ok(InjectOutcome::ServerRestarted);
-        let log = logs_from(|| log_outcome(&job(false), "%19 (earlier tmux server)", &gone));
+    fn a_wrong_pane_is_a_warning() {
+        let wrong = Ok(InjectOutcome::WrongPane(WrongPane::RunsHerdr));
+        let log = logs_from(|| log_outcome(&job(false), "main:12.0 (%19)", &wrong));
         assert!(log.contains("WARN"), "{log}");
-        assert!(log.contains("ServerRestarted"), "{log}");
+        assert!(log.contains("WrongPane(RunsHerdr)"), "{log}");
+    }
 
-        let msg = notification(&job(true), "%19 (earlier tmux server)", &gone)
-            .expect("a nudge that did not go out must not be silent");
-        assert!(msg.contains("%19"), "{msg}");
-        assert!(msg.contains("not the one running now"), "{msg}");
+    /// Each way of being the wrong pane says which it is, since each sends you
+    /// to look somewhere different: for the pane the session is in now, or
+    /// inside the client that took the pane over.
+    #[test]
+    fn a_wrong_pane_notification_says_which_way_it_is_wrong() {
+        let job = job(true);
+        let n = |w| notification(&job, "herdr:w7:pX", &Ok(InjectOutcome::WrongPane(w))).unwrap();
+        assert!(
+            n(WrongPane::ServerRestarted).contains("tmux server that is not the one running now")
+        );
+        assert_eq!(
+            n(WrongPane::OtherConversation),
+            "nudge sent nothing to herdr:w7:pX: that pane now holds a different conversation than the one you scheduled for"
+        );
+        assert_eq!(
+            n(WrongPane::RunsHerdr),
+            "nudge sent nothing to herdr:w7:pX: that tmux pane now runs herdr, so a nudge there would land in whichever herdr pane has focus"
+        );
+        assert_eq!(
+            n(WrongPane::RunsTmux),
+            "nudge sent nothing to herdr:w7:pX: that herdr pane now runs tmux, so a nudge there would land in whichever tmux pane is active"
+        );
     }
 }

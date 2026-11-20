@@ -246,6 +246,26 @@ mod tests {
     }
 
     #[test]
+    fn tmux_and_herdr_jobs_save_and_reload_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let mut herdr = spec();
+        herdr.target = TargetSpec::Herdr {
+            pane: "w7:pX".into(),
+            socket: "/h/.config/herdr/herdr.sock".into(),
+            agent_session: Some("cfebd961".into()),
+        };
+
+        let mut q = Queue::load(path.clone()).unwrap();
+        q.add(spec()).unwrap();
+        q.add(herdr).unwrap();
+
+        let reloaded = Queue::load(path).unwrap();
+        assert_eq!(reloaded.all(), q.all());
+        assert_eq!(reloaded.all().len(), 2);
+    }
+
+    #[test]
     fn remove_reports_hit_and_miss() {
         let dir = tempfile::tempdir().unwrap();
         let mut q = Queue::load(dir.path().join("q.json")).unwrap();

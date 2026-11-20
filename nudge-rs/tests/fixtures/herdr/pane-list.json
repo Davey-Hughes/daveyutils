@@ -1,0 +1,82 @@
+{
+  "id": "cli:pane:list",
+  "result": {
+    "panes": [
+      {
+        "agent": "claude",
+        "agent_session": {
+          "agent": "claude",
+          "kind": "id",
+          "source": "herdr:claude",
+          "value": "00000000-0000-4000-8000-000000000001"
+        },
+        "agent_status": "working",
+        "cwd": "/home/user/project",
+        "focused": false,
+        "foreground_cwd": "/home/user/project",
+        "pane_id": "w12:p1",
+        "revision": 108,
+        "scroll": {
+          "max_offset_from_bottom": 0,
+          "offset_from_bottom": 0,
+          "viewport_rows": 37
+        },
+        "tab_id": "w12:t1",
+        "terminal_id": "term_66057d010ada61",
+        "terminal_title": "✳ fixture-session",
+        "terminal_title_stripped": "fixture-session",
+        "tokens": {
+          "session": "fixture-session"
+        },
+        "workspace_id": "w12"
+      },
+      {
+        "agent": "opencode",
+        "agent_session": {
+          "agent": "opencode",
+          "kind": "id",
+          "source": "herdr:opencode",
+          "value": "ses_fixture0000000000000001"
+        },
+        "agent_status": "blocked",
+        "cwd": "/home/user/project",
+        "focused": true,
+        "foreground_cwd": "/home/user/project",
+        "pane_id": "w19:p1",
+        "revision": 71,
+        "scroll": {
+          "max_offset_from_bottom": 0,
+          "offset_from_bottom": 0,
+          "viewport_rows": 37
+        },
+        "tab_id": "w19:t1",
+        "terminal_id": "term_6605d81bdc61f16",
+        "terminal_title": "✳ fixture-session",
+        "terminal_title_stripped": "fixture-session",
+        "tokens": {
+          "session": "fixture-session"
+        },
+        "workspace_id": "w19"
+      },
+      {
+        "agent_status": "unknown",
+        "cwd": "/home/user/project",
+        "focused": false,
+        "foreground_cwd": "/home/user/project",
+        "pane_id": "wD:p2",
+        "revision": 1,
+        "scroll": {
+          "max_offset_from_bottom": 0,
+          "offset_from_bottom": 0,
+          "viewport_rows": 37
+        },
+        "tab_id": "wD:t2",
+        "terminal_id": "term_66057d010bfa4a",
+        "terminal_title": "/home/user/project",
+        "terminal_title_stripped": "/home/user/project",
+        "workspace_id": "wD"
+      }
+    ],
+    "type": "pane_list"
+  }
+}

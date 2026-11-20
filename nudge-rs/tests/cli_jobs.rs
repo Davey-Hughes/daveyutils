@@ -9,14 +9,14 @@ use nudge::app::format_jobs;
 use nudge::config::Toggles;
 use nudge::ipc::{Request, Response, client, server};
 use nudge::job::{JobSpec, TargetSpec};
+use nudge::panes::Positions;
 use nudge::queue::Queue;
 use nudge::target::PaneDims;
-use nudge::tmux_panes::Positions;
 use nudge::verify::Baseline;
 
 /// A pane that yields no snapshot: the stand-in for `snapshot_pane` in tests
 /// that are not about the recency gate.
-fn no_snapshot(_pane: &str, _opts: &Toggles) -> Option<Baseline> {
+fn no_snapshot(_target: &TargetSpec, _opts: &Toggles) -> Option<Baseline> {
     None
 }
 
@@ -87,6 +87,7 @@ fn format_jobs_keeps_its_columns_aligned_around_a_long_pane_label() {
             ]
             .into(),
             names: std::collections::HashMap::new(),
+            herdr_names: std::collections::HashMap::new(),
         },
     );
     let lines: Vec<&str> = out.lines().collect();
@@ -106,6 +107,7 @@ fn format_jobs_shows_where_each_pane_sits_now() {
             server: None,
             panes: [("%19".to_string(), "main:11.0".to_string())].into(),
             names: std::collections::HashMap::new(),
+            herdr_names: std::collections::HashMap::new(),
         },
     );
     assert!(out.contains("main:11.0 (%19)"), "{out}");
@@ -126,6 +128,7 @@ fn format_jobs_names_the_session_in_each_pane() {
             ]
             .into(),
             names: [("%13".to_string(), "warmer-sessions".to_string())].into(),
+            herdr_names: std::collections::HashMap::new(),
         },
     );
     let lines: Vec<&str> = out.lines().collect();
@@ -315,7 +318,7 @@ fn edit_resnapshots_the_pane_instead_of_inheriting_the_old_baseline() {
     let cli =
         <nudge::cli::Cli as clap::Parser>::try_parse_from(["nudge", "--edit", "1", "-m", "6pm"])
             .unwrap();
-    let fresh = |_p: &str, _o: &Toggles| {
+    let fresh = |_t: &TargetSpec, _o: &Toggles| {
         Some(Baseline {
             fingerprint: nudge::verify::fingerprint("the pane at edit time"),
             dims: dims(80),
@@ -346,15 +349,20 @@ fn edit_snapshots_the_new_pane_when_the_job_is_moved() {
         "other:0.2",
     ])
     .unwrap();
+    // `other:0.2` as `edit` resolves it before the merge: by tmux's id.
+    let to = TargetSpec::Tmux {
+        pane: "%9".into(),
+        server: None,
+    };
     let seen = std::cell::RefCell::new(Vec::new());
-    let record = |p: &str, _o: &Toggles| {
-        seen.borrow_mut().push(p.to_string());
+    let record = |t: &TargetSpec, _o: &Toggles| {
+        seen.borrow_mut().push(t.clone());
         None
     };
-    nudge::app::merge_edit(&job, &cli, None, &noon(), 2, &record).unwrap();
+    nudge::app::merge_edit(&job, &cli, Some(to.clone()), &noon(), 2, &record).unwrap();
     assert_eq!(
         *seen.borrow(),
-        vec!["other:0.2".to_string()],
+        vec![to],
         "the snapshot must describe the pane the job is being moved to"
     );
 }
@@ -375,7 +383,7 @@ fn edit_with_no_verify_drops_the_snapshot() {
     let cli =
         <nudge::cli::Cli as clap::Parser>::try_parse_from(["nudge", "--edit", "1", "--no-verify"])
             .unwrap();
-    let always_snapshots = |_p: &str, _o: &Toggles| {
+    let always_snapshots = |_t: &TargetSpec, _o: &Toggles| {
         Some(Baseline {
             fingerprint: "x".into(),
             dims: dims(80),
@@ -433,7 +441,10 @@ fn edit_moving_the_job_stores_the_new_panes_server() {
     let spec = nudge::app::merge_edit(
         &no_retry_job(5),
         &cli(&["nudge", "--edit", "5", "-p", "%7"]),
-        Some("200-2".into()),
+        Some(TargetSpec::Tmux {
+            pane: "%7".into(),
+            server: Some("200-2".into()),
+        }),
         &noon(),
         2,
         &no_snapshot,

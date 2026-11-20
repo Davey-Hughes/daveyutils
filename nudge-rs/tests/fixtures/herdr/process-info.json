@@ -1,0 +1,42 @@
+{
+  "id": "cli:pane:process_info",
+  "result": {
+    "process_info": {
+      "foreground_process_group_id": 3719005,
+      "foreground_processes": [
+        {
+          "argv": [
+            "/home/user/.local/bin/rust-analyzer"
+          ],
+          "cmdline": "/home/user/.local/bin/rust-analyzer",
+          "cwd": "/home/user/project",
+          "name": "rust-analyzer",
+          "pid": 499801
+        },
+        {
+          "argv": [
+            "/usr/bin/claude"
+          ],
+          "cmdline": "/usr/bin/claude",
+          "cwd": "/home/user/project",
+          "name": "claude",
+          "pid": 3719005
+        },
+        {
+          "argv": [
+            "/home/user/.local/bin/some-mcp",
+            "-t",
+            "stdio"
+          ],
+          "cmdline": "/home/user/.local/bin/some-mcp -t stdio",
+          "cwd": "/home/user/project",
+          "name": "some-mcp",
+          "pid": 3719166
+        }
+      ],
+      "pane_id": "w24:p1",
+      "shell_pid": 3717397
+    },
+    "type": "pane_process_info"
+  }
+}

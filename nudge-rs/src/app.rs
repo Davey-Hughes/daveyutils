@@ -13,12 +13,13 @@ use jiff::ZonedDateTime;
 use crate::cli::{Cli, resolve_options, tri};
 use crate::config::Toggles;
 use crate::detect::detect_reset;
+use crate::here::{Here, parse_pane_arg};
 use crate::ipc::{Request, Response, client};
 use crate::job::{Job, JobSpec, TargetSpec};
+use crate::panes::{Located, Positions, auto_locate, label, locate, named_label};
 use crate::paths;
-use crate::target::{PaneDims, Target, tmux::TmuxTarget};
+use crate::target::{PaneDims, Target};
 use crate::timespec::parse_timespec;
-use crate::tmux_panes::{Positions, named_label};
 
 /// The mode `dispatch` resolves a parsed CLI + TTY state into.
 #[derive(Debug, PartialEq, Eq)]
@@ -92,11 +93,11 @@ fn baseline_fields(b: Option<crate::verify::Baseline>) -> (Option<String>, Optio
 /// `baseline` is the pane snapshot the recency gate compares against at fire
 /// time; the caller takes it (only when `--verify` is on) so this stays pure.
 ///
-/// `server` is the tmux server `pane`'s id was read from:
-/// [`PaneLocation::server`](crate::target::tmux::PaneLocation).
+/// `target` is stored as given, stamp and all: the tmux server its pane's id
+/// was read from, or the conversation its herdr pane held, as
+/// [`locate`]/[`auto_locate`] found them.
 pub fn build_spec(
-    pane: &str,
-    server: Option<String>,
+    target: TargetSpec,
     fire_at: jiff::Timestamp,
     cli: &Cli,
     opts: &Toggles,
@@ -111,10 +112,7 @@ pub fn build_spec(
     // job that will not consult one is just a stale fingerprint in queue.json.
     let (verify_fingerprint, verify_dims) = baseline_fields(baseline.filter(|_| opts.verify));
     JobSpec {
-        target: TargetSpec::Tmux {
-            pane: pane.to_string(),
-            server,
-        },
+        target,
         messages,
         send_delay_secs: cli.delay.unwrap_or(0.75),
         fire_at,
@@ -128,15 +126,16 @@ pub fn build_spec(
     }
 }
 
-/// Snapshot `pane` for the recency gate, but only when `--verify` is on.
+/// Snapshot `target`'s pane for the recency gate, but only when `--verify` is
+/// on.
 ///
 /// The one production seam that takes a real capture for the gate. Never
 /// fallible: a pane that will not answer yields no snapshot, and a job with no
 /// snapshot fails open. `--verify` failing to arm must never be a reason the
 /// user's nudge does not get scheduled at all.
-fn snapshot_pane(pane: &str, opts: &Toggles) -> Option<crate::verify::Baseline> {
+fn snapshot_pane(target: &TargetSpec, opts: &Toggles) -> Option<crate::verify::Baseline> {
     snapshot_gate(opts, || {
-        crate::verify::capture_baseline(&TmuxTarget::new(pane))
+        crate::verify::capture_baseline(target.connect().as_ref())
     })
 }
 
@@ -144,7 +143,8 @@ fn snapshot_pane(pane: &str, opts: &Toggles) -> Option<crate::verify::Baseline> 
 /// flag is on.
 ///
 /// Split out from [`snapshot_pane`] so the guard is testable at all — its own
-/// body shells out to tmux, so nothing could assert this without a live server.
+/// body shells out to tmux or herdr, so nothing could assert this without a
+/// live server.
 /// Both consumers (`build_spec`, `merge_edit`) now independently drop a
 /// baseline when `--verify` is off, which is what makes the *stored* job right;
 /// what this guard alone still decides is whether nudge shells out to tmux
@@ -160,14 +160,28 @@ fn snapshot_gate(
     take()
 }
 
-/// Determine the fire time: explicit `-m`, else auto-detect from the pane.
-pub fn fire_time(cli: &Cli, pane: &str, now: &ZonedDateTime) -> anyhow::Result<jiff::Timestamp> {
+/// The time `-m` names.
+fn explicit_time(t: &str, now: &ZonedDateTime) -> anyhow::Result<jiff::Timestamp> {
+    Ok(parse_timespec(t, now)
+        .map_err(|e| anyhow::anyhow!("could not parse time '{t}': {e}"))?
+        .timestamp())
+}
+
+/// Determine the fire time: explicit `-m`, else auto-detect from `target`.
+///
+/// `pane` is how to name the pane to the user when its banner cannot be read.
+/// A [`Target`] cannot name itself, and the name is most of the help: after
+/// `-a`, it is the only sign of which pane nudge looked at.
+pub fn fire_time(
+    cli: &Cli,
+    target: &dyn Target,
+    pane: &str,
+    now: &ZonedDateTime,
+) -> anyhow::Result<jiff::Timestamp> {
     if let Some(t) = &cli.time {
-        return Ok(parse_timespec(t, now)
-            .map_err(|e| anyhow::anyhow!("could not parse time '{t}': {e}"))?
-            .timestamp());
+        return explicit_time(t, now);
     }
-    let screen = TmuxTarget::new(pane)
+    let screen = target
         .capture()
         .context("capturing pane to auto-detect the rate limit")?;
     let clock_ext = std::env::var("NUDGE_CLOCK_PATTERN").ok();
@@ -340,7 +354,8 @@ fn daemon_log(state_dir: &Path) -> Option<std::fs::File> {
     opts.open(&path).ok()
 }
 
-/// Start `exe --daemon` detached, with its diagnostics going to the log.
+/// Start `exe --daemon` detached, in a session of its own (see
+/// [`in_own_session`]), with its diagnostics going to the log.
 ///
 /// `exe` is a parameter rather than `current_exe()` inside because a test
 /// harness *is* `current_exe()` and would have to stub the whole spawn to work
@@ -352,48 +367,86 @@ fn daemon_log(state_dir: &Path) -> Option<std::fs::File> {
 /// state dir meaning no nudge ever fires again.
 pub fn spawn_daemon(exe: &Path, paths: &paths::Paths) -> std::io::Result<std::process::Child> {
     let log = daemon_log(&paths.state_dir).map_or_else(Stdio::null, Stdio::from);
-    std::process::Command::new(exe)
-        .arg("--daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(log)
-        .process_group(0)
-        .spawn()
+    in_own_session(
+        std::process::Command::new(exe)
+            .arg("--daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log),
+    )
+    .spawn()
+}
+
+/// Make `cmd` start in a new session, which it leads, with no controlling
+/// terminal, so that nothing aimed at the session of whoever started it
+/// reaches it.
+///
+/// A process group of its own is not enough. herdr 0.9.5 closes a popup or a
+/// pane by sending SIGHUP, then SIGTERM, then SIGKILL to every process in the
+/// pane's session, not its process group (`shutdown_pane_processes`). Any
+/// nudge run with no daemon running starts one, so a daemon left in the
+/// session of the herdr pane or popup it was started from died whenever herdr
+/// closed that pane or popup with its command still running in it, and every
+/// job queued with it never fired. On a private herdr on 2026-11-19 that was
+/// a pane closed with the shell nudge ran from still open, and nudge's own
+/// popup closed by herdr while nudge waited in it for a key. A new session
+/// also leaves behind the terminal's SIGHUP when a tmux pane or popup closes.
+///
+/// `setsid` fails with EPERM for a process that already leads a process
+/// group, so this cannot be combined with `process_group(0)`, which is what
+/// it replaces.
+fn in_own_session(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    // SAFETY: the closure runs in the child between fork and exec, where only
+    // async-signal-safe calls are allowed. `setsid` is one, and reading errno
+    // allocates nothing.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Where the pane `found` sits, as the summary of a job scheduled for it
+/// shows it. Only that one pane: listing every pane to label one would ask
+/// tmux and every herdr session for panes the summary never shows.
+fn located_positions(found: &Located) -> Positions {
+    let mut positions = Positions::new();
+    if let TargetSpec::Tmux { server, .. } = &found.spec {
+        positions.server.clone_from(server);
+    }
+    positions.insert(&found.spec, &found.position, found.name.clone());
+    positions
 }
 
 /// Schedule a nudge.
 pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
+    let here = Here::from_env();
     // `--auto` and `-p` conflict at the parser, so `Some(p)` with `cli.auto`
     // set never reaches here and the arms cannot disagree about precedence.
-    let pane = match &cli.pane {
-        Some(p) => p.clone(),
-        None if cli.auto => crate::tmux_panes::auto_target()?,
-        None => crate::app::pick_pane()?,
+    // Each way of naming a pane ends in what the job stores for it: tmux's id
+    // and server, or herdr's id, socket and conversation (see `Located`).
+    let found = match &cli.pane {
+        Some(p) => locate(&parse_pane_arg(p)?, &here)?,
+        None if cli.auto => auto_locate(&here)?,
+        None => pick_pane()?,
     };
-    // From here on the pane is tmux's id for it, which is what the job stores:
-    // see `TmuxTarget::locate`.
-    let loc = TmuxTarget::new(&pane).locate()?;
-    let pane = loc.id.clone();
-    let server = loc.server.clone();
-    let positions = Positions {
-        server: server.clone(),
-        names: loc.name.map(|n| (loc.id.clone(), n)).into_iter().collect(),
-        panes: std::collections::HashMap::from([(loc.id, loc.position)]),
-    };
+    let positions = located_positions(&found);
     let opts = resolve_options(cli);
     let now = ZonedDateTime::now();
-    let fire_at = fire_time(cli, &pane, &now)?;
+    let fire_at = fire_time(
+        cli,
+        found.spec.connect().as_ref(),
+        &label(&found.spec, &positions),
+        &now,
+    )?;
     // Snapshot last, and only for --verify: this is the "before" the fire-time
     // gate compares against, so it wants to be as close to the user's actual
     // parked-at-the-banner pane as we can get it.
-    let spec = build_spec(
-        &pane,
-        server,
-        fire_at,
-        cli,
-        &opts,
-        snapshot_pane(&pane, &opts),
-    );
+    let baseline = snapshot_pane(&found.spec, &opts);
+    let spec = build_spec(found.spec, fire_at, cli, &opts, baseline);
 
     // The clone is the summary's: the request takes the spec by value, and the
     // confirmation line needs it back once the daemon has answered with an id.
@@ -520,8 +573,8 @@ pub fn format_jobs(jobs: &[Job], positions: &Positions) -> String {
     }
     // As wide as the longest name and label, so the columns after them stay
     // aligned. No NAME column when no job has a name.
-    let (names, widest_name) = crate::tmux_panes::job_names(jobs, positions);
-    let (labels, widest) = crate::tmux_panes::job_labels(jobs, positions);
+    let (names, widest_name) = crate::panes::job_names(jobs, positions);
+    let (labels, widest) = crate::panes::job_labels(jobs, positions);
     let n = widest_name.max(4);
     let w = widest.max(20);
     // `write!` formats straight into `out`; `push_str(&format!(..))` would
@@ -570,7 +623,8 @@ fn live_socket() -> anyhow::Result<std::path::PathBuf> {
 pub fn list() -> anyhow::Result<()> {
     match request(&live_socket()?, &Request::List)? {
         Response::Jobs(jobs) => {
-            print!("{}", format_jobs(&jobs, &crate::tmux_panes::positions()));
+            let positions = crate::panes::positions_for(jobs.iter().map(|j| &j.target));
+            print!("{}", format_jobs(&jobs, &positions));
             Ok(())
         }
         other => bail!("unexpected response: {other:?}"),
@@ -599,15 +653,16 @@ pub fn cancel(id: u64) -> anyhow::Result<()> {
 /// (`-p`) or turn `--verify` on, and the snapshot has to describe the pane the
 /// job will actually watch. Production passes [`snapshot_pane`].
 ///
-/// `server` is the tmux server `cli.pane` was read from, for a job moved with
-/// `-p`. Without `-p` the job's own target is kept, stamp and all.
+/// `target` is the pane `cli.pane` names, resolved as `schedule` resolves one
+/// ([`locate`]), for a job moved with `-p`; `cli.pane` itself is not read.
+/// Without one the job's own target is kept, stamp and all.
 pub fn merge_edit(
     job: &Job,
     cli: &Cli,
-    server: Option<String>,
+    target: Option<TargetSpec>,
     now: &ZonedDateTime,
     default_retries: i64,
-    snapshot: &dyn Fn(&str, &Toggles) -> Option<crate::verify::Baseline>,
+    snapshot: &dyn Fn(&TargetSpec, &Toggles) -> Option<crate::verify::Baseline>,
 ) -> anyhow::Result<JobSpec> {
     let base = Toggles {
         notify: job.notify,
@@ -634,19 +689,15 @@ pub fn merge_edit(
         settle_secs: None,
     };
     let opts = crate::config::resolve(&base, &overrides);
-    // A pane kept from the job keeps the job's stamp. Re-read now, it would
-    // vouch for an id that may belong to a pane on a newer server.
-    let target = match &cli.pane {
-        Some(p) => TargetSpec::Tmux {
-            pane: p.clone(),
-            server,
-        },
-        None => job.target.clone(),
-    };
-    let TargetSpec::Tmux { pane, .. } = &target;
-    let pane = pane.clone();
+    // A pane kept from the job keeps the job's stamp. Re-read now, a tmux
+    // job's server would vouch for an id that may belong to a pane on a newer
+    // server, and a herdr job's conversation for whatever the pane holds at
+    // the edit, which may not be the one the job was scheduled for.
+    let target = target.unwrap_or_else(|| job.target.clone());
+    // `-m` only: an edit never reads a reset from the pane, so it needs no
+    // capture of one, from tmux or herdr.
     let fire_at = match &cli.time {
-        Some(_) => fire_time(cli, &pane, now)?,
+        Some(t) => explicit_time(t, now)?,
         None => job.fire_at,
     };
     let messages = if cli.input.is_empty() {
@@ -665,7 +716,7 @@ pub fn merge_edit(
     // --verify is off" is this function's own invariant to keep and not one to
     // borrow from whatever the caller happened to pass.
     let (verify_fingerprint, verify_dims) =
-        baseline_fields(snapshot(&pane, &opts).filter(|_| opts.verify));
+        baseline_fields(snapshot(&target, &opts).filter(|_| opts.verify));
     Ok(JobSpec {
         target,
         messages,
@@ -703,20 +754,18 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
         .find(|j| j.id == id)
         .ok_or_else(|| anyhow::anyhow!("no pending job with id {id}"))?;
 
-    // A job moved with `-p` stores the new pane's id, as `schedule` does.
-    // Resolved here so `merge_edit` stays pure.
-    let mut cli = cli.clone();
-    let mut server = None;
-    if let Some(p) = &cli.pane {
-        let loc = TmuxTarget::new(p).locate()?;
-        server = loc.server;
-        cli.pane = Some(loc.id);
-    }
+    // A job moved with `-p` stores what `schedule` would for that pane, so a
+    // job can move from tmux to herdr and back. Resolved here so `merge_edit`
+    // stays pure.
+    let target = match &cli.pane {
+        Some(p) => Some(locate(&parse_pane_arg(p)?, &Here::from_env())?.spec),
+        None => None,
+    };
     let now = ZonedDateTime::now();
     let spec = merge_edit(
         &job,
-        &cli,
-        server,
+        cli,
+        target,
         &now,
         crate::cli::default_retries(),
         &snapshot_pane,
@@ -738,7 +787,7 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
                     id,
                     new_id,
                     &spec,
-                    &crate::tmux_panes::positions(),
+                    &crate::panes::positions_for([&spec.target]),
                     now.time_zone(),
                     now.timestamp()
                 )
@@ -765,11 +814,67 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
     }
 }
 
-/// Interactively choose a tmux pane.
-pub fn pick_pane() -> anyhow::Result<String> {
-    let (panes, _default_idx, _server) = crate::tmux_panes::list()?;
+/// Whether nudge should wait for a key before it exits.
+///
+/// Only in a popup, which closes the moment its command exits and takes what
+/// nudge printed with it: herdr's does (seen 2026-11-19), and so does tmux's
+/// `display-popup -E`. Only after scheduling, whose confirmation or error is
+/// the whole answer to `nudge -a`; the dashboard shows its own. And only with
+/// a terminal on stdin to read the key from, or nothing could ever answer.
+pub fn should_hold(route: &Route, here: &Here, stdin_tty: bool) -> bool {
+    *route == Route::Schedule && here.is_popup() && stdin_tty
+}
+
+/// Keep a popup open until a key is pressed, so that what nudge printed can
+/// be read. See [`should_hold`] for when.
+///
+/// Raw mode, so that any key will do, Enter or not, and is not echoed. Best
+/// effort throughout: a terminal that will not go raw is no reason to report
+/// a failure on top of whatever nudge just said, so nudge exits as it would
+/// have without the wait, and without the prompt promising one.
+pub fn hold_popup_open() {
+    use crossterm::event::{Event, poll, read};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    use std::io::Write as _;
+
+    if enable_raw_mode().is_err() {
+        return;
+    }
+    // Keys pressed while nudge was still at work wait in the terminal to be
+    // read: an Enter pressed twice, or a key pressed to close a popup before
+    // it asked for one. The first of them would end the hold at once, before
+    // anyone had read what it is there to show. Only a key pressed after the
+    // prompt answers it.
+    while poll(Duration::ZERO).unwrap_or(false) {
+        if read().is_err() {
+            break;
+        }
+    }
+    let mut stderr = std::io::stderr();
+    let _ = write!(stderr, "Press any key to close");
+    let _ = stderr.flush();
+    // Keys only: a resize of the terminal under the popup arrives as an event
+    // too, and is no answer to the prompt.
+    while let Ok(event) = read() {
+        if let Event::Key(_) = event {
+            break;
+        }
+    }
+    let _ = disable_raw_mode();
+    let _ = writeln!(stderr);
+}
+
+/// Interactively choose a pane.
+///
+/// Offers tmux's panes and every running herdr session's, listed by where
+/// each sits (see [`crate::panes::list`]). None of them holds the other
+/// multiplexer's client, so the one chosen is the pane the job is for, stored
+/// as listed: a herdr pane keeps the conversation it held then, as `-p` would
+/// stamp it.
+pub fn pick_pane() -> anyhow::Result<Located> {
+    let (panes, _default_idx) = crate::panes::list()?;
     if panes.is_empty() {
-        anyhow::bail!("no tmux panes found; pass -p <pane>");
+        anyhow::bail!("no tmux or herdr panes found; pass -p <pane>");
     }
     let labels: Vec<String> = panes
         .iter()
@@ -785,7 +890,14 @@ pub fn pick_pane() -> anyhow::Result<String> {
         .prompt()
         .context("pane selection cancelled")?;
     let idx = labels.iter().position(|l| l == &choice).unwrap();
-    Ok(panes[idx].target.clone())
+    // By the spec, not the position the list shows: a window closing while
+    // the prompt was open would hand that position to another pane.
+    let chosen = &panes[idx];
+    Ok(Located {
+        spec: chosen.spec.clone(),
+        position: chosen.target.clone(),
+        name: crate::panes::session_name(&chosen.title),
+    })
 }
 
 /// Write a shell completion script for the `nudge` binary.
@@ -1080,6 +1192,25 @@ mod tests {
         );
     }
 
+    /// herdr closes a popup or pane by signalling every process in its
+    /// session, so the daemon must not share the session of the `nudge` that
+    /// started it.
+    #[test]
+    fn the_daemon_is_started_in_a_session_of_its_own() {
+        let mut child = in_own_session(std::process::Command::new("sleep").arg("30"))
+            .spawn()
+            .expect("spawn sleep");
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        // SAFETY: getsid only reads the session id of a process; 0 means
+        // this one.
+        let (theirs, ours) = unsafe { (libc::getsid(pid), libc::getsid(0)) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_ne!(theirs, -1, "getsid on the child failed");
+        assert_ne!(theirs, ours, "the child is still in nudge's session");
+        assert_eq!(theirs, pid, "the child leads a session of its own");
+    }
+
     fn toggles(verify: bool) -> Toggles {
         Toggles {
             notify: false,
@@ -1169,6 +1300,172 @@ mod tests {
             err.contains("pkill -f 'nudge --daemon'"),
             "must name the remedy: {err}"
         );
+    }
+
+    fn noon() -> ZonedDateTime {
+        jiff::civil::date(2026, 7, 13)
+            .at(12, 0, 0, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .unwrap()
+    }
+
+    fn no_snapshot(_target: &TargetSpec, _opts: &Toggles) -> Option<crate::verify::Baseline> {
+        None
+    }
+
+    fn herdr_pane(pane: &str, agent_session: Option<&str>) -> TargetSpec {
+        TargetSpec::Herdr {
+            pane: pane.into(),
+            socket: "/s".into(),
+            agent_session: agent_session.map(Into::into),
+        }
+    }
+
+    /// A job queued for the herdr pane `w7:pX`, holding conversation `abc`.
+    fn herdr_job() -> Job {
+        JobSpec {
+            target: herdr_pane("w7:pX", Some("abc")),
+            ..a_spec("unused", &["go"], "2026-07-13T15:00:00Z")
+        }
+        .into_job(1)
+    }
+
+    /// With no `-p` the job stays where it is, stamp and all. Stamped again at
+    /// the edit, it would vouch for whatever the pane holds now, which may be
+    /// another conversation than the one it was scheduled for.
+    #[test]
+    fn merge_edit_keeps_a_herdr_target() {
+        let job = herdr_job();
+        let spec = merge_edit(
+            &job,
+            &cli(&["nudge", "--edit", "1", "-m", "6pm"]),
+            None,
+            &noon(),
+            2,
+            &no_snapshot,
+        )
+        .unwrap();
+        assert_eq!(spec.target, job.target);
+    }
+
+    #[test]
+    fn merge_edit_moves_to_a_new_herdr_pane() {
+        let to = herdr_pane("w1:p2", Some("def"));
+        let seen = std::cell::RefCell::new(Vec::new());
+        let record = |t: &TargetSpec, _o: &Toggles| {
+            seen.borrow_mut().push(t.clone());
+            None
+        };
+        let spec = merge_edit(
+            &herdr_job(),
+            &cli(&["nudge", "--edit", "1", "-p", "herdr:w1:p2"]),
+            Some(to.clone()),
+            &noon(),
+            2,
+            &record,
+        )
+        .unwrap();
+        assert_eq!(spec.target, to);
+        assert_eq!(
+            *seen.borrow(),
+            vec![to],
+            "the snapshot describes the pane the job moves to"
+        );
+    }
+
+    /// A job is not tied to the multiplexer it was scheduled in: `-p` takes a
+    /// herdr job to a tmux pane as readily as to another herdr pane.
+    #[test]
+    fn merge_edit_moves_a_herdr_job_to_a_tmux_pane() {
+        let to = TargetSpec::Tmux {
+            pane: "%3".into(),
+            server: Some("100-1".into()),
+        };
+        let spec = merge_edit(
+            &herdr_job(),
+            &cli(&["nudge", "--edit", "1", "-p", "%3"]),
+            Some(to.clone()),
+            &noon(),
+            2,
+            &no_snapshot,
+        )
+        .unwrap();
+        assert_eq!(spec.target, to);
+    }
+
+    /// The confirmation for a herdr pane names the session in it, as it does
+    /// for a tmux pane.
+    #[test]
+    fn a_herdr_summary_names_the_pane_and_the_session_in_it() {
+        let found = Located {
+            spec: herdr_pane("w7:pX", Some("abc")),
+            position: "herdr:w7:pX".into(),
+            name: Some("warmer-sessions".into()),
+        };
+        let spec = JobSpec {
+            target: found.spec.clone(),
+            ..a_spec("unused", &["go"], "2026-07-16T14:14:00Z")
+        };
+        let s = schedule_summary(
+            1,
+            &spec,
+            &located_positions(&found),
+            &jiff::tz::TimeZone::UTC,
+            "2026-07-16T12:00:00Z".parse().unwrap(),
+        );
+        assert!(
+            s.contains("warmer-sessions · herdr:default:w7:pX · \"go\""),
+            "{s}"
+        );
+    }
+
+    /// And for a tmux pane, where it sits now beside the id the job stores.
+    #[test]
+    fn a_tmux_summary_names_the_pane_where_it_sits_and_the_session_in_it() {
+        let found = Located {
+            spec: TargetSpec::Tmux {
+                pane: "%19".into(),
+                server: Some("100-1".into()),
+            },
+            position: "main:12.0".into(),
+            name: Some("ra-scan-3".into()),
+        };
+        let spec = JobSpec {
+            target: found.spec.clone(),
+            ..a_spec("unused", &["go"], "2026-07-16T14:14:00Z")
+        };
+        let s = schedule_summary(
+            1,
+            &spec,
+            &located_positions(&found),
+            &jiff::tz::TimeZone::UTC,
+            "2026-07-16T12:00:00Z".parse().unwrap(),
+        );
+        assert!(s.contains("ra-scan-3 · main:12.0 (%19) · \"go\""), "{s}");
+    }
+
+    /// A popup closes the moment nudge exits, taking what nudge printed with
+    /// it, so only there does nudge wait for a key. Only after scheduling,
+    /// which is what prints a confirmation or an error and exits; and only
+    /// with a terminal to read the key from.
+    #[test]
+    fn holds_only_a_popup_schedule_on_a_tty() {
+        assert!(should_hold(&Route::Schedule, &Here::TmuxPopup, true));
+        assert!(should_hold(
+            &Route::Schedule,
+            &Here::HerdrPopup {
+                pane: "w1:p1".into(),
+                socket: None
+            },
+            true
+        ));
+        assert!(!should_hold(&Route::Schedule, &Here::TmuxPopup, false));
+        assert!(!should_hold(
+            &Route::Schedule,
+            &Here::TmuxPane { pane: "%3".into() },
+            true
+        ));
+        assert!(!should_hold(&Route::Dashboard, &Here::TmuxPopup, true));
     }
 
     #[test]

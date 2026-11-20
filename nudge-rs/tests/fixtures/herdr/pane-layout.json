@@ -1,0 +1,31 @@
+{
+  "id": "cli:pane:layout",
+  "result": {
+    "layout": {
+      "area": {
+        "height": 37,
+        "width": 126,
+        "x": 0,
+        "y": 0
+      },
+      "focused_pane_id": "w24:p1",
+      "panes": [
+        {
+          "focused": true,
+          "pane_id": "w24:p1",
+          "rect": {
+            "height": 37,
+            "width": 126,
+            "x": 0,
+            "y": 0
+          }
+        }
+      ],
+      "splits": [],
+      "tab_id": "w24:t1",
+      "workspace_id": "w24",
+      "zoomed": false
+    },
+    "type": "pane_layout"
+  }
+}

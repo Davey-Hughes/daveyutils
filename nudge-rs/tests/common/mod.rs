@@ -6,9 +6,30 @@
 //! otherwise warn as unused in every binary that doesn't happen to call them.
 #![allow(dead_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
+
+/// What to pass a [`stand_in`] so that it waits for half a minute: `-c` and
+/// this. The `; :` after `sleep` stops bash from running sleep in its own
+/// place, which would rename the process `sleep`.
+pub const STAND_IN_WAIT: &str = "sleep 30; :";
+
+/// A copy of bash at `dir/name`, to stand in for a program, such as herdr's
+/// client or tmux's, that tmux or herdr is meant to find in a pane. The kernel
+/// names a process after the file it ran, and tmux and herdr both go by that
+/// name, so the copy passes for the program without it being installed. Run it
+/// with `-c` and [`STAND_IN_WAIT`].
+///
+/// bash, not sleep: Ubuntu 26.04's sleep is uutils' coreutils, one program that
+/// picks its tool by the name it runs under, and a copy of it named `herdr`
+/// exits at once with `coreutils: unknown program 'herdr'` (seen 2026-11-19).
+/// bash runs under any name.
+pub fn stand_in(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::copy("/bin/bash", &path).expect("copy /bin/bash");
+    path
+}
 
 /// The byte budget every socket path built by these tests must fit inside.
 ///
@@ -154,6 +175,225 @@ impl Drop for TmuxServer {
 pub fn tmux_available() -> bool {
     std::process::Command::new("tmux")
         .arg("-V")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// A herdr server private to one test, with its own config, state and home
+/// directories under `tmpdir`.
+///
+/// herdr keeps its socket, session file and logs in `$XDG_CONFIG_HOME/herdr`,
+/// and fetched agent manifests in `$XDG_STATE_HOME/herdr` (seen 2026-11-19),
+/// so pointing those and `HOME` into `tmpdir` leaves nothing of the
+/// developer's for it to read or write. The session running these tests may
+/// itself sit in a herdr pane, whose `HERDR_SOCKET_PATH` names the developer's
+/// live server: every inherited `HERDR_*` is removed from the server and from
+/// every command handed out here, and each of those names this server's
+/// socket, so none of them can reach that one.
+///
+/// It is never stopped with `herdr server stop`, which goes through a socket:
+/// it is a child of the test, and is signalled by its PID.
+pub struct HerdrServer {
+    dir: std::path::PathBuf,
+    socket: std::path::PathBuf,
+    child: std::process::Child,
+}
+
+impl HerdrServer {
+    /// Start a headless herdr server whose files all live under `tmpdir`, and
+    /// wait until it answers.
+    pub fn start(tmpdir: &Path) -> Self {
+        let dir = tmpdir.to_path_buf();
+        // Where herdr puts its API socket when `XDG_CONFIG_HOME` is `dir`, as
+        // the server's own banner reported it on 2026-11-19.
+        let socket = dir.join("herdr").join("herdr.sock");
+        assert_socket_path_fits(&socket);
+        // herdr resumes the agent a pane last reported once it restarts, by
+        // typing `claude --resume <id>` into the pane's shell (seen
+        // 2026-11-19), so a test that reports a Claude session and restarts
+        // the server would start a real Claude Code. This stub is first on
+        // the server's PATH and stands in for it, holding the pane as an agent
+        // would.
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("claude");
+        std::fs::write(&stub, "#!/bin/sh\nexec sleep 300\n").unwrap();
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        // Constructed before the wait, so that a server that never answers is
+        // still killed by `Drop`.
+        let server = HerdrServer {
+            child: spawn_herdr_server(&dir),
+            dir,
+            socket,
+        };
+        server.wait_until_up();
+        server
+    }
+
+    /// The server's API socket, as a job would store it.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// A `herdr` command aimed at this server and nothing else.
+    pub fn herdr(&self) -> std::process::Command {
+        let mut c = std::process::Command::new("herdr");
+        herdr_env(&mut c, &self.dir);
+        c.env("HERDR_SOCKET_PATH", &self.socket);
+        c
+    }
+
+    /// Run a herdr command on this server and return what it printed.
+    pub fn run(&self, args: &[&str]) -> String {
+        let out = self.herdr().args(args).output().expect("spawn herdr");
+        assert!(
+            out.status.success(),
+            "herdr {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Open a pane in a workspace of its own and type `cmd` into its shell, or
+    /// leave the shell at its prompt if `cmd` is empty. Returns the pane's id.
+    ///
+    /// `pane run` only queues the command: it may still be starting when this
+    /// returns.
+    pub fn new_pane(&self, cmd: &str) -> String {
+        let created: serde_json::Value =
+            serde_json::from_str(&self.run(&["workspace", "create"])).expect("herdr JSON");
+        let pane = created["result"]["root_pane"]["pane_id"]
+            .as_str()
+            .expect("a new workspace's root pane")
+            .to_string();
+        if !cmd.is_empty() {
+            self.run(&["pane", "run", &pane, cmd]);
+        }
+        pane
+    }
+
+    /// Stop the server and start a new one with the same directories, as a
+    /// reboot would.
+    ///
+    /// SIGTERM and not `Child::kill`'s SIGKILL: herdr saves the session it
+    /// restores from as the session changes, but not at once, and always on
+    /// the way down. A test server killed outright a second after its pane
+    /// was made came back with no workspaces at all (seen 2026-11-19). A
+    /// reboot ends it with SIGTERM too.
+    pub fn restart(&mut self) {
+        let pid = self.child.id().to_string();
+        let ok = std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .expect("spawn kill")
+            .success();
+        assert!(ok, "could not signal the herdr server {pid}");
+        let deadline = std::time::Instant::now() + HERDR_PATIENCE;
+        while self.child.try_wait().expect("wait for herdr").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the herdr server {pid} did not exit on SIGTERM"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        self.child = spawn_herdr_server(&self.dir);
+        self.wait_until_up();
+    }
+
+    /// Wait until the server answers a request, which is later than its socket
+    /// appearing. After a restart the old socket file may still be there.
+    fn wait_until_up(&self) {
+        let deadline = std::time::Instant::now() + HERDR_PATIENCE;
+        loop {
+            let up = self
+                .herdr()
+                .args(["pane", "list"])
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if up {
+                return;
+            }
+            let log = std::fs::read_to_string(self.dir.join("server.out")).unwrap_or_default();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the herdr server never answered on {}:\n{log}",
+                self.socket.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for HerdrServer {
+    fn drop(&mut self) {
+        // By the handle, never by name or through a socket: this can only be
+        // the server this test started.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// How long a private herdr server gets to start or stop. A failure deadline,
+/// not a delay: one that works never spends it.
+const HERDR_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Start `herdr server` with its files in `dir`, its output in
+/// `dir/server.out`.
+fn spawn_herdr_server(dir: &Path) -> std::process::Child {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("server.out"))
+        .unwrap();
+    let mut cmd = std::process::Command::new("herdr");
+    herdr_env(&mut cmd, dir);
+    cmd.arg("server")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .expect("spawn herdr server")
+}
+
+/// The environment a private herdr server and every command aimed at it run
+/// in: everything that could lead to the developer's herdr, tmux or Claude
+/// Code removed, and every directory herdr writes to inside `dir`.
+fn herdr_env(cmd: &mut std::process::Command, dir: &Path) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("HERDR_")) {
+            cmd.env_remove(key);
+        }
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(dir.join("bin")).chain(std::env::split_paths(&path)))
+            .unwrap();
+    cmd.env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        // A Claude Code that started anyway, the stub notwithstanding, would
+        // otherwise use the developer's own settings and sessions.
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir)
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        // herdr starts a pane in `$SHELL`. A plain sh keeps the developer's
+        // shell config out of what the tests read.
+        .env("SHELL", "/bin/sh")
+        // A pane's shell writes its history to `$HOME` as it exits, which is
+        // after the server is killed and can be after the test has removed
+        // `dir`, leaving a `.bash_history` behind in a directory of its own
+        // (one in five runs, 2026-11-19). An empty HISTFILE keeps none.
+        .env("HISTFILE", "")
+        .env("PATH", path);
+}
+
+/// Whether herdr is installed. Tests that need a real server skip without it.
+pub fn herdr_available() -> bool {
+    std::process::Command::new("herdr")
+        .arg("--version")
         .output()
         .is_ok_and(|o| o.status.success())
 }

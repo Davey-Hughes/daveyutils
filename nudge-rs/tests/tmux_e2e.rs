@@ -13,7 +13,9 @@ use std::{
 use jiff::{civil::date, tz::TimeZone};
 use nudge::inject::{InjectOutcome, run_injection};
 use nudge::job::{Job, TargetSpec};
-use nudge::target::{Target, tmux::TmuxTarget};
+use nudge::target::{Key, Target, WrongPane, tmux::TmuxTarget};
+
+mod common;
 
 fn tmux_available() -> bool {
     Command::new("tmux")
@@ -64,7 +66,7 @@ impl Server {
     ///
     /// Refused, with tmux's `no server running on` or `error connecting to`,
     /// because that is what both callers need: a new server can start on the
-    /// socket, and `server_restarted` sees no server at all. Weaker conditions
+    /// socket, and `wrong_pane` sees no server at all. Weaker conditions
     /// were not enough. `list-sessions` merely failing let a restart's
     /// `new-session` fail under load. Even after the server's process had
     /// exited, a client asking straight away twice connected and was then
@@ -287,7 +289,7 @@ fn send_key_is_read_before_the_text_that_follows_it() {
     let log = KeyLog::attach(&server);
     let target = server.target();
 
-    target.send_key("i").unwrap();
+    target.send_key(Key::Char('i')).unwrap();
     target.send_line("go").unwrap();
 
     let keys = log.until(b'\r');
@@ -369,8 +371,9 @@ impl KeyLog {
     }
 }
 
-/// `send_key` takes tmux's key names, which is how it presses Backspace to
-/// take back an `i` that a Claude box with no Vim keys typed as text.
+/// `send_key` presses keys that are not text, by tmux's name for them, which is
+/// how it presses Backspace to take back an `A` that a Claude box with no Vim
+/// keys typed as text.
 #[test]
 fn send_key_presses_a_named_key() {
     if !tmux_available() {
@@ -381,7 +384,7 @@ fn send_key_presses_a_named_key() {
     let log = KeyLog::attach(&server);
     let target = server.target();
 
-    target.send_key("BSpace").unwrap();
+    target.send_key(Key::Backspace).unwrap();
     target.send_line("go").unwrap();
 
     assert_eq!(text_of(&log.until(b'\r')), "\x7fgo\r");
@@ -619,10 +622,16 @@ fn end_to_end_verify_still_fires_into_a_pane_nobody_touched() {
     }
     let server = Server::start();
     let target = server.target();
-    server.stage("printf 'quota reached. Resets in 45m\\n'");
+    // The `%s` keeps the banner out of the typed command's echo, so that the
+    // wait below ends only once `sh` has run it. Waiting on text the echo
+    // also holds let the snapshot be taken under load before `sh` had even
+    // drawn its first prompt: tmux shows the typed line at once, the shell's
+    // startup is a pause long enough to pass for quiet, and the prompt, the
+    // command and the banner then all land after the snapshot.
+    server.stage("printf 'quota reached. Resets in %s\\n' 45m");
     wait_for_text(
         &target,
-        "quota reached",
+        "Resets in 45m",
         "the banner must be up before the pane is snapshotted",
     );
     // Nobody touches the pane from here on. Waiting for it to stop rendering
@@ -767,7 +776,7 @@ fn a_pane_on_the_server_it_was_read_from_has_not_restarted() {
     let server = Server::start();
     let loc = server.target().locate().unwrap();
     let target = TmuxTarget::with_socket(&loc.id, &server.socket).expecting_server(loc.server);
-    assert!(!target.server_restarted().unwrap());
+    assert_eq!(target.wrong_pane().unwrap(), None);
 }
 
 /// After a reboot and before tmux is started again there is no server at all,
@@ -785,7 +794,10 @@ fn a_pane_id_with_no_tmux_server_running_counts_as_restarted() {
     server.stop();
 
     let target = TmuxTarget::with_socket(&loc.id, &server.socket).expecting_server(loc.server);
-    assert!(target.server_restarted().unwrap());
+    assert_eq!(
+        target.wrong_pane().unwrap(),
+        Some(WrongPane::ServerRestarted)
+    );
 }
 
 /// The bug: a new server numbers its panes from `%0` again, so a job kept
@@ -823,10 +835,74 @@ fn a_pane_id_from_a_restarted_server_is_refused() {
     };
     let target = TmuxTarget::with_socket(&loc.id, &server.socket).expecting_server(loc.server);
     let out = run_injection(&target, &job, &fixed_now(), None, None, None).unwrap();
-    assert_eq!(out, InjectOutcome::ServerRestarted);
+    assert_eq!(out, InjectOutcome::WrongPane(WrongPane::ServerRestarted));
     // Nothing to wait for if nothing was sent, so a short look is the check.
     thread::sleep(Duration::from_millis(200));
     assert!(!target.capture().unwrap().contains("stale_"));
+}
+
+/// A tmux pane running herdr's client passes what it is sent on to whichever
+/// herdr pane has focus, so a nudge typed there could land in any of them.
+/// `pane_current_command` is the name of the program in the pane's
+/// foreground, so a [`common::stand_in`] named `herdr` looks the same to it as
+/// herdr does, and needs no herdr installed.
+#[test]
+fn a_pane_running_herdr_is_the_wrong_pane() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let sh = server.tmux(&["display-message", "-p", "-t", "s", "#{pane_id}"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = common::stand_in(dir.path(), "herdr");
+    // Separate arguments rather than one command line, so that tmux runs the
+    // copy itself rather than a shell that might stay in the foreground.
+    let herdr_pane = server.tmux(&[
+        "split-window",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        "s:0",
+        herdr.to_str().unwrap(),
+        "-c",
+        common::STAND_IN_WAIT,
+    ]);
+
+    let target = TmuxTarget::with_socket(&herdr_pane, &server.socket);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut wrong = target.wrong_pane().unwrap();
+    while wrong.is_none() && Instant::now() < deadline {
+        thread::sleep(TICK);
+        wrong = target.wrong_pane().unwrap();
+    }
+    assert_eq!(wrong, Some(WrongPane::RunsHerdr));
+
+    assert_eq!(
+        TmuxTarget::with_socket(&sh, &server.socket)
+            .wrong_pane()
+            .unwrap(),
+        None,
+        "a pane running a shell is the right pane"
+    );
+}
+
+/// The trap `locate` steps around applies here too: `display-message -t` on a
+/// window that is gone answers for the current pane and exits 0, so asked
+/// first it would read the command running in some other pane.
+#[test]
+fn a_pane_that_does_not_exist_is_an_error_not_another_panes_command() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let server = Server::start();
+    let err = TmuxTarget::with_socket("s:9.0", &server.socket)
+        .wrong_pane()
+        .expect_err("there is no window 9, so there is no command to read");
+    assert!(err.to_string().contains("s:9.0"), "{err:#}");
 }
 
 /// The bug itself: the windows renumber between scheduling and firing.

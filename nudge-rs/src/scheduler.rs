@@ -54,9 +54,10 @@ pub fn apply_outcome(
         // the pane briefly unavailable) turned `-a -r -1` into zero retries.
         //
         // Ok(SkippedNoBanner) is deliberately excluded: the pane no longer shows
-        // a banner, so the job is done, not failed. ServerRestarted is final
-        // like Unsubmitted: the pane is gone for good, and a retry would find
-        // whichever pane took its id.
+        // a banner, so the job is done, not failed. WrongPane is final like
+        // Unsubmitted: the pane the job was for is gone for good, and a retry
+        // would find whichever pane took its id, or the same other
+        // conversation or client.
         //
         // Note the consequence of Err joining this arm: `-a -r -1` against a
         // pane that is permanently gone now retries forever, where before it
@@ -68,7 +69,7 @@ pub fn apply_outcome(
         // Silently dropping the job on one transient tmux hiccup -- the server
         // restarting, the pane briefly unavailable -- was the worse failure,
         // because nothing said it had happened.
-        Ok(InjectOutcome::Sent(_)) | Err(_) if job.auto_retry && job.retries_left != 0 => {
+        Ok(InjectOutcome::Sent(_)) | Err(_) if job.will_retry() => {
             let left = if job.retries_left > 0 {
                 job.retries_left - 1
             } else {
@@ -99,6 +100,7 @@ mod tests {
     use crate::inject::InjectOutcome;
     use crate::job::{Job, JobSpec, TargetSpec};
     use crate::queue::Queue;
+    use crate::target::WrongPane;
     use jiff::{ToSpan, civil::date, tz::TimeZone};
 
     fn now() -> jiff::ZonedDateTime {
@@ -349,20 +351,28 @@ mod tests {
         assert!(q.get(1).is_none());
     }
 
-    /// The pane went with the server that issued its id, and a retry would
-    /// only find the new pane that took it. The job is done.
+    /// The pane went with the server that issued its id, or it holds some
+    /// other conversation or the other multiplexer's client now, and a retry
+    /// would only find the same thing. The job is done.
     #[test]
-    fn apply_server_restarted_removes_even_with_retry() {
-        let j = job(1, "2026-07-13T11:59:00Z", true, -1);
-        let (_d, mut q) = q_with(&j);
-        let cur = q.get(1).unwrap().clone();
-        apply_outcome(
-            &mut q,
-            &cur,
-            &Ok(InjectOutcome::ServerRestarted),
-            now().timestamp(),
-        )
-        .unwrap();
-        assert!(q.get(1).is_none());
+    fn apply_wrong_pane_removes_even_with_retry() {
+        for why in [
+            WrongPane::ServerRestarted,
+            WrongPane::OtherConversation,
+            WrongPane::RunsHerdr,
+            WrongPane::RunsTmux,
+        ] {
+            let j = job(1, "2026-07-13T11:59:00Z", true, -1);
+            let (_d, mut q) = q_with(&j);
+            let cur = q.get(1).unwrap().clone();
+            apply_outcome(
+                &mut q,
+                &cur,
+                &Ok(InjectOutcome::WrongPane(why)),
+                now().timestamp(),
+            )
+            .unwrap();
+            assert!(q.get(1).is_none(), "{why:?}");
+        }
     }
 }

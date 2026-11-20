@@ -35,14 +35,20 @@ mod tests {
         let mut form = Form::fresh();
         form.panes = vec![
             Pane {
-                id: "%1".into(),
                 target: "s:0.1".into(),
                 title: "claude".into(),
+                spec: crate::job::TargetSpec::Tmux {
+                    pane: "%1".into(),
+                    server: None,
+                },
             },
             Pane {
-                id: "%2".into(),
                 target: "s:0.2".into(),
                 title: "vim".into(),
+                spec: crate::job::TargetSpec::Tmux {
+                    pane: "%2".into(),
+                    server: None,
+                },
             },
         ];
         form.pane_idx = 0;
@@ -69,7 +75,7 @@ use jiff::Timestamp;
 
 use crate::detect::Detection;
 use crate::job::{Job, JobSpec};
-use crate::tmux_panes::Pane;
+use crate::panes::Pane;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -207,7 +213,8 @@ pub struct Form {
     /// The selected pane's captured screen for the live preview; `None` when the
     /// pane could not be captured (rendered as "(preview unavailable)").
     ///
-    /// Holds RAW SGR escape sequences (captured with `tmux capture-pane -e`).
+    /// Holds RAW SGR escape sequences (captured with `tmux capture-pane -e`,
+    /// or herdr's `pane read --format ansi`).
     /// Only `view::preview_text` may render it — it parses the escapes into
     /// styled spans. Never feed this to a plain widget, or a pane's control
     /// bytes would reach the terminal and corrupt the dashboard.
@@ -292,11 +299,10 @@ pub struct Model {
     pub tab: Tab,
     pub jobs: Vec<Job>,
     /// Where each job's pane sits now, read with the jobs: a job names its
-    /// pane by tmux's id, which says nothing to a person.
-    pub positions: crate::tmux_panes::Positions,
-    /// The tmux server `form.panes` was read from: what a job scheduled from
-    /// the form stores, since its pane was picked from that list.
-    pub pane_server: Option<String>,
+    /// pane by tmux's or herdr's id, which says little to a person. Its server
+    /// is the tmux server running now, which a tmux job's stamp is checked
+    /// against.
+    pub positions: crate::panes::Positions,
     pub selected: usize,
     pub form: Form,
     pub status: Status,
@@ -323,8 +329,7 @@ impl Model {
         Model {
             tab: Tab::NewNudge,
             jobs: Vec::new(),
-            positions: crate::tmux_panes::Positions::new(),
-            pane_server: None,
+            positions: crate::panes::Positions::new(),
             selected: 0,
             form: Form::fresh(),
             status: Status::default(),

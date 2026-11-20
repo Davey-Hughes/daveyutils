@@ -26,11 +26,11 @@ told at the time instead."
 // arg attributes without removing a single one.
 #[allow(clippy::struct_excessive_bools)]
 pub struct Cli {
-    /// Target tmux pane (e.g. bot:0.1). Prompts interactively if omitted.
+    /// Target pane: a tmux pane (bot:0.1, %3) or a herdr pane (herdr:w7:pX, herdr:<session>:w1:p2). Prompts interactively if omitted.
     #[arg(short, long)]
     pub pane: Option<String>,
 
-    /// No prompts: target the pane you were last in, read its reset time, send the default message.
+    /// No prompts: target the pane you were last in (tmux), the pane under a tmux or herdr popup, or herdr's focused pane behind a tmux pane running herdr; read its reset time, send the default message.
     //
     // Plain `//` below, not `///`: clap renders every paragraph after the first
     // as long help, so this rationale would otherwise be printed by `--help`.
