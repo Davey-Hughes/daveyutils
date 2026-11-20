@@ -1,7 +1,7 @@
 use std::io::IsTerminal;
 
 use clap::Parser;
-use nudge::app::{hold_popup_open, route, should_hold};
+use nudge::app::{Printed, hold_popup_open, route, should_hold};
 use nudge::cli::Cli;
 use nudge::here::Here;
 
@@ -16,7 +16,8 @@ fn main() {
     if let Err(e) = &result {
         eprintln!("nudge: {e}");
     }
-    if should_hold(&route, &here, std::io::stdin().is_terminal()) {
+    let printed = result.as_ref().map_or(Printed::Something, |p| *p);
+    if should_hold(&route, &here, std::io::stdin().is_terminal(), printed) {
         hold_popup_open();
     }
     if result.is_err() {

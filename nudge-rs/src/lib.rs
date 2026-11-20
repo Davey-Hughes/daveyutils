@@ -29,11 +29,12 @@ pub mod tmux_panes;
 pub mod tui;
 pub mod verify;
 
-/// Dispatch a parsed CLI to the right mode.
-pub fn run(cli: &cli::Cli) -> anyhow::Result<()> {
+/// Dispatch a parsed CLI to the right mode, and say whether it left anything
+/// on the terminal: a popup is held open only for something to read.
+pub fn run(cli: &cli::Cli) -> anyhow::Result<app::Printed> {
     if let Some(shell) = cli.completions {
         app::print_completions(shell);
-        return Ok(());
+        return Ok(app::Printed::Something);
     }
     if cli.daemon {
         daemon::init_tracing();
@@ -50,22 +51,22 @@ pub fn run(cli: &cli::Cli) -> anyhow::Result<()> {
             weekly_ext.as_deref(),
             jiff::ToSpan::hours(6),
         ) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(app::Printed::Something),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // Another daemon already owns this state. That is not a failure:
                 // exiting non-zero makes systemd's Restart=on-failure retry every
                 // RestartSec forever against a lock it can never win.
                 eprintln!("nudge: {e}");
-                Ok(())
+                Ok(app::Printed::Something)
             }
             Err(e) => Err(e.into()),
         };
     }
     if cli.install_daemon {
-        return register::install(&std::env::current_exe()?);
+        return register::install(&std::env::current_exe()?).map(|()| app::Printed::Something);
     }
     if cli.uninstall_daemon {
-        return register::uninstall();
+        return register::uninstall().map(|()| app::Printed::Something);
     }
     // Check the user's banner patterns once, here, where there is a user to
     // tell. detect.rs can only warn-and-degrade (a panic there would kill the

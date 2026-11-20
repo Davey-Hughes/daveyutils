@@ -27,16 +27,26 @@ pub struct Pane {
     pub spec: TargetSpec,
 }
 
-/// Every pane the picker offers, tmux's then herdr's (see [`merge`]), and
-/// which of them to preselect: the pane `-a` would find from where nudge is
+/// Every pane the picker offers, tmux's then herdr's (see [`all`]), and which
+/// of them to preselect: the pane `-a` would find from where nudge is
 /// running, or the first wherever `-a` would refuse (see [`default_idx`]).
+pub fn list() -> Result<(Vec<Pane>, usize)> {
+    let panes = all()?;
+    let found = auto_locate(&Here::from_env()).ok();
+    let idx = default_idx(&panes, found.as_ref().map(|f| &f.spec));
+    Ok((panes, idx))
+}
+
+/// Every pane the picker offers, tmux's then herdr's (see [`merge`]), for a
+/// caller that already knows which to select: [`list`] without the
+/// [`auto_locate`] its preselection costs.
 ///
 /// `Err` only when neither tmux nor herdr could be asked: either one alone
 /// missing (no tmux server, herdr not installed) leaves the other's panes, and
 /// herdr with no session running simply has none to add. Every herdr call
 /// goes through [`herdr::list_panes`] and [`HerdrTarget`], which name the
 /// session they are for with `HERDR_SOCKET_PATH`.
-pub fn list() -> Result<(Vec<Pane>, usize)> {
+pub fn all() -> Result<Vec<Pane>> {
     let tmux = list_rows();
     let herdr = herdr::sessions().map(|sessions| {
         herdr_listing(sessions, herdr::list_panes, |socket, pane| {
@@ -47,10 +57,7 @@ pub fn list() -> Result<(Vec<Pane>, usize)> {
         (Err(t), Err(h)) => bail!("no tmux or herdr panes to pick from: {t:#}; {h:#}"),
         (_, herdr) => herdr.unwrap_or_default(),
     };
-    let panes = merge(tmux, herdr);
-    let found = auto_locate(&Here::from_env()).ok();
-    let idx = default_idx(&panes, found.as_ref().map(|f| &f.spec));
-    Ok((panes, idx))
+    Ok(merge(tmux, herdr))
 }
 
 /// Each running herdr session in `sessions`, with its panes and the ids of

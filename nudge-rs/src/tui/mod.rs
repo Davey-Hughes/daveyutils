@@ -19,7 +19,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app;
+use crate::app::{self, Printed};
 use crate::cli::default_retries;
 use crate::paths;
 use model::{Model, ScheduleDefaults};
@@ -75,7 +75,10 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn schedule_defaults() -> ScheduleDefaults {
+/// What the form schedules with for the fields it does not show, read from
+/// the environment, and the local time zone. `--ask` overrides some of them
+/// with its flags (see [`crate::app::ask_form`]).
+pub fn schedule_defaults() -> ScheduleDefaults {
     ScheduleDefaults {
         send_delay_secs: 0.75,
         settle_secs: std::env::var("NUDGE_SETTLE_SECS")
@@ -87,10 +90,36 @@ fn schedule_defaults() -> ScheduleDefaults {
     }
 }
 
-/// Open the dashboard. Resolves paths and ensures a daemon *before* raw mode so
-/// a spawn or a stale-build handshake prints as normal output, not into the
-/// alternate screen.
+/// Open the dashboard.
 pub fn run() -> anyhow::Result<()> {
+    drive(Model::new(schedule_defaults(), jiff::Timestamp::now())).map(|_| ())
+}
+
+/// Open the dashboard on the form `--ask` filled in (see [`Model::asking`]).
+/// [`Printed::Nothing`] when it closed with no summary to print (see there).
+pub fn run_ask(model: Model) -> anyhow::Result<Printed> {
+    drive(model)
+}
+
+/// What to ask for before the first frame: the jobs, and the panes unless
+/// the form already holds a list.
+///
+/// The `--ask` form opens with its list, and must keep it. A list arriving
+/// for a new nudge selects `default_idx`, the pane `-a` would pick, which is
+/// not the pane `-p` named.
+fn priming(model: &Model) -> Vec<update::Effect> {
+    if model.form.panes.is_empty() {
+        vec![update::Effect::PollJobs, update::Effect::ListPanes]
+    } else {
+        vec![update::Effect::PollJobs]
+    }
+}
+
+/// Run the dashboard from `model` until it quits, then print its summary, if
+/// it has one, to the real terminal. Resolves paths and ensures a daemon
+/// *before* raw mode so a spawn or a stale-build handshake prints as normal
+/// output, not into the alternate screen.
+fn drive(mut model: Model) -> anyhow::Result<Printed> {
     let paths = paths::resolve();
     app::ensure_daemon(&paths)?;
     let socket = paths.socket.clone();
@@ -107,12 +136,12 @@ pub fn run() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal: Terminal<CrosstermBackend<Stdout>> = Terminal::new(backend)?;
 
-    let mut model = Model::new(schedule_defaults(), jiff::Timestamp::now());
     // Prime the first frame with jobs (and, later, panes on first Tab).
     let tick = update::update(&mut model, update::Msg::Tick(jiff::Timestamp::now()));
     dispatch_effects(&mut model, tick, &socket);
-    dispatch_effects(&mut model, vec![update::Effect::PollJobs], &socket);
-    dispatch_effects(&mut model, vec![update::Effect::ListPanes], &socket);
+    for effect in priming(&model) {
+        dispatch_effects(&mut model, vec![effect], &socket);
+    }
 
     while !model.should_quit {
         terminal.draw(|f| view::view(&model, f))?;
@@ -133,10 +162,13 @@ pub fn run() -> anyhow::Result<()> {
     // goes first so it un-hides the cursor while its screen is still current.
     drop(terminal);
     drop(guard);
-    if let Some(summary) = &model.exit_summary {
-        println!("{summary}");
+    match &model.exit_summary {
+        Some(summary) => {
+            println!("{summary}");
+            Ok(Printed::Something)
+        }
+        None => Ok(Printed::Nothing),
     }
-    Ok(())
 }
 
 /// Run each effect (blocking) and feed its `Msg` straight back into `update`.
@@ -195,6 +227,35 @@ mod tests {
     fn ctrl_s_maps_to_schedule_and_stay() {
         let ev = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert_eq!(map_event(&ev), Some(update::Msg::SubmitStay));
+    }
+
+    fn bare() -> Model {
+        Model::new(schedule_defaults(), jiff::Timestamp::now())
+    }
+
+    #[test]
+    fn the_dashboard_lists_panes_at_startup() {
+        assert_eq!(
+            priming(&bare()),
+            vec![update::Effect::PollJobs, update::Effect::ListPanes]
+        );
+    }
+
+    /// A fresh list arriving as a new nudge's `PanesLoaded` selects
+    /// `default_idx`, which is the pane `-a` would pick and not the pane `-p`
+    /// named, so the `--ask` form, which opens with its list, is not relisted.
+    #[test]
+    fn the_ask_form_is_not_relisted_at_startup() {
+        let mut m = bare();
+        m.form.panes = vec![crate::panes::Pane {
+            target: "s:0.1".into(),
+            title: String::new(),
+            spec: crate::job::TargetSpec::Tmux {
+                pane: "%1".into(),
+                server: None,
+            },
+        }];
+        assert_eq!(priming(&m), vec![update::Effect::PollJobs]);
     }
 
     #[test]

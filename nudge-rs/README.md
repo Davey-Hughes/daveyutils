@@ -33,6 +33,7 @@ automatically).
 
 ```sh
 nudge -a                         # no prompts: last pane, its reset time, default message
+nudge -a --ask                   # the same, but type the time when the pane shows none
 nudge -p bot:0.1                 # auto-detect the reset time from the pane
 nudge -p bot:0.1 -m "14:30"      # explicit time
 nudge -p bot:0.1 --auto-retry -r -1 -v   # retry forever, verify before each send
@@ -83,6 +84,16 @@ because unlike the dashboard's preselection nobody sees its choice before the
 message is delivered. A pane with no recognisable rate-limit banner is the same
 story — pass `-m` to set the time yourself.
 
+With `--ask`, nudge opens the dashboard's form for that pane instead, with the
+cursor in the time and the reason on the bottom line. Type a time (`5m`,
+`14:30`) and press Enter. `-i`, `-v`, `-n` and `-r` carry over, except that a
+pane with no banner opens with verify off, since verify skips a job whose pane
+still shows no banner when it comes due. `--ask` does nothing when the pane does show a
+time, and needs `-a` or `-p`. It falls back to the error when nobody is at a
+terminal, when more than one `-i` or a blank one is given (the form holds one
+message, and sends its default for a blank one), or when the pane is not in
+the form's list.
+
 It composes with the other scheduling flags (`-m`, `-i`, `-v`, `-n`, `-r`), and
 conflicts with `-p` and with `--list`/`--cancel`/`--edit`.
 
@@ -121,13 +132,15 @@ label works as `-p` from anywhere, inside a named herdr session or out. The
 picker and the dashboard list the panes of every running herdr session beside
 tmux's.
 
-For `nudge -a`, bind it to a popup in herdr's `config.toml`:
+For `nudge -a`, bind it to a popup in herdr's `config.toml`. With `--ask`, a
+pane with no banner opens the form to type the time in, rather than an error
+the popup can do nothing about:
 
 ```toml
 [[keys.command]]
 key = "prefix+u"
 type = "popup"
-command = "nudge -a"
+command = "nudge -a --ask"
 width = "60%"
 height = "40%"
 ```
@@ -161,7 +174,8 @@ picker leaves client panes out.
 
 A popup closes as soon as its command exits, and would take nudge's
 confirmation or error with it. So in a tmux or herdr popup, nudge prints it and
-waits with `Press any key to close`.
+waits with `Press any key to close`. The `--ask` form quit without scheduling
+prints nothing, so its popup closes straight away.
 
 When a job comes due, nudge checks that its pane is still the one you
 scheduled for before typing anything:

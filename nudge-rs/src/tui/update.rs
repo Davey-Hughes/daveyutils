@@ -2980,4 +2980,138 @@ mod tests {
             "no re-capture when the pane is unchanged"
         );
     }
+
+    fn listed_pane(id: &str) -> Pane {
+        Pane {
+            target: format!("s:0.{}", id.trim_start_matches('%')),
+            title: String::new(),
+            spec: tmux_spec(id),
+        }
+    }
+
+    /// What `nudge -p %<n> --ask` hands the dashboard for a pane with no
+    /// banner, from a list of `%1` and `%2`.
+    fn ask_for(id: &str) -> Ask {
+        Ask {
+            panes: vec![listed_pane("%1"), listed_pane("%2")],
+            pane: tmux_spec(id),
+            reason: "no rate-limit banner detected in s:0.2 (%2)".into(),
+            message: None,
+            verify: false,
+            notify: false,
+            auto_retry: false,
+        }
+    }
+
+    #[test]
+    fn asking_selects_the_located_pane_with_the_cursor_in_a_manual_time() {
+        let m = Model::asking(defaults(), t0(), ask_for("%2")).unwrap();
+        assert_eq!(m.tab, Tab::NewNudge);
+        assert_eq!(m.form.mode, Mode::New);
+        assert_eq!(m.form.pane_idx, 1);
+        assert_eq!(
+            (m.form.when, m.form.focus, m.form.nav_mode),
+            (WhenMode::Manual, FormField::When, VimMode::Insert)
+        );
+        assert_eq!((m.form.manual_time.as_str(), m.form.cursor), ("", 0));
+        assert_eq!(
+            m.status.0.as_deref(),
+            Some("no rate-limit banner detected in s:0.2 (%2)")
+        );
+    }
+
+    /// Never another pane in its place: the job would go where nobody asked.
+    #[test]
+    fn asking_for_a_pane_the_list_lacks_opens_nothing() {
+        assert!(Model::asking(defaults(), t0(), ask_for("%9")).is_none());
+    }
+
+    #[test]
+    fn asking_carries_the_message_and_toggles() {
+        let a = Ask {
+            message: Some("go on".into()),
+            verify: true,
+            notify: true,
+            auto_retry: true,
+            ..ask_for("%1")
+        };
+        let m = Model::asking(defaults(), t0(), a).unwrap();
+        assert_eq!(m.form.message, MessageField::Editable("go on".into()));
+        assert!(m.form.verify && m.form.notify && m.form.auto_retry);
+
+        let m = Model::asking(defaults(), t0(), ask_for("%1")).unwrap();
+        assert_eq!(
+            m.form.message,
+            MessageField::Editable("please continue".into())
+        );
+    }
+
+    #[test]
+    fn typing_a_time_into_the_ask_form_schedules_it_and_quits() {
+        let mut m = Model::asking(
+            defaults(),
+            t0(),
+            Ask {
+                auto_retry: true,
+                ..ask_for("%2")
+            },
+        )
+        .unwrap();
+        for c in ['5', 'm'] {
+            update(&mut m, Msg::Key(KeyCode::Char(c)));
+        }
+        let fx = update(&mut m, Msg::Key(KeyCode::Enter));
+        let [
+            Effect::Schedule {
+                spec,
+                snapshot_pane: None,
+            },
+        ] = fx.as_slice()
+        else {
+            panic!("{fx:?}")
+        };
+        assert_eq!(spec.target, tmux_spec("%2"));
+        assert_eq!(
+            spec.fire_at,
+            t0().checked_add(jiff::ToSpan::minutes(5)).unwrap()
+        );
+        assert_eq!(spec.retries_left, defaults().retries);
+        assert!(
+            (spec.send_delay_secs - defaults().send_delay_secs).abs() < f64::EPSILON,
+            "{}",
+            spec.send_delay_secs
+        );
+
+        update(&mut m, Msg::Scheduled(7));
+        assert!(m.should_quit);
+        let summary = m.exit_summary.as_deref().expect("a summary to print");
+        assert!(summary.contains("scheduled job 7"), "{summary}");
+    }
+
+    /// The first Tick captures the pane for the preview. With no banner
+    /// there, that capture must leave the time manual and the reason on
+    /// screen.
+    #[test]
+    fn the_ask_forms_first_capture_keeps_the_manual_time_and_the_reason() {
+        let mut m = Model::asking(defaults(), t0(), ask_for("%2")).unwrap();
+        let fx = update(&mut m, Msg::Tick(t0()));
+        assert!(
+            fx.contains(&Effect::CapturePane {
+                target: tmux_spec("%2")
+            }),
+            "{fx:?}"
+        );
+        update(
+            &mut m,
+            Msg::PaneCaptured {
+                screen: Some("$ ".into()),
+                detection: Detection::None,
+            },
+        );
+        assert_eq!(m.form.when, WhenMode::Manual);
+        assert_eq!(
+            m.status.0.as_deref(),
+            Some("no rate-limit banner detected in s:0.2 (%2)")
+        );
+    }
 }

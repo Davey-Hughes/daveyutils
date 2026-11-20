@@ -74,7 +74,7 @@ mod tests {
 use jiff::Timestamp;
 
 use crate::detect::Detection;
-use crate::job::{Job, JobSpec};
+use crate::job::{Job, JobSpec, TargetSpec};
 use crate::panes::Pane;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -294,6 +294,23 @@ impl Form {
     }
 }
 
+/// What `nudge -a --ask` or `-p <pane> --ask` hands the dashboard when the
+/// pane it found shows no time to nudge at. See [`Model::asking`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ask {
+    /// The form's pane list, read by the caller.
+    pub panes: Vec<Pane>,
+    /// The pane `-a` or `-p` found.
+    pub pane: TargetSpec,
+    /// Why it gave no time, for the status line.
+    pub reason: String,
+    /// The `-i` message, if one was given.
+    pub message: Option<String>,
+    pub verify: bool,
+    pub notify: bool,
+    pub auto_retry: bool,
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Model {
     pub tab: Tab,
@@ -342,6 +359,36 @@ impl Model {
             pending_spec: None,
             exit_summary: None,
         }
+    }
+
+    /// The dashboard opened on the form for `ask.pane`, with When set to a
+    /// manual time and the cursor in it, and the reason the pane gave no time
+    /// on the status line. What `--ask` opens.
+    ///
+    /// `None` when `ask.panes` does not hold that pane: picking another in its
+    /// place would schedule the nudge for a pane nobody asked for. Matched by
+    /// `same_pane`, as an edit finds its job's pane, since the list and `-a`
+    /// read the pane moments apart.
+    pub fn asking(defaults: ScheduleDefaults, now: Timestamp, ask: Ask) -> Option<Model> {
+        let pane_idx = ask.panes.iter().position(|p| p.spec.same_pane(&ask.pane))?;
+        let mut model = Model::new(defaults, now);
+        model.form = Form {
+            panes: ask.panes,
+            pane_idx,
+            when: WhenMode::Manual,
+            focus: FormField::When,
+            nav_mode: VimMode::Insert,
+            cursor: 0,
+            verify: ask.verify,
+            notify: ask.notify,
+            auto_retry: ask.auto_retry,
+            ..Form::fresh()
+        };
+        if let Some(message) = ask.message {
+            model.form.message = MessageField::Editable(message);
+        }
+        model.status.set(ask.reason);
+        Some(model)
     }
 
     /// Keep `selected` inside `jobs` after the list changes.

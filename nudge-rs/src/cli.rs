@@ -19,6 +19,10 @@ Linux, or ~/Library/Application Support/nudge on macOS. That is the place to \
 look when a nudge did not fire and you want to know why. Use --notify to be \
 told at the time instead."
 )]
+// The ways of finding a pane that `--ask` needs one of. `multiple(true)` so
+// that the group adds no conflict of its own: `--auto` already refuses `-p`,
+// with its own reasons.
+#[command(group(clap::ArgGroup::new("pane_or_auto").args(["pane", "auto"]).multiple(true)))]
 // struct_excessive_bools: the lint's advice is to group the flags into an enum
 // or a sub-struct, but this *is* the flag surface -- clap derives the parser
 // from these fields, so every bool here is one `--flag` the user types. Folding
@@ -49,6 +53,20 @@ pub struct Cli {
         conflicts_with_all = ["pane", "edit", "cancel", "list", "list_plain"]
     )]
     pub auto: bool,
+
+    /// When the pane shows no reset time, open the dashboard's form to type one instead of failing. Needs -a or -p.
+    //
+    // Plain `//`, as above, so that --help prints only the line above.
+    //
+    // The conflicts are `--auto`'s: `route` reaches --edit/--cancel/--list
+    // before it ever reads this, so without them those combinations would
+    // silently ignore the flag rather than refuse it.
+    #[arg(
+        long = "ask",
+        requires = "pane_or_auto",
+        conflicts_with_all = ["edit", "cancel", "list", "list_plain"]
+    )]
+    pub ask: bool,
 
     /// Specific target time (e.g. "14:30" or "now + 45 min"); else auto-detect.
     #[arg(short = 'm', long = "time")]
@@ -412,6 +430,41 @@ mod tests {
         ] {
             assert!(
                 Cli::try_parse_from(args).is_err(),
+                "{args:?} must be refused"
+            );
+        }
+    }
+
+    /// `--ask` stands in for `-m` on a pane `-a` or `-p` found, so it has no
+    /// meaning without one of them. Beside `-m` it has nothing to do, and is
+    /// harmless.
+    #[test]
+    fn ask_needs_auto_or_a_pane() {
+        assert!(Cli::try_parse_from(["nudge", "--ask"]).is_err());
+        assert!(parse(&["nudge", "-a", "--ask"]).ask);
+        assert!(parse(&["nudge", "-p", "x", "--ask"]).ask);
+        assert!(
+            parse(&["nudge", "-p", "x", "--ask", "-m", "3pm"]).ask,
+            "-m beside it is harmless"
+        );
+    }
+
+    /// As for `--auto`: `route` reaches these modes before it ever reads
+    /// `--ask`, so without the conflict the flag would be silently ignored.
+    #[test]
+    fn ask_refuses_to_share_a_command_line_with_a_job_management_mode() {
+        for extra in [
+            &["--edit", "5"][..],
+            &["--cancel", "5"],
+            &["--list"],
+            &["--list-plain"],
+        ] {
+            let args: Vec<&str> = ["nudge", "-p", "x", "--ask"]
+                .into_iter()
+                .chain(extra.iter().copied())
+                .collect();
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
                 "{args:?} must be refused"
             );
         }

@@ -156,7 +156,19 @@ impl TmuxServer {
 
     /// Point `cmd`'s tmux calls at this server. `TMUX` names the socket of the
     /// session running the test, and tmux prefers it, so it goes.
+    ///
+    /// Only while `TMUX_TMPDIR` exists. tmux skips a `TMUX_TMPDIR` that does
+    /// not, and falls back to the default socket directory, where the
+    /// developer's own server lives (seen 2026-11-19: a fixture that deleted
+    /// its tempdir before this server's `kill-server` reached
+    /// `/tmp/tmux-1000/default`). A command aimed there must fail here.
     pub fn env(&self, cmd: &mut std::process::Command) {
+        assert!(
+            self.tmpdir.is_dir(),
+            "TMUX_TMPDIR {} is gone, so tmux would fall back to the developer's \
+             own server; drop the TmuxServer before its tempdir",
+            self.tmpdir.display()
+        );
         cmd.env("TMUX_TMPDIR", &self.tmpdir)
             .env_remove("TMUX")
             .env_remove("TMUX_PANE");
@@ -165,8 +177,20 @@ impl TmuxServer {
 
 impl Drop for TmuxServer {
     fn drop(&mut self) {
-        // Safe only because of the explicit TMUX_TMPDIR + TMUX removal above:
-        // this can address nothing but the server we started in our own tempdir.
+        // With the directory gone, `kill-server` would reach the developer's
+        // own server (see `env`). Leave this one running, and say so, rather
+        // than risk that. A panic here would abort a test already unwinding.
+        if !self.tmpdir.is_dir() {
+            eprintln!(
+                "warning: TMUX_TMPDIR {} went before its tmux server was stopped; \
+                 leaving the server running rather than risk the developer's own",
+                self.tmpdir.display()
+            );
+            return;
+        }
+        // Safe only because of the explicit TMUX_TMPDIR + TMUX removal in
+        // `env`: this can address nothing but the server we started in our own
+        // tempdir.
         let _ = self.tmux().arg("kill-server").status();
     }
 }

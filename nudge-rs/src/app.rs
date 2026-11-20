@@ -12,7 +12,7 @@ use jiff::ZonedDateTime;
 
 use crate::cli::{Cli, resolve_options, tri};
 use crate::config::Toggles;
-use crate::detect::detect_reset;
+use crate::detect::{Detection, detect_reset};
 use crate::here::{Here, parse_pane_arg};
 use crate::ipc::{Request, Response, client};
 use crate::job::{Job, JobSpec, TargetSpec};
@@ -187,28 +187,90 @@ pub fn fire_time(
     let clock_ext = std::env::var("NUDGE_CLOCK_PATTERN").ok();
     let dur_ext = std::env::var("NUDGE_DURATION_PATTERN").ok();
     let weekly_ext = std::env::var("NUDGE_WEEKLY_PATTERN").ok();
-    match detect_reset(
+    let detection = detect_reset(
         &screen,
         now,
         clock_ext.as_deref(),
         dur_ext.as_deref(),
         weekly_ext.as_deref(),
-    ) {
-        crate::detect::Detection::Reset(z) => Ok(z.timestamp()),
-        crate::detect::Detection::None => {
-            bail!("no rate-limit banner detected in {pane}; pass -m to set a time")
+    );
+    Ok(reset_or_why(detection, pane)?)
+}
+
+/// Why a pane gave nudge no time to fire at: it shows no rate-limit banner,
+/// a banner whose reset day nudge cannot read, or a reset that has passed.
+///
+/// A type of its own, not just a message, so that `--ask` can tell these
+/// apart from every other failure and offer the form instead. `Display` is
+/// the error `-a` and `-p` print, which `--ask` must leave as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoTime {
+    NoBanner {
+        pane: String,
+    },
+    Unreadable {
+        pane: String,
+        banner: String,
+        gap: String,
+    },
+    Elapsed {
+        pane: String,
+        banner: String,
+        time: String,
+    },
+}
+
+impl NoTime {
+    /// The first line of the error, without the advice to pass `-m`: what
+    /// the `--ask` form shows on its status line, where the answer is to
+    /// type a time instead.
+    pub fn headline(&self) -> String {
+        match self {
+            NoTime::NoBanner { pane } => format!("no rate-limit banner detected in {pane}"),
+            NoTime::Unreadable { pane, gap, .. } => {
+                format!(
+                    "rate-limit banner found in {pane}, but I can't read its reset day: {gap:?}"
+                )
+            }
+            NoTime::Elapsed { pane, time, .. } => format!(
+                "the rate-limit banner in {pane} says to try again at {time}, and that has already passed"
+            ),
         }
-        crate::detect::Detection::Unreadable { banner, gap } => bail!(
-            "rate-limit banner found in {pane}, but I can't read its reset day: {gap:?}\n\
-             (from {banner:?})\n\
-             Schedule it by hand with -m, and please file this text."
-        ),
-        crate::detect::Detection::Elapsed { banner, time } => bail!(
-            "the rate-limit banner in {pane} says to try again at {time}, and that has already passed\n\
-             (from {banner:?})\n\
-             Its reset has come and gone, so the pane no longer says when to nudge. \
-             Pass -m to set a time."
-        ),
+    }
+}
+
+impl std::fmt::Display for NoTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headline = self.headline();
+        match self {
+            NoTime::NoBanner { .. } => write!(f, "{headline}; pass -m to set a time"),
+            NoTime::Unreadable { banner, .. } => write!(
+                f,
+                "{headline}\n\
+                 (from {banner:?})\n\
+                 Schedule it by hand with -m, and please file this text."
+            ),
+            NoTime::Elapsed { banner, .. } => write!(
+                f,
+                "{headline}\n\
+                 (from {banner:?})\n\
+                 Its reset has come and gone, so the pane no longer says when to nudge. \
+                 Pass -m to set a time."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NoTime {}
+
+/// The time `detection` found on the pane named `pane`, or why there is none.
+fn reset_or_why(detection: Detection, pane: &str) -> Result<jiff::Timestamp, NoTime> {
+    let pane = pane.to_string();
+    match detection {
+        Detection::Reset(z) => Ok(z.timestamp()),
+        Detection::None => Err(NoTime::NoBanner { pane }),
+        Detection::Unreadable { banner, gap } => Err(NoTime::Unreadable { pane, banner, gap }),
+        Detection::Elapsed { banner, time } => Err(NoTime::Elapsed { pane, banner, time }),
     }
 }
 
@@ -421,8 +483,109 @@ fn located_positions(found: &Located) -> Positions {
     positions
 }
 
+/// Whether a pane that gave no time should open the form instead of failing:
+/// `--ask` was passed, someone is at a terminal both ways to answer it, and
+/// the form can hold the message as given. It has one message field, so with
+/// more than one `-i` it would send the first alone; and it sends its default
+/// for a blank one, where `-a` sends it blank. Failing as `-a` does keeps the
+/// message as given.
+pub fn asks(cli: &Cli, stdin_tty: bool, stdout_tty: bool) -> bool {
+    let form_holds_it = match cli.input.as_slice() {
+        [] => true,
+        [one] => !one.trim().is_empty(),
+        _ => false,
+    };
+    cli.ask && form_holds_it && stdin_tty && stdout_tty
+}
+
+/// The `--ask` form's starting state for `pane`, from the flags `schedule`
+/// would have used.
+///
+/// The form shows the message and the three toggles. The send delay (`-w`),
+/// the retry count (`-r`) and the settle time it does not show, so they ride
+/// in the defaults the form schedules with. `opts` is `resolve_options(cli)`,
+/// so the `NUDGE_*` defaults apply as they would to `-a -m`.
+///
+/// Except verify, on a pane with no banner. Verify skips a job whose pane
+/// shows no banner when it comes due (see `inject`), so ticked there it would
+/// almost certainly mean the nudge never fires. The form opens with it off
+/// and says so on the status line, and ticking it back is the user's call.
+/// The other reasons for no time are a banner on screen, which verify can
+/// still check, so they keep it.
+pub fn ask_form(
+    cli: &Cli,
+    opts: &Toggles,
+    pane: TargetSpec,
+    why: &NoTime,
+    panes: Vec<crate::panes::Pane>,
+    base: crate::tui::model::ScheduleDefaults,
+) -> (crate::tui::model::ScheduleDefaults, crate::tui::model::Ask) {
+    let defaults = crate::tui::model::ScheduleDefaults {
+        send_delay_secs: cli.delay.unwrap_or(base.send_delay_secs),
+        settle_secs: opts.settle_secs,
+        retries: opts.retries,
+        ..base
+    };
+    let verify_dropped = opts.verify && matches!(why, NoTime::NoBanner { .. });
+    let reason = if verify_dropped {
+        format!(
+            "{}; verify starts off, since it skips a pane with no banner",
+            why.headline()
+        )
+    } else {
+        why.headline()
+    };
+    let ask = crate::tui::model::Ask {
+        panes,
+        pane,
+        reason,
+        message: cli.input.first().cloned(),
+        verify: opts.verify && !verify_dropped,
+        notify: opts.notify,
+        auto_retry: opts.auto_retry,
+    };
+    (defaults, ask)
+}
+
+/// What a run left on the terminal, which is what a popup is held open for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Printed {
+    Something,
+    /// Nothing: the dashboard closed with no summary to print. For the
+    /// `--ask` form, that is a quit before Enter scheduled anything. A job
+    /// scheduled with ^S on the way showed its id on the status line instead.
+    Nothing,
+}
+
+/// Open the dashboard's form for `found`, which gave no time (`why`), so
+/// that one can be typed instead.
+///
+/// Fails with `why`, as `-a` and `-p` do without `--ask`, when the form
+/// cannot offer that pane: no pane list could be read, or the list does not
+/// have it.
+fn ask(cli: &Cli, opts: &Toggles, found: &Located, why: NoTime) -> anyhow::Result<Printed> {
+    // Not `panes::list`: its preselection would locate the pane again, and
+    // `found` already is it.
+    let Ok(panes) = crate::panes::all() else {
+        return Err(why.into());
+    };
+    let (defaults, start) = ask_form(
+        cli,
+        opts,
+        found.spec.clone(),
+        &why,
+        panes,
+        crate::tui::schedule_defaults(),
+    );
+    let Some(model) = crate::tui::model::Model::asking(defaults, jiff::Timestamp::now(), start)
+    else {
+        return Err(why.into());
+    };
+    crate::tui::run_ask(model)
+}
+
 /// Schedule a nudge.
-pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
+pub fn schedule(cli: &Cli) -> anyhow::Result<Printed> {
     let here = Here::from_env();
     // `--auto` and `-p` conflict at the parser, so `Some(p)` with `cli.auto`
     // set never reaches here and the arms cannot disagree about precedence.
@@ -436,12 +599,29 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
     let positions = located_positions(&found);
     let opts = resolve_options(cli);
     let now = ZonedDateTime::now();
-    let fire_at = fire_time(
+    let fire_at = match fire_time(
         cli,
         found.spec.connect().as_ref(),
         &label(&found.spec, &positions),
         &now,
-    )?;
+    ) {
+        Ok(t) => t,
+        // A pane with no time to read. `--ask` offers the form for it;
+        // without it, `-a` and `-p` fail as they always have.
+        Err(e) => match e.downcast::<NoTime>() {
+            Ok(why)
+                if asks(
+                    cli,
+                    std::io::IsTerminal::is_terminal(&std::io::stdin()),
+                    std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                ) =>
+            {
+                return ask(cli, &opts, &found, why);
+            }
+            Ok(why) => return Err(why.into()),
+            Err(e) => return Err(e),
+        },
+    };
     // Snapshot last, and only for --verify: this is the "before" the fire-time
     // gate compares against, so it wants to be as close to the user's actual
     // parked-at-the-banner pane as we can get it.
@@ -456,7 +636,7 @@ pub fn schedule(cli: &Cli) -> anyhow::Result<()> {
                 "{}",
                 schedule_summary(id, &spec, &positions, now.time_zone(), now.timestamp())
             );
-            Ok(())
+            Ok(Printed::Something)
         }
         Response::Error(e) => bail!("daemon rejected the job: {e}"),
         other => bail!("unexpected response: {other:?}"),
@@ -803,13 +983,14 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
 }
 
 /// Dispatch non-daemon modes.
-pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
+pub fn dispatch(cli: &Cli) -> anyhow::Result<Printed> {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let printed = |r: anyhow::Result<()>| r.map(|()| Printed::Something);
     match route(cli, is_tty) {
-        Route::Cancel(id) => cancel(id),
-        Route::Edit(id) => edit(id, cli),
-        Route::StaticList => list(),
-        Route::Dashboard => crate::tui::run(),
+        Route::Cancel(id) => printed(cancel(id)),
+        Route::Edit(id) => printed(edit(id, cli)),
+        Route::StaticList => printed(list()),
+        Route::Dashboard => printed(crate::tui::run()),
         Route::Schedule => schedule(cli),
     }
 }
@@ -819,10 +1000,12 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<()> {
 /// Only in a popup, which closes the moment its command exits and takes what
 /// nudge printed with it: herdr's does (seen 2026-11-19), and so does tmux's
 /// `display-popup -E`. Only after scheduling, whose confirmation or error is
-/// the whole answer to `nudge -a`; the dashboard shows its own. And only with
-/// a terminal on stdin to read the key from, or nothing could ever answer.
-pub fn should_hold(route: &Route, here: &Here, stdin_tty: bool) -> bool {
-    *route == Route::Schedule && here.is_popup() && stdin_tty
+/// the whole answer to `nudge -a`; the dashboard shows its own. Only when
+/// that printed something: the `--ask` form quit without scheduling leaves
+/// nothing to read. And only with a terminal on stdin to read the key from,
+/// or nothing could ever answer.
+pub fn should_hold(route: &Route, here: &Here, stdin_tty: bool, printed: Printed) -> bool {
+    *route == Route::Schedule && printed == Printed::Something && here.is_popup() && stdin_tty
 }
 
 /// Keep a popup open until a key is pressed, so that what nudge printed can
@@ -867,12 +1050,12 @@ pub fn hold_popup_open() {
 /// Interactively choose a pane.
 ///
 /// Offers tmux's panes and every running herdr session's, listed by where
-/// each sits (see [`crate::panes::list`]). None of them holds the other
+/// each sits (see [`crate::panes::all`]). None of them holds the other
 /// multiplexer's client, so the one chosen is the pane the job is for, stored
 /// as listed: a herdr pane keeps the conversation it held then, as `-p` would
 /// stamp it.
 pub fn pick_pane() -> anyhow::Result<Located> {
-    let (panes, _default_idx) = crate::panes::list()?;
+    let panes = crate::panes::all()?;
     if panes.is_empty() {
         anyhow::bail!("no tmux or herdr panes found; pass -p <pane>");
     }
@@ -919,6 +1102,241 @@ mod tests {
 
     fn cli(args: &[&str]) -> Cli {
         <Cli as clap::Parser>::try_parse_from(args).unwrap()
+    }
+
+    fn why(d: Detection) -> NoTime {
+        reset_or_why(d, "herdr:default:w1:p2").unwrap_err()
+    }
+
+    /// `--ask` must leave `-a` and `-p` as they were, so what they print for a
+    /// pane with no readable time is pinned here, word for word.
+    #[test]
+    fn no_time_prints_what_a_and_p_printed_before_ask() {
+        assert_eq!(
+            why(Detection::None).to_string(),
+            "no rate-limit banner detected in herdr:default:w1:p2; pass -m to set a time"
+        );
+        assert_eq!(
+            why(Detection::Unreadable {
+                banner: "resets Fri".into(),
+                gap: "Fri".into()
+            })
+            .to_string(),
+            "rate-limit banner found in herdr:default:w1:p2, but I can't read its reset day: \"Fri\"\n\
+             (from \"resets Fri\")\n\
+             Schedule it by hand with -m, and please file this text."
+        );
+        assert_eq!(
+            why(Detection::Elapsed {
+                banner: "try again at 3pm".into(),
+                time: "3pm".into()
+            })
+            .to_string(),
+            "the rate-limit banner in herdr:default:w1:p2 says to try again at 3pm, and that has already passed\n\
+             (from \"try again at 3pm\")\n\
+             Its reset has come and gone, so the pane no longer says when to nudge. Pass -m to set a time."
+        );
+    }
+
+    #[test]
+    fn the_headline_is_the_first_line_without_the_dash_m_hint() {
+        assert_eq!(
+            why(Detection::None).headline(),
+            "no rate-limit banner detected in herdr:default:w1:p2"
+        );
+        assert_eq!(
+            why(Detection::Unreadable {
+                banner: "b".into(),
+                gap: "Fri".into()
+            })
+            .headline(),
+            "rate-limit banner found in herdr:default:w1:p2, but I can't read its reset day: \"Fri\""
+        );
+        assert_eq!(
+            why(Detection::Elapsed {
+                banner: "b".into(),
+                time: "3pm".into()
+            })
+            .headline(),
+            "the rate-limit banner in herdr:default:w1:p2 says to try again at 3pm, and that has already passed"
+        );
+    }
+
+    #[test]
+    fn a_readable_reset_passes_through() {
+        let z: jiff::ZonedDateTime = "2026-07-16T15:00:00+00:00[UTC]".parse().unwrap();
+        assert_eq!(
+            reset_or_why(Detection::Reset(z.clone()), "p"),
+            Ok(z.timestamp())
+        );
+    }
+
+    #[test]
+    fn asks_only_with_the_flag_a_message_the_form_can_hold_and_a_terminal_both_ways() {
+        assert!(asks(&cli(&["nudge", "-a", "--ask"]), true, true));
+        assert!(asks(
+            &cli(&["nudge", "-a", "--ask", "-i", "go"]),
+            true,
+            true
+        ));
+        assert!(!asks(&cli(&["nudge", "-a"]), true, true));
+        assert!(
+            !asks(
+                &cli(&["nudge", "-a", "--ask", "-i", "a", "-i", "b"]),
+                true,
+                true
+            ),
+            "the form holds one message; it must not drop the rest"
+        );
+        for blank in ["", "  "] {
+            assert!(
+                !asks(&cli(&["nudge", "-a", "--ask", "-i", blank]), true, true),
+                "{blank:?}: -a sends a blank message as given, the form its default instead"
+            );
+        }
+        assert!(!asks(&cli(&["nudge", "-a", "--ask"]), false, true));
+        assert!(!asks(&cli(&["nudge", "-a", "--ask"]), true, false));
+    }
+
+    fn form_base() -> crate::tui::model::ScheduleDefaults {
+        crate::tui::model::ScheduleDefaults {
+            send_delay_secs: 0.4,
+            settle_secs: 5.0,
+            retries: 2,
+            tz: jiff::tz::TimeZone::UTC,
+        }
+    }
+
+    fn ask_toggles(verify: bool) -> Toggles {
+        Toggles {
+            notify: true,
+            verify,
+            auto_retry: true,
+            retries: 5,
+            settle_secs: 3.0,
+        }
+    }
+
+    fn pane_1() -> TargetSpec {
+        TargetSpec::Tmux {
+            pane: "%1".into(),
+            server: None,
+        }
+    }
+
+    #[test]
+    fn ask_form_carries_every_flag_the_form_has_room_for() {
+        let cli = cli(&[
+            "nudge", "-a", "--ask", "-i", "go", "-v", "-n", "-r", "5", "-w", "0.2",
+        ]);
+        let why = NoTime::Unreadable {
+            pane: "s:0.1 (%1)".into(),
+            banner: "resets Fri".into(),
+            gap: "Fri".into(),
+        };
+        let (d, a) = ask_form(
+            &cli,
+            &ask_toggles(true),
+            pane_1(),
+            &why,
+            vec![],
+            form_base(),
+        );
+        assert_eq!(d.retries, 5);
+        assert!(
+            (d.send_delay_secs - 0.2).abs() < f64::EPSILON,
+            "{}",
+            d.send_delay_secs
+        );
+        assert!(
+            (d.settle_secs - 3.0).abs() < f64::EPSILON,
+            "{}",
+            d.settle_secs
+        );
+        assert_eq!(a.message.as_deref(), Some("go"));
+        assert!(a.verify && a.notify && a.auto_retry);
+        assert_eq!(a.pane, pane_1());
+        assert_eq!(
+            a.reason,
+            "rate-limit banner found in s:0.1 (%1), but I can't read its reset day: \"Fri\""
+        );
+    }
+
+    /// Without `-w`, the form's own send delay rather than a copy of it. A job
+    /// with one message never waits it out, but `--edit -i a -i b` keeps the
+    /// stored delay, so it has to be the one asked for.
+    #[test]
+    fn ask_form_without_w_sends_at_the_forms_delay() {
+        let (d, _) = ask_form(
+            &cli(&["nudge", "-a", "--ask"]),
+            &ask_toggles(false),
+            pane_1(),
+            &NoTime::NoBanner {
+                pane: "s:0.1 (%1)".into(),
+            },
+            vec![],
+            form_base(),
+        );
+        assert!(
+            (d.send_delay_secs - 0.4).abs() < f64::EPSILON,
+            "{}",
+            d.send_delay_secs
+        );
+    }
+
+    /// Verify skips a job whose pane shows no banner when it comes due, so
+    /// with it ticked on a pane that shows none now, the nudge would almost
+    /// certainly never fire. The form opens with it off and says so; ticking
+    /// it back is the user's call. A banner nudge cannot read, or one whose
+    /// time has passed, is still a banner to verify, so those keep it.
+    #[test]
+    fn ask_form_opens_with_verify_off_on_a_pane_with_no_banner() {
+        let no_banner = NoTime::NoBanner {
+            pane: "s:0.1 (%1)".into(),
+        };
+        let form = |verify: bool, why: &NoTime| {
+            ask_form(
+                &cli(&["nudge", "-a", "--ask"]),
+                &ask_toggles(verify),
+                pane_1(),
+                why,
+                vec![],
+                form_base(),
+            )
+            .1
+        };
+
+        let a = form(true, &no_banner);
+        assert!(!a.verify);
+        assert_eq!(
+            a.reason,
+            "no rate-limit banner detected in s:0.1 (%1); verify starts off, since it \
+             skips a pane with no banner",
+            "'starts': the line stays put if the user ticks verify back on"
+        );
+
+        let a = form(false, &no_banner);
+        assert!(!a.verify);
+        assert_eq!(a.reason, "no rate-limit banner detected in s:0.1 (%1)");
+
+        let elapsed = NoTime::Elapsed {
+            pane: "s:0.1 (%1)".into(),
+            banner: "try again at 3pm".into(),
+            time: "3pm".into(),
+        };
+        assert!(form(true, &elapsed).verify);
+    }
+
+    /// `schedule` tells "no time" from every other failure by downcasting.
+    /// That only works if the error keeps its type inside anyhow.
+    #[test]
+    fn no_time_survives_a_trip_through_anyhow() {
+        let e: anyhow::Error = why(Detection::None).into();
+        assert_eq!(
+            e.to_string(),
+            "no rate-limit banner detected in herdr:default:w1:p2; pass -m to set a time"
+        );
+        assert!(e.downcast::<NoTime>().is_ok());
     }
 
     fn a_spec(pane: &str, messages: &[&str], fire_at: &str) -> JobSpec {
@@ -1450,22 +1868,47 @@ mod tests {
     /// with a terminal to read the key from.
     #[test]
     fn holds_only_a_popup_schedule_on_a_tty() {
-        assert!(should_hold(&Route::Schedule, &Here::TmuxPopup, true));
+        let shown = Printed::Something;
+        assert!(should_hold(&Route::Schedule, &Here::TmuxPopup, true, shown));
         assert!(should_hold(
             &Route::Schedule,
             &Here::HerdrPopup {
                 pane: "w1:p1".into(),
                 socket: None
             },
-            true
+            true,
+            shown
         ));
-        assert!(!should_hold(&Route::Schedule, &Here::TmuxPopup, false));
+        assert!(!should_hold(
+            &Route::Schedule,
+            &Here::TmuxPopup,
+            false,
+            shown
+        ));
         assert!(!should_hold(
             &Route::Schedule,
             &Here::TmuxPane { pane: "%3".into() },
-            true
+            true,
+            shown
         ));
-        assert!(!should_hold(&Route::Dashboard, &Here::TmuxPopup, true));
+        assert!(!should_hold(
+            &Route::Dashboard,
+            &Here::TmuxPopup,
+            true,
+            shown
+        ));
+    }
+
+    /// The `--ask` form quit without scheduling leaves nothing on the
+    /// terminal, so there is nothing to keep a popup open for.
+    #[test]
+    fn a_popup_whose_form_was_quit_without_scheduling_is_not_held() {
+        assert!(!should_hold(
+            &Route::Schedule,
+            &Here::TmuxPopup,
+            true,
+            Printed::Nothing
+        ));
     }
 
     #[test]
