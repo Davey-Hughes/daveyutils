@@ -147,15 +147,13 @@ pub fn capture_baseline(
 /// [`capture_baseline`] now, with the user's `NUDGE_*_PATTERN` extensions:
 /// what the CLI and the dashboard take when they schedule a `--verify` job.
 pub fn capture_baseline_now(target: &dyn Target) -> Option<Baseline> {
-    let clock_ext = std::env::var("NUDGE_CLOCK_PATTERN").ok();
-    let dur_ext = std::env::var("NUDGE_DURATION_PATTERN").ok();
-    let weekly_ext = std::env::var("NUDGE_WEEKLY_PATTERN").ok();
+    let patterns = crate::detect::Patterns::from_env();
     capture_baseline(
         target,
         &jiff::ZonedDateTime::now(),
-        clock_ext.as_deref(),
-        dur_ext.as_deref(),
-        weekly_ext.as_deref(),
+        patterns.clock(),
+        patterns.duration(),
+        patterns.weekly(),
     )
 }
 
@@ -192,49 +190,22 @@ pub fn recency(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::target::PaneDims;
+    use crate::target::fake::FakeTarget;
 
-    /// A pane that shows a screen at a size (or none it will report), and is
-    /// only ever read.
-    struct Showing(&'static str, Option<PaneDims>);
-
-    impl Target for Showing {
-        fn capture(&self) -> anyhow::Result<String> {
-            Ok(self.0.to_string())
-        }
-        fn capture_styled(&self) -> anyhow::Result<String> {
-            self.capture()
-        }
-        fn send_line(&self, _: &str) -> anyhow::Result<()> {
-            unreachable!("a snapshot only reads")
-        }
-        fn send_key(&self, _: crate::target::Key) -> anyhow::Result<()> {
-            unreachable!("a snapshot only reads")
-        }
-        fn wrong_pane(&self) -> anyhow::Result<Option<crate::target::WrongPane>> {
-            Ok(None)
-        }
-        fn settle(&self) {}
-        fn dims(&self) -> Option<PaneDims> {
-            self.1
-        }
-    }
-
-    const DIMS: PaneDims = PaneDims {
-        width: 80,
-        height: 24,
-    };
-
-    fn snapshot_of(pane: &Showing) -> Option<Baseline> {
+    fn snapshot_of(pane: &FakeTarget) -> Option<Baseline> {
         let now = jiff::civil::date(2026, 7, 13)
             .at(23, 0, 0, 0)
             .to_zoned_datetime(jiff::tz::TimeZone::UTC)
             .unwrap();
-        capture_baseline(pane, &now, None, None, None)
+        let b = capture_baseline(pane, &now, None, None, None);
+        // A snapshot only reads: scheduling must never type into the pane.
+        assert!(pane.sent.borrow().is_empty(), "a snapshot typed a line");
+        assert!(pane.keys.borrow().is_empty(), "a snapshot pressed a key");
+        b
     }
 
-    fn snapshot(screen: &'static str) -> Baseline {
-        snapshot_of(&Showing(screen, Some(DIMS))).expect("a readable pane")
+    fn snapshot(screen: &str) -> Baseline {
+        snapshot_of(&FakeTarget::new(screen)).expect("a readable pane")
     }
 
     #[test]
@@ -253,7 +224,8 @@ mod tests {
     /// never fire.
     #[test]
     fn a_pane_whose_size_cannot_be_read_still_says_whether_it_showed_a_banner() {
-        let b = snapshot_of(&Showing("● Done.\n\n❯ ", None)).expect("its text was read");
+        let b = snapshot_of(&FakeTarget::with_unknown_dims("● Done.\n\n❯ "))
+            .expect("its text was read");
         assert_eq!(b.recency, None);
         assert!(!b.banner);
     }

@@ -290,129 +290,14 @@ fn claude_insert_mode(target: &dyn Target, before: &InputBox, mode: ClaudeMode) 
 mod tests {
     use super::*;
     use crate::job::{Job, TargetSpec};
+    use crate::target::fake::{DIMS, FakeTarget};
     use jiff::{civil::date, tz::TimeZone};
-    use std::cell::RefCell;
 
     fn now() -> jiff::ZonedDateTime {
         date(2026, 7, 13)
             .at(10, 0, 0, 0)
             .to_zoned_datetime(TimeZone::fixed(jiff::tz::Offset::UTC))
             .unwrap()
-    }
-
-    /// In-memory Target: returns a scripted screen, records what was sent.
-    struct FakeTarget {
-        /// What successive `capture()` calls answer, in order; the last entry
-        /// repeats forever, so one entry is a pane that never changes.
-        screens: RefCell<Vec<String>>,
-        /// What successive `dims()` calls answer, in order; the last entry
-        /// repeats forever. A one-element script is therefore a pane whose size
-        /// is not changing, however many times it is read.
-        dims_reads: RefCell<Vec<Option<crate::target::PaneDims>>>,
-        sent: RefCell<Vec<String>>,
-        /// Each lone key pressed, with how many lines had been sent before it.
-        keys: RefCell<Vec<(usize, Key)>>,
-        /// Whether `capture()` fails, as it does for a pane tmux cannot read.
-        capture_fails: bool,
-        /// What `wrong_pane()` answers.
-        wrong_pane: Option<WrongPane>,
-    }
-    impl FakeTarget {
-        fn new(screen: &str) -> Self {
-            FakeTarget {
-                screens: RefCell::new(vec![screen.to_string()]),
-                dims_reads: RefCell::new(vec![Some(DIMS)]),
-                sent: RefCell::new(Vec::new()),
-                keys: RefCell::new(Vec::new()),
-                capture_fails: false,
-                wrong_pane: None,
-            }
-        }
-        /// A pane that shows each of `screens` in turn, one per capture.
-        fn showing(screens: &[&str]) -> Self {
-            FakeTarget {
-                screens: RefCell::new(screens.iter().map(ToString::to_string).collect()),
-                ..FakeTarget::new("")
-            }
-        }
-        /// A pane that takes keys but will not give up its screen.
-        fn unreadable() -> Self {
-            FakeTarget {
-                capture_fails: true,
-                ..FakeTarget::new("")
-            }
-        }
-        /// A pane whose size tmux will not report (it went away, or tmux
-        /// answered with the empty fields it returns for a dead pane).
-        fn with_unknown_dims(screen: &str) -> Self {
-            FakeTarget {
-                dims_reads: RefCell::new(vec![None]),
-                ..FakeTarget::new(screen)
-            }
-        }
-        /// The same pane, resized: tmux reflows the capture, so the text is
-        /// different *and* so are the dims.
-        fn resized(screen: &str, dims: crate::target::PaneDims) -> Self {
-            FakeTarget {
-                dims_reads: RefCell::new(vec![Some(dims)]),
-                ..FakeTarget::new(screen)
-            }
-        }
-        /// A pane resized *while the capture was in flight*: a read taken before
-        /// it still answers the old size, the capture comes back already
-        /// reflowed, and a read taken after sees the new size.
-        fn resized_mid_capture(
-            screen: &str,
-            before: crate::target::PaneDims,
-            after: crate::target::PaneDims,
-        ) -> Self {
-            FakeTarget {
-                dims_reads: RefCell::new(vec![Some(before), Some(after)]),
-                ..FakeTarget::new(screen)
-            }
-        }
-    }
-
-    const DIMS: crate::target::PaneDims = crate::target::PaneDims {
-        width: 80,
-        height: 24,
-    };
-    impl Target for FakeTarget {
-        fn capture(&self) -> anyhow::Result<String> {
-            if self.capture_fails {
-                anyhow::bail!("can't find pane");
-            }
-            let mut screens = self.screens.borrow_mut();
-            Ok(if screens.len() > 1 {
-                screens.remove(0)
-            } else {
-                screens[0].clone()
-            })
-        }
-        fn send_line(&self, text: &str) -> anyhow::Result<()> {
-            self.sent.borrow_mut().push(text.to_string());
-            Ok(())
-        }
-        fn capture_styled(&self) -> anyhow::Result<String> {
-            self.capture()
-        }
-        fn settle(&self) {}
-        fn send_key(&self, key: Key) -> anyhow::Result<()> {
-            let lines_before = self.sent.borrow().len();
-            self.keys.borrow_mut().push((lines_before, key));
-            Ok(())
-        }
-        fn wrong_pane(&self) -> anyhow::Result<Option<WrongPane>> {
-            Ok(self.wrong_pane)
-        }
-        fn dims(&self) -> Option<crate::target::PaneDims> {
-            let mut reads = self.dims_reads.borrow_mut();
-            if reads.len() > 1 {
-                reads.remove(0)
-            } else {
-                reads[0]
-            }
-        }
     }
 
     fn job(verify: bool, messages: &[&str]) -> Job {

@@ -194,15 +194,13 @@ pub fn fire_time(
     let screen = target
         .capture()
         .context("capturing pane to auto-detect the rate limit")?;
-    let clock_ext = std::env::var("NUDGE_CLOCK_PATTERN").ok();
-    let dur_ext = std::env::var("NUDGE_DURATION_PATTERN").ok();
-    let weekly_ext = std::env::var("NUDGE_WEEKLY_PATTERN").ok();
+    let patterns = crate::detect::Patterns::from_env();
     let detection = detect_reset(
         &screen,
         now,
-        clock_ext.as_deref(),
-        dur_ext.as_deref(),
-        weekly_ext.as_deref(),
+        patterns.clock(),
+        patterns.duration(),
+        patterns.weekly(),
     );
     Ok(reset_or_why(detection, pane)?)
 }

@@ -63,6 +63,46 @@ fn compile(base: &str, ext: &str) -> Result<Regex, regex::Error> {
     Regex::new(&format!("(?i)(?:{base}|{ext})"))
 }
 
+/// The user's extensions to the built-in banner patterns:
+/// `NUDGE_CLOCK_PATTERN`, `NUDGE_DURATION_PATTERN` and `NUDGE_WEEKLY_PATTERN`.
+/// Read in one place so that every caller of [`detect_reset`] and
+/// [`validate_patterns`] in a process reads the same three variables. The
+/// daemon reads them from its own environment when it starts, which is not
+/// necessarily the one a later `nudge` runs in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Patterns {
+    clock: Option<String>,
+    duration: Option<String>,
+    weekly: Option<String>,
+}
+
+impl Patterns {
+    /// The three variables as the environment holds them now.
+    pub fn from_env() -> Patterns {
+        let var = |name| std::env::var(name).ok();
+        Patterns {
+            clock: var("NUDGE_CLOCK_PATTERN"),
+            duration: var("NUDGE_DURATION_PATTERN"),
+            weekly: var("NUDGE_WEEKLY_PATTERN"),
+        }
+    }
+
+    /// `NUDGE_CLOCK_PATTERN`.
+    pub fn clock(&self) -> Option<&str> {
+        self.clock.as_deref()
+    }
+
+    /// `NUDGE_DURATION_PATTERN`.
+    pub fn duration(&self) -> Option<&str> {
+        self.duration.as_deref()
+    }
+
+    /// `NUDGE_WEEKLY_PATTERN`.
+    pub fn weekly(&self) -> Option<&str> {
+        self.weekly.as_deref()
+    }
+}
+
 /// Reject a `NUDGE_*_PATTERN` the CLI cannot use, naming the variable.
 ///
 /// [`build_re`] must never fail — it runs on the daemon's scheduler thread,

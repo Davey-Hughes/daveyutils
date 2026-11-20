@@ -24,18 +24,16 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
             Err(e) => Msg::ActionFailed(format!("{e:#}")),
         },
         Effect::CapturePane { target } => {
-            let clock = std::env::var("NUDGE_CLOCK_PATTERN").ok();
-            let dur = std::env::var("NUDGE_DURATION_PATTERN").ok();
-            let weekly = std::env::var("NUDGE_WEEKLY_PATTERN").ok();
+            let patterns = crate::detect::Patterns::from_env();
             match target.connect().capture_styled() {
                 Ok(raw) => {
                     let now = jiff::ZonedDateTime::now();
                     let detection = detect_reset(
                         &raw,
                         &now,
-                        clock.as_deref(),
-                        dur.as_deref(),
-                        weekly.as_deref(),
+                        patterns.clock(),
+                        patterns.duration(),
+                        patterns.weekly(),
                     );
                     // Keep the escapes — the view parses them into styled text
                     // (parsing confines them to SGR styling; no raw control

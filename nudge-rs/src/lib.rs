@@ -41,14 +41,12 @@ pub fn run(cli: &cli::Cli) -> anyhow::Result<app::Printed> {
         let p = paths::resolve();
         // Bound to locals, not passed inline: `run` borrows these for the life
         // of the call, and it does not return until the daemon is done.
-        let clock_ext = std::env::var("NUDGE_CLOCK_PATTERN").ok();
-        let dur_ext = std::env::var("NUDGE_DURATION_PATTERN").ok();
-        let weekly_ext = std::env::var("NUDGE_WEEKLY_PATTERN").ok();
+        let patterns = detect::Patterns::from_env();
         return match daemon::run(
             &p,
-            clock_ext.as_deref(),
-            dur_ext.as_deref(),
-            weekly_ext.as_deref(),
+            patterns.clock(),
+            patterns.duration(),
+            patterns.weekly(),
             jiff::ToSpan::hours(6),
         ) {
             Ok(()) => Ok(app::Printed::Something),
@@ -72,11 +70,8 @@ pub fn run(cli: &cli::Cli) -> anyhow::Result<app::Printed> {
     // tell. detect.rs can only warn-and-degrade (a panic there would kill the
     // daemon's scheduler thread), and on this path nothing is listening to a
     // warning: init_tracing() runs in daemon mode only.
-    detect::validate_patterns(
-        std::env::var("NUDGE_CLOCK_PATTERN").ok().as_deref(),
-        std::env::var("NUDGE_DURATION_PATTERN").ok().as_deref(),
-        std::env::var("NUDGE_WEEKLY_PATTERN").ok().as_deref(),
-    )?;
+    let patterns = detect::Patterns::from_env();
+    detect::validate_patterns(patterns.clock(), patterns.duration(), patterns.weekly())?;
     // scheduling / job-management dispatch is added in Tasks 3-4 & 6.
     app::dispatch(cli)
 }

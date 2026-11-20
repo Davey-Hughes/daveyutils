@@ -116,6 +116,8 @@ pub trait Target {
     fn dims(&self) -> Option<PaneDims>;
 }
 
+#[cfg(test)]
+pub(crate) mod fake;
 pub mod herdr;
 pub mod tmux;
 
