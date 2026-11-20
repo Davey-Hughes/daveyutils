@@ -39,6 +39,11 @@ fn spec(pane: &str) -> JobSpec {
     }
 }
 
+/// The progress of `spec`'s job as an edit reads it before anything fires:
+/// what every Replace here sends as `seen`, unless it means to send an older
+/// copy.
+const SEEN: &str = r#"{"fire_at":"2026-07-13T15:00:00Z","retries_left":0}"#;
+
 fn wait_for_socket(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() {
@@ -87,7 +92,7 @@ fn replace_swaps_the_job_in_one_request() {
     let new_spec = serde_json::to_string(&spec("new:0.0")).unwrap();
     let resp = round_trip(
         &socket,
-        &format!(r#"{{"op":"Replace","data":{{"id":1,"spec":{new_spec}}}}}"#),
+        &format!(r#"{{"op":"Replace","data":{{"id":1,"seen":{SEEN},"spec":{new_spec}}}}}"#),
     );
 
     assert_eq!(
@@ -122,7 +127,7 @@ fn replace_of_an_unknown_id_changes_nothing() {
     let new_spec = serde_json::to_string(&spec("new:0.0")).unwrap();
     let resp = round_trip(
         &socket,
-        &format!(r#"{{"op":"Replace","data":{{"id":99,"spec":{new_spec}}}}}"#),
+        &format!(r#"{{"op":"Replace","data":{{"id":99,"seen":{SEEN},"spec":{new_spec}}}}}"#),
     );
 
     assert_eq!(
@@ -163,7 +168,7 @@ fn replace_carries_the_verify_snapshot_to_the_daemon() {
 
     let resp = round_trip(
         &socket,
-        &format!(r#"{{"op":"Replace","data":{{"id":1,"spec":{new_spec}}}}}"#),
+        &format!(r#"{{"op":"Replace","data":{{"id":1,"seen":{SEEN},"spec":{new_spec}}}}}"#),
     );
     assert_eq!(resp, r#"{"Replaced":2}"#);
 
@@ -178,5 +183,60 @@ fn replace_carries_the_verify_snapshot_to_the_daemon() {
             }
         )),
         "an edited --verify job must reach the daemon still holding its new baseline"
+    );
+}
+
+/// The job fired while the edit was open: the daemon moved it to its retry
+/// and took a retry off. The edit, made against the job as it was, must not
+/// land, and the answer carries the job as it is now for the edit to start
+/// again from.
+#[test]
+fn replace_of_a_job_that_fired_since_is_refused_with_the_job_now() {
+    let (_dir, socket, queue) = serving_queue("old:0.0");
+    let retry_at: jiff::Timestamp = "2026-07-13T15:00:05Z".parse().unwrap();
+    let fired = {
+        let mut q = queue.lock().unwrap();
+        assert!(q.reschedule(1, retry_at, 3).unwrap());
+        q.get(1).unwrap().clone()
+    };
+
+    let new_spec = serde_json::to_string(&spec("new:0.0")).unwrap();
+    let resp = round_trip(
+        &socket,
+        &format!(r#"{{"op":"Replace","data":{{"id":1,"seen":{SEEN},"spec":{new_spec}}}}}"#),
+    );
+
+    let resp: nudge::ipc::Response =
+        serde_json::from_str(&resp).unwrap_or_else(|e| panic!("not a Response ({e}): {resp}"));
+    assert_eq!(resp, nudge::ipc::Response::Changed(fired.clone()));
+    assert_eq!(
+        queue.lock().unwrap().all(),
+        [fired],
+        "the job must stay as the fire left it"
+    );
+}
+
+/// Mid-fire the job still reads as the edit saw it, so only the daemon's
+/// record that it is firing can stop the swap.
+#[test]
+fn replace_of_a_job_being_fired_is_refused() {
+    let (_dir, socket, queue) = serving_queue("old:0.0");
+    let before = {
+        let mut q = queue.lock().unwrap();
+        assert!(q.start_firing(1).is_some());
+        q.all().to_vec()
+    };
+
+    let new_spec = serde_json::to_string(&spec("new:0.0")).unwrap();
+    let resp = round_trip(
+        &socket,
+        &format!(r#"{{"op":"Replace","data":{{"id":1,"seen":{SEEN},"spec":{new_spec}}}}}"#),
+    );
+
+    assert_eq!(resp, r#""Firing""#);
+    assert_eq!(
+        queue.lock().unwrap().all(),
+        before,
+        "the job must be untouched"
     );
 }

@@ -142,7 +142,22 @@ pub fn run_with(
         } else {
             crate::panes::positions_for(plan_now.fire.iter().map(|job| &job.target))
         };
-        for job in &plan_now.fire {
+        for planned in &plan_now.fire {
+            // Claimed under the lock just before it fires, not when planned:
+            // the jobs fire one at a time, and one cancelled or edited while
+            // it waited its turn must not be fired from the planned copy. A
+            // claimed job refuses edits until its outcome is applied below.
+            let claimed = queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .start_firing(planned.id);
+            let Some(job) = &claimed else {
+                tracing::info!(
+                    "nudge: job {} was cancelled or edited before its turn; not firing it",
+                    planned.id
+                );
+                continue;
+            };
             let pane = describe_pane(job, &positions);
             let outcome = run_injection(
                 &*job.target.connect(),

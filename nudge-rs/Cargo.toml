@@ -38,7 +38,13 @@ name = "nudge"
 # showed no banner, so the nudge never fires.
 # 0.10.1 changes only what the daemon's notification says when a failed job
 # gets no retry (why not), so it is a marker, not load-bearing.
-version = "0.10.1"
+# 0.10.2 is load-bearing for the wire format: Replace carries the progress the
+# edit read (`seen`), and may be answered Changed or Firing. A 0.10.1 daemon
+# ignores `seen` and swaps blindly, so a job that fired while its edit was
+# open comes back at its old, past time with the retry it used, and fires
+# again at once. A 0.10.1 daemon also fires a job cancelled while it waited
+# its turn in a batch.
+version = "0.10.2"
 edition = "2024"
 description = "Rate-limit auto-resumer for AI CLIs in tmux or herdr"
 license = "GPL-3.0-or-later"

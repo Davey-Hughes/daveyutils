@@ -8,7 +8,7 @@ use super::model::{
 };
 use crate::app::schedule_summary;
 use crate::detect::Detection;
-use crate::job::{Job, JobSpec, TargetSpec};
+use crate::job::{Job, JobSpec, Progress, TargetSpec};
 use crate::panes::{Pane, Positions, session_name};
 use crate::timespec::parse_timespec;
 
@@ -52,6 +52,11 @@ pub enum Msg {
         id: Option<u64>,
         no_banner: bool,
     },
+    /// The daemon refused the edit: the job fired while the form was open,
+    /// and this is the job now.
+    JobChanged(Job),
+    /// The daemon refused the edit of job `id`: it is firing right now.
+    JobFiring(u64),
     ActionFailed(String),
 }
 
@@ -70,8 +75,10 @@ pub enum Effect {
         snapshot_pane: Option<TargetSpec>,
     },
     Cancel(u64),
+    /// `seen` is the job as the form read it ([`CarriedEdit::seen`]).
     Replace {
         id: u64,
+        seen: Progress,
         spec: JobSpec,
         snapshot_pane: Option<TargetSpec>,
     },
@@ -141,6 +148,8 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             model.status.set("that job is already gone");
             vec![Effect::PollJobs]
         }
+        Msg::JobChanged(job) => edit_refused(model, Some(&job), job.id),
+        Msg::JobFiring(id) => edit_refused(model, None, id),
         Msg::Cancelled(true) => {
             model.status.set("cancelled");
             vec![Effect::PollJobs]
@@ -154,6 +163,43 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             vec![]
         }
     }
+}
+
+/// The daemon refused to save the edit of job `id`. With `changed`, the job
+/// fired while the form was open, and this is the job now. Without it, the
+/// job is firing right now.
+///
+/// The form stays open with what the user typed: only the save was refused.
+/// A changed job's fire time and retries left are taken into the form, so
+/// the next save is of the job as it is now. The form never shows the kept
+/// time, so the status line says what the job is now.
+fn edit_refused(model: &mut Model, changed: Option<&Job>, id: u64) -> Vec<Effect> {
+    model.pending_spec = None;
+    let Some(job) = changed else {
+        model.status.set(format!(
+            "job {id} is firing right now — save again in a moment"
+        ));
+        return vec![];
+    };
+    if model.form.mode == Mode::Editing(id)
+        && let Some(carried) = &mut model.form.carried
+    {
+        carried.catch_up(job);
+    }
+    let due = job
+        .fire_at
+        .to_zoned_datetime(model.defaults.tz.clone())
+        .strftime("%H:%M:%S");
+    let left = match job.retries_left {
+        ..0 => "no retry limit".to_string(),
+        0 => "no retries left".to_string(),
+        1 => "1 retry left".to_string(),
+        n => format!("{n} retries left"),
+    };
+    model.status.set(format!(
+        "job {id} fired while you were editing; it is now due at {due} with {left} — save again"
+    ));
+    vec![Effect::PollJobs]
 }
 
 /// Fill the form's pane list, and select a pane in it.
@@ -391,6 +437,7 @@ fn enter_edit(model: &mut Model, job: &Job) {
             retries_left: job.retries_left,
             retry_asked: false,
             target: job.target.clone(),
+            fired: false,
         }),
         preview: None,
         last_capture: None,
@@ -1109,7 +1156,7 @@ fn submit(model: &mut Model, after: AfterSubmit) -> Vec<Effect> {
     };
 
     let spec = build_spec(model, &pane, fire_at);
-    let snapshot_pane = model.form.verify.then(|| spec.target.clone());
+    let snapshot_pane = model.form.takes_snapshot().then(|| spec.target.clone());
     // Stash the spec for the reply's summary — the form is reset by then.
     model.pending_spec = Some(spec.clone());
     match model.form.mode {
@@ -1121,9 +1168,18 @@ fn submit(model: &mut Model, after: AfterSubmit) -> Vec<Effect> {
             }]
         }
         Mode::Editing(id) => {
+            // `enter_edit` always carries the job over, so this is never hit.
+            let Some(seen) = model.form.carried.as_ref().map(CarriedEdit::seen) else {
+                model.pending_spec = None;
+                model
+                    .status
+                    .set("this edit lost the job it edits — reopen it");
+                return vec![];
+            };
             model.after_submit = AfterSubmit::Jobs;
             vec![Effect::Replace {
                 id,
+                seen,
                 spec,
                 snapshot_pane,
             }]
@@ -2786,6 +2842,213 @@ mod tests {
         );
         assert!(!m.should_quit);
         assert_eq!(m.tab, Tab::Jobs);
+    }
+
+    /// A job with auto-retry and one message, so its message can be edited,
+    /// open in the edit form with a new message typed.
+    fn editing_a_retrying_job() -> (Model, Job) {
+        let mut m = with_jobs(0);
+        let mut j = multi_msg_job();
+        j.messages = vec!["one".into()];
+        m.jobs = vec![j.clone()];
+        m.form.panes = vec![Pane {
+            target: "s:0.7".into(),
+            title: String::new(),
+            spec: tmux_spec("%7"),
+        }];
+        edit(&mut m);
+        m.form.message = MessageField::Editable("typed in the form".into());
+        (m, j)
+    }
+
+    /// The daemon swaps the job only if it is still as the form read it.
+    #[test]
+    fn saving_an_edit_sends_the_job_as_the_form_read_it() {
+        let (mut m, j) = editing_a_retrying_job();
+        m.form.focus = FormField::Submit;
+        match update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter)).as_slice() {
+            [Effect::Replace { seen, .. }] => assert_eq!(*seen, j.progress()),
+            other => panic!("expected Replace, got {other:?}"),
+        }
+    }
+
+    /// The job fired while the form was open, so the daemon refused the
+    /// save. The form stays as the user left it, and takes the job's new time
+    /// and retries, so the next save is of the job as it is now.
+    #[test]
+    fn an_edit_refused_because_the_job_fired_stays_open_and_catches_up() {
+        let (mut m, j) = editing_a_retrying_job();
+        saved_edit(&mut m);
+        let mut fired = j.clone();
+        fired.fire_at = "2026-07-16T13:06:45Z".parse().unwrap();
+        fired.retries_left = 2;
+
+        let fx = update(&mut m, Msg::JobChanged(fired.clone()));
+
+        assert_eq!(fx, vec![Effect::PollJobs]);
+        assert_eq!(m.tab, Tab::NewNudge, "the form stays open");
+        assert_eq!(m.form.mode, Mode::Editing(7));
+        assert_eq!(
+            m.form.message,
+            MessageField::Editable("typed in the form".into()),
+            "what the user typed stays"
+        );
+        assert_eq!(m.pending_spec, None, "no save is in flight");
+        assert_eq!(
+            m.status.0.as_deref(),
+            Some(
+                "job 7 fired while you were editing; it is now due at 13:06:45 \
+                 with 2 retries left — save again"
+            )
+        );
+
+        let again = saved_edit(&mut m);
+        assert_eq!(again.fire_at, fired.fire_at, "Keep is the job's time now");
+        assert_eq!(again.retries_left, 2, "the retries the job has now");
+        m.form.focus = FormField::Submit;
+        match update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter)).as_slice() {
+            [Effect::Replace { seen, .. }] => assert_eq!(*seen, fired.progress()),
+            other => panic!("expected Replace, got {other:?}"),
+        }
+    }
+
+    /// A `--verify` job in pane `%7`, open in the edit form with `%7` and `%8`
+    /// listed, its first save refused because the job fired, and the form
+    /// caught up with it.
+    fn caught_up_with_a_fire() -> Model {
+        let mut m = with_jobs(0);
+        let mut j = multi_msg_job();
+        j.target = tmux_spec("%7");
+        j.verify = true;
+        m.jobs = vec![j.clone()];
+        m.form.panes = ["%7", "%8"]
+            .into_iter()
+            .map(|id| Pane {
+                target: id.into(),
+                title: String::new(),
+                spec: tmux_spec(id),
+            })
+            .collect();
+        edit(&mut m);
+        assert_eq!(m.form.pane_idx, 0, "precondition: the job's own pane");
+        m.form.focus = FormField::Submit;
+        match update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter)).as_slice() {
+            [Effect::Replace { snapshot_pane, .. }] => assert_eq!(
+                *snapshot_pane,
+                Some(tmux_spec("%7")),
+                "precondition: an edit snapshots the pane"
+            ),
+            other => panic!("expected Replace, got {other:?}"),
+        }
+        let mut fired = j;
+        fired.fire_at = "2026-07-16T13:06:45Z".parse().unwrap();
+        fired.retries_left = 2;
+        update(&mut m, Msg::JobChanged(fired));
+        m
+    }
+
+    /// The job just typed into its pane, and the reply is likely still
+    /// arriving. A fingerprint of it would read that reply as the user
+    /// resuming and skip the retry, which is why the fire dropped the job's
+    /// own (`Queue::reschedule`). The save after catching up takes none.
+    #[test]
+    fn a_save_after_catching_up_with_a_fire_takes_no_snapshot_of_its_pane() {
+        let mut m = caught_up_with_a_fire();
+        m.form.focus = FormField::Submit;
+        match update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter)).as_slice() {
+            [
+                Effect::Replace {
+                    snapshot_pane,
+                    spec,
+                    ..
+                },
+            ] => {
+                assert!(spec.verify);
+                assert_eq!(*snapshot_pane, None);
+            }
+            other => panic!("expected Replace, got {other:?}"),
+        }
+    }
+
+    /// A pane the fire never typed into is fingerprinted as usual.
+    #[test]
+    fn a_save_after_catching_up_snapshots_a_pane_it_moves_the_job_to() {
+        let mut m = caught_up_with_a_fire();
+        m.form.pane_idx = 1;
+        m.form.focus = FormField::Submit;
+        match update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter)).as_slice() {
+            [Effect::Replace { snapshot_pane, .. }] => {
+                assert_eq!(*snapshot_pane, Some(tmux_spec("%8")));
+            }
+            other => panic!("expected Replace, got {other:?}"),
+        }
+    }
+
+    /// With no snapshot to take, the save cannot find the pane bannerless, so
+    /// the form must not promise one try because the preview shows no banner.
+    #[test]
+    fn after_catching_up_the_form_does_not_predict_one_try_from_the_preview() {
+        let mut m = caught_up_with_a_fire();
+        m.form.preview = Some("$ ".into());
+        m.form.detected = Some(Detection::None);
+        assert!(!m.form.one_try());
+        m.form.pane_idx = 1;
+        assert!(m.form.one_try(), "another pane still gets its snapshot");
+    }
+
+    /// While the picker is open, the preview shows the pane it highlights, so
+    /// the snapshot question is asked of that pane too: `one_try` combines
+    /// the two, and must not mix one pane's preview with another's answer.
+    #[test]
+    fn after_catching_up_the_snapshot_follows_the_picker_highlight() {
+        let mut m = caught_up_with_a_fire();
+        m.form.focus = FormField::Pane;
+        update(&mut m, Msg::Key(crossterm::event::KeyCode::Char('/')));
+        let picker = m.form.picker.as_ref().expect("the picker opens");
+        let row_of = |id: &str| {
+            picker
+                .matches
+                .iter()
+                .position(|&i| m.form.panes[i].spec == tmux_spec(id))
+                .unwrap()
+        };
+        let (fired_row, other_row) = (row_of("%7"), row_of("%8"));
+        // The preview of whichever pane is highlighted shows no banner.
+        m.form.preview = Some("$ ".into());
+        m.form.detected = Some(Detection::None);
+
+        m.form.picker.as_mut().unwrap().highlight = other_row;
+        assert!(m.form.takes_snapshot(), "%8 was never fired into");
+        assert!(m.form.one_try(), "%8's snapshot would find no banner");
+        m.form.picker.as_mut().unwrap().highlight = fired_row;
+        assert!(
+            !m.form.takes_snapshot(),
+            "%7 is the pane the job fired into"
+        );
+        assert!(
+            !m.form.one_try(),
+            "%7 gets no snapshot to find it bannerless"
+        );
+    }
+
+    /// Mid-fire there is nothing new to catch up to yet: the form stays as
+    /// it is, and the status line says to save again in a moment.
+    #[test]
+    fn an_edit_refused_because_the_job_is_firing_stays_open() {
+        let (mut m, _) = editing_a_retrying_job();
+        saved_edit(&mut m);
+        let form = m.form.clone();
+
+        let fx = update(&mut m, Msg::JobFiring(7));
+
+        assert_eq!(fx, [] as [Effect; 0]);
+        assert_eq!(m.tab, Tab::NewNudge);
+        assert_eq!(m.form, form, "the form is left as it was");
+        assert_eq!(m.pending_spec, None);
+        assert_eq!(
+            m.status.0.as_deref(),
+            Some("job 7 is firing right now — save again in a moment")
+        );
     }
 
     #[test]

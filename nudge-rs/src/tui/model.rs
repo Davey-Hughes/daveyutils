@@ -189,6 +189,30 @@ pub struct CarriedEdit {
     pub retry_asked: bool,
     /// The job's target as it was, so a pane left alone keeps its stamp.
     pub target: crate::job::TargetSpec,
+    /// Set once the job fired while this edit was open and the form caught
+    /// up with it ([`CarriedEdit::catch_up`]). A save then takes no `--verify`
+    /// snapshot of the pane it fired into ([`Form::takes_snapshot`]).
+    pub fired: bool,
+}
+
+impl CarriedEdit {
+    /// The job's progress as this edit read it, which the daemon checks
+    /// before it lets the edit replace the job.
+    pub fn seen(&self) -> crate::job::Progress {
+        crate::job::Progress {
+            fire_at: self.fire_at,
+            retries_left: self.retries_left,
+        }
+    }
+
+    /// Start this edit again from `job` as it is now, after it fired while
+    /// the form was open: its fire time and its retries left are the two
+    /// things a fire changes.
+    pub fn catch_up(&mut self, job: &crate::job::Job) {
+        self.fire_at = job.fire_at;
+        self.retries_left = job.retries_left;
+        self.fired = true;
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -303,7 +327,29 @@ impl Form {
     /// counted: its snapshot would most likely fail too, and a job without
     /// one keeps its retries.
     pub fn one_try(&self) -> bool {
-        self.verify && self.preview.is_some() && self.detected == Some(Detection::None)
+        self.takes_snapshot() && self.preview.is_some() && self.detected == Some(Detection::None)
+    }
+
+    /// Whether saving this form takes a `--verify` snapshot of its pane:
+    /// verify is on, unless the job fired while the edit was open and the
+    /// pane is the one it fired into.
+    ///
+    /// The reply to that fire is likely still arriving there. A fingerprint
+    /// of it would read the reply as the user resuming, and the retry would
+    /// be skipped. `Queue::reschedule` drops the job's own fingerprint after a
+    /// fire for that reason, and `nudge --edit` takes none in the same case.
+    ///
+    /// The pane is [`Form::active_pane`], the one the preview shows, so
+    /// [`Form::one_try`] asks both questions of the same pane. It is the
+    /// selected pane whenever the form can be saved.
+    pub fn takes_snapshot(&self) -> bool {
+        let fired_into_it = self.carried.as_ref().is_some_and(|c| {
+            c.fired
+                && self
+                    .active_pane()
+                    .is_some_and(|p| c.target.same_pane(&p.spec))
+        });
+        self.verify && !fired_into_it
     }
 
     /// The pane the preview/detection should track: the picker's highlighted

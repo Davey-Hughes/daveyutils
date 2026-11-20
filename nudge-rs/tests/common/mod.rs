@@ -169,7 +169,14 @@ impl TmuxServer {
              own server; drop the TmuxServer before its tempdir",
             self.tmpdir.display()
         );
+        // HISTFILE reaches the panes through the command that starts the
+        // server. A pane's `sh` writes what was typed into it to `$HOME` as it
+        // exits: the developer's own home, unless the test moved HOME into
+        // its tempdir. There the write can land while the tempdir is being
+        // removed, which then fails and leaves it behind. An empty HISTFILE
+        // keeps none, as `herdr_env` does for herdr.
         cmd.env("TMUX_TMPDIR", &self.tmpdir)
+            .env("HISTFILE", "")
             .env_remove("TMUX")
             .env_remove("TMUX_PANE");
     }

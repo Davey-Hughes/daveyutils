@@ -143,6 +143,29 @@ impl Job {
     pub fn one_try(&self) -> bool {
         one_try(self.verify, self.verify_no_banner)
     }
+
+    /// Where this job has got to: see [`Progress`].
+    pub fn progress(&self) -> Progress {
+        Progress {
+            fire_at: self.fire_at,
+            retries_left: self.retries_left,
+        }
+    }
+}
+
+/// The two fields of a job the daemon changes on its own: after a fire with a
+/// retry to come, it moves `fire_at` to the retry and takes one off
+/// `retries_left`, and the job keeps its id.
+///
+/// An edit sends the progress it read along with its replacement, so the
+/// daemon can refuse an edit made against an older copy of the job. Without
+/// that check, a job that fired while its edit form was open came back with
+/// its old fire time, which had already passed, and the retry it had just
+/// used. It fired again at once.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Progress {
+    pub fire_at: jiff::Timestamp,
+    pub retries_left: i64,
 }
 
 /// The rule behind [`Job::one_try`], kept in one place for `JobSpec` too.

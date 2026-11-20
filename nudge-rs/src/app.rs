@@ -149,6 +149,26 @@ fn snapshot_pane(target: &TargetSpec, opts: &Toggles) -> Option<crate::verify::B
     })
 }
 
+/// [`snapshot_pane`], except of the pane a job has just fired into
+/// (`fired_into`), which gets none.
+///
+/// The reply to the fire is likely still arriving there. A fingerprint of it
+/// would read that reply as the user resuming, and the retry would be skipped.
+/// `Queue::reschedule` drops the job's own fingerprint after a fire for that
+/// reason, so an edit applied to the job as the fire left it must not take a
+/// new one. A different pane was not typed into, and is fingerprinted as
+/// usual.
+fn snapshot_unless_fired_into(
+    fired_into: Option<&TargetSpec>,
+    target: &TargetSpec,
+    opts: &Toggles,
+) -> Option<crate::verify::Baseline> {
+    if fired_into.is_some_and(|f| f.same_pane(target)) {
+        return None;
+    }
+    snapshot_pane(target, opts)
+}
+
 /// The `--verify`-only guard around taking a capture: `take` runs only when the
 /// flag is on.
 ///
@@ -917,13 +937,18 @@ pub fn merge_edit(
 /// Ctrl-C — fired the message twice, at the old time and the new, while the
 /// error read as though the edit hadn't happened at all. A single round-trip
 /// cannot half-apply: either the swap is committed or nothing is.
+///
+/// If the job fires between the `List` and the `Replace`, the daemon refuses
+/// the swap and sends the job as it is now. The flags only say what to
+/// change, so they are applied to that job and sent once more. A job still
+/// firing, or firing again before that second try lands, is an error.
 pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
     let socket = live_socket()?;
     let jobs = match request(&socket, &Request::List)? {
         Response::Jobs(j) => j,
         other => bail!("unexpected response: {other:?}"),
     };
-    let job = jobs
+    let mut job = jobs
         .into_iter()
         .find(|j| j.id == id)
         .ok_or_else(|| anyhow::anyhow!("no pending job with id {id}"))?;
@@ -936,43 +961,63 @@ pub fn edit(id: u64, cli: &Cli) -> anyhow::Result<()> {
         None => None,
     };
     let now = ZonedDateTime::now();
-    let spec = merge_edit(
-        &job,
-        cli,
-        target,
-        &now,
-        crate::cli::default_retries(),
-        &snapshot_pane,
-    )?;
+    let mut reapplied = false;
+    loop {
+        let fired_into = reapplied.then(|| job.target.clone());
+        let spec = merge_edit(
+            &job,
+            cli,
+            target.clone(),
+            &now,
+            crate::cli::default_retries(),
+            &|t, opts| snapshot_unless_fired_into(fired_into.as_ref(), t, opts),
+        )?;
 
-    // Cloned for the same reason `schedule` clones: the request consumes the
-    // spec, and the confirmation describes it once the daemon has replied.
-    match request(
-        &socket,
-        &Request::Replace {
-            id,
-            spec: spec.clone(),
-        },
-    )? {
-        Response::Replaced(Some(new_id)) => {
-            println!(
-                "{}",
-                edit_summary(
-                    id,
-                    new_id,
-                    &spec,
-                    &crate::panes::positions_for([&spec.target]),
-                    now.time_zone(),
-                    now.timestamp()
-                )
-            );
-            Ok(())
+        // Cloned for the same reason `schedule` clones: the request consumes the
+        // spec, and the confirmation describes it once the daemon has replied.
+        match request(
+            &socket,
+            &Request::Replace {
+                id,
+                seen: job.progress(),
+                spec: spec.clone(),
+            },
+        )? {
+            Response::Replaced(Some(new_id)) => {
+                if reapplied {
+                    println!(
+                        "nudge: job {id} fired while it was being edited; the edit went to what is left of it"
+                    );
+                }
+                println!(
+                    "{}",
+                    edit_summary(
+                        id,
+                        new_id,
+                        &spec,
+                        &crate::panes::positions_for([&spec.target]),
+                        now.time_zone(),
+                        now.timestamp()
+                    )
+                );
+                return Ok(());
+            }
+            // It fired for the last time or was cancelled between the List
+            // above and now. Nothing was scheduled in its place.
+            Response::Replaced(None) => bail!("no pending job with id {id}"),
+            Response::Changed(current) if !reapplied => {
+                job = current;
+                reapplied = true;
+            }
+            Response::Changed(_) => {
+                bail!("job {id} keeps firing while it is being edited; it is unchanged, try again")
+            }
+            Response::Firing => {
+                bail!("job {id} is firing right now; it is unchanged, try again in a few seconds")
+            }
+            Response::Error(e) => bail!("failed to edit job {id}: {e}; it is unchanged"),
+            other => bail!("failed to edit job {id}: {other:?}; it is unchanged"),
         }
-        // It fired or was cancelled between the List above and now. Nothing was
-        // scheduled in its place.
-        Response::Replaced(None) => bail!("no pending job with id {id}"),
-        Response::Error(e) => bail!("failed to edit job {id}: {e}; it is unchanged"),
-        other => bail!("failed to edit job {id}: {other:?}; it is unchanged"),
     }
 }
 

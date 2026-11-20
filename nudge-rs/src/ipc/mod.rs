@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::job::{Job, JobSpec};
-use crate::queue::Queue;
+use crate::job::{Job, JobSpec, Progress};
+use crate::queue::{Queue, ReplaceOutcome};
 
 /// Read/write timeout for one IPC exchange, applied on both ends.
 ///
@@ -39,8 +39,13 @@ pub enum Request {
     /// Doing it as Schedule-then-Cancel left both jobs live in between, so a
     /// failure of the second leg fired the message twice. A round-trip cannot
     /// half-apply, so there is no window to lose.
+    ///
+    /// `seen` is the job's progress as the edit read it. The daemon swaps the
+    /// job only if it still reads that way and is not being fired (see
+    /// [`Queue::replace`]).
     Replace {
         id: u64,
+        seen: Progress,
         spec: JobSpec,
     },
     Ping,
@@ -53,6 +58,11 @@ pub enum Response {
     Cancelled(bool),
     /// The replacement's id, or `None` if the original was already gone.
     Replaced(Option<u64>),
+    /// A Replace refused because the job has fired since the edit read it.
+    /// This is the job now, for the edit to start again from.
+    Changed(Job),
+    /// A Replace refused because the daemon is firing the job right now.
+    Firing,
     /// The answering daemon's version, which is the point of the exchange.
     ///
     /// A Ping used to ask only "is anything there?", and an old daemon answers
@@ -104,8 +114,11 @@ pub fn handle_request(req: Request, queue: &mut Queue) -> Response {
             Ok(removed) => Response::Cancelled(removed),
             Err(e) => Response::Error(e.to_string()),
         },
-        Request::Replace { id, spec } => match queue.replace(id, spec) {
-            Ok(new_id) => Response::Replaced(new_id),
+        Request::Replace { id, seen, spec } => match queue.replace(id, seen, spec) {
+            Ok(ReplaceOutcome::Swapped(new_id)) => Response::Replaced(Some(new_id)),
+            Ok(ReplaceOutcome::Gone) => Response::Replaced(None),
+            Ok(ReplaceOutcome::Changed(job)) => Response::Changed(job),
+            Ok(ReplaceOutcome::Firing) => Response::Firing,
             Err(e) => Response::Error(e.to_string()),
         },
     }

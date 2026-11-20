@@ -217,6 +217,25 @@ after you change its time or message. To give it the default count again,
 untick and tick Auto-retry in the edit form, or run
 `nudge --edit <id> --auto-retry` (`-r <n>` for a count of your own).
 
+If the job fires while its edit form is open, saving is refused and the form
+stays as you left it. When the job has a retry to come, the status line gives
+its new time and the retries it has left, and the form now edits that, so save
+again to apply your changes. When that fire was its last, the status line says
+the job is already gone, and nothing is scheduled in its place.
+
+If you save while the job is being fired, nothing is saved and the status line
+says so. Save again once the fire is over, and you get one of the two answers
+above.
+
+`nudge --edit` handles a fire that happened since it read the job by itself:
+it applies your flags to the job as the fire left it. If the job is being
+fired at that moment, it exits with an error and the job is unchanged; run it
+again a few seconds later.
+
+An edit applied after a fire takes no `--verify` snapshot of the pane the job
+fired into, since the reply to the nudge is likely still arriving there. Its
+retries check for the banner only, as every retry does.
+
 `q` quits from anywhere it isn't a character you are typing: the message field, a
 manual time, and the pane picker's query keep it as text, and in the picker's
 Normal mode it closes the picker rather than the dashboard. Everywhere else it

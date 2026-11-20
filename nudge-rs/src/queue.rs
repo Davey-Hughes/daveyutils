@@ -1,11 +1,27 @@
 //! Load and atomically persist the job list as JSON.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::job::{Job, JobSpec};
+use crate::job::{Job, JobSpec, Progress};
+
+/// What [`Queue::replace`] did.
+#[derive(Debug, PartialEq)]
+pub enum ReplaceOutcome {
+    /// The job is swapped for its replacement, which has this id.
+    Swapped(u64),
+    /// No job has that id: it fired for the last time, or was cancelled or
+    /// dropped, since the edit read it.
+    Gone,
+    /// The job has fired since the edit read it, and this is the job now.
+    /// Nothing was swapped.
+    Changed(Job),
+    /// The daemon is firing the job right now. Nothing was swapped.
+    Firing,
+}
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct State {
@@ -16,6 +32,11 @@ struct State {
 pub struct Queue {
     path: PathBuf,
     state: State,
+    /// The jobs the daemon has taken to fire and not yet settled. A fire runs
+    /// without the queue lock, and a job reads as it was until its outcome is
+    /// applied, so only this tells an edit that the job is about to change.
+    /// Not persisted: a daemon that stops mid-fire leaves no fire running.
+    firing: HashSet<u64>,
     /// Saves attempted since `load`, counted only to drive [`Queue::fail_nth_save`].
     #[cfg(test)]
     saves: std::cell::Cell<u64>,
@@ -36,6 +57,7 @@ impl Queue {
         Ok(Queue {
             path,
             state,
+            firing: HashSet::new(),
             #[cfg(test)]
             saves: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -98,29 +120,68 @@ impl Queue {
         Ok(true)
     }
 
-    /// Swap job `id` for `spec` in one transaction, returning the replacement's
-    /// id — or `None` if `id` was not there, in which case nothing changes.
+    /// Swap job `id` for `spec` in one transaction, if the job is still as the
+    /// edit read it: `seen` is its [`Progress`] then. Anything else changes
+    /// nothing, and the outcome says why.
     ///
     /// One commit, so an edit can never publish a state where both the original
     /// and its replacement are live. Doing it as a separate `add` + `remove`
     /// (which is what the CLI used to do over two round-trips) leaves exactly
     /// that state in between, and anything that stops the second step — a daemon
     /// restart, a stolen socket, a Ctrl-C — makes the message fire twice.
-    pub fn replace(&mut self, id: u64, spec: JobSpec) -> std::io::Result<Option<u64>> {
-        let mut next = self.state.clone();
-        let before = next.jobs.len();
-        next.jobs.retain(|j| j.id != id);
-        if next.jobs.len() == before {
+    ///
+    /// The `seen` check exists because an edit carries over the time and the
+    /// retries it read. Swapped in after the job fired, it would restore a fire
+    /// time that has passed and the retry just used, and fire again at once.
+    pub fn replace(
+        &mut self,
+        id: u64,
+        seen: Progress,
+        spec: JobSpec,
+    ) -> std::io::Result<ReplaceOutcome> {
+        let Some(job) = self.get(id) else {
             // The original is gone (fired or cancelled since the caller listed
             // it). Scheduling the replacement now would resurrect a job the user
             // no longer has: all-or-nothing means nothing.
-            return Ok(None);
+            return Ok(ReplaceOutcome::Gone);
+        };
+        // Firing first: mid-fire the job still reads as `seen` does, and
+        // will not once the fire settles.
+        if self.is_firing(id) {
+            return Ok(ReplaceOutcome::Firing);
         }
+        if job.progress() != seen {
+            return Ok(ReplaceOutcome::Changed(job.clone()));
+        }
+        let mut next = self.state.clone();
+        next.jobs.retain(|j| j.id != id);
         next.next_id += 1;
         let new_id = next.next_id;
         next.jobs.push(spec.into_job(new_id));
         self.commit(next)?;
-        Ok(Some(new_id))
+        Ok(ReplaceOutcome::Swapped(new_id))
+    }
+
+    /// Take job `id` to fire: mark it as being fired, until
+    /// [`Queue::stop_firing`], and return it as it is now. While it is
+    /// marked, [`Queue::replace`] refuses to swap it.
+    ///
+    /// `None` if it is no longer queued: cancelled, or swapped for an edit,
+    /// since the daemon planned to fire it. Then there is nothing to fire.
+    pub fn start_firing(&mut self, id: u64) -> Option<Job> {
+        let job = self.get(id)?.clone();
+        self.firing.insert(id);
+        Some(job)
+    }
+
+    /// The fire of job `id` is over, and its outcome applied or about to be.
+    pub fn stop_firing(&mut self, id: u64) {
+        self.firing.remove(&id);
+    }
+
+    /// Whether job `id` is marked as being fired.
+    pub fn is_firing(&self, id: u64) -> bool {
+        self.firing.contains(&id)
     }
 
     /// Update a job's fire time and remaining retries, dropping any `--verify`
@@ -373,10 +434,11 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         let mut q = Queue::load(sub.join("q.json")).unwrap();
         let id = q.add(spec()).unwrap();
+        let seen = q.get(id).unwrap().progress();
         block_saving(&sub);
 
         assert!(
-            q.replace(id, spec()).is_err(),
+            q.replace(id, seen, spec()).is_err(),
             "save must fail for this test to mean anything"
         );
         // Note the modest claim: this covers the case where the FIRST save
@@ -410,9 +472,10 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut q = Queue::load(dir.path().join("q.json")).unwrap();
             let id = q.add(spec()).unwrap(); // save #1
+            let seen = q.get(id).unwrap().progress();
             q.fail_nth_save(fail_at);
 
-            let outcome = q.replace(id, spec());
+            let outcome = q.replace(id, seen, spec());
 
             assert_eq!(
                 q.all().len(),
@@ -424,13 +487,15 @@ mod tests {
             );
             match outcome {
                 // The swap committed: only the replacement is live.
-                Ok(Some(new_id)) => assert_eq!(
+                Ok(ReplaceOutcome::Swapped(new_id)) => assert_eq!(
                     q.all()[0].id,
                     new_id,
                     "fail_at={fail_at}: a replace that reported success must leave \
                      its replacement, not the original"
                 ),
-                Ok(None) => panic!("fail_at={fail_at}: the original was there to replace"),
+                Ok(other) => {
+                    panic!("fail_at={fail_at}: the original was there to replace, got {other:?}")
+                }
                 // It did not: only the original is, untouched.
                 Err(_) => assert_eq!(
                     q.all()[0].id,
@@ -439,6 +504,117 @@ mod tests {
                      leave the original"
                 ),
             }
+        }
+    }
+
+    /// A job that retries twice, as `-a -r 2` schedules one.
+    fn retrying() -> JobSpec {
+        JobSpec {
+            auto_retry: true,
+            retries_left: 2,
+            ..spec()
+        }
+    }
+
+    /// The job fires while its edit form is open: the daemon moves it to the
+    /// retry and takes a retry off, and it keeps its id. The edit, saved
+    /// after, was made against the job as it was before the fire.
+    #[test]
+    fn an_edit_of_a_job_that_fired_since_it_was_read_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = Queue::load(dir.path().join("q.json")).unwrap();
+        let id = q.add(retrying()).unwrap();
+        let seen = q.get(id).unwrap().progress();
+        let retry_at = "2026-07-13T15:00:05Z".parse().unwrap();
+        assert!(q.reschedule(id, retry_at, 1).unwrap());
+        let fired = q.get(id).unwrap().clone();
+
+        // The edit keeps the time and the retries as the form read them.
+        let outcome = q.replace(id, seen, retrying()).unwrap();
+
+        assert_eq!(
+            outcome,
+            ReplaceOutcome::Changed(fired.clone()),
+            "an edit of an older copy must be refused, with the job as it is now"
+        );
+        assert_eq!(
+            q.all(),
+            [fired],
+            "the job must stay as the fire left it. Swapped, it would be due \
+             at once, at its old time, with the retry it just used back"
+        );
+    }
+
+    /// The daemon fires without the queue lock, so an edit can arrive
+    /// mid-fire, while the job still reads as it was. Swapped then, the fire's
+    /// outcome finds no job to settle, and the replacement, at the old time,
+    /// fires again at once.
+    #[test]
+    fn an_edit_of_a_job_the_daemon_is_firing_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = Queue::load(dir.path().join("q.json")).unwrap();
+        let id = q.add(retrying()).unwrap();
+        let job = q.get(id).unwrap().clone();
+        assert!(q.start_firing(id).is_some());
+
+        assert_eq!(
+            q.replace(id, job.progress(), retrying()).unwrap(),
+            ReplaceOutcome::Firing
+        );
+        assert_eq!(
+            q.all(),
+            std::slice::from_ref(&job),
+            "the job must be untouched"
+        );
+
+        q.stop_firing(id);
+        assert_eq!(
+            q.replace(id, job.progress(), retrying()).unwrap(),
+            ReplaceOutcome::Swapped(2),
+            "once the fire is settled, an edit of the job as it is goes through"
+        );
+    }
+
+    /// A job cancelled mid-fire is gone, not firing: there is nothing left to
+    /// edit, and the fire in progress settles nothing.
+    #[test]
+    fn a_job_cancelled_while_it_fires_is_gone_to_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = Queue::load(dir.path().join("q.json")).unwrap();
+        let id = q.add(retrying()).unwrap();
+        let seen = q.get(id).unwrap().progress();
+        assert!(q.start_firing(id).is_some());
+        assert!(q.remove(id).unwrap());
+
+        assert_eq!(
+            q.replace(id, seen, retrying()).unwrap(),
+            ReplaceOutcome::Gone
+        );
+        assert_eq!(q.all(), [], "nothing must come back");
+    }
+
+    /// The daemon plans a batch, then claims each job just before it fires
+    /// it. One cancelled or swapped for an edit in between is not claimed,
+    /// so the daemon does not fire its own stale copy of it.
+    #[test]
+    fn only_a_job_still_queued_can_be_taken_to_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = Queue::load(dir.path().join("q.json")).unwrap();
+        let kept = q.add(spec()).unwrap();
+        let cancelled = q.add(spec()).unwrap();
+        let edited = q.add(spec()).unwrap();
+        assert!(q.remove(cancelled).unwrap());
+        let seen = q.get(edited).unwrap().progress();
+        assert!(matches!(
+            q.replace(edited, seen, spec()).unwrap(),
+            ReplaceOutcome::Swapped(_)
+        ));
+
+        assert_eq!(q.start_firing(kept).as_ref(), q.get(kept));
+        assert!(q.is_firing(kept));
+        for gone in [cancelled, edited] {
+            assert_eq!(q.start_firing(gone), None, "job {gone}");
+            assert!(!q.is_firing(gone), "job {gone}");
         }
     }
 

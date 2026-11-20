@@ -39,13 +39,16 @@ pub fn plan(jobs: &[Job], now: &ZonedDateTime, grace: &Span) -> Plan {
     Plan { fire, drop_stale }
 }
 
-/// Apply the result of firing `job`: reschedule for a retry, or remove.
+/// Apply the result of firing `job`: reschedule for a retry, or remove. The
+/// fire is over either way, persisted or not, so the job stops being marked
+/// as firing first.
 pub fn apply_outcome(
     queue: &mut Queue,
     job: &Job,
     outcome: &anyhow::Result<InjectOutcome>,
     retry_at: jiff::Timestamp,
 ) -> std::io::Result<()> {
+    queue.stop_firing(job.id);
     match outcome {
         // A send that landed with retries still budgeted, and a send that
         // *failed* while the user asked to retry, both reschedule -- only the
@@ -176,11 +179,9 @@ mod tests {
         assert_eq!(w2, MAX_POLL);
     }
 
-    fn q_with(job: &Job) -> (tempfile::TempDir, Queue) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut q = Queue::load(dir.path().join("q.json")).unwrap();
-        // add via JobSpec then overwrite fields to match `job`
-        q.add(JobSpec {
+    /// The spec `job` was built from, to add it to a queue.
+    fn spec_of(job: &Job) -> JobSpec {
+        JobSpec {
             target: job.target.clone(),
             messages: job.messages.clone(),
             send_delay_secs: job.send_delay_secs,
@@ -193,9 +194,36 @@ mod tests {
             verify_fingerprint: job.verify_fingerprint.clone(),
             verify_dims: job.verify_dims,
             verify_no_banner: job.verify_no_banner,
-        })
-        .unwrap();
+        }
+    }
+
+    fn q_with(job: &Job) -> (tempfile::TempDir, Queue) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = Queue::load(dir.path().join("q.json")).unwrap();
+        q.add(spec_of(job)).unwrap();
         (dir, q)
+    }
+
+    /// The fire is over once its outcome is applied, whatever the outcome:
+    /// left marked, the job could never be edited again.
+    #[test]
+    fn applying_any_outcome_ends_the_fire() {
+        let cases: [(bool, i64, anyhow::Result<InjectOutcome>); 4] = [
+            (true, 2, Ok(InjectOutcome::Sent(1))),         // rescheduled
+            (false, 0, Ok(InjectOutcome::Sent(1))),        // removed
+            (true, 2, inject_err()),                       // rescheduled after a failure
+            (true, 2, Ok(InjectOutcome::SkippedNoBanner)), // removed
+        ];
+        for (auto_retry, retries, outcome) in cases {
+            let j = job(1, "2026-07-13T11:59:00Z", auto_retry, retries);
+            let (_d, mut q) = q_with(&j);
+            let cur = q.start_firing(1).unwrap();
+            let retry_at: jiff::Timestamp = "2026-07-13T12:05:00Z".parse().unwrap();
+
+            apply_outcome(&mut q, &cur, &outcome, retry_at).unwrap();
+
+            assert!(!q.is_firing(1), "{outcome:?} left the job marked as firing");
+        }
     }
 
     #[test]

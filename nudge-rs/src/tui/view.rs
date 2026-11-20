@@ -1262,6 +1262,7 @@ mod tests {
                 pane: "%1".into(),
                 server: None,
             },
+            fired: false,
         });
         // Whole at 50 columns: form rows do not wrap, so a longer hint would
         // lose its instruction off the edge. One press only unticks the box,

@@ -80,10 +80,18 @@ fn job_on(target: TargetSpec) -> nudge::job::Job {
 /// It reads the op out of the raw JSON and answers Replace with a raw line, so
 /// this test compiles — and fails, recording Schedule and Cancel — against a
 /// CLI that has never heard of an atomic replace.
-fn recording_daemon(socket: &Path, listed: nudge::job::Job) -> Arc<Mutex<Vec<String>>> {
+///
+/// Each Replace is answered with the next of `replace_replies`, a raw line.
+/// Once they run out, every Replace is answered as swapped, as job 6.
+fn recording_daemon(
+    socket: &Path,
+    listed: nudge::job::Job,
+    replace_replies: Vec<String>,
+) -> Arc<Mutex<Vec<String>>> {
     let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let listener = UnixListener::bind(socket).unwrap();
     let recorded = Arc::clone(&lines);
+    let mut replace_replies = std::collections::VecDeque::from(replace_replies);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let mut line = String::new();
@@ -106,8 +114,11 @@ fn recording_daemon(socket: &Path, listed: nudge::job::Job) -> Arc<Mutex<Vec<Str
                 })
                 .unwrap(),
                 "List" => serde_json::to_string(&Response::Jobs(vec![listed.clone()])).unwrap(),
-                // The daemon's answer to an atomic replace: the new job's id.
-                "Replace" => r#"{"Replaced":6}"#.to_string(),
+                // The daemon's answer to an atomic replace: the new job's id,
+                // unless the test scripted a refusal first.
+                "Replace" => replace_replies
+                    .pop_front()
+                    .unwrap_or_else(|| r#"{"Replaced":6}"#.to_string()),
                 // Schedule/Cancel land here: an edit that reaches them has
                 // already opened the double-fire window this test exists to
                 // close.
@@ -140,6 +151,12 @@ struct Fixture {
 }
 
 fn fixture(listed: nudge::job::Job) -> Fixture {
+    fixture_answering(listed, Vec::new())
+}
+
+/// [`fixture`], with the stand-in answering each Replace with the next of
+/// `replace_replies` until they run out.
+fn fixture_answering(listed: nudge::job::Job, replace_replies: Vec<String>) -> Fixture {
     // common::short_tempdir, not tempfile::tempdir: this test binds a real
     // socket under a HOME rooted at the tempdir, and macOS's $TMPDIR is long
     // enough that resolve_from's "Library/Application Support/nudge" suffix
@@ -158,7 +175,7 @@ fn fixture(listed: nudge::job::Job) -> Fixture {
     // being spawned; this is what stops that being the only thing.
     let lock = nudge::daemon::acquire_singleton_lock(&paths.state_dir).unwrap();
 
-    let lines = recording_daemon(&paths.socket, listed);
+    let lines = recording_daemon(&paths.socket, listed, replace_replies);
     Fixture {
         home,
         lines,
@@ -265,5 +282,187 @@ fn editing_a_herdr_job_keeps_its_pane_and_stamp() {
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("herdr:default:w7:pX"),
         "{report}"
+    );
+}
+
+/// Job 1 with two retries left, as `-a -r 2` schedules it.
+fn retrying_job() -> nudge::job::Job {
+    let mut job = job();
+    job.auto_retry = true;
+    job.retries_left = 2;
+    job
+}
+
+/// Every Replace request the stand-in was sent, in order, as `(seen, spec)`.
+fn replaces(lines: &[String]) -> Vec<(nudge::job::Progress, JobSpec)> {
+    lines
+        .iter()
+        .filter_map(|l| match serde_json::from_str(l) {
+            Ok(Request::Replace { seen, spec, .. }) => Some((seen, spec)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The job fired between the CLI's List and its Replace: the daemon moved it
+/// to its retry and took a retry off, and refused the swap. The flags only
+/// say what to change, so the CLI applies them to the job as it is now and
+/// sends that, which keeps the new time and the retries now left.
+#[test]
+fn an_edit_of_a_job_that_fired_meanwhile_goes_to_the_job_as_it_is_now() {
+    let listed = retrying_job();
+    let mut fired = listed.clone();
+    fired.fire_at = "2026-07-13T15:00:05Z".parse().unwrap();
+    fired.retries_left = 1;
+    let refusal = serde_json::to_string(&Response::Changed(fired.clone())).unwrap();
+    let f = fixture_answering(listed.clone(), vec![refusal]);
+
+    let out = run_nudge(&f.home, &["--edit", "1", "-i", "a new message"]);
+    let report = report(&out);
+
+    assert!(out.status.success(), "{report}");
+    let sent = replaces(&f.lines.lock().unwrap());
+    assert_eq!(sent.len(), 2, "one refused Replace, one more\n{report}");
+    assert_eq!(sent[0].0, listed.progress(), "{report}");
+    let (seen, spec) = &sent[1];
+    assert_eq!(*seen, fired.progress(), "{report}");
+    assert_eq!(
+        spec.fire_at, fired.fire_at,
+        "the time the job has now\n{report}"
+    );
+    assert_eq!(spec.retries_left, 1, "the retries it has now\n{report}");
+    assert_eq!(spec.messages, vec!["a new message".to_string()], "{report}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("job 1 fired while it was being edited"),
+        "{report}"
+    );
+    assert!(stdout.contains("edited job 1 -> 6"), "{report}");
+}
+
+/// Applied once more, the edit is refused again: the job fired a second
+/// time. That is no edit to chase, so the CLI stops, and says the job is
+/// unchanged.
+#[test]
+fn an_edit_refused_twice_leaves_the_job_unchanged() {
+    let listed = retrying_job();
+    let mut fired = listed.clone();
+    fired.fire_at = "2026-07-13T15:00:05Z".parse().unwrap();
+    fired.retries_left = 1;
+    let refusal = serde_json::to_string(&Response::Changed(fired)).unwrap();
+    let f = fixture_answering(listed, vec![refusal.clone(), refusal]);
+
+    let out = run_nudge(&f.home, &["--edit", "1", "-i", "a new message"]);
+    let report = report(&out);
+
+    assert!(!out.status.success(), "{report}");
+    assert_eq!(replaces(&f.lines.lock().unwrap()).len(), 2, "{report}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("job 1 keeps firing"), "{report}");
+    assert!(stderr.contains("it is unchanged"), "{report}");
+}
+
+/// The daemon is firing the job right now. What the job will be after is not
+/// known yet, so there is nothing to apply the edit to: the CLI says to try
+/// again.
+#[test]
+fn an_edit_of_a_job_being_fired_says_to_try_again() {
+    let f = fixture_answering(retrying_job(), vec![r#""Firing""#.to_string()]);
+
+    let out = run_nudge(&f.home, &["--edit", "1", "-i", "a new message"]);
+    let report = report(&out);
+
+    assert!(!out.status.success(), "{report}");
+    assert_eq!(replaces(&f.lines.lock().unwrap()).len(), 1, "{report}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("job 1 is firing right now; it is unchanged, try again in a few seconds"),
+        "{report}"
+    );
+}
+
+/// `nudge --edit 1 -i "a new message" <extra>` on a `--verify` job in pane
+/// `bot:0` of a private tmux server, where the stand-in daemon refuses the
+/// first Replace because the job has fired. Returns every Replace sent, as
+/// `(seen, spec)`, and the run's report.
+///
+/// The server stands in the fixture's `TMUX_TMPDIR`, so the CLI can take real
+/// snapshots. It has a second window, `bot:1`, for an edit to move the job to.
+fn edit_after_a_fire(extra: &[&str]) -> (Vec<(nudge::job::Progress, JobSpec)>, String) {
+    let tmp = common::short_tempdir();
+    let tmux = common::TmuxServer::start(&tmp.path().join("tmux"), "bot");
+    tmux.run(&["new-window", "-d", "-t", "bot:1", "sh"]);
+    let pane = tmux.run(&["display-message", "-p", "-t", "bot:0", "#{pane_id}"]);
+    let mut listed = retrying_job();
+    listed.target = TargetSpec::Tmux { pane, server: None };
+    listed.verify = true;
+    let mut fired = listed.clone();
+    fired.fire_at = "2026-07-13T15:00:05Z".parse().unwrap();
+    fired.retries_left = 1;
+    let refusal = serde_json::to_string(&Response::Changed(fired)).unwrap();
+    let f = fixture_answering(listed, vec![refusal]);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nudge"));
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("HERDR_")) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.args(["--edit", "1", "-i", "a new message"])
+        .args(extra)
+        .env("HOME", &f.home)
+        .env("XDG_CONFIG_HOME", f.home.join("config"))
+        .env("XDG_STATE_HOME", f.home.join("state"))
+        .env("XDG_RUNTIME_DIR", f.home.join("run"));
+    tmux.env(&mut cmd);
+    let out = cmd.output().expect("failed to run the nudge binary");
+    let report = report(&out);
+    assert!(out.status.success(), "{report}");
+    let sent = replaces(&f.lines.lock().unwrap());
+    assert_eq!(sent.len(), 2, "{report}");
+    (sent, report)
+}
+
+/// The job just typed into its pane, and the reply to it is likely still
+/// arriving. A `--verify` fingerprint of that pane would read the reply as the
+/// user resuming, and skip the retry; the fire dropped the job's own
+/// fingerprint for that reason (`Queue::reschedule`). So the edit applied to
+/// the job as the fire left it takes none of that pane either.
+#[test]
+fn an_edit_applied_after_a_fire_takes_no_snapshot_of_the_pane_it_fired_into() {
+    if !common::tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let (sent, report) = edit_after_a_fire(&[]);
+
+    assert!(
+        sent[0].1.verify_fingerprint.is_some(),
+        "precondition: the first edit, before the fire was known, snapshots \
+         the pane\n{report}"
+    );
+    let again = &sent[1].1;
+    assert!(again.verify, "{report}");
+    assert_eq!(
+        (again.verify_fingerprint.as_deref(), again.verify_dims),
+        (None, None),
+        "no snapshot of the pane the job just fired into\n{report}"
+    );
+    assert!(!again.verify_no_banner, "{report}");
+}
+
+/// The edit moves the job to a pane the fire never typed into, so that pane
+/// is fingerprinted as any edit's would be.
+#[test]
+fn an_edit_applied_after_a_fire_snapshots_a_pane_it_moves_the_job_to() {
+    if !common::tmux_available() {
+        eprintln!("skipping: tmux not installed");
+        return;
+    }
+    let (sent, report) = edit_after_a_fire(&["-p", "bot:1"]);
+
+    assert!(
+        sent[1].1.verify_fingerprint.is_some(),
+        "the new pane gets its snapshot\n{report}"
     );
 }
