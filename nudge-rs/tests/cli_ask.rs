@@ -75,24 +75,28 @@ fn nudge(home: &Path, server: &TmuxServer) -> Command {
 /// the server's `kill-server` must run while its `TMUX_TMPDIR`, inside the
 /// tempdir, still exists. Once the directory is gone, tmux falls back to the
 /// default socket directory, and `kill-server` there is the developer's own
-/// tmux. So `server` comes first and `_tmp` last.
+/// tmux. So `server` comes first and `_tmp` last. The watchdog is still
+/// there while the server is stopped, in case the run is interrupted then.
 struct Fixture {
     server: TmuxServer,
     home: PathBuf,
     paths: Paths,
     agent: String,
+    watchdog: common::Watchdog,
     _tmp: tempfile::TempDir,
 }
 
 fn fixture() -> Fixture {
     let tmp = common::short_tempdir();
+    // First, so that a run that is interrupted leaves none of what follows.
+    let watchdog = common::Watchdog::over(tmp.path());
     let home = tmp.path().to_path_buf();
     let paths = child_paths(&home);
     common::assert_socket_path_fits(&paths.socket);
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     std::fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
     std::fs::create_dir_all(home.join("config")).unwrap();
-    let server = TmuxServer::start(&home.join("tmux"), "s");
+    let server = watchdog.start_tmux(&home.join("tmux"), "s");
     let agent = server.run(&[
         "new-window",
         "-d",
@@ -108,6 +112,7 @@ fn fixture() -> Fixture {
         home,
         paths,
         agent,
+        watchdog,
         _tmp: tmp,
     }
 }
@@ -118,7 +123,7 @@ impl Fixture {
     /// In a process group of its own, so that the guard can kill a `tmux`
     /// the daemon has in flight along with it (see `common::DaemonGuard`).
     /// That also puts it out of reach of a Ctrl-C at the terminal, which
-    /// goes to the test's group: an interrupted run leaves it running.
+    /// goes to the test's group, so the fixture's watchdog is told about it.
     fn daemon(&self) -> common::DaemonGuard {
         let log = std::fs::File::create(self.home.join("daemon.log")).unwrap();
         let child = nudge(&self.home, &self.server)
@@ -129,7 +134,7 @@ impl Fixture {
             .process_group(0)
             .spawn()
             .expect("spawn the daemon");
-        let guard = common::DaemonGuard::new(child);
+        let guard = self.watchdog.guard(child);
         wait_until(
             || {
                 matches!(

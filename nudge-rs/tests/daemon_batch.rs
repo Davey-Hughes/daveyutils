@@ -5,7 +5,8 @@
 //! Hermetic in the way `cli_daemon_log.rs` is, because this test runs a real
 //! daemon that types into tmux panes:
 //! - The daemon is the real `nudge --daemon`, started by production
-//!   `spawn_daemon` and killed on drop, so nothing outlives the test.
+//!   `spawn_daemon` and killed on drop, so nothing outlives the test. A
+//!   `common::Watchdog` does the same for a run that is interrupted.
 //! - HOME/XDG_* point at a tempdir, so the queue and socket are ours.
 //! - `TMUX_TMPDIR` points at a private tmux server, and `TMUX`/`TMUX_PANE`
 //!   are removed, so neither the daemon nor this test can reach the
@@ -117,6 +118,8 @@ fn jobs_waiting_their_turn_can_be_cancelled_or_edited() {
     // common::short_tempdir, for the socket path's length on macOS (see
     // cli_daemon_log.rs).
     let tmp = common::short_tempdir();
+    // First, so that a run that is interrupted leaves none of what follows.
+    let watchdog = common::Watchdog::over(tmp.path());
     let home = tmp.path().to_path_buf();
     let tmux_tmpdir = home.join("tmux");
     std::fs::create_dir_all(&tmux_tmpdir).unwrap();
@@ -134,7 +137,7 @@ fn jobs_waiting_their_turn_can_be_cancelled_or_edited() {
         common::keep_this_process_off_the_developers_panes(&home);
     }
 
-    let tmux = common::TmuxServer::start(&tmux_tmpdir, "slow");
+    let tmux = watchdog.start_tmux(&tmux_tmpdir, "slow");
     for session in ["cancelled", "edited"] {
         tmux.run(&[
             "new-session",
@@ -179,7 +182,7 @@ fn jobs_waiting_their_turn_can_be_cancelled_or_edited() {
     assert_eq!((slow_id, cancel_id, edit_id), (1, 2, 3));
     drop(queue);
 
-    let daemon = common::DaemonGuard::new(
+    let daemon = watchdog.guard(
         nudge::app::spawn_daemon(Path::new(env!("CARGO_BIN_EXE_nudge")), &paths)
             .expect("spawn the daemon"),
     );

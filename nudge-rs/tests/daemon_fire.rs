@@ -9,9 +9,10 @@
 //!   which nothing can stop: a test that failed midway took its tmux server
 //!   and tempdir away from under a daemon still firing, and tmux then falls
 //!   back to the developer's own server (see `common::TmuxServer::env`).
-//!   The price is the one `daemon_batch.rs` pays: a run that is interrupted
-//!   rather than failed drops nothing, and leaves the daemon running beside
-//!   its private tmux server, where the thread died with the test.
+//!   A run that is interrupted rather than failed drops nothing, and the
+//!   daemon is out of a Ctrl-C's reach where the thread died with the test,
+//!   so a `common::Watchdog` stops the daemon, the server and the tempdir
+//!   then.
 //! - HOME/XDG_* point at a tempdir, so the queue and socket are ours.
 //! - `TMUX_TMPDIR` points at a private tmux server, and `TMUX`/`TMUX_PANE`
 //!   are removed, so neither the daemon nor this test can reach the
@@ -54,11 +55,13 @@ fn daemon_fires_a_due_job_into_the_pane() {
     // common::short_tempdir, for the socket path's length on macOS (see
     // cli_daemon_log.rs).
     //
-    // What follows is declared in the order tempdir, tmux server, daemon, and
-    // so dropped in the reverse: the daemon is killed before the server it
-    // types into is stopped, and the server is stopped before its directory
-    // goes.
+    // What follows is declared in the order tempdir, watchdog, tmux server,
+    // daemon, and so dropped in the reverse: the daemon is killed before the
+    // server it types into is stopped, and the server is stopped before its
+    // directory goes.
     let tmp = common::short_tempdir();
+    // First, so that a run that is interrupted leaves none of what follows.
+    let watchdog = common::Watchdog::over(tmp.path());
     let home = tmp.path().to_path_buf();
     let tmux_tmpdir = home.join("tmux");
     std::fs::create_dir_all(&tmux_tmpdir).unwrap();
@@ -76,7 +79,7 @@ fn daemon_fires_a_due_job_into_the_pane() {
         common::keep_this_process_off_the_developers_panes(&home);
     }
 
-    let tmux = common::TmuxServer::start(&tmux_tmpdir, SESSION);
+    let tmux = watchdog.start_tmux(&tmux_tmpdir, SESSION);
     // The server this test and its daemon reach is the one in the tempdir.
     // tmux resolves the directory before naming its socket, and macOS's /tmp
     // is a link, hence `canonicalize`.
@@ -137,7 +140,7 @@ fn daemon_fires_a_due_job_into_the_pane() {
         .unwrap();
     drop(queue); // done writing; the daemon will `Queue::load` its own handle
 
-    let mut daemon = common::DaemonGuard::new(
+    let mut daemon = watchdog.guard(
         nudge::app::spawn_daemon(Path::new(env!("CARGO_BIN_EXE_nudge")), &paths)
             .expect("spawn the daemon"),
     );

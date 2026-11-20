@@ -194,6 +194,10 @@ pub struct DaemonGuard {
     stopped: bool,
     /// How the daemon ended, once stopped.
     ended: Option<std::process::ExitStatus>,
+    /// The pipe of the [`Watchdog`] that kills this daemon's group if the
+    /// test process ends first, for a guard from [`Watchdog::guard`]. Not a
+    /// hold on it: the watchdog goes off when the test's one end closes.
+    watchdog: std::sync::Weak<std::io::PipeWriter>,
 }
 
 impl DaemonGuard {
@@ -202,6 +206,7 @@ impl DaemonGuard {
             daemon,
             stopped: false,
             ended: None,
+            watchdog: std::sync::Weak::new(),
         }
     }
 
@@ -255,23 +260,35 @@ impl DaemonGuard {
         // Collected by something other than this guard: its pid may already
         // be another process's (see the type's doc), so nothing is killed
         // and nobody knows how it ended.
-        if self.look() == Seen::NotOurs {
+        let ours = self.look() != Seen::NotOurs;
+        let pid = self.pid();
+        if ours {
+            // 0 and -1 name the caller's own group and every process there
+            // is. No child has pid 0 or 1, but nothing here should rest on
+            // that.
+            if pid > 1 {
+                // SAFETY: `kill` takes ids and no pointers. A group numbered
+                // after the daemon's pid can only be one the daemon leads
+                // (see the type's doc). A daemon that leads none, having
+                // been started in the test's own group, has no such group,
+                // and this fails with ESRCH and touches nothing.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            let _ = self.daemon.kill();
+        }
+        // Between the kill and the collecting. Any sooner, and a test that
+        // ended right here would leave a daemon its watchdog had been told
+        // to spare, with its tmux server and tempdir gone from under it. Any
+        // later, and the watchdog could kill a group that is no longer the
+        // daemon's.
+        if let Some(pipe) = self.watchdog.upgrade() {
+            tell(&pipe, &format!("reaped {pid}"));
+        }
+        if !ours {
             return None;
         }
-        let pid = self.pid();
-        // 0 and -1 name the caller's own group and every process there is.
-        // No child has pid 0 or 1, but nothing here should rest on that.
-        if pid > 1 {
-            // SAFETY: `kill` takes ids and no pointers. A group numbered
-            // after the daemon's pid can only be one the daemon leads (see
-            // the type's doc). A daemon that leads none, having been started
-            // in the test's own group, has no such group, and this fails
-            // with ESRCH and touches nothing.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-        }
-        let _ = self.daemon.kill();
         self.ended = self.daemon.wait().ok();
         self.ended
     }
@@ -290,6 +307,282 @@ enum Seen {
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// What a [`Watchdog`] runs. Its input is the pipe the test holds the other
+/// end of, and `$1` is the fixture's tempdir. It reads what the fixture tells
+/// it until the pipe closes, which is the test process ending, and then
+/// stops what it was told about: the daemons first, then the tmux servers
+/// they type into, then the directory all of it lives in.
+///
+/// - `group N`: kill process group N.
+/// - `reaped N`: do not, after all, for one `group N` told before. N's daemon
+///   is about to be collected, and the number may then pass to another
+///   process. A `group N` that comes later is that other process, and counts
+///   again. So group N is killed while some `group N` is left that no
+///   `reaped N` after it has taken back; a `reaped N` that finds none is
+///   ignored. Which of the same number a `reaped` takes cannot matter. Not all
+///   of them, because a guard whose daemon was collected behind its back
+///   tells `reaped` late: by then a newer daemon may hold N too, and its own
+///   `group N` must stay.
+/// - `tmux PATH`: stop the tmux server on the socket at PATH. `-S` names the
+///   socket outright, so with it gone tmux fails rather than fall back to the
+///   developer's own server. Asked again for two seconds while no server
+///   answers: one that was still starting when the test died is already out
+///   of reach, and has not made its socket yet (seen 2026-11-20, in three of
+///   twelve runs killed within 80ms of starting). A server slower than that
+///   is left running. A server the test had already stopped costs the two
+///   seconds too.
+///
+/// The directory is removed again for as long as it is still there, since a
+/// process on its way out can still be writing into it.
+///
+/// Plain `sh`, because that is what a CI container has: `kill -s` and `--`
+/// before a negative number are the one spelling both bash and dash take.
+const WATCHDOG_SCRIPT: &str = r#"
+dir=$1
+shift
+groups=
+while IFS=' ' read -r kind what; do
+  case $kind in
+    group) groups="$groups $what" ;;
+    reaped)
+      kept=
+      found=
+      for group in $groups; do
+        if [ -z "$found" ] && [ "$group" = "$what" ]; then
+          found=1
+        else
+          kept="$kept $group"
+        fi
+      done
+      groups=$kept
+      ;;
+    tmux) set -- "$@" "$what" ;;
+  esac
+done
+for group in $groups; do
+  [ "$group" -gt 1 ] || continue
+  kill -s KILL -- "-$group"
+done
+for socket in "$@"; do
+  for try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    tmux -S "$socket" kill-server && break
+    sleep 0.1
+  done
+done
+for try in 1 2 3 4 5 6 7 8 9 10; do
+  rm -rf -- "${dir:?}"
+  [ -e "$dir" ] || break
+  sleep 0.2
+done
+"#;
+
+/// Cleans up after a test process that ended without dropping its fixture.
+///
+/// A daemon these tests start is out of the terminal's reach, in a session
+/// or a process group of its own: that is what lets [`DaemonGuard`] kill
+/// everything the daemon started. So a Ctrl-C, which goes to the test's
+/// group, kills the test and not the daemon, and no `Drop` runs in a killed
+/// process. Each interrupted run used to leave a `nudge --daemon`, a private
+/// tmux server with its panes, and a tempdir, until the next reboot.
+///
+/// The watchdog is a `sh` in a session of its own, so a Ctrl-C does not
+/// reach it either. It waits on a pipe that only the test process holds the
+/// writing end of. However the test ends, the kernel closes that end, and
+/// the watchdog then stops what the fixture told it about (see
+/// [`WATCHDOG_SCRIPT`]). A test that ends in the ordinary way kills its
+/// watchdog as it is dropped, before the pipe closes, and the fixture's own
+/// cleanup is all that runs.
+///
+/// Start it first, straight after the tempdir, and tell it about each thing
+/// as it is started. What the test starts afterwards does not get the pipe:
+/// Rust opens it close-on-exec. (macOS sets that in a second step, so there
+/// a command started from another thread in between would be handed the
+/// pipe, and this watchdog would wait for that command to end as well.)
+///
+/// A pid is only safely a daemon's until the daemon is collected (see
+/// [`DaemonGuard`]). A guard made by [`Watchdog::guard`] therefore tells the
+/// watchdog to forget its daemon before it collects it.
+///
+/// Two cases are left, and accepted. A daemon that has exited, on its own or
+/// by its guard's kill just before the guard could tell `reaped`, and that
+/// the test had not yet collected, is collected by init when the test
+/// process dies, a moment before the watchdog kills the group of its number.
+/// If that group was empty, a process started in that moment could have been
+/// handed the number. That takes the system to run through every pid it has
+/// within the milliseconds of one interrupted test.
+///
+/// And a daemon collected by something other than its guard leaves its
+/// number with the watchdog until the guard is stopped. The number can be
+/// another process's by then, and if the test dies first, the watchdog kills
+/// whatever group has it. Nothing in these suites does that: the guard
+/// alone holds the daemon's `Child`, and of the daemons a watchdog knows,
+/// only one in a test of the watchdog itself is collected behind its guard's
+/// back, on purpose.
+pub struct Watchdog {
+    sh: std::process::Child,
+    /// The test's end of the pipe, and the only thing that keeps it open:
+    /// a guard holds a `Weak` of it. Only ever `None` once
+    /// [`Watchdog::fire`] has closed it.
+    pipe: Option<std::sync::Arc<std::io::PipeWriter>>,
+}
+
+impl Watchdog {
+    /// Start a watchdog that will remove `dir`, a tempdir from
+    /// [`short_tempdir`], with everything in it.
+    pub fn over(dir: &Path) -> Self {
+        use std::os::unix::process::CommandExt as _;
+
+        assert!(
+            is_a_fixtures_tempdir(dir),
+            "{} is not a fixture's tempdir, and the watchdog would remove it",
+            dir.display()
+        );
+        let (ours, pipe) = std::io::pipe().expect("open a pipe");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(WATCHDOG_SCRIPT)
+            .arg("nudge-test-watchdog")
+            .arg(dir)
+            .stdin(ours)
+            // Not the test's own: whatever reads the test's output would
+            // wait for the watchdog too.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE");
+        // SAFETY: the closure runs in the child between fork and exec, where
+        // only async-signal-safe calls are allowed. `setsid` is one, and
+        // reading errno allocates nothing.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let sh = cmd.spawn().expect("start the watchdog");
+        Watchdog {
+            sh,
+            pipe: Some(std::sync::Arc::new(pipe)),
+        }
+    }
+
+    /// Write `line` to the watchdog.
+    fn tell(&self, line: &str) {
+        if let Some(pipe) = &self.pipe {
+            tell(pipe, line);
+        }
+    }
+
+    /// The watchdog's process id.
+    pub fn pid(&self) -> libc::pid_t {
+        libc::pid_t::try_from(self.sh.id()).expect("a process id is a pid_t")
+    }
+
+    /// [`TmuxServer::start`], for a server this watchdog stops before the
+    /// directory goes. It is told where the server will listen before the
+    /// server is started: tmux puts its server out of the terminal's reach
+    /// at once, and a run interrupted while it starts would otherwise leave
+    /// a server that nothing knows of.
+    pub fn start_tmux(&self, tmpdir: &Path, session: &str) -> TmuxServer {
+        let socket = tmux_socket(tmpdir);
+        let socket = socket.to_str().expect("a socket path that is text");
+        assert!(!socket.contains('\n'), "a socket path on one line");
+        self.tell(&format!("tmux {socket}"));
+        TmuxServer::start(tmpdir, session)
+    }
+
+    /// Kill process group `pid` too. For a daemon, use [`Watchdog::guard`],
+    /// which also has the group forgotten in time.
+    pub fn watch_group(&self, pid: libc::pid_t) {
+        // 0 and -1 name the caller's own group and every process there is.
+        assert!(pid > 1, "{pid} is no process group to kill");
+        self.tell(&format!("group {pid}"));
+    }
+
+    /// Leave process group `pid` alone after all: its number is about to
+    /// stop being the daemon's.
+    pub fn forget_group(&self, pid: libc::pid_t) {
+        self.tell(&format!("reaped {pid}"));
+    }
+
+    /// A [`DaemonGuard`] for `daemon` whose group this watchdog kills if the
+    /// test process ends before the guard has stopped it.
+    pub fn guard(&self, daemon: std::process::Child) -> DaemonGuard {
+        let mut guard = DaemonGuard::new(daemon);
+        self.watch_group(guard.pid());
+        if let Some(pipe) = &self.pipe {
+            guard.watchdog = std::sync::Arc::downgrade(pipe);
+        }
+        guard
+    }
+
+    /// Do what the test process ending does: close its end of the pipe, and
+    /// wait for the watchdog to finish. For the watchdog's own tests.
+    ///
+    /// Panics if the watchdog does not finish, which is what it does while
+    /// anything else holds the pipe open: a command that was handed it.
+    pub fn fire(mut self) {
+        drop(self.pipe.take());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if self
+                .sh
+                .try_wait()
+                .expect("ask after the watchdog")
+                .is_some()
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watchdog never finished: something else holds its pipe open, \
+                 or what it runs is stuck"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+/// Write `line` to a watchdog's pipe, whole. A watchdog that has stopped
+/// reading is not an error.
+fn tell(mut pipe: &std::io::PipeWriter, line: &str) {
+    use std::io::Write as _;
+
+    let _ = pipe.write_all(format!("{line}\n").as_bytes());
+}
+
+/// Whether `dir` is one [`short_tempdir`] could have made: `/tmp/nudge-`
+/// and something more, and nothing below it.
+pub fn is_a_fixtures_tempdir(dir: &Path) -> bool {
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    dir.parent() == Some(Path::new("/tmp"))
+        && name.len() > "nudge-".len()
+        && name.starts_with("nudge-")
+}
+
+/// Where a tmux server started under `tmpdir` as its `TMUX_TMPDIR` listens:
+/// tmux's default socket there.
+fn tmux_socket(tmpdir: &Path) -> PathBuf {
+    // SAFETY: `getuid` takes nothing and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    tmpdir.join(format!("tmux-{uid}")).join("default")
+}
+
+impl Drop for Watchdog {
+    /// Kill the watchdog before the pipe closes, which is what would set it
+    /// off. The pipe is a field, and fields go after this returns.
+    ///
+    /// Through `Child`, which knows whether the watchdog has been collected
+    /// and then sends nothing: after [`Watchdog::fire`] it has been, and its
+    /// pid may be another process's. A `libc::kill` here would not know.
+    fn drop(&mut self) {
+        let _ = self.sh.kill();
+        let _ = self.sh.wait();
     }
 }
 

@@ -19,7 +19,8 @@
 //!   the developer's server, and `TMUX` — which names the socket of the session
 //!   running this test, and which tmux prefers — is removed.
 //! - The daemon is spawned by production `spawn_daemon` and killed on drop, so
-//!   nothing outlives the test.
+//!   nothing outlives the test. A `common::Watchdog` does the same for a run
+//!   that is interrupted.
 //!
 //! Single test in this file on purpose: it sets process-wide env, which the
 //! daemon inherits and which no sibling test may race.
@@ -33,8 +34,6 @@ use std::time::{Duration, Instant};
 use nudge::job::{JobSpec, TargetSpec};
 use nudge::paths::{Os, Paths, resolve_from};
 use nudge::queue::Queue;
-
-use common::TmuxServer as Server;
 
 fn tmux_available() -> bool {
     Command::new("tmux")
@@ -65,6 +64,8 @@ fn a_verify_skip_lands_in_the_daemon_log() {
     // logged. Sibling tests in other files escape it only by not setting HOME
     // or by not deriving a socket path from resolve_from at all.
     let tmp = common::short_tempdir();
+    // First, so that a run that is interrupted leaves none of what follows.
+    let watchdog = common::Watchdog::over(tmp.path());
     let home = tmp.path().to_path_buf();
     let tmux_tmpdir = home.join("tmux");
     std::fs::create_dir_all(&tmux_tmpdir).unwrap();
@@ -83,7 +84,7 @@ fn a_verify_skip_lands_in_the_daemon_log() {
     }
 
     let session = format!("nudgelog_{}", std::process::id());
-    let server = Server::start(&tmux_tmpdir, &session);
+    let server = watchdog.start_tmux(&tmux_tmpdir, &session);
 
     let paths: Paths = resolve_from(
         &home,
@@ -126,7 +127,7 @@ fn a_verify_skip_lands_in_the_daemon_log() {
     drop(queue);
 
     // Production spawn, production stderr wiring, the real nudge binary.
-    let daemon = common::DaemonGuard::new(
+    let daemon = watchdog.guard(
         nudge::app::spawn_daemon(Path::new(env!("CARGO_BIN_EXE_nudge")), &paths)
             .expect("spawn the daemon"),
     );
