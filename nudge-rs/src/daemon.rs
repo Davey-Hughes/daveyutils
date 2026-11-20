@@ -302,6 +302,13 @@ pub fn notification(
              there would land in whichever tmux pane is active"
         )),
         Err(_) if job.will_retry() => None,
+        // With -r the user expects a retry, so say why there was none.
+        Err(e) if job.auto_retry && job.one_try() => Some(format!(
+            "nudge gave up on {pane} without a retry, as it had no banner to check: {e:#}"
+        )),
+        Err(e) if job.auto_retry => Some(format!(
+            "nudge gave up on {pane} with no retries left: {e:#}"
+        )),
         Err(e) => Some(format!("nudge gave up on {pane}: {e:#}")),
     }
 }
@@ -523,15 +530,22 @@ mod tests {
         let mut spent = job(true);
         spent.auto_retry = true;
         spent.retries_left = 0;
-        assert!(notification(&spent, "p", &err()).is_some());
+        let said = notification(&spent, "p", &err()).expect("no notification");
+        // "no retries left", not "used up": `-r 0` asked for none and never
+        // had any to use.
+        assert!(said.contains("with no retries left"), "{said}");
+        assert!(said.contains("herdr said no: boom"), "{said}");
         // A verify job whose pane showed no banner gets no retries, whatever
-        // -r says, so its failure is the end of it.
+        // -r says, so its failure is the end of it, and the notification says
+        // why the -r was not honoured.
         let mut once = job(true);
         once.auto_retry = true;
         once.retries_left = -1;
         once.verify = true;
         once.verify_no_banner = true;
-        assert!(notification(&once, "p", &err()).is_some());
+        let said = notification(&once, "p", &err()).expect("no notification");
+        assert!(said.contains("no banner to check"), "{said}");
+        assert!(said.contains("herdr said no: boom"), "{said}");
     }
 
     #[test]

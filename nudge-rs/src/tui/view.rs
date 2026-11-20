@@ -269,13 +269,25 @@ fn form_view(model: &Model, f: &mut Frame, area: Rect) {
     let mark = |field: FormField| if form.focus == field { "▶ " } else { "  " };
     let onoff = |b: bool| if b { "[x]" } else { "[ ]" };
     // Show how many retries auto-retry will actually schedule (from config, or a
-    // carried job's remaining count) so the count isn't a mystery.
-    let auto_retry_label = if form.auto_retry {
-        let n = form.retry_base(model.defaults.retries);
-        let unit = if n == 1 { "retry" } else { "retries" };
-        format!("auto-retry ({n} {unit})")
-    } else {
+    // carried job's remaining count) so the count isn't a mystery, and none for
+    // a job that will get one try.
+    let auto_retry_label = if !form.auto_retry {
         "auto-retry".to_string()
+    } else if form.one_try() {
+        "auto-retry (none: no banner to check)".to_string()
+    } else {
+        let n = form.retry_base(model.defaults.retries);
+        // An edited job with no retries left gets the default back only when
+        // Auto-retry is ticked again, and nothing else on the form says so.
+        let rearm = n == 0
+            && model.defaults.retries != 0
+            && form.carried.as_ref().is_some_and(|c| !c.retry_asked);
+        if rearm {
+            // Short enough for a 50-column popup: form rows do not wrap.
+            "auto-retry (none: untick+tick re-arms)".to_string()
+        } else {
+            format!("auto-retry ({})", crate::job::retries_in_words(n))
+        }
     };
     // The focused text field and the char its cursor is on (Normal) or before
     // (Insert) — `None` on selector fields, which show no cursor.
@@ -588,12 +600,18 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use crate::detect::Detection;
     use crate::job::TargetSpec;
 
-    use super::super::model::{Model, ScheduleDefaults, VimMode, WhenMode};
+    use super::super::model::{CarriedEdit, Model, ScheduleDefaults, VimMode, WhenMode};
 
     fn render(model: &Model) -> String {
-        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        render_at(model, 80)
+    }
+
+    /// `render` at `width` columns, as in a narrow herdr popup.
+    fn render_at(model: &Model, width: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
         term.draw(|f| view(model, f)).unwrap();
         let buf = term.backend().buffer().clone();
         (0..buf.area.height)
@@ -1180,6 +1198,88 @@ mod tests {
         let out = render(&m);
         assert!(out.contains("auto-retry"), "{out}");
         assert!(!out.contains("retries)"), "no count when off: {out}");
+    }
+
+    /// `-r -1` used to read "auto-retry (-1 retries)".
+    #[test]
+    fn auto_retry_without_a_limit_says_so() {
+        let mut d = defaults();
+        d.retries = -1;
+        let mut m = Model::new(d, "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        m.form.auto_retry = true;
+        assert!(
+            render(&m).contains("auto-retry (no limit)"),
+            "{}",
+            render(&m)
+        );
+    }
+
+    /// With verify on and no banner in the preview, the snapshot on submit
+    /// will make the job one try, so the form must not promise retries. That
+    /// covers the edit form of a one-try job too, which keeps Auto-retry
+    /// ticked: the edit takes a new snapshot, and a pane that shows a banner
+    /// by then gets its retries back.
+    #[test]
+    fn auto_retry_on_a_verify_pane_with_no_banner_says_no_retries() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        m.form.auto_retry = true;
+        m.form.verify = true;
+        m.form.preview = Some("> \n".into());
+        m.form.detected = Some(Detection::None);
+        // Whole at 50 columns: form rows do not wrap.
+        let out = render_at(&m, 50);
+        assert!(
+            out.contains("auto-retry (none: no banner to check)"),
+            "{out}"
+        );
+        // Without verify nothing is checked, so the job retries as asked.
+        m.form.verify = false;
+        assert!(render(&m).contains("auto-retry (2 retries)"));
+        // A pane that could not be captured is no evidence either way.
+        m.form.verify = true;
+        m.form.preview = None;
+        assert!(render(&m).contains("auto-retry (2 retries)"));
+    }
+
+    /// An edit of a job with its retries used up gives none back, and the
+    /// form says so rather than showing the default count.
+    #[test]
+    fn auto_retry_on_an_edit_with_its_retries_used_up_says_none() {
+        let mut m = Model::new(defaults(), "2026-07-16T12:00:00Z".parse().unwrap());
+        m.tab = Tab::NewNudge;
+        m.form.auto_retry = true;
+        m.form.carried = Some(CarriedEdit {
+            fire_at: "2026-07-16T14:00:00Z".parse().unwrap(),
+            messages: vec!["please continue".into()],
+            send_delay_secs: 0.5,
+            settle_secs: 5.0,
+            auto_retry: true,
+            retries_left: 0,
+            retry_asked: false,
+            target: TargetSpec::Tmux {
+                pane: "%1".into(),
+                server: None,
+            },
+        });
+        // Whole at 50 columns: form rows do not wrap, so a longer hint would
+        // lose its instruction off the edge. One press only unticks the box,
+        // so the hint names both.
+        let out = render_at(&m, 50);
+        assert!(
+            out.contains("auto-retry (none: untick+tick re-arms)"),
+            "the form says how to get them back: {out}"
+        );
+        // Ticked again, it shows what the save will store.
+        if let Some(c) = &mut m.form.carried {
+            c.retry_asked = true;
+        }
+        assert!(
+            render(&m).contains("auto-retry (2 retries)"),
+            "{}",
+            render(&m)
+        );
     }
 
     #[test]

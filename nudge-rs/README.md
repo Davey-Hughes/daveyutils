@@ -36,7 +36,7 @@ nudge -a                         # no prompts: last pane, its reset time, defaul
 nudge -a --ask                   # the same, but type the time when the pane shows none
 nudge -p bot:0.1                 # auto-detect the reset time from the pane
 nudge -p bot:0.1 -m "14:30"      # explicit time
-nudge -p bot:0.1 --auto-retry -r -1 -v   # retry forever, verify before each send
+nudge -p bot:0.1 --auto-retry -r -1 -v   # verify, retry while the pane shows a banner
 nudge -p herdr:w7:pX             # a herdr pane (see herdr below for which session)
 nudge                            # interactive pane picker
 nudge --list                     # pending jobs
@@ -184,8 +184,9 @@ scheduled for before typing anything:
   it (herdr's `agent_session` for the pane). If the pane holds a different
   conversation when the job comes due, it gets nothing. If herdr reports no
   conversation for the pane, nudge cannot tell and treats it as a failed send:
-  retried with `-r`, and without `-r` dropped, with a notification (under
-  `--notify`) and a log line that say why. A `/clear` in
+  retried with `-r` (unless it is a `-v` job with [one try](#--verify)), and
+  otherwise dropped, with a notification (under `--notify`) and a log line that
+  say why. A `/clear` in
   that pane counts, and so does quitting the agent and starting another. herdr
   keeps a pane's id and its conversation across a restart, so a plain herdr
   restart does not drop the job; the check is there because a closed
@@ -209,6 +210,12 @@ Run `nudge` with no arguments in a terminal to open the interactive dashboard:
   schedules without quitting and drops you on the Jobs tab.
 - **Jobs** — `Tab` to it: a live table of pending nudges with a countdown to
   each; `↑↓` to select, `c` to cancel, `e` to edit, `r` to refresh.
+
+An edit keeps the retries a job has left, and that includes none: a job
+scheduled with `-r 0`, or one that has used its retries up, still gets none
+after you change its time or message. To give it the default count again,
+untick and tick Auto-retry in the edit form, or run
+`nudge --edit <id> --auto-retry` (`-r <n>` for a count of your own).
 
 `q` quits from anywhere it isn't a character you are typing: the message field, a
 manual time, and the pane picker's query keep it as text, and in the picker's
@@ -385,8 +392,9 @@ again later`, or a layout nudge does not know) would show none at fire time
 either. For that job nudge drops the banner check and injects if the pane is
 unchanged, or if it cannot tell (the window was resized, or a herdr tab is
 zoomed), with no banner check to fall back on. It gets one try, whatever `-r`
-says, and the confirmation says so: after nudge has typed into the pane,
-nothing would be left to tell whether you had come back.
+says, and the confirmation says so, as do the dashboard and a `--notify` that it
+failed: after nudge has typed into the pane, nothing would be left to tell
+whether you had come back.
 
 Anything it cannot judge, it injects. Resizing the window reflows the pane, a
 job scheduled by an older build carries no fingerprint, and a pane that will not

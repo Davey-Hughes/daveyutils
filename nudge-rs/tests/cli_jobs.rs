@@ -222,6 +222,66 @@ fn edit_auto_retry_with_an_explicit_count_uses_that_count() {
     assert_eq!(spec.retries_left, 7);
 }
 
+/// A job on its last try: auto-retry on, its retries used up.
+fn spent_job(id: u64) -> nudge::job::Job {
+    JobSpec {
+        auto_retry: true,
+        retries_left: 0,
+        ..spec("bot:0.1")
+    }
+    .into_job(id)
+}
+
+#[test]
+fn edit_of_a_job_with_its_retries_used_up_keeps_them_used_up() {
+    // The fallback above is for a job that never had auto-retry on. One that
+    // has spent its budget also holds 0, and an edit that changed only the
+    // time gave it the default count again.
+    let spec = nudge::app::merge_edit(
+        &spent_job(5),
+        &cli(&["nudge", "--edit", "5", "-m", "6pm"]),
+        None,
+        &noon(),
+        2,
+        &no_snapshot,
+    )
+    .unwrap();
+    assert!(spec.auto_retry);
+    assert_eq!(spec.retries_left, 0);
+}
+
+#[test]
+fn edit_of_a_job_with_its_retries_used_up_rearms_on_an_explicit_auto_retry() {
+    // `--auto-retry` asks for retries, so it gets what it gets on a job that
+    // never had any: the default, not the 0 the job holds.
+    let spec = nudge::app::merge_edit(
+        &spent_job(5),
+        &cli(&["nudge", "--edit", "5", "--auto-retry"]),
+        None,
+        &noon(),
+        2,
+        &no_snapshot,
+    )
+    .unwrap();
+    assert!(spec.auto_retry);
+    assert_eq!(spec.retries_left, 2);
+}
+
+#[test]
+fn edit_of_a_job_with_its_retries_used_up_takes_a_new_count_from_r() {
+    let spec = nudge::app::merge_edit(
+        &spent_job(5),
+        &cli(&["nudge", "--edit", "5", "-r", "3"]),
+        None,
+        &noon(),
+        2,
+        &no_snapshot,
+    )
+    .unwrap();
+    assert!(spec.auto_retry);
+    assert_eq!(spec.retries_left, 3);
+}
+
 #[test]
 fn edit_without_auto_retry_keeps_a_no_retry_job_at_zero() {
     // The fallback must not arm retries on a job the user never asked to retry.

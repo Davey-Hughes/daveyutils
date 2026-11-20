@@ -80,8 +80,12 @@ pub fn run_effect(effect: Effect, socket: &Path) -> Msg {
             snapshot_pane,
         } => {
             attach_baseline(&mut spec, snapshot_pane);
+            let no_banner = spec.verify_no_banner;
             match client::request(socket, &Request::Replace { id, spec }) {
-                Ok(Response::Replaced(new_id)) => Msg::Replaced(new_id),
+                Ok(Response::Replaced(new_id)) => Msg::Replaced {
+                    id: new_id,
+                    no_banner,
+                },
                 Ok(Response::Error(e)) => Msg::ActionFailed(format!("failed to edit: {e}")),
                 Ok(other) => Msg::ActionFailed(format!("unexpected response: {other:?}")),
                 Err(e) => Msg::ActionFailed(format!("daemon request failed: {e}")),

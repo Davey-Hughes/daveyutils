@@ -179,7 +179,14 @@ pub struct CarriedEdit {
     pub messages: Vec<String>,
     pub send_delay_secs: f64,
     pub settle_secs: f64,
+    /// Whether the job had auto-retry on, which tells a job whose retries are
+    /// used up from one that never had any (see [`crate::job::edit_retry_base`]).
+    pub auto_retry: bool,
     pub retries_left: i64,
+    /// Set once Auto-retry is toggled in this edit. Ticking it is asking for
+    /// retries, as `--auto-retry` is, so a job whose retries are used up gets
+    /// the default count back.
+    pub retry_asked: bool,
     /// The job's target as it was, so a pane left alone keeps its stamp.
     pub target: crate::job::TargetSpec,
 }
@@ -274,14 +281,29 @@ impl Form {
         self.focused_text().map_or(0, |s| s.chars().count())
     }
 
-    /// How many retries a scheduled job gets when auto-retry is on: the carried
-    /// job's remaining count if it still has any, else the config default.
-    /// Mirrors `app::merge_edit`'s "a job with 0 left re-arms the default".
+    /// How many retries a scheduled job gets when auto-retry is on: the config
+    /// default for a new nudge, and for an edit what `app::merge_edit` starts
+    /// from ([`crate::job::edit_retry_base`]).
     pub fn retry_base(&self, default_retries: i64) -> i64 {
         match &self.carried {
-            Some(c) if c.retries_left != 0 => c.retries_left,
-            _ => default_retries,
+            Some(c) => crate::job::edit_retry_base(
+                c.auto_retry,
+                c.retries_left,
+                c.retry_asked,
+                default_retries,
+            ),
+            None => default_retries,
         }
+    }
+
+    /// Whether the job this form schedules will get one try
+    /// ([`Job::one_try`]): `--verify` is on and the live preview of its pane
+    /// shows no banner. The snapshot taken on submit decides, by the same rule
+    /// on the same screen. A pane the preview could not capture is not
+    /// counted: its snapshot would most likely fail too, and a job without
+    /// one keeps its retries.
+    pub fn one_try(&self) -> bool {
+        self.verify && self.preview.is_some() && self.detected == Some(Detection::None)
     }
 
     /// The pane the preview/detection should track: the picker's highlighted

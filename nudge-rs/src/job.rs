@@ -141,7 +141,47 @@ impl Job {
     /// that holds after a failed send too, since with several messages some
     /// may have gone in before the error.
     pub fn one_try(&self) -> bool {
-        self.verify && self.verify_no_banner
+        one_try(self.verify, self.verify_no_banner)
+    }
+}
+
+/// The rule behind [`Job::one_try`], kept in one place for `JobSpec` too.
+fn one_try(verify: bool, verify_no_banner: bool) -> bool {
+    verify && verify_no_banner
+}
+
+/// A retry count in words: `-1` (or any negative, which the scheduler treats
+/// the same) is "no limit", 0 is "no retries".
+pub fn retries_in_words(n: i64) -> String {
+    match n {
+        ..0 => "no limit".to_string(),
+        0 => "no retries".to_string(),
+        1 => "1 retry".to_string(),
+        n => format!("{n} retries"),
+    }
+}
+
+/// The retry count an edit of a job starts from, before any `-r`.
+///
+/// The job's own count, except where the edit should arm `default_retries`,
+/// what a new schedule would:
+/// - The job has no auto-retry, so it has no count of its own (it stores 0).
+///   An edit that turns auto-retry on would otherwise store auto-retry with 0
+///   retries, which never retries.
+/// - The job has auto-retry with 0 left (`-r 0`, or its retries used up), and
+///   the edit `asked` for auto-retry itself: `--auto-retry`, or ticking it again
+///   in the dashboard. An edit that changes only the time or the message gives
+///   no retries back.
+pub fn edit_retry_base(
+    auto_retry: bool,
+    retries_left: i64,
+    asked: bool,
+    default_retries: i64,
+) -> i64 {
+    if !auto_retry || (retries_left == 0 && asked) {
+        default_retries
+    } else {
+        retries_left
     }
 }
 
@@ -171,7 +211,24 @@ pub struct JobSpec {
 impl JobSpec {
     /// See [`Job::one_try`].
     pub fn one_try(&self) -> bool {
-        self.verify && self.verify_no_banner
+        one_try(self.verify, self.verify_no_banner)
+    }
+
+    /// What auto-retry will do for this job, for a summary of it; `None` with
+    /// auto-retry off. A job that gets no retries says so in place of
+    /// "auto-retry", whether `-r 0` asked for none, its retries are used up,
+    /// or it is [`one_try`](Self::one_try).
+    pub fn retry_note(&self) -> Option<String> {
+        if !self.auto_retry {
+            return None;
+        }
+        Some(if self.one_try() {
+            "no retries (no banner to check)".to_string()
+        } else if self.retries_left == 0 {
+            retries_in_words(0)
+        } else {
+            format!("auto-retry ({})", retries_in_words(self.retries_left))
+        })
     }
 
     pub fn into_job(self, id: u64) -> Job {
@@ -419,6 +476,84 @@ mod tests {
             pane: "%1".into(),
             server: server.map(String::from),
         }
+    }
+
+    /// Which count an edit starts from, case by case.
+    #[test]
+    fn an_edit_arms_the_default_without_auto_retry_or_when_asked_with_none_left() {
+        // (auto_retry, retries_left, asked) -> base, with a default of 2.
+        for (auto_retry, left, asked, want) in [
+            (true, 3, false, 3),
+            (true, 3, true, 3), // asking keeps a count the job still has
+            (true, -1, true, -1),
+            (true, 0, false, 0), // used up stays used up
+            (true, 0, true, 2),  // unless the edit asks for retries
+            (false, 0, false, 2),
+            // A job without auto-retry has no count of its own, whatever a
+            // hand-edited queue.json says; -1 here would mean no limit.
+            (false, -1, false, 2),
+        ] {
+            assert_eq!(
+                edit_retry_base(auto_retry, left, asked, 2),
+                want,
+                "auto_retry {auto_retry}, {left} left, asked {asked}"
+            );
+        }
+    }
+
+    /// `-r -1` is no limit, not "-1 retries", and a count of 0 is none.
+    #[test]
+    fn a_retry_count_reads_as_words() {
+        assert_eq!(retries_in_words(-1), "no limit");
+        assert_eq!(retries_in_words(0), "no retries");
+        assert_eq!(retries_in_words(1), "1 retry");
+        assert_eq!(retries_in_words(2), "2 retries");
+    }
+
+    fn retrying(retries_left: i64) -> JobSpec {
+        JobSpec {
+            target: target(None),
+            messages: vec!["please continue".into()],
+            send_delay_secs: 0.5,
+            fire_at: "2026-07-13T15:00:00Z".parse().unwrap(),
+            notify: false,
+            verify: false,
+            auto_retry: true,
+            retries_left,
+            settle_secs: 5.0,
+            verify_fingerprint: None,
+            verify_dims: None,
+            verify_no_banner: false,
+        }
+    }
+
+    /// A summary says what the daemon will do: `-r 0` used to read
+    /// "auto-retry (0)", and `-r -1` "auto-retry (-1)".
+    #[test]
+    fn the_retry_note_says_what_the_daemon_will_do() {
+        assert_eq!(
+            retrying(2).retry_note().as_deref(),
+            Some("auto-retry (2 retries)")
+        );
+        assert_eq!(
+            retrying(-1).retry_note().as_deref(),
+            Some("auto-retry (no limit)")
+        );
+        assert_eq!(retrying(0).retry_note().as_deref(), Some("no retries"));
+        let once = JobSpec {
+            verify: true,
+            verify_no_banner: true,
+            ..retrying(2)
+        };
+        assert_eq!(
+            once.retry_note().as_deref(),
+            Some("no retries (no banner to check)")
+        );
+        let off = JobSpec {
+            auto_retry: false,
+            ..retrying(0)
+        };
+        assert_eq!(off.retry_note(), None, "nothing to say without -r");
     }
 
     #[test]

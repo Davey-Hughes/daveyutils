@@ -36,7 +36,9 @@ name = "nudge"
 # 0.10.0 is load-bearing for the daemon's behavior: a 0.9.1 daemon ignores a
 # job's verify_no_banner, and skips a --verify job scheduled on a pane that
 # showed no banner, so the nudge never fires.
-version = "0.10.0"
+# 0.10.1 changes only what the daemon's notification says when a failed job
+# gets no retry (why not), so it is a marker, not load-bearing.
+version = "0.10.1"
 edition = "2024"
 description = "Rate-limit auto-resumer for AI CLIs in tmux or herdr"
 license = "GPL-3.0-or-later"

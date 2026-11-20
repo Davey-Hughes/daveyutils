@@ -45,7 +45,13 @@ pub enum Msg {
         no_banner: bool,
     },
     Cancelled(bool),
-    Replaced(Option<u64>),
+    /// The daemon swapped the edited job for `id`, or found it already gone
+    /// (`None`). `no_banner` is as for [`Msg::Scheduled`]: an edit takes a new
+    /// snapshot.
+    Replaced {
+        id: Option<u64>,
+        no_banner: bool,
+    },
     ActionFailed(String),
 }
 
@@ -123,8 +129,14 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             note_no_banner(model, no_banner);
             finish_submit(model, id, "scheduled job")
         }
-        Msg::Replaced(Some(id)) => finish_submit(model, id, "edited — now job"),
-        Msg::Replaced(None) => {
+        Msg::Replaced {
+            id: Some(id),
+            no_banner,
+        } => {
+            note_no_banner(model, no_banner);
+            finish_submit(model, id, "edited — now job")
+        }
+        Msg::Replaced { id: None, .. } => {
             model.pending_spec = None;
             model.status.set("that job is already gone");
             vec![Effect::PollJobs]
@@ -218,7 +230,13 @@ fn finish_submit(model: &mut Model, id: u64, verb: &str) -> Vec<Effect> {
             vec![]
         }
         AfterSubmit::Jobs => {
-            model.status.set(format!("{verb} {id}"));
+            // Auto-retry was ticked, but the snapshot found no banner, so the
+            // job gets one try. Said here as the exit summary would say it.
+            let one_try = spec.filter(JobSpec::one_try).and_then(|s| s.retry_note());
+            model.status.set(match one_try {
+                Some(note) => format!("{verb} {id} · {note}"),
+                None => format!("{verb} {id}"),
+            });
             model.tab = Tab::Jobs;
             model.form = Form::fresh();
             vec![Effect::PollJobs]
@@ -369,7 +387,9 @@ fn enter_edit(model: &mut Model, job: &Job) {
             messages: job.messages.clone(),
             send_delay_secs: job.send_delay_secs,
             settle_secs: job.settle_secs,
+            auto_retry: job.auto_retry,
             retries_left: job.retries_left,
+            retry_asked: false,
             target: job.target.clone(),
         }),
         preview: None,
@@ -851,7 +871,12 @@ fn toggle_flag(form: &mut super::model::Form) {
     match form.focus {
         FormField::Verify => form.verify = !form.verify,
         FormField::Notify => form.notify = !form.notify,
-        FormField::AutoRetry => form.auto_retry = !form.auto_retry,
+        FormField::AutoRetry => {
+            form.auto_retry = !form.auto_retry;
+            if let Some(c) = &mut form.carried {
+                c.retry_asked = true;
+            }
+        }
         _ => {}
     }
 }
@@ -2038,6 +2063,79 @@ mod tests {
         }
     }
 
+    /// Save the edit form as it stands and return the spec it would store.
+    fn saved_edit(m: &mut Model) -> crate::job::JobSpec {
+        m.form.focus = FormField::Submit;
+        match update(m, Msg::Key(crossterm::event::KeyCode::Enter)).as_slice() {
+            [Effect::Replace { spec, .. }] => spec.clone(),
+            other => panic!("expected Replace, got {other:?}"),
+        }
+    }
+
+    /// A job on its last try holds `auto_retry` with 0 retries left. Saving an
+    /// edit of it, say a new message, used to give it the default budget
+    /// again, so every edit undid the `-r` the job was scheduled with.
+    #[test]
+    fn editing_a_job_with_its_retries_used_up_keeps_them_used_up() {
+        let mut m = with_jobs(0);
+        let mut spent = multi_msg_job();
+        spent.retries_left = 0;
+        m.jobs = vec![spent];
+        m.form.panes = vec![Pane {
+            target: "s:0.7".into(),
+            title: String::new(),
+            spec: tmux_spec("%7"),
+        }];
+        edit(&mut m);
+        let spec = saved_edit(&mut m);
+        assert!(spec.auto_retry);
+        assert_eq!(spec.retries_left, 0, "no retries left, none given back");
+    }
+
+    /// Ticking Auto-retry on a job that never had it is not a used-up budget:
+    /// the job gets what a new nudge would.
+    #[test]
+    fn ticking_auto_retry_on_an_edited_job_arms_the_default_budget() {
+        let mut m = with_jobs(0);
+        let mut plain = multi_msg_job();
+        plain.auto_retry = false;
+        plain.retries_left = 0;
+        m.jobs = vec![plain];
+        m.form.panes = vec![Pane {
+            target: "s:0.7".into(),
+            title: String::new(),
+            spec: tmux_spec("%7"),
+        }];
+        edit(&mut m);
+        m.form.auto_retry = true;
+        let spec = saved_edit(&mut m);
+        assert_eq!(spec.retries_left, defaults().retries);
+    }
+
+    /// The form has no retry count, so unticking and ticking Auto-retry again
+    /// is how an edit asks for retries back, as `--edit <id> --auto-retry`
+    /// does. A job with retries left keeps its own count.
+    #[test]
+    fn re_ticking_auto_retry_gives_a_used_up_job_the_default_budget() {
+        for (left, want) in [(0, defaults().retries), (3, 3)] {
+            let mut m = with_jobs(0);
+            let mut j = multi_msg_job();
+            j.retries_left = left;
+            m.jobs = vec![j];
+            m.form.panes = vec![Pane {
+                target: "s:0.7".into(),
+                title: String::new(),
+                spec: tmux_spec("%7"),
+            }];
+            edit(&mut m);
+            m.form.focus = FormField::AutoRetry;
+            update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(' ')));
+            update(&mut m, Msg::Key(crossterm::event::KeyCode::Char(' ')));
+            assert!(m.form.auto_retry);
+            assert_eq!(saved_edit(&mut m).retries_left, want, "{left} left");
+        }
+    }
+
     /// The job names its pane by id, and the form opens on that pane, not on
     /// whichever pane happens to sort first.
     #[test]
@@ -2601,6 +2699,59 @@ mod tests {
         );
     }
 
+    /// Ctrl-S prints no summary, so the status line is where a one-try job
+    /// says it will not retry.
+    #[test]
+    fn ctrl_s_on_a_one_try_job_says_it_will_not_retry() {
+        let mut m = form_model();
+        m.form.verify = true;
+        m.form.auto_retry = true;
+        m.form.detected = Some(Detection::Reset(
+            t0().checked_add(jiff::ToSpan::hours(2))
+                .unwrap()
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC),
+        ));
+        update(&mut m, Msg::SubmitStay);
+        update(
+            &mut m,
+            Msg::Scheduled {
+                id: 12,
+                no_banner: true,
+            },
+        );
+        assert_eq!(
+            m.status.0.as_deref(),
+            Some("scheduled job 12 · no retries (no banner to check)")
+        );
+    }
+
+    /// An edit takes a new snapshot too, and its reply carries the answer.
+    #[test]
+    fn saving_an_edit_of_a_one_try_job_says_it_will_not_retry() {
+        let mut m = with_jobs(1);
+        let mut j = multi_msg_job();
+        j.verify = true;
+        m.jobs = vec![j];
+        m.form.panes = vec![Pane {
+            target: "s:0.7".into(),
+            title: String::new(),
+            spec: tmux_spec("%7"),
+        }];
+        edit(&mut m);
+        saved_edit(&mut m);
+        update(
+            &mut m,
+            Msg::Replaced {
+                id: Some(8),
+                no_banner: true,
+            },
+        );
+        assert_eq!(
+            m.status.0.as_deref(),
+            Some("edited — now job 8 · no retries (no banner to check)")
+        );
+    }
+
     #[test]
     fn ctrl_s_is_ignored_where_there_is_nothing_to_submit() {
         // The Jobs tab has no form, and the picker owns the keyboard while open.
@@ -2626,7 +2777,13 @@ mod tests {
         m.form.focus = FormField::Submit;
         update(&mut m, Msg::Key(crossterm::event::KeyCode::Enter));
         assert_eq!(m.after_submit, AfterSubmit::Jobs);
-        update(&mut m, Msg::Replaced(Some(8)));
+        update(
+            &mut m,
+            Msg::Replaced {
+                id: Some(8),
+                no_banner: false,
+            },
+        );
         assert!(!m.should_quit);
         assert_eq!(m.tab, Tab::Jobs);
     }

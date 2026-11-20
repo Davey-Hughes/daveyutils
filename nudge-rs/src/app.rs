@@ -725,11 +725,7 @@ fn job_summary(
     if spec.notify {
         flags.push("notify".to_string());
     }
-    if spec.auto_retry && spec.one_try() {
-        flags.push("no retries (no banner to check)".to_string());
-    } else if spec.auto_retry {
-        flags.push(format!("auto-retry ({})", spec.retries_left));
-    }
+    flags.extend(spec.retry_note());
     let flags = if flags.is_empty() {
         String::new()
     } else {
@@ -848,13 +844,16 @@ pub fn merge_edit(
         // the base straight from the job made `--edit <id> --auto-retry` (no -r)
         // resolve to auto_retry=true with a budget of 0 — which apply_outcome
         // reads as exhausted, deleting the job on its first fire while the CLI
-        // reported a successful edit. Fall back to the count a fresh schedule
-        // would arm; an explicit -r still overrides it below.
-        retries: if job.retries_left == 0 {
-            default_retries
-        } else {
-            job.retries_left
-        },
+        // reported a successful edit. Such a job falls back to the count a fresh
+        // schedule would arm. One whose retries are used up keeps 0, unless
+        // --auto-retry asks for them. An explicit -r still overrides any of
+        // these below.
+        retries: crate::job::edit_retry_base(
+            job.auto_retry,
+            job.retries_left,
+            cli.auto_retry,
+            default_retries,
+        ),
         settle_secs: job.settle_secs,
     };
     let overrides = crate::config::FlagOverrides {
@@ -1379,8 +1378,24 @@ mod tests {
         assert_eq!(
             s,
             "nudge: scheduled job 7 for 2026-07-16 14:14 (in 2h 14m)\n       \
-             bot:0.1 · \"please continue\" · notify, auto-retry (2)"
+             bot:0.1 · \"please continue\" · notify, auto-retry (2 retries)"
         );
+    }
+
+    /// `-r 0` gets no retries, and the summary used to read "auto-retry (0)".
+    #[test]
+    fn the_summary_of_r_0_says_no_retries() {
+        let mut spec = a_spec("bot:0.1", &["please continue"], "2026-07-16T14:14:00Z");
+        spec.auto_retry = true;
+        spec.retries_left = 0;
+        let s = schedule_summary(
+            7,
+            &spec,
+            &Positions::new(),
+            &jiff::tz::TimeZone::UTC,
+            "2026-07-16T12:00:00Z".parse().unwrap(),
+        );
+        assert!(s.ends_with("· \"please continue\" · no retries"), "{s}");
     }
 
     /// The daemon will not retry a verify job whose pane showed no banner, so
